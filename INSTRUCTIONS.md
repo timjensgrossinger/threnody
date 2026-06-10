@@ -91,7 +91,9 @@ of a marked block.
 ## Legal and provider terms
 
 Threnody is not affiliated with or endorsed by any AI provider. Operators are
-responsible for complying with each provider's terms of service.
+responsible for complying with each provider's terms of service. Provider terms,
+policies, and enforcement may change at any time without notice; Threnody cannot
+guarantee continued compatibility with any provider's rules.
 
 - See [docs/LEGAL.md](docs/LEGAL.md) for routing risk tiers and team guidance
 - Cross-routing Claude Pro/Max subscription OAuth from non-Claude hosts carries

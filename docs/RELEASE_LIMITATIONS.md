@@ -31,7 +31,9 @@ private provider quotas that are not available through stable APIs.
 ## Provider compliance boundaries
 
 Threnody cannot certify routing patterns as fully compliant with every provider
-terms of service. See [docs/LEGAL.md](LEGAL.md) for the full risk-tier guide.
+terms of service. Provider terms, policies, and enforcement may change at any
+time without notice; Threnody cannot guarantee continued compatibility with any
+provider's rules. See [docs/LEGAL.md](LEGAL.md) for the full risk-tier guide.
 
 - **Highest risk:** routing Claude Pro/Max subscription OAuth from a non-Claude
   host (for example Copilot, Cursor, or Codex) to `claude -p`

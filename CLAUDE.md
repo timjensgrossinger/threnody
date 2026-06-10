@@ -212,6 +212,7 @@ Routing eval fixtures live in `tests/eval/` organised by tier (`low_tier/`, `med
 ## Legal and provider compliance
 
 - Threnody is not affiliated with or endorsed by any AI provider
+- Provider terms, policies, and enforcement may change at any time without notice
 - Cross-routing Claude Pro/Max OAuth from non-Claude hosts is the highest provider-policy risk
 - Claude Code → Claude Code routing is blocked by default; see `docs/LEGAL.md`
 - `threnody serve` and remote MCP tools are deprecated; use local MCP stdio only

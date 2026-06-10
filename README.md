@@ -39,7 +39,7 @@ cd threnody
 
 Restart your shell, then connect from Claude Code, Copilot CLI, Gemini, Codex, Cursor, or Junie — Threnody registers as an MCP server automatically.
 
-**Provider terms:** Threnody is not affiliated with or endorsed by any AI provider. You are responsible for complying with each provider's terms of service. See [docs/LEGAL.md](docs/LEGAL.md) before routing across subscriptions.
+**Provider terms:** Threnody is not affiliated with or endorsed by any AI provider. You are responsible for complying with each provider's terms of service. Provider terms, policies, and enforcement may change at any time without notice. See [docs/LEGAL.md](docs/LEGAL.md) before routing across subscriptions.
 
 ---
 
@@ -219,6 +219,9 @@ endorsed by, or sponsored by Anthropic, OpenAI, GitHub, Google, Cursor,
 JetBrains, or any other provider named in this repository.
 
 - Use at your own risk and in compliance with each provider's terms of service
+- Provider terms, policies, and enforcement may change at any time without
+  notice; Threnody cannot guarantee continued compatibility with any provider's
+  rules
 - Cross-routing Claude Pro/Max subscription OAuth from non-Claude hosts carries
   the highest provider-policy risk; see [docs/LEGAL.md](docs/LEGAL.md)
 - Claude Code → Claude Code routing is blocked by default; explicit opt-in only

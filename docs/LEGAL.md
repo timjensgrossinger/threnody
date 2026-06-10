@@ -1,9 +1,10 @@
 # Legal and Provider Terms
 
 **This document is not legal advice.** It summarizes practical compliance
-boundaries for Threnody operators. Provider terms change and enforcement is
-discretionary. Consult qualified counsel before commercializing routing or
-exposing Threnody to many users.
+boundaries for Threnody operators. Provider terms, policies, and enforcement may
+change at any time without notice; Threnody cannot guarantee continued
+compatibility with any provider's rules. Consult qualified counsel before
+commercializing routing or exposing Threnody to many users.
 
 ## What Threnody is
 

@@ -1083,5 +1083,6 @@ if [[ "$HAS_OPENCODE" -eq 1 ]]; then
     echo "     OpenCode is available as a low-tier host/provider via opencode/nemotron-3-super-free"
 fi
 echo "  Provider terms: see $INSTALL_DIR/docs/LEGAL.md"
+echo "  Provider policies may change at any time; use at your own risk."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
