@@ -797,7 +797,7 @@ def test_install_writes_claude_routing_hook() -> None:
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        install_dir = home / ".local" / "lib" / "Switchyard"
+        install_dir = home / ".local" / "lib" / "switchyard"
         install_dir.mkdir(parents=True)
         (install_dir / "config.yaml").write_text("routing_policy:\n  mode: default\n", encoding="utf-8")
 
@@ -841,7 +841,7 @@ def test_install_keeps_claude_routing_hook_on_policy_parse_error() -> None:
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        install_dir = home / ".local" / "lib" / "Switchyard"
+        install_dir = home / ".local" / "lib" / "switchyard"
         install_dir.mkdir(parents=True)
         (install_dir / "config.yaml").write_text("routing_policy: [\n", encoding="utf-8")
 
@@ -869,7 +869,7 @@ def test_install_removes_claude_routing_hook_when_policy_disables_it() -> None:
         home = Path(td) / "home"
         bin_dir = Path(td) / "bin"
         settings_dir = home / ".claude"
-        install_dir = home / ".local" / "lib" / "Switchyard"
+        install_dir = home / ".local" / "lib" / "switchyard"
         home.mkdir()
         bin_dir.mkdir()
         settings_dir.mkdir(parents=True)
