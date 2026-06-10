@@ -58,6 +58,13 @@ class StubRegistry:
         return {"providers": []}
 
 
+class DelegatingStubRegistry(StubRegistry):
+    def _ordered_execution_candidates(self, tier, *, caller=None, caller_allowlists=None):
+        codex = SimpleNamespace(name="codex", display_name="OpenAI Codex")
+        copilot = SimpleNamespace(name="github-copilot", display_name="GitHub Copilot")
+        return [copilot, codex], []
+
+
 class WritingRegistry(StubRegistry):
     def __init__(self, target: Path, content: str) -> None:
         self.target = target
@@ -1071,6 +1078,70 @@ def test_handle_route_task_prefers_free_low_tier_metadata(monkeypatch) -> None:
         assert result["provider_cost_hint"] == "free"
         assert result["cost_rank"] == 0
         assert result["billing_source"] == "user_override"
+
+
+def test_handle_route_task_execution_hint_host_native_for_claude(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "route-hint.db"
+        cfg = TGsConfig(db_path=db_path)
+        db = Database(db_path=db_path)
+        router = SimpleNamespace(
+            classify=lambda _task: SimpleNamespace(
+                tier="medium",
+                score=0.55,
+                reason="medium-tier task",
+                agents=1,
+                override=False,
+            )
+        )
+        monkeypatch.setattr(
+            mcp_server,
+            "_ensure_init",
+            lambda: (cfg, db, router, None, None),
+        )
+        monkeypatch.setattr(mcp_server, "get_registry", lambda: DelegatingStubRegistry())
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+        result = mcp_server.handle_route_task({"task": "refactor auth module"})
+
+        hint = result["execution_hint"]
+        assert hint["mode"] == "host_native"
+        assert "Task agent" in str(hint["recommended_action"])
+        assert "github-copilot" in hint["delegation_targets"]
+        assert "execute_subtask" in result["quick_action"] or "Task agent" in result["quick_action"]
+
+
+def test_handle_route_task_execution_hint_delegate_for_copilot(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "route-delegate.db"
+        cfg = TGsConfig(db_path=db_path)
+        db = Database(db_path=db_path)
+        router = SimpleNamespace(
+            classify=lambda _task: SimpleNamespace(
+                tier="low",
+                score=0.2,
+                reason="low-tier task",
+                agents=1,
+                override=False,
+            )
+        )
+        monkeypatch.setattr(
+            mcp_server,
+            "_ensure_init",
+            lambda: (cfg, db, router, None, None),
+        )
+        monkeypatch.setattr(mcp_server, "get_registry", lambda: DelegatingStubRegistry())
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "external-caller")
+
+        result = mcp_server.handle_route_task({
+            "task": "quick fix",
+            "caller": "external-caller",
+        })
+
+        hint = result["execution_hint"]
+        assert hint["mode"] == "delegate"
+        assert "execute_subtask" in str(hint["recommended_action"])
+        assert hint["delegation_targets"] == ["github-copilot", "codex"]
 
 
 def test_execute_subtask_returns_billing_metadata(monkeypatch) -> None:

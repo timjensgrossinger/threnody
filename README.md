@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="docs/assets/hero.svg" alt="Threnody — multi-agent MCP orchestrator and LLM router" width="100%">
+  <img src="docs/assets/hero.svg" alt="Threnody — local-first MCP meta-harness for AI coding CLIs" width="100%">
 </p>
 
 <h1 align="center">Threnody</h1>
-<h3 align="center">Multi-agent MCP orchestrator &amp; LLM router for AI coding CLIs — Copilot, Claude Code, Gemini, Cursor, Codex, and more</h3>
+<h3 align="center">Local-first MCP meta-harness — host executes, Threnody coordinates swarms, memory, and learning</h3>
 
 <p align="center"><sub>
-  AI agent orchestration · MCP server · model routing · cost-aware tier routing · wave-based parallel execution
+  MCP coordination · self-learning agents · swarm orchestration · cross-session memory · optional delegation
 </sub></p>
 
 <p align="center">
@@ -18,9 +18,9 @@
 </p>
 
 <p align="center">
-  <strong>No Threnody-managed API keys.</strong> Runs through CLI subscriptions you already have.<br>
-  <strong>Cost-aware.</strong> Boilerplate on free models; hard problems on premium tiers.<br>
-  <strong>Parallel.</strong> Multi-file work decomposes into dependency-ordered waves.
+  <strong>Host executes.</strong> Task tool, direct edits, host-configured local/API backends.<br>
+  <strong>Threnody coordinates.</strong> Route, plan, swarm, memory, and approval-gated learning.<br>
+  <strong>Delegate when needed.</strong> Optional subprocess routing to other installed CLIs.
 </p>
 
 ---
@@ -43,7 +43,7 @@ cd threnody
 
 Restart your shell, then connect from Claude Code, Copilot CLI, Gemini, Codex, Cursor, or Junie — Threnody registers as an MCP server automatically.
 
-**Provider terms:** Threnody is not affiliated with or endorsed by any AI provider. You are responsible for complying with each provider's terms of service. Provider terms, policies, and enforcement may change at any time without notice. See [docs/LEGAL.md](docs/LEGAL.md) before routing across subscriptions.
+**Provider terms:** Threnody is not affiliated with or endorsed by any AI provider. Credentials stay in provider-native stores; you configure auth in each host CLI. See [docs/LEGAL.md](docs/LEGAL.md) for operator responsibilities.
 
 Docs: [limitations](docs/RELEASE_LIMITATIONS.md) · [legal](docs/LEGAL.md) · [architecture](docs/ARCHITECTURE.md)
 
@@ -51,9 +51,11 @@ Docs: [limitations](docs/RELEASE_LIMITATIONS.md) · [legal](docs/LEGAL.md) · [a
 
 ## What is Threnody?
 
-**Threnody** is a local-first **AI agent orchestration** layer and **MCP server** for developer workflows. It acts as an **LLM router** and **multi-agent CLI** coordinator: score task complexity, pick the cheapest authenticated provider per tier, decompose hard work into parallel waves, and expose ~41 MCP tools to any compatible host shell.
+**Threnody** is a local-first **MCP meta-harness** for developer workflows. Register it in Claude Code, Copilot CLI, Gemini, Codex, Cursor, or Junie — the **host shell executes** work while Threnody **coordinates** routing, planning, swarms, cross-session memory, and approval-gated learned agents.
 
-Search terms that describe the same project: **model routing**, **agent router**, **MCP orchestrator**, **multi-agent coding**, **CLI model selection**, **cost-aware AI routing**, **Copilot / Claude / Gemini orchestration**.
+Optional **delegation** via `execute_subtask` routes to other installed CLIs (Copilot, Codex, Cursor, endpoints, Aider, …). Claude Code and Gemini CLI are **router-only hosts** by default: coordination anchors, not subprocess delegation targets.
+
+Search terms that describe the same project: **MCP orchestrator**, **meta-harness**, **multi-agent coding**, **swarm coordination**, **self-learning agents**, **Copilot / Claude / Gemini orchestration**.
 
 ---
 
@@ -61,26 +63,27 @@ Search terms that describe the same project: **model routing**, **agent router**
 
 | | |
 |---|---|
-| **Save money** | Route simple edits to free/low-tier models. Reserve opus/sonnet-class models for work that needs reasoning. |
-| **Use what you have** | Works with GitHub Copilot, Claude Code, Gemini CLI, Codex, Cursor, Junie, OpenCode, Aider, Amazon Q/Kiro, and more — pick the cheapest authenticated CLI per task. |
-| **See everything** | Every wave shows agent, tier, model, provider, and target files before and after execution. |
+| **Coordinate in the host** | `route_task` returns tier guidance and `execution_hint` — host Task tool and direct edits first. |
+| **Learn over time** | Pattern tracking, draft agents, and an approval queue before anything goes live. |
+| **Swarm when needed** | Decompose hard work into dependency-ordered waves with linear, DAG, hierarchical, or star topologies. |
+| **Delegate optionally** | `execute_subtask` routes to other backends when you want cross-CLI execution. |
 
 ---
 
 ## Who this is for
 
-- Developers who already pay for one or more AI CLI subscriptions and want cheaper models for simple work
-- Teams routing across Copilot, Claude Code, Gemini, Codex, or Cursor from a single MCP host
-- Operators who want local-first routing, explicit provider diagnostics, and approval-gated learned agents
-- Anyone who wants credentials to stay in provider-native stores — Threnody does not manage your API keys
+- Developers who want MCP coordination (swarms, memory, learning) inside their existing AI CLI host
+- Teams standardizing on one MCP layer across Copilot, Claude Code, Gemini, Codex, or Cursor
+- Operators who want local-first state, explicit provider diagnostics, and approval-gated learned agents
+- Anyone who wants credentials to stay in provider-native stores — Threnody does not manage API keys
 
 ## Who this is not for
 
 - A single chat assistant for casual coding questions — one CLI agent is enough; Threnody adds orchestration overhead
 - A hosted SaaS with a support SLA — solo open-source project; GitHub issues are how support happens
-- Compliance-certified agent orchestration — Threnody documents routing risk tiers; it does not ship audit-grade compliance bundles or regulatory certifications
+- Compliance-certified agent orchestration — Threnody documents operator responsibilities; it does not ship audit-grade compliance bundles
 - Non-coding LLM workflows (research, writing, data pipelines) — Threnody wraps CLI coding agents specifically
-- Anyone who needs Threnody to guarantee provider ToS compliance — your deployment posture depends on which CLIs, subscriptions, and routing patterns you enable
+- Anyone who needs Threnody to guarantee provider ToS compliance — your deployment posture depends on which CLIs and routing patterns you enable
 
 ---
 
@@ -106,10 +109,18 @@ threnody inspect approvals approve 12 --project . --operator you
 
 ## How it works
 
-1. **You give a task** to Copilot CLI, Claude Code, Gemini, or another MCP host.
+```text
+Host shell (Claude / Copilot / Gemini / …)
+  → route_task          tier + execution_hint (host-native first)
+  → host executes       Task tool, direct edits, host backends
+  → optional delegate   execute_subtask → other CLIs / endpoints
+  → swarm / learning    execute_swarm, memory_*, learning_*
+```
+
+1. **You give a task** to your MCP host shell.
 2. **Threnody scores complexity** → low / medium / high tier (no extra LLM call on the hot path).
-3. **Discovery picks the cheapest** authenticated provider for that tier (excludes the caller to prevent recursion).
-4. **Complex tasks decompose** into waves — independent subtasks run in parallel, dependents wait for prior waves.
+3. **`route_task` returns `execution_hint`** — host-native guidance by default; delegation targets when routable backends exist.
+4. **Complex tasks decompose** into waves — `execute_swarm` or host Task agents; optional `execute_subtask` for cross-backend work.
 
 ### What leaves your machine
 
@@ -136,32 +147,32 @@ Full list: [docs/RELEASE_LIMITATIONS.md](docs/RELEASE_LIMITATIONS.md)
 
 | | Feature | What it does |
 |---|---|---|
-| 🎯 | **Tier routing** | Heuristic complexity scoring + intent modifiers (`quick` → cheaper, `production` → higher quality) |
-| 🔍 | **Live discovery** | Scans installed CLIs, checks auth, ranks models by bundled cost data, caches in SQLite |
-| 🌊 | **Wave orchestration** | `decompose_task` → parallel waves → integration verify; linear, DAG, hierarchical, and star topologies |
-| 🔌 | **MCP-native** | ~41 tools over stdio JSON-RPC; works with any MCP-compatible host shell |
-| 🧠 | **Warm-path eval** | Background rework detection and quality scoring after subtasks complete |
+| 🎯 | **Tier routing** | Heuristic complexity scoring + `execution_hint` for host-native vs delegated work |
+| 🧠 | **Learning loop** | Pattern tracking → draft agents → approval queue → auto-match future work |
+| 🐝 | **Swarm orchestration** | `execute_swarm` with linear, DAG, hierarchical, and star topologies |
+| 💾 | **Cross-session memory** | `memory_*` MCP tools backed by local SQLite |
+| 🔌 | **MCP-native** | ~43 tools over stdio JSON-RPC; works with any MCP-compatible host shell |
+| 🔀 | **Optional delegation** | `execute_subtask` to Copilot, Codex, Cursor, endpoints, Aider, … |
 | 📈 | **Adaptive thresholds** | EMA-based threshold learning from routing outcomes |
 | 🛡️ | **Write safety** | Path validation, outside-workspace preview gate, audit trail |
-| 👁️ | **Operator CLI** | `threnody inspect`, `threnody tune`, `threnody doctor`, `threnody-watch` |
 
 ---
 
 ## Supported providers
 
-| Provider | Binary | Routeable | Notes |
+| Provider | Binary | Role | Notes |
 |---|---|---|---|
-| **GitHub Copilot** | `gh` | ✅ | Core host; includes free `gpt-5-mini` low tier |
-| **Claude Code** | `claude` | ✅ | haiku / sonnet / opus |
-| **Gemini CLI** | `gemini` | ✅ | flash-lite / flash / pro |
-| **OpenCode** | `opencode` | ✅ | Low-tier auto-route by default |
-| **OpenAI Codex** | `codex` | ✅ | Host shell + execution |
-| **Cursor** | `cursor-agent` | ✅ | Host shell + execution |
-| **JetBrains Junie** | `junie` | ✅ | Medium-tier auto-route by default |
-| **Aider** | `aider` | ✅ | Secondary adapter |
-| **Amazon Q / Kiro** | `q` / `kiro` | ✅ | Secondary adapter |
-| **Mistral Vibe** | `vibe` | ✅ | Secondary adapter |
-| **Blackbox AI** | `blackbox` | ✅ | When CLI installed |
+| **Claude Code** | `claude` | Host (router-only) | MCP coordination anchor; host executes by default |
+| **Gemini CLI** | `gemini` | Host (router-only) | MCP coordination anchor; host executes by default |
+| **GitHub Copilot** | `gh` | Host + delegation | Core host; routable for cross-backend work |
+| **OpenAI Codex** | `codex` | Host + delegation | Host shell + subprocess execution |
+| **Cursor** | `cursor-agent` | Host + delegation | Host shell + subprocess execution |
+| **OpenCode** | `opencode` | Delegation | Low-tier auto-route by default |
+| **JetBrains Junie** | `junie` | Delegation | Medium-tier auto-route by default |
+| **Aider** | `aider` | Delegation | Secondary adapter |
+| **Amazon Q / Kiro** | `q` / `kiro` | Delegation | Secondary adapter |
+| **Mistral Vibe** | `vibe` | Delegation | Secondary adapter |
+| **Blackbox AI** | `blackbox` | Delegation | When CLI installed |
 | **Windsurf** | `windsurf` | detect only | Never selected for execution |
 
 Run `threnody inspect status --project . --details` for your live provider matrix.
@@ -220,7 +231,7 @@ Full reference: [docs/CLI.md](docs/CLI.md)
 | [Model Discovery](docs/MODEL_DISCOVERY.md) | Live catalogs, tier pins, cost ranks |
 | [Routing Quality](docs/ROUTING_QUALITY.md) | Eval methodology and accuracy |
 | [Release Limitations](docs/RELEASE_LIMITATIONS.md) | Beta scope, privacy, roadmap |
-| [Legal and Provider Terms](docs/LEGAL.md) | ToS risk tiers, routing guidance, team use |
+| [Legal and Provider Terms](docs/LEGAL.md) | Operator responsibilities and provider links |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common fixes |
 
 ---
@@ -264,12 +275,11 @@ Threnody is provided **"AS IS"** under the [Apache License 2.0](LICENSE) (no
 warranty; limitation of liability). You are solely responsible for determining
 whether your routing patterns comply with each provider's current terms.
 
-**Highest-risk pattern:** cross-routing Claude Pro/Max subscription OAuth from
-a non-Claude host to `claude -p`. **Blocked by default:** Claude Code → Claude
-Code subprocess routing on the same subscription.
+**Default execution model:** host shells execute via Task tool and direct edits.
+Claude Code and Gemini CLI are router-only coordination anchors — not default
+`execute_subtask` targets. Override only via `providers.router_only_allow_execution`.
 
-Full risk tiers, per-provider notes, and team guidance:
-[docs/LEGAL.md](docs/LEGAL.md)
+Operator responsibilities and provider links: [docs/LEGAL.md](docs/LEGAL.md)
 
 ## License
 

@@ -162,10 +162,15 @@ def _provider_models(p: Mapping) -> Mapping:
     return {}
 
 
+ROUTER_ONLY_HOSTS = frozenset({"claude-code", "gemini-cli"})
+
+
 def _provider_label(p: dict) -> str:
     models = _provider_models(p)
     model_str = " / ".join(str(models[t]) for t in ("low", "medium", "high") if models.get(t))
-    return f"{p.get('name', '(unknown)')}  ({p.get('billing', 'unknown')} · {model_str})"
+    name = p.get("name", "(unknown)")
+    role = "host (coordination)" if name in ROUTER_ONLY_HOSTS else "delegation"
+    return f"{name}  [{role}]  ({p.get('billing', 'unknown')} · {model_str})"
 
 
 def _format_yaml_scalar(value: object) -> str:
@@ -241,7 +246,7 @@ def _page1_rich(providers: list[dict]) -> list[str]:
     console.print(
         Panel(
             "[bold]Step 1/4 — Provider Selection[/bold]",
-            subtitle="Select which providers Threnody may use",
+            subtitle="Select providers for coordination and optional delegation",
             style="blue",
         )
     )
@@ -264,7 +269,7 @@ def _page1_rich(providers: list[dict]) -> list[str]:
 def _page1_plain(providers: list[dict]) -> list[str]:
     available = [p for p in providers if p.get("available", True)]
     print("\n=== Step 1/4 — Provider Selection ===")
-    print("Select which providers Threnody may use.\n")
+    print("Select providers for coordination and optional delegation.\n")
     for i, p in enumerate(available, 1):
         marker = "[*]" if p.get("routeable", True) else "[ ]"
         print(f"  {i}. {marker} {_provider_label(p)}")

@@ -95,8 +95,7 @@ responsible for complying with each provider's terms of service. Provider terms,
 policies, and enforcement may change at any time without notice; Threnody cannot
 guarantee continued compatibility with any provider's rules.
 
-- See [docs/LEGAL.md](docs/LEGAL.md) for routing risk tiers and team guidance
-- Cross-routing Claude Pro/Max subscription OAuth from non-Claude hosts carries
-  the highest provider-policy risk
-- Claude Code → Claude Code routing is blocked by default; explicit opt-in only
+- See [docs/LEGAL.md](docs/LEGAL.md) for operator responsibilities and provider links
+- Host shells execute by default; Claude Code and Gemini CLI are router-only coordination anchors
+- `execute_subtask` delegates to other backends; override router-only hosts via `providers.router_only_allow_execution`
 - Safer routing examples live in [config.example.yaml](config.example.yaml)

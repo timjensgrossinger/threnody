@@ -2492,6 +2492,9 @@ HOST_PROVIDER_NAMES = frozenset({
     "opencode",
 })
 
+# Host CLIs used for MCP coordination; not subprocess execution targets by default.
+ROUTER_ONLY_PROVIDERS = frozenset({"claude-code", "gemini-cli"})
+
 
 def installer_provider_inventory(
     *,
@@ -3479,6 +3482,49 @@ class ProviderRegistry:
             opt_out_reason and opt_out_reason in caller_ids
         )
 
+    def _provider_is_router_only(self, provider: CLIProvider) -> bool:
+        return self._normalize_identifier(provider.name) in ROUTER_ONLY_PROVIDERS
+
+    def _router_only_allow_execution_set(self) -> set[str]:
+        raw = self._config_overrides
+        allow: list[Any] = []
+        if isinstance(raw, dict):
+            top_level = raw.get("router_only_allow_execution")
+            if isinstance(top_level, list):
+                allow = top_level
+            providers_section = raw.get("providers")
+            if isinstance(providers_section, dict):
+                nested = providers_section.get("router_only_allow_execution")
+                if isinstance(nested, list):
+                    allow = nested if nested else allow
+        return {
+            self._normalize_identifier(str(provider_id))
+            for provider_id in allow
+            if isinstance(provider_id, str) and provider_id.strip()
+        }
+
+    def _router_only_execution_allowed(
+        self,
+        provider: CLIProvider,
+        *,
+        caller: str | None,
+        tier: str,
+        caller_allowlists: dict[str, list[str]] | None,
+    ) -> bool:
+        if not self._provider_is_router_only(provider):
+            return True
+        if self._normalize_identifier(provider.name) in self._router_only_allow_execution_set():
+            return True
+        _has_allowlist, _allowed_providers = self._caller_allowlist(
+            caller_allowlists,
+            caller,
+        )
+        if _has_allowlist and self._provider_allowed_for_caller(provider, _allowed_providers):
+            return True
+        if self._caller_specific_preference_matches(provider, tier, caller):
+            return True
+        return False
+
     def _normalize_usage_window_map(self, usage_windows: dict[str, Any]) -> dict[str, Any]:
         normalized: dict[str, Any] = {}
         for provider_id, window_config in usage_windows.items():
@@ -3729,6 +3775,18 @@ class ProviderRegistry:
 
         for provider in ordered:
             adapter = self._adapter_for_provider(provider, adapters)
+
+            if self._provider_is_router_only(provider) and not self._router_only_execution_allowed(
+                provider,
+                caller=caller,
+                tier=tier,
+                caller_allowlists=caller_allowlists,
+            ):
+                excluded_providers.append({
+                    "provider": provider.display_name,
+                    "reason": "router-only host (coordinate in host; delegate to other backends)",
+                })
+                continue
 
             # If there's no known adapter for this provider but the caller name
             # matches the provider, perform a conservative anti-recursion
@@ -4052,6 +4110,7 @@ class ProviderRegistry:
                 "endpoint_origin": _public_endpoint_origin(getattr(provider, "endpoint_base_url", None)),
                 "opt_out": provider.name == "claude-code",
                 "opt_out_reason": "claude-code" if provider.name == "claude-code" else None,
+                "router_only": provider.name in ROUTER_ONLY_PROVIDERS,
             },
             callables=callables or None,
         )
@@ -4448,6 +4507,15 @@ class ProviderRegistry:
                 "display_name": provider.display_name,
                 "binary": provider.binary,
                 "routeable": readiness.routeable if readiness else False,
+                "router_only": self._provider_is_router_only(provider),
+                "execution_routeable": bool(
+                    readiness.routeable if readiness else False
+                ) and self._router_only_execution_allowed(
+                    provider,
+                    caller=None,
+                    tier="low",
+                    caller_allowlists=None,
+                ),
                 "detect_reason": readiness.reason.value if readiness else "unknown",
                 "models_summary": models_summary,
                 "billing": self._billing_summary_for_provider(provider),

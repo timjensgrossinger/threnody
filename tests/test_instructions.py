@@ -21,13 +21,14 @@ def test_claude_default_instructions_are_strict() -> None:
     body = render_shell_instructions(TGsConfig.defaults(), "claude-code")
 
     assert "These instructions apply only to **Claude Code**" in body
+    assert "meta-harness" in body
     assert "Routing mode: strict" in body
     assert "ALWAYS call `route_task` before writing or editing code or other non-exempt project files." in body
     assert "Routing exemptions" in body
     assert "`.md`" in body
     assert "`.mdc`" in body
     assert "All other filetypes remain routed by default" in body
-    assert "For low-tier work, use `execute_subtask`" in body
+    assert "use `execute_subtask` only when delegating" in body
     assert "Agent transparency is required" in body
     assert "PreToolUse" in body
     assert "validate_routing_guard" in body
@@ -76,7 +77,7 @@ def test_custom_copilot_strict_opt_in_emits_mandatory_instructions() -> None:
 
     assert "Routing mode: strict" in body
     assert "ALWAYS call `route_task` before writing or editing code or other non-exempt project files." in body
-    assert "For low-tier work, use `execute_subtask`" in body
+    assert "For low-tier work, use `execute_subtask` only when delegating" in body
     assert "PreToolUse" not in body
 
 

@@ -70,7 +70,11 @@ class TestOrderedExecutionCandidatesAllowlist:
                 )
         assert [p.name for p in selected] == ["claude-code", "blackbox-ai"]
         assert len(excluded) == 1
-        assert "not in caller allowlist for github-copilot" in excluded[0]["reason"]
+        assert excluded[0]["provider"] == "Gemini Cli"
+        assert (
+            "not in caller allowlist for github-copilot" in excluded[0]["reason"]
+            or "router-only host" in excluded[0]["reason"]
+        )
 
     def test_exclusion_reason_includes_caller(self):
         pa, pb = _make_provider("claude-code"), _make_provider("gemini-cli")
@@ -78,7 +82,11 @@ class TestOrderedExecutionCandidatesAllowlist:
         with patch.object(reg, "get_providers_for_tier", return_value=[pa, pb]):
             with patch.object(reg, "list_adapters", return_value=[]):
                 _, excluded = reg._ordered_execution_candidates("low", caller="my-caller", caller_allowlists={"my-caller": ["claude-code"]})
-        assert "my-caller" in excluded[0]["reason"]
+        assert excluded[0]["provider"] == "Gemini Cli"
+        assert (
+            "my-caller" in excluded[0]["reason"]
+            or "router-only host" in excluded[0]["reason"]
+        )
 
     def test_empty_allowlist_fallback(self, caplog):
         pa, pb = _make_provider("a"), _make_provider("b")
@@ -113,7 +121,11 @@ class TestOrderedExecutionCandidatesAllowlist:
 
         assert [p.name for p in selected] == ["claude-code"]
         assert len(excluded) == 1
-        assert "not in caller allowlist for github-copilot-cli" in excluded[0]["reason"]
+        assert excluded[0]["provider"] == "Gemini Cli"
+        assert (
+            "not in caller allowlist for github-copilot-cli" in excluded[0]["reason"]
+            or "router-only host" in excluded[0]["reason"]
+        )
 
     def test_multiple_callers_only_matching_applied(self):
         pa, pb = _make_provider("a"), _make_provider("b")
@@ -129,8 +141,8 @@ class TestOrderedExecutionCandidatesAllowlist:
     def test_caller_specific_preferences_only_apply_to_matching_caller(self):
         claude = _make_provider("claude-code", 3)
         mistral = _make_provider("mistral-vibe", 4)
-        gemini = _make_provider("gemini-cli", 0)
-        reg = _make_registry(claude, mistral, gemini)
+        codex = _make_provider("codex", 0)
+        reg = _make_registry(claude, mistral, codex)
         reg._config_overrides = {
             "providers": {
                 "preferred_routing_by_caller": {
@@ -149,23 +161,37 @@ class TestOrderedExecutionCandidatesAllowlist:
             copilot_selected, _ = reg._ordered_execution_candidates("low", caller="github-copilot")
 
         assert [p.name for p in claude_selected[:2]] == ["claude-code", "mistral-vibe"]
-        assert copilot_selected[0].name == "gemini-cli"
+        assert copilot_selected[0].name == "codex"
 
     def test_anti_recursion_matches_caller_aliases(self):
         copilot = _make_provider("github-copilot", 0)
-        gemini = _make_provider("gemini-cli", 1)
-        reg = _make_registry(copilot, gemini)
+        codex = _make_provider("codex", 1)
+        reg = _make_registry(copilot, codex)
 
         with patch.object(reg, "list_adapters", return_value=[]):
             selected, excluded = reg._ordered_execution_candidates("low", caller="github-copilot-cli")
 
-        assert [p.name for p in selected] == ["gemini-cli"]
+        assert [p.name for p in selected] == ["codex"]
         assert excluded == [
             {
                 "provider": "Github Copilot",
                 "reason": "caller anti-recursion (github-copilot-cli)",
             }
         ]
+
+    def test_allowlist_overrides_router_only(self):
+        claude = _make_provider("claude-code")
+        copilot = _make_provider("github-copilot")
+        reg = _make_registry(claude, copilot)
+        with patch.object(reg, "get_providers_for_tier", return_value=[claude, copilot]):
+            with patch.object(reg, "list_adapters", return_value=[]):
+                selected, excluded = reg._ordered_execution_candidates(
+                    "low",
+                    caller="github-copilot",
+                    caller_allowlists={"github-copilot": ["claude-code", "github-copilot"]},
+                )
+        assert [p.name for p in selected] == ["claude-code"]
+        assert not any("router-only host" in e.get("reason", "") for e in excluded if e.get("provider") == "Claude Code")
 
 
 class TestPassThrough:

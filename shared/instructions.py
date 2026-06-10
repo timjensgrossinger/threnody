@@ -51,6 +51,18 @@ def render_shell_instructions(
 
     lines.append(f"These instructions apply only to **{label}** (`{profile.shell_id}`).")
     lines.append("")
+    lines.extend(
+        [
+            "### Threnody role: meta-harness",
+            "",
+            "Threnody is a local MCP coordination layer — **the host shell executes work** "
+            "(Task tool, direct edits, host-configured backends).",
+            "Use coordination tools first: `route_task`, `plan_task`, `execute_swarm`, `memory_*`, `learning_*`.",
+            "`execute_subtask` is **delegation to other backends** (Copilot, Codex, Cursor, endpoints, Aider, …) — "
+            "not for subprocess routing to Claude Code or Gemini CLI host shells unless explicitly configured.",
+        ]
+    )
+    lines.append("")
 
     if profile.route_task_mandatory:
         lines.extend(
@@ -86,9 +98,9 @@ def render_shell_instructions(
 
     lines.append("")
     if profile.low_tier_execute_subtask:
-        lines.append("For low-tier work, use `execute_subtask` when it can safely write the whole target file.")
+        lines.append("For low-tier work, use `execute_subtask` only when delegating to another backend is safer or required.")
     else:
-        lines.append("For low-tier work, `execute_subtask` is optional; use it only when it is safer or cheaper than direct editing.")
+        lines.append("For low-tier work, prefer host-native edits or the Task tool; use `execute_subtask` only for cross-backend delegation.")
 
     lines.append("")
     if profile.agent_transparency_required:

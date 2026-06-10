@@ -217,15 +217,15 @@ def test_self_hosted_code_only_bypass_stays_low_tier_only(monkeypatch) -> None:
     copilot.execute.return_value = "copilot-result"
 
     fallback = MagicMock(spec=CLIProvider)
-    fallback.name = "claude-code"
-    fallback.display_name = "Claude Code"
-    fallback.binary = "claude"
-    fallback.tier_models = {"medium": "sonnet"}
+    fallback.name = "codex"
+    fallback.display_name = "OpenAI Codex"
+    fallback.binary = "codex"
+    fallback.tier_models = {"medium": "o3"}
     fallback.cost_rank = {"medium": 3}
     fallback.billing_model = "subscription"
     fallback.safe_self_hosted_code_only = False
     fallback.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
-    fallback.execute.return_value = "claude-result"
+    fallback.execute.return_value = "codex-result"
 
     with patch("shared.discovery.BUILTIN_PROVIDERS", [copilot, fallback]):
         registry = ProviderRegistry()
@@ -252,5 +252,78 @@ def test_self_hosted_code_only_bypass_stays_low_tier_only(monkeypatch) -> None:
 
     copilot.execute.assert_not_called()
     fallback.execute.assert_called_once()
-    assert result["provider"] == "Claude Code"
-    assert result["model"] == "sonnet"
+    assert result["provider"] == "OpenAI Codex"
+    assert result["model"] == "o3"
+
+
+def test_router_only_blocks_claude_cross_host(monkeypatch) -> None:
+    """Router-only claude-code is excluded when Copilot delegates cross-host."""
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
+    monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
+    claude = MagicMock(spec=CLIProvider)
+    claude.name = "claude-code"
+    claude.display_name = "Claude Code"
+    claude.binary = "claude"
+    claude.tier_models = {"low": "haiku"}
+    claude.cost_rank = {"low": 0}
+    claude.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
+    claude.execute.return_value = "should-not-run"
+
+    copilot = MagicMock(spec=CLIProvider)
+    copilot.name = "github-copilot"
+    copilot.display_name = "GitHub Copilot"
+    copilot.binary = "gh"
+    copilot.tier_models = {"low": "gpt-5-mini"}
+    copilot.cost_rank = {"low": 1}
+    copilot.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
+    copilot.execute.return_value = "ok"
+
+    with (
+        patch("shared.discovery.BUILTIN_PROVIDERS", [claude, copilot]),
+        patch("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ()),
+    ):
+        registry = ProviderRegistry()
+
+    result = registry.execute_cheapest("hello", tier="low", caller="github-copilot")
+
+    claude.execute.assert_not_called()
+    copilot.execute.assert_called_once()
+    assert result["provider"] == "GitHub Copilot"
+    assert any(
+        e.get("reason") == "router-only host (coordinate in host; delegate to other backends)"
+        for e in result.get("excluded_providers", [])
+    )
+
+
+def test_router_only_gemini_cross_host(monkeypatch) -> None:
+    """Router-only gemini-cli is excluded for non-Gemini callers."""
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
+    monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
+    gemini = MagicMock(spec=CLIProvider)
+    gemini.name = "gemini-cli"
+    gemini.display_name = "Gemini CLI"
+    gemini.binary = "gemini"
+    gemini.tier_models = {"low": "flash-lite"}
+    gemini.cost_rank = {"low": 0}
+    gemini.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
+    gemini.execute.return_value = "should-not-run"
+
+    codex = MagicMock(spec=CLIProvider)
+    codex.name = "codex"
+    codex.display_name = "OpenAI Codex"
+    codex.binary = "codex"
+    codex.tier_models = {"low": "o4-mini"}
+    codex.cost_rank = {"low": 1}
+    codex.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
+    codex.execute.return_value = "ok"
+
+    with patch("shared.discovery.BUILTIN_PROVIDERS", [gemini, codex]):
+        registry = ProviderRegistry()
+
+    result = registry.execute_cheapest("hello", tier="low", caller="github-copilot")
+
+    gemini.execute.assert_not_called()
+    codex.execute.assert_called_once()
+    assert result["provider"] == "OpenAI Codex"
+    excluded = result.get("excluded_providers", [])
+    assert any(e.get("provider") == "Gemini CLI" for e in excluded)

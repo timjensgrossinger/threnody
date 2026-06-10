@@ -104,12 +104,14 @@ from shared.agents import (
 from copilot.providers import CopilotProvider
 from shared.resilience import RetryPolicy as _RetryPolicy
 from shared.discovery import (
+    HOST_PROVIDER_NAMES,
     ProviderRegistry,
     ProviderUsageChecker,
     caller_from_client_name,
     detect_caller,
     get_registry,
 )
+from shared.config import normalize_caller_id
 from shared.quota import ProviderQuotaService
 from shared.adapters import ProviderCapability
 from shared.snapshot import FileDiff, FileSnapshot, apply_unified_diff
@@ -2858,6 +2860,96 @@ def _validate_routing_guard(
     }
 
 
+def _delegation_targets_for_tier(
+    registry: Any,
+    tier: str,
+    *,
+    caller: str | None,
+    caller_allowlists: dict[str, list[str]] | None,
+) -> list[str]:
+    if not hasattr(registry, "_ordered_execution_candidates"):
+        return []
+    try:
+        ordered, _ = registry._ordered_execution_candidates(
+            tier,
+            caller=caller,
+            caller_allowlists=caller_allowlists,
+        )
+    except Exception:
+        log.debug("_delegation_targets_for_tier failed", exc_info=True)
+        return []
+    return [str(getattr(provider, "name", "")) for provider in ordered if getattr(provider, "name", "")]
+
+
+def _build_route_execution_hint(
+    *,
+    tier: str,
+    caller: str | None,
+    registry: Any,
+    caller_allowlists: dict[str, list[str]] | None,
+) -> dict[str, object]:
+    normalized_caller = normalize_caller_id(caller)
+    delegation_targets = _delegation_targets_for_tier(
+        registry,
+        tier,
+        caller=caller,
+        caller_allowlists=caller_allowlists,
+    )
+    host_native = bool(normalized_caller and normalized_caller in HOST_PROVIDER_NAMES)
+
+    if host_native:
+        tier_actions = {
+            "low": "Use direct edits or the host Task tool for trivial changes",
+            "medium": "Spawn a host Task agent (e.g. sonnet-class model)",
+            "high": "Spawn a host Task agent (e.g. opus-class model) or execute_swarm for multi-agent work",
+        }
+        recommended = tier_actions.get(tier, "Use host-native execution (Task tool or direct edits)")
+        if delegation_targets:
+            preview = ", ".join(delegation_targets[:4])
+            recommended = f"{recommended}; optional delegation via execute_subtask → {preview}"
+        return {
+            "mode": "host_native",
+            "recommended_action": recommended,
+            "delegation_targets": delegation_targets,
+        }
+
+    if delegation_targets:
+        return {
+            "mode": "delegate",
+            "recommended_action": f"→ execute_subtask(prompt=..., tier='{tier}', target_file='...')",
+            "delegation_targets": delegation_targets,
+        }
+
+    return {
+        "mode": "host_native",
+        "recommended_action": "Use host-native execution (Task tool or direct edits)",
+        "delegation_targets": [],
+    }
+
+
+def _route_quick_action(
+    *,
+    tier: str,
+    caller: str | None,
+    execution_hint: dict[str, object],
+) -> str:
+    recommended = execution_hint.get("recommended_action")
+    if isinstance(recommended, str) and recommended.strip():
+        return recommended
+    normalized_caller = normalize_caller_id(caller)
+    if normalized_caller and normalized_caller in HOST_PROVIDER_NAMES:
+        return {
+            "low": "Use direct edits or host Task tool for trivial changes",
+            "medium": "→ spawn Task agent with model='sonnet'",
+            "high": "→ spawn Task agent with model='opus'",
+        }.get(tier, "→ proceed per tier guidance")
+    return {
+        "low": "→ execute_subtask(prompt=..., tier='low', target_file='...')",
+        "medium": "→ execute_subtask(prompt=..., tier='medium', target_file='...')",
+        "high": "→ execute_subtask(prompt=..., tier='high', target_file='...')",
+    }.get(tier, "→ proceed per tier guidance")
+
+
 def handle_route_task(args: dict) -> dict:
     config, db, router, planner, orchestrator = _ensure_init()
     task = args.get("task", "")
@@ -2869,8 +2961,9 @@ def handle_route_task(args: dict) -> dict:
     caller = args.get("caller") or _resolve_caller()
     caller_allowlists = getattr(config, "caller_provider_allowlists", None) or None
     selection = None
+    registry = None
     try:
-        registry = _get_registry_with_config()
+        registry = _get_registry_with_config(config)
         selection = _select_provider_metadata(
             registry,
             decision.tier,
@@ -2881,6 +2974,7 @@ def handle_route_task(args: dict) -> dict:
         )
     except Exception:
         selection = None
+        registry = None
 
     model = (
         _normalize_route_text(selection.get("model"))
@@ -2889,6 +2983,17 @@ def handle_route_task(args: dict) -> dict:
     ) or CopilotProvider().resolve_model(decision.tier)
 
     cached = db.cache_get(task)
+    if registry is None:
+        try:
+            registry = _get_registry_with_config(config)
+        except Exception:
+            registry = None
+    execution_hint = _build_route_execution_hint(
+        tier=decision.tier,
+        caller=caller,
+        registry=registry,
+        caller_allowlists=caller_allowlists,
+    )
     result = {
         "tier": decision.tier,
         "model": model,
@@ -2897,12 +3002,13 @@ def handle_route_task(args: dict) -> dict:
         "agents": decision.agents,
         "cache_hit": cached is not None,
         "override": decision.override,
+        "execution_hint": execution_hint,
     }
-    result["quick_action"] = {
-        "low":    "→ execute_subtask(prompt=..., tier='low', target_file='...')",
-        "medium": "→ spawn Task agent with model='sonnet'",
-        "high":   "→ spawn Task agent with model='opus'",
-    }.get(decision.tier, "→ proceed per tier guidance")
+    result["quick_action"] = _route_quick_action(
+        tier=decision.tier,
+        caller=caller,
+        execution_hint=execution_hint,
+    )
     if isinstance(selection, dict) and _has_executable_routing_metadata(selection):
         result.update({
             key: value

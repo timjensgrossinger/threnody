@@ -672,7 +672,7 @@ fi
 # ── AI custom instructions ───────────────────────────────────────────────────
 
 echo ""
-echo "📝 Custom instructions (shell-specific router policy)"
+echo "📝 Custom instructions (shell-specific coordination policy)"
 
 SYNCED_CLAUDE_INSTRUCTIONS=0
 SYNCED_CLAUDE_HOOKS=0
@@ -1072,12 +1072,12 @@ echo "    threnody inspect approvals --project .   Pending approval queue"
 echo "    threnody tune show --project .           Persisted operator controls"
 echo ""
 if [[ "$HOST_COUNT" -ge 2 ]]; then
-    echo "  🔗 $HOST_COUNT host CLIs detected — cross-routing enabled!"
+    echo "  🔗 $HOST_COUNT host CLIs detected — coordination + optional delegation enabled"
 elif [[ "$HOST_COUNT" -eq 1 ]]; then
-    echo "  📎 Single host CLI detected — install another host shell to unlock more cross-routing options"
+    echo "  📎 Single host CLI detected — install another CLI to unlock delegation targets"
 fi
 if [[ "$HAS_GH" -eq 1 || "$HAS_GEMINI" -eq 1 ]]; then
-    echo "     Free-tier low routing is available through GitHub Copilot and/or Gemini when authenticated"
+    echo "     Host-native execution uses your CLI auth; delegate via execute_subtask when needed"
 fi
 if [[ "$HAS_OPENCODE" -eq 1 ]]; then
     echo "     OpenCode is available as a low-tier host/provider via opencode/nemotron-3-super-free"

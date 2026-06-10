@@ -91,7 +91,7 @@ decompose_task / plan_task
 
 execute_subtask / swarm runs
   → shared/orchestrator.py # topology runner → wave-based parallel subprocess execution
-  → shared/discovery.py    # ProviderRegistry picks cheapest authenticated CLI
+  → shared/discovery.py    # ProviderRegistry picks routable delegation targets (excludes router-only hosts by default)
 
 ```
 
@@ -122,7 +122,7 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 | `shared/speculative.py` | Borderline-score speculative execution |
 | `shared/context.py` | Reads source files, injects diff context into subtask prompts; write-safety boundary |
 | `shared/style.py` | Per-project code style profiling; `StyleLearner` / `DecompositionPrefs` |
-| `shared/discovery.py` | `ProviderRegistry` singleton — detects CLIs, routes to cheapest |
+| `shared/discovery.py` | `ProviderRegistry` singleton — detects CLIs, router-only hosts, delegated execution |
 | `shared/adapters.py` | `ProviderAdapter` versioned contract + `ExecutionResult`; secondary adapters (Blackbox, Aider, Q/Kiro) |
 | `shared/swarm.py` | Swarm persistence domain helpers |
 | `shared/memory.py` | Cross-session memory store |
@@ -194,8 +194,8 @@ Routing eval fixtures live in `tests/eval/` organised by tier (`low_tier/`, `med
 
 - Threnody is not affiliated with or endorsed by any AI provider
 - Provider terms, policies, and enforcement may change at any time without notice
-- Cross-routing Claude Pro/Max OAuth from non-Claude hosts is the highest provider-policy risk
-- Claude Code → Claude Code routing is blocked by default; see `docs/LEGAL.md`
+- Host shells execute by default; Claude Code and Gemini CLI are router-only coordination anchors
+- Override router-only hosts via `providers.router_only_allow_execution`; see `docs/LEGAL.md`
 
 `routing_exceptions` is an exemption list, not a code-file allowlist. Add only extra non-code surfaces; do not enumerate code languages or config formats. Built-in exemptions cover `.md`, `.mdc`, and known AI assistant instruction files; every other filetype remains routed by default unless explicitly exempted.
 

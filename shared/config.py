@@ -1272,6 +1272,10 @@ class TGsConfig:
     # Populated by settings wizard. Format: list of lowercase provider IDs.
     disabled_providers: list[str] = field(default_factory=list)
 
+    # Providers that may execute via subprocess despite router-only defaults.
+    # Format: list of lowercase provider IDs (e.g. claude-code, gemini-cli).
+    router_only_allow_execution: list[str] = field(default_factory=list)
+
     # Janitor-style verify gate (plan 04).
     verify_gate: VerifyGateConfig = field(default_factory=VerifyGateConfig)
 
@@ -1975,6 +1979,11 @@ class TGsConfig:
                     str(p).strip().lower() for p in raw_disabled if p is not None
                 ]
 
+            raw_router_only_allow = providers_section.get("router_only_allow_execution", [])
+            if isinstance(raw_router_only_allow, list):
+                cfg.router_only_allow_execution = [
+                    str(p).strip().lower() for p in raw_router_only_allow if p is not None
+                ]
 
             # Optional: per-provider usage-window thresholds
             raw_usage_windows = providers_section.get("usage_windows", {})
@@ -2242,6 +2251,7 @@ class TGsConfig:
                     if (windows := self._usage_window_config_to_list(config))
                 },
                 "endpoint_providers": [entry.to_dict() for entry in self.endpoint_providers],
+                "router_only_allow_execution": list(self.router_only_allow_execution),
             },
             "thresholds": {
                 "mini_max": self.thresholds.low_max,

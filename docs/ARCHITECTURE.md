@@ -1,7 +1,7 @@
 # Architecture and Trust Boundaries
 
-Threnody is a local MCP server that routes work to AI CLIs already installed
-on the operator's machine.
+Threnody is a local MCP meta-harness: the host shell executes work; Threnody
+coordinates routing, planning, swarms, memory, and learning.
 
 ```text
 MCP host shell
@@ -9,21 +9,38 @@ MCP host shell
         |
         | JSON-RPC over stdio
         v
-Threnody mcp_server.py
+Threnody mcp_server.py  (coordination layer)
         |
         +-- shared.router        task tier classification
-        +-- shared.discovery     provider detection and execution
-        +-- shared.orchestrator  planning, swarm, and verification gates
+        +-- shared.orchestrator  planning, swarm, verification gates
+        +-- shared.agents        pattern learning and approval queue
+        +-- shared.memory        cross-session memory store
+        +-- shared.discovery     provider detection and delegated execution
         +-- shared.db            local SQLite state
         |
-        +-- local provider CLIs and loopback endpoints
+        +-- host-native execution (Task tool, direct edits, host backends)
+        +-- optional delegation → other CLIs / loopback / network endpoints
 ```
+
+## Two-path execution model
+
+| Path | When | Mechanism |
+|------|------|-----------|
+| **Host-native** | Default for MCP host shells | Host Task tool, direct edits, host-configured local/API backends |
+| **Delegated** | Operator routes to another backend | `execute_subtask` → Copilot, Codex, Cursor, endpoints, Aider, etc. |
+
+Claude Code and Gemini CLI are **router-only hosts** by default: Threnody registers
+as MCP inside them but does not subprocess their CLIs for delegated work unless
+the operator opts in via `providers.router_only_allow_execution`.
+
+`route_task` returns `execution_hint` with `mode: host_native | delegate` and
+`delegation_targets` listing routable backends for the tier.
 
 ## Trust Boundaries
 
 - Host shells are trusted only as local MCP clients. Caller detection is used
-  for anti-recursion and policy selection, not authentication.
-- Provider CLIs execute as the current operating-system user.
+  for policy selection, not authentication.
+- Delegated provider CLIs execute as the current operating-system user.
 - Runtime configuration lives outside the source tree in an untracked
   `config.yaml`.
 - Network endpoint providers are never auto-discovered beyond loopback.
@@ -36,9 +53,9 @@ Threnody mcp_server.py
 ## Local State
 
 Threnody stores routing cache, telemetry, provider readiness, approval
-queues, learned agents, and memory snapshots in local SQLite. The database is
-not sent to provider CLIs except through task prompts explicitly created by the
-operator or the MCP host.
+queues, learned agents, swarm checkpoints, and memory snapshots in local SQLite.
+The database is not sent to provider CLIs except through task prompts explicitly
+created by the operator or the MCP host.
 
 ## Release-Sensitive Invariants
 
@@ -47,3 +64,4 @@ operator or the MCP host.
 - Missing required verify-gate tools fail instead of passing silently.
 - OpenCode is low-only by default; Junie is medium-only by default.
 - Windsurf is detect-only and never selected for execution.
+- `claude-code` and `gemini-cli` are router-only by default for delegated execution.
