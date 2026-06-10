@@ -18,7 +18,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-os.environ.setdefault("SWITCHYARD_TEST_MODE", "1")
+os.environ.setdefault("THRENODY_TEST_MODE", "1")
 
 from shared.config import TGsConfig
 from shared.db import Database

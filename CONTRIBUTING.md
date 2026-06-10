@@ -1,14 +1,14 @@
 # Contributing
 
-Switchyard requires Python 3.10 or newer. Keep changes focused and follow the
+Threnody requires Python 3.10 or newer. Keep changes focused and follow the
 existing module boundaries: shared behavior belongs in `shared/`, while
 provider-specific command and model behavior belongs in its adapter.
 
 ## Development Setup
 
 ```bash
-git clone https://github.com/timjensgrossinger/switchyard.git
-cd switchyard
+git clone https://github.com/timjensgrossinger/threnody.git
+cd threnody
 python3 -m pip install pyyaml pytest
 ```
 
@@ -21,8 +21,8 @@ is needed.
 Run focused tests first, then the hermetic suite:
 
 ```bash
-SWITCHYARD_TEST_MODE=1 python3 -m pytest tests/test_router.py -q
-SWITCHYARD_TEST_MODE=1 python3 -m pytest tests/ -q
+THRENODY_TEST_MODE=1 python3 -m pytest tests/test_router.py -q
+THRENODY_TEST_MODE=1 python3 -m pytest tests/ -q
 python3 -m py_compile mcp_server.py shared/router.py
 bash -n install.sh shell/*.sh
 ```

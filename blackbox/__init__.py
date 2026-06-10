@@ -1,1 +1,1 @@
-# Blackbox AI provider package for Switchyard.
+# Blackbox AI provider package for Threnody.

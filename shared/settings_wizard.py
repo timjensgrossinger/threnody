@@ -93,7 +93,7 @@ try:
     from shared.config import _load_basic_yaml_mapping
     from shared.config import SUPPORTED_ROUTING_POLICY_SHELLS
 except Exception:
-    _DEFAULT_CONFIG_PATH: Path = Path.home() / ".local/lib/switchyard/config.yaml"  # type: ignore[assignment]
+    _DEFAULT_CONFIG_PATH: Path = Path.home() / ".local/lib/threnody/config.yaml"  # type: ignore[assignment]
     SUPPORTED_ROUTING_POLICY_SHELLS = (  # type: ignore[assignment]
         "claude-code",
         "github-copilot-cli",
@@ -105,7 +105,7 @@ except Exception:
     def _load_basic_yaml_mapping(text: str) -> dict:  # type: ignore[no-redef]
         return {}
 
-BASE_DIR = Path("~/.local/lib/switchyard").expanduser()
+BASE_DIR = Path("~/.local/lib/threnody").expanduser()
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +241,7 @@ def _page1_rich(providers: list[dict]) -> list[str]:
     console.print(
         Panel(
             "[bold]Step 1/4 — Provider Selection[/bold]",
-            subtitle="Select which providers Switchyard may use",
+            subtitle="Select which providers Threnody may use",
             style="blue",
         )
     )
@@ -264,7 +264,7 @@ def _page1_rich(providers: list[dict]) -> list[str]:
 def _page1_plain(providers: list[dict]) -> list[str]:
     available = [p for p in providers if p.get("available", True)]
     print("\n=== Step 1/4 — Provider Selection ===")
-    print("Select which providers Switchyard may use.\n")
+    print("Select which providers Threnody may use.\n")
     for i, p in enumerate(available, 1):
         marker = "[*]" if p.get("routeable", True) else "[ ]"
         print(f"  {i}. {marker} {_provider_label(p)}")

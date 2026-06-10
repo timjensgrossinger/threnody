@@ -797,7 +797,7 @@ def test_install_writes_claude_routing_hook() -> None:
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        install_dir = home / ".local" / "lib" / "switchyard"
+        install_dir = home / ".local" / "lib" / "threnody"
         install_dir.mkdir(parents=True)
         (install_dir / "config.yaml").write_text("routing_policy:\n  mode: default\n", encoding="utf-8")
 
@@ -822,7 +822,7 @@ def test_install_writes_claude_routing_hook() -> None:
         assert managed
         hook = managed[0]["hooks"][0]
         assert hook["type"] == "mcp_tool"
-        assert hook["server"] == "Switchyard"
+        assert hook["server"] == "Threnody"
         assert hook["tool"] == "validate_routing_guard"
 
 
@@ -841,7 +841,7 @@ def test_install_keeps_claude_routing_hook_on_policy_parse_error() -> None:
         env = os.environ.copy()
         env["HOME"] = str(home)
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        install_dir = home / ".local" / "lib" / "switchyard"
+        install_dir = home / ".local" / "lib" / "threnody"
         install_dir.mkdir(parents=True)
         (install_dir / "config.yaml").write_text("routing_policy: [\n", encoding="utf-8")
 
@@ -869,7 +869,7 @@ def test_install_removes_claude_routing_hook_when_policy_disables_it() -> None:
         home = Path(td) / "home"
         bin_dir = Path(td) / "bin"
         settings_dir = home / ".claude"
-        install_dir = home / ".local" / "lib" / "switchyard"
+        install_dir = home / ".local" / "lib" / "threnody"
         home.mkdir()
         bin_dir.mkdir()
         settings_dir.mkdir(parents=True)
@@ -892,7 +892,7 @@ def test_install_removes_claude_routing_hook_when_policy_disables_it() -> None:
                                 "hooks": [
                                     {
                                         "type": "mcp_tool",
-                                        "server": "Switchyard",
+                                        "server": "Threnody",
                                         "tool": "validate_routing_guard",
                                     }
                                 ],

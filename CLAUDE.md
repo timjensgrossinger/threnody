@@ -15,29 +15,25 @@ python3 -m pytest tests/test_router.py -v
 python3 -m pytest tests/test_router.py::test_name -v
 
 # Isolated from host CLIs (also set automatically by conftest fixtures)
-SWITCHYARD_TEST_MODE=1 python3 -m pytest tests/ -v
+THRENODY_TEST_MODE=1 python3 -m pytest tests/ -v
 
 # Lightweight syntax check (used by installer)
 python3 -m py_compile mcp_server.py shared/router.py
 
 # Routing eval suite — run before changing config.yaml or eval fixtures
-switchyard eval run
-switchyard eval run --filter low,urgency
+threnody eval run
+threnody eval run --filter low,urgency
 python3 -m shared.routing_eval       # repo-local fallback
 
 # Refresh local eval baseline
-switchyard eval baseline
+threnody eval baseline
 python3 -m shared.eval_baseline      # repo-local fallback
 
 # Start the MCP server (manual testing)
 python3 mcp_server.py
 
-# Remote HTTP(S) server
-switchyard serve [--host 0.0.0.0] [--port 8765] [--no-tls] [--token TOKEN]
-# SWITCHYARD_SERVER_TOKEN env var supplies a stable token; auto-generated if omitted (changes on every restart without it)
-
 # Live monitoring (separate terminal)
-switchyard-watch
+threnody-watch
 
 # Shell aliases (installed by install.sh — restart shell or source ~/.zshrc first)
 ghc agent "implement JWT auth for the user service"  # multi-agent wave orchestration
@@ -48,26 +44,26 @@ ghc agent -w "refactor the database layer"            # show plan only, no execu
 ghc agent --no-plan "add a docstring to this function" # single agent, skip orchestration
 
 # Provider health diagnostics and self-repair
-switchyard doctor                              # diagnose all providers, exit 1 if any QUARANTINED
-switchyard doctor --repair                     # diagnose + bounded self-repair
+threnody doctor                              # diagnose all providers, exit 1 if any QUARANTINED
+threnody doctor --repair                     # diagnose + bounded self-repair
 
 # Provider / readiness diagnostics
-switchyard inspect status --project . --details
+threnody inspect status --project . --details
 
 # Operator controls
-switchyard inspect task <task-id>
-switchyard inspect approvals --project .
-switchyard inspect approvals approve <id> --project . --operator <name>
-switchyard tune show --project .
-switchyard tune set concurrency_limit 5 --project .
-switchyard tune reset concurrency_limit --project .
-switchyard users --help
+threnody inspect task <task-id>
+threnody inspect approvals --project .
+threnody inspect approvals approve <id> --project . --operator <name>
+threnody tune show --project .
+threnody tune set concurrency_limit 5 --project .
+threnody tune reset concurrency_limit --project .
+threnody users --help
 
 # DB maintenance
-switchyard db check [--db PATH]        # integrity check + report
-switchyard db repair [--db PATH]       # recover from latest timestamped backup
-switchyard db backup [--db PATH]       # online backup via conn.backup (keeps 3)
-switchyard db prune [--db PATH] [--keep N]  # rotate old backups
+threnody db check [--db PATH]        # integrity check + report
+threnody db repair [--db PATH]       # recover from latest timestamped backup
+threnody db backup [--db PATH]       # online backup via conn.backup (keeps 3)
+threnody db prune [--db PATH] [--keep N]  # rotate old backups
 
 # Re-run installer (idempotent — updates provider registrations and shell aliases)
 ./install.sh
@@ -75,7 +71,7 @@ switchyard db prune [--db PATH] [--keep N]  # rotate old backups
 
 No `pyproject.toml`, `setup.py`, or build step — plain Python 3.10+. Core dependency is `pyyaml`; `install.sh` also installs `rich` and `questionary` for the settings wizard when available. At least one AI CLI must be installed: `gh` (GitHub Copilot), `claude` (Claude Code), `gemini`, `codex`, `cursor-agent`, `junie`, or `opencode`.
 
-`switchyard eval run` and `python3 -m shared.routing_eval` load the **installed** config from `~/.local/lib/switchyard/config.yaml`, not the repo-root `config.yaml` template. The `switchyard ...` commands require the shell wrapper from `install.sh`; the `python3 -m ...` forms are repo-local fallbacks.
+`threnody eval run` and `python3 -m shared.routing_eval` load the **installed** config from `~/.local/lib/threnody/config.yaml`, not the repo-root `config.yaml` template. The `threnody ...` commands require the shell wrapper from `install.sh`; the `python3 -m ...` forms are repo-local fallbacks.
 
 ## Architecture
 
@@ -104,8 +100,6 @@ execute_subtask / swarm runs
   → shared/orchestrator.py # topology runner → wave-based parallel subprocess execution
   → shared/discovery.py    # ProviderRegistry picks cheapest authenticated CLI
 
-remote_dispatch / remote_job_status
-  → shared/remote_client.py → shared/remote_server.py (HTTP(S) + Bearer auth)
 ```
 
 The planner is advisory — it only returns decomposition metadata. The orchestrator owns runtime behavior: execution, retries, escalation, token budgets, topology fallback, swarm, and checkpoints.
@@ -127,7 +121,7 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 |---|---|
 | `shared/config.py` | `TGsConfig` dataclass — all constants, YAML loading, hard tier bounds |
 | `shared/db.py` | Single `Database` wrapper — SQLite WAL, 37+ tables, startup integrity check, auto-recovery, backup rotation |
-| `shared/db_cli.py` | `switchyard db` CLI — operator-facing check/repair/backup/prune subcommands backed by `Database` |
+| `shared/db_cli.py` | `threnody db` CLI — operator-facing check/repair/backup/prune subcommands backed by `Database` |
 | `shared/adaptive.py` | EMA-based threshold learning |
 | `shared/agents.py` | Learning loop: pattern tracking → draft → approval queue → registration |
 | `shared/eval.py` | Background rework detection + quality eval |
@@ -148,13 +142,13 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 | `shared/provider_factory.py` | Registry-driven resolver that maps `CLIProvider.name` → concrete `Provider` subclass for `Orchestrator` construction |
 | `shared/health.py` | Provider health state machine and circuit-breaker helpers |
 | `shared/resilience.py` | Error classification, retry policy, auth probing — used by discovery execute paths |
-| `shared/doctor.py` | Provider health diagnostics and bounded self-repair; backs `switchyard doctor [--repair]` |
+| `shared/doctor.py` | Provider health diagnostics and bounded self-repair; backs `threnody doctor [--repair]` |
 | `shared/edit_blocks.py` | Aider-style SEARCH/REPLACE block parser used by `execute_subtask` `blocks` mode |
-| `shared/remote_client.py` | Stdlib-only HTTP client for `remote_dispatch` / `remote_job_status` MCP tools |
-| `shared/remote_server.py` | Threaded HTTP(S) server with Bearer auth, rate limiting, async job queue |
+| `shared/remote_client.py` | Deprecated HTTP client for legacy `remote_dispatch` / `remote_job_status` tools |
+| `shared/remote_server.py` | Deprecated threaded HTTP(S) server (`threnody serve`; unsupported) |
 | `mcp_server.py` | MCP server (JSON-RPC/stdio) — lazy-init, ~41 public tools |
 | `shell/ghc.sh` | Multi-agent shell script backing the `ghc` / `ghcs` / `ghce` aliases |
-| `shell/switchyard-watch` | Live monitoring daemon; run in a separate terminal alongside the MCP server |
+| `shell/threnody-watch` | Live monitoring daemon; run in a separate terminal alongside the MCP server |
 
 `mcp_server.py` is ~310 KB — use `grep` rather than reading it whole. All meaningful logic is in `shared/`; the server is a thin dispatch layer.
 
@@ -171,7 +165,7 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 
 ### Data layer
 
-- Single SQLite WAL at `~/.local/lib/switchyard/cache.db`
+- Single SQLite WAL at `~/.local/lib/threnody/cache.db`
 - WAL mode + `synchronous=NORMAL` is intentional — routing cache data loss on crash is acceptable; for `remote_jobs` and `approval_queue` tables, durability is operator responsibility via backup rotation (configurable via `cache.backup_keep` in `config.yaml`)
 - All schema changes go through `Database._init_schema()` — no ad-hoc connections elsewhere
 - Tables: `cache`, `plan_cache`, `artifacts`, `telemetry`, `adaptive_thresholds`, `agent_definitions`, `agent_audit`, `style_profiles`, `project_routing`, `project_settings`, `rework_events`, `subtask_patterns`, `escalations`, `speculation_log`, `swarm_runs`, `swarm_workers`, `swarm_events`, `routing_guards`, `routing_guard_executions`, `remote_jobs`, `approval_queue`, `coordinator_round_checkpoints`, `plan_revisions`, `coordinator_amendments`, `fanout_telemetry`, `preview_tokens`, `memory`, and more
@@ -191,7 +185,7 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 - **New provider** touches three places: `CLIBackend` in `shared/planner.py`, `Provider` implementation in the provider dir, `CLIProvider` entry in `BUILTIN_PROVIDERS` in `shared/discovery.py`.
 - **LLM output parsing**: reuse `_extract_json(raw)` from `shared/planner.py` — fenced JSON first, then brace-balancing fallback.
 - **Pattern utilities**: reuse `pattern_hash` / `normalize_pattern` from `shared/agents.py`.
-- **Config template vs installed**: `config.yaml` in the repo root is the template only. Runtime reads `~/.local/lib/switchyard/config.yaml`. `install.sh` creates the installed copy only when absent — editing the template does not overwrite an existing install.
+- **Config template vs installed**: `config.yaml` in the repo root is the template only. Runtime reads `~/.local/lib/threnody/config.yaml`. `install.sh` creates the installed copy only when absent — editing the template does not overwrite an existing install.
 - **Instruction surface alignment**: when routing UX, tool names, install behavior, or host-shell integration changes, update `README.md`, `INSTRUCTIONS.md`, `CLAUDE.md`, `install.sh`, `.github/copilot-instructions.md`, and `shared/instructions.py` together. `routing_policy` in `config.yaml` controls instruction strictness: `strict` (default for Claude Code) enforces mandatory `route_task` calls; `advisory` (default for GitHub Copilot CLI) renders guidance only.
 - **`execute_subtask` surgical edit modes**: use `mode=` to control how `target_file` is written:
   - `write` (default) — model output written verbatim. Safe for new files only.
@@ -207,13 +201,21 @@ Tests live in `tests/test_*.py`. `tests/conftest.py` provides function-scoped fi
 
 Use `tempfile.TemporaryDirectory()` for ephemeral DB files in tests that don't use conftest fixtures. Never share DB state between tests.
 
-`SWITCHYARD_TEST_MODE=1` isolates discovery/execution from host-installed CLIs. The conftest autouse fixture sets this automatically.
+`THRENODY_TEST_MODE=1` isolates discovery/execution from host-installed CLIs. The conftest autouse fixture sets this automatically.
 
-Routing eval fixtures live in `tests/eval/` organised by tier (`low_tier/`, `medium_tier/`, `high_tier/`, `urgency/`, `fanout/`). `schema.json` and `README.md` in that directory describe the fixture contract. When adding a new routing signal, add a matching fixture and run `switchyard eval baseline` to update the baseline.
+Routing eval fixtures live in `tests/eval/` organised by tier (`low_tier/`, `medium_tier/`, `high_tier/`, `urgency/`, `fanout/`). `schema.json` and `README.md` in that directory describe the fixture contract. When adding a new routing signal, add a matching fixture and run `threnody eval baseline` to update the baseline.
 
 ## Config
 
-`config.yaml` controls complexity-scoring signals, tier bounds, parallelism, speculation, per-provider effort defaults, and `remote_server` / `remote_client` settings. Loaded via `TGsConfig.from_yaml()` in `shared/config.py`.
+`config.yaml` controls complexity-scoring signals, tier bounds, parallelism, speculation, per-provider effort defaults, and legacy `remote_server` / `remote_client` settings (deprecated). Loaded via `TGsConfig.from_yaml()` in `shared/config.py`.
+
+## Legal and provider compliance
+
+- Threnody is not affiliated with or endorsed by any AI provider
+- Provider terms, policies, and enforcement may change at any time without notice
+- Cross-routing Claude Pro/Max OAuth from non-Claude hosts is the highest provider-policy risk
+- Claude Code → Claude Code routing is blocked by default; see `docs/LEGAL.md`
+- `threnody serve` and remote MCP tools are deprecated; use local MCP stdio only
 
 `routing_exceptions` is an exemption list, not a code-file allowlist. Add only extra non-code surfaces there; do not enumerate code languages or config formats.
 
@@ -232,8 +234,8 @@ routing_policy:
 Changing `routing_policy` regenerates managed instruction blocks in all host-shell config files. To preview or manually copy the generated block for a shell without running the installer:
 
 ```bash
-python3 -m shared.instructions claude-code --config ~/.local/lib/switchyard/config.yaml
-python3 -m shared.instructions github-copilot-cli --config ~/.local/lib/switchyard/config.yaml
+python3 -m shared.instructions claude-code --config ~/.local/lib/threnody/config.yaml
+python3 -m shared.instructions github-copilot-cli --config ~/.local/lib/threnody/config.yaml
 ```
 
 See `KNOWN_BOTTLENECKS.md` for current performance constraints — notably: serial planner/synthesis stages, single-lane speculative fallback, and sequential warm-path eval.

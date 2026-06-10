@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420" role="img" aria-label="Switchyard architecture">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420" viewBox="0 0 900 420" role="img" aria-label="Threnody architecture">
   <defs>
     <linearGradient id="box" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#21262d"/>
@@ -6,19 +6,19 @@
     </linearGradient>
   </defs>
   <rect width="900" height="420" fill="#0d1117" rx="8"/>
-  <text x="450" y="36" text-anchor="middle" font-family="system-ui,sans-serif" font-size="18" font-weight="600" fill="#f0f6fc">How Switchyard fits in</text>
+  <text x="450" y="36" text-anchor="middle" font-family="system-ui,sans-serif" font-size="18" font-weight="600" fill="#f0f6fc">How Threnody fits in</text>
   <!-- Host shells -->
   <rect x="40" y="70" width="820" height="56" rx="8" fill="url(#box)" stroke="#30363d"/>
-  <text x="450" y="104" text-anchor="middle" font-family="system-ui,sans-serif" font-size="14" fill="#8b949e">MCP host shells  Claude Code · Copilot CLI · Gemini · Codex · Cursor · Junie</text>
+  <text x="450" y="104" text-anchor="middle" font-family="system-ui,sans-serif" font-size="14" fill="#8b949e">MCP host shells  Claude Code ï¿½ Copilot CLI ï¿½ Gemini ï¿½ Codex ï¿½ Cursor ï¿½ Junie</text>
   <path d="M450 126 L450 160" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow)"/>
-  <!-- Switchyard core -->
+  <!-- Threnody core -->
   <rect x="200" y="160" width="500" height="80" rx="10" fill="#1f2937" stroke="#58a6ff" stroke-width="2"/>
-  <text x="450" y="195" text-anchor="middle" font-family="system-ui,sans-serif" font-size="20" font-weight="600" fill="#58a6ff">Switchyard MCP server</text>
-  <text x="450" y="220" text-anchor="middle" font-family="system-ui,sans-serif" font-size="13" fill="#8b949e">route · plan · orchestrate · learn · inspect</text>
+  <text x="450" y="195" text-anchor="middle" font-family="system-ui,sans-serif" font-size="20" font-weight="600" fill="#58a6ff">Threnody MCP server</text>
+  <text x="450" y="220" text-anchor="middle" font-family="system-ui,sans-serif" font-size="13" fill="#8b949e">route ï¿½ plan ï¿½ orchestrate ï¿½ learn ï¿½ inspect</text>
   <path d="M450 240 L450 270" stroke="#f0883e" stroke-width="2"/>
   <!-- Shared modules -->
   <rect x="60" y="270" width="780" height="56" rx="8" fill="url(#box)" stroke="#30363d"/>
-  <text x="450" y="304" text-anchor="middle" font-family="system-ui,sans-serif" font-size="13" fill="#c9d1d9">router · discovery · orchestrator · agents · eval · db (local SQLite)</text>
+  <text x="450" y="304" text-anchor="middle" font-family="system-ui,sans-serif" font-size="13" fill="#c9d1d9">router ï¿½ discovery ï¿½ orchestrator ï¿½ agents ï¿½ eval ï¿½ db (local SQLite)</text>
   <path d="M450 326 L450 350" stroke="#3fb950" stroke-width="2"/>
   <!-- Providers -->
   <rect x="40" y="350" width="820" height="56" rx="8" fill="url(#box)" stroke="#3fb950"/>

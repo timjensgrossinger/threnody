@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard Copilot CLI provider.
+Threnody Copilot CLI provider.
 
 Maps tier labels to models available via GitHub Copilot CLI (ghcs/ghce/ghcag).
 Detects cross-provider availability (Claude CLI) for extended routing.

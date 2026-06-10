@@ -68,7 +68,7 @@ def _builtin_provider(name: str) -> CLIProvider:
 
 @pytest.fixture
 def production_mode(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
 
 
@@ -1050,7 +1050,7 @@ def test_registry_adds_configured_network_endpoint_provider(production_mode):
 
 
 def test_registry_auto_discovers_local_endpoint_without_listing_unreachable_candidates(monkeypatch):
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
 
     def discover(provider: CLIProvider, **_: object) -> dict[str, str]:
         if provider.name == "local-ollama":
@@ -1094,7 +1094,7 @@ def test_registry_keeps_unreachable_configured_endpoint_visible(production_mode)
 
 
 def test_registry_applies_provider_cost_overrides(monkeypatch):
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
     registry = ProviderRegistry(config_overrides={
         "provider_cost_overrides": {
             "test-provider": {
@@ -1119,7 +1119,7 @@ def test_registry_applies_provider_cost_overrides(monkeypatch):
 
 
 def test_get_registry_refreshes_when_cost_overrides_change(monkeypatch):
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
 
     baseline_registry = get_registry()
     assert baseline_registry.select_provider_for_tier("medium")["billing_source"] == "provider_default"
@@ -1148,7 +1148,7 @@ def test_get_registry_refreshes_when_cost_overrides_change(monkeypatch):
 
 
 def test_get_registry_refreshes_when_cost_overrides_mutate_in_place(monkeypatch):
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
 
     overrides = {
         "provider_cost_overrides": {
@@ -1178,7 +1178,7 @@ def test_get_registry_refreshes_when_cost_overrides_mutate_in_place(monkeypatch)
 
 
 def test_get_registry_without_args_preserves_existing_override_state(monkeypatch):
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
 
     overrides = {
         "provider_cost_overrides": {
@@ -1202,7 +1202,7 @@ def test_get_registry_without_args_preserves_existing_override_state(monkeypatch
 
 
 def test_registry_paid_billing_override_replaces_free_rank(monkeypatch):
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
     registry = ProviderRegistry(config_overrides={
         "provider_cost_overrides": {
             "test-provider": {
@@ -1502,24 +1502,24 @@ def test_get_registry_singleton(production_mode):
 
 
 # ---------------------------------------------------------------------------
-# 21. SWITCHYARD_TEST_MODE provider detection stubs (Wave 3: TEST-01)
+# 21. THRENODY_TEST_MODE provider detection stubs (Wave 3: TEST-01)
 # ---------------------------------------------------------------------------
 
 
 def test_test_mode_stubs_providers(monkeypatch):
-    """Test that SWITCHYARD_TEST_MODE=1 returns only stub test providers.
+    """Test that THRENODY_TEST_MODE=1 returns only stub test providers.
     
-    Wave 3 TEST-01: Verify that when SWITCHYARD_TEST_MODE is set, 
+    Wave 3 TEST-01: Verify that when THRENODY_TEST_MODE is set, 
     ProviderRegistry uses _get_test_providers() stub instead of detecting
     real CLI installations. This isolates tests from machine-specific CLIs.
     
     Expected behavior:
-        - With SWITCHYARD_TEST_MODE=1: registry has only test-provider
+        - With THRENODY_TEST_MODE=1: registry has only test-provider
         - Real provider detection is skipped
         - No PATH scan, no subprocess calls to real CLIs
     """
     # Set test mode env var
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
     
     # Create registry — should use stubs
     registry = ProviderRegistry()
@@ -1544,19 +1544,19 @@ def test_test_mode_stubs_providers(monkeypatch):
 
 
 def test_production_mode_detects_real_providers(monkeypatch):
-    """Test that without SWITCHYARD_TEST_MODE, real provider detection occurs.
+    """Test that without THRENODY_TEST_MODE, real provider detection occurs.
     
-    Wave 3 TEST-01: Verify that when SWITCHYARD_TEST_MODE is NOT set,
+    Wave 3 TEST-01: Verify that when THRENODY_TEST_MODE is NOT set,
     ProviderRegistry performs real provider detection (scans PATH, etc).
     This allows production use cases to find installed CLI tools.
     
     Expected behavior:
-        - With SWITCHYARD_TEST_MODE unset: registry attempts real detection
+        - With THRENODY_TEST_MODE unset: registry attempts real detection
         - Available providers depend on which CLIs are installed
         - At minimum, should try to detect github-copilot, claude-code, gemini
     """
     # Ensure test mode is NOT set; isolate from local endpoint candidates (Ollama etc.)
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
 
     # Create registry — should attempt real detection

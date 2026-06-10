@@ -2,7 +2,7 @@
   "id": "fixtures-swarm-dag-fallback",
   "category": "medium_tier",
   "tags": ["stable", "swarm"],
-  "test_mode": "SWITCHYARD_TEST_MODE",
+  "test_mode": "THRENODY_TEST_MODE",
   "prompt": "Implement authentication middleware across auth_login.py auth_token.py auth_middleware.py with swarm fallback to DAG when parent artifacts are missing during hierarchical execution.",
   "expected": {
     "tier": "medium",

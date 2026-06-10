@@ -1,5 +1,5 @@
 """
-junie — JetBrains Junie CLI adapter for Switchyard.
+junie — JetBrains Junie CLI adapter for Threnody.
 
 Thin entry point for Junie provider detection and execution with
 dual-auth support (BYOK + JetBrains-managed) and JSON telemetry extraction.

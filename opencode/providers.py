@@ -1,5 +1,5 @@
 """
-opencode/providers.py — OpenCode provider implementation for Switchyard.
+opencode/providers.py — OpenCode provider implementation for Threnody.
 
 Implements command building, auth detection, and output cleaning for the
 OpenCode CLI. The initial rollout is intentionally low-tier-only and targets

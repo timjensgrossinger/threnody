@@ -1,5 +1,5 @@
 """
-Deterministic baseline capture helper for Switchyard eval suite.
+Deterministic baseline capture helper for Threnody eval suite.
 
 Usage:
   python3 -m shared.eval_baseline [output_path]
@@ -78,10 +78,10 @@ def _fixture_to_baseline_entry(fixture: dict[str, Any], router) -> dict[str, Any
 def capture_baseline(output_path: str | Path = DEFAULT_OUTPUT) -> None:
     outp = Path(output_path)
     # Ensure test mode for any downstream code paths
-    # Note: routing_eval.run_eval would set SWITCHYARD_TEST_MODE, but we set again here
+    # Note: routing_eval.run_eval would set THRENODY_TEST_MODE, but we set again here
     import os
 
-    os.environ.setdefault("SWITCHYARD_TEST_MODE", "1")
+    os.environ.setdefault("THRENODY_TEST_MODE", "1")
 
     # Lazy-instantiate router same way as routing_eval.run_eval
     from shared.router import TaskRouter

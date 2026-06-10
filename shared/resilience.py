@@ -148,7 +148,7 @@ class AuthProbe:
     @classmethod
     def check(cls, provider_name: str) -> bool:
         """Return True if provider appears authenticated. Cached for TTL seconds."""
-        if os.environ.get("SWITCHYARD_TEST_MODE") == "1":
+        if os.environ.get("THRENODY_TEST_MODE") == "1":
             return True
 
         key = provider_name.lower()

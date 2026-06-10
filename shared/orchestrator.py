@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard wave-based parallel execution engine.
+Threnody wave-based parallel execution engine.
 
 Executes subtasks wave by wave, with per-agent token ceiling (kill switch).
 Provider-agnostic — the provider layer resolves tier labels to CLI commands.

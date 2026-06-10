@@ -43,7 +43,7 @@ class FileSnapshot:
         "cache.db",
         "cache.db-shm",
         "cache.db-wal",
-        "switchyard-status.json",
+        "threnody-status.json",
     }
 
     def __init__(self, workspace_root: str | Path) -> None:

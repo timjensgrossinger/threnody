@@ -1,6 +1,6 @@
 # Model Discovery and Tiering
 
-Switchyard separates provider model discovery from routing tier assignment.
+Threnody separates provider model discovery from routing tier assignment.
 
 ## Catalog Precedence
 
@@ -48,7 +48,7 @@ Tiering is provider-relative: explicit pins, subscription multipliers or
 provider metadata, relative provider pricing, then capability metadata.
 Global API price thresholds are not a routing authority.
 
-Before execution, Switchyard validates the selected model. An unavailable or
+Before execution, Threnody validates the selected model. An unavailable or
 deprecated model is replaced only by an ordered same-tier model, and the
 fallback reason is returned in execution and inspection telemetry.
 

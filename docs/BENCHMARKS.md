@@ -11,9 +11,9 @@ import mcp_server
 print(len(mcp_server.TOOLS))
 PY
 
-time SWITCHYARD_TEST_MODE=1 python3 -m shared.routing_eval
+time THRENODY_TEST_MODE=1 python3 -m shared.routing_eval
 
-time SWITCHYARD_TEST_MODE=1 python3 -m pytest tests/test_parallel_execution.py -q
+time THRENODY_TEST_MODE=1 python3 -m pytest tests/test_parallel_execution.py -q
 ```
 
 ## Current Reference Run

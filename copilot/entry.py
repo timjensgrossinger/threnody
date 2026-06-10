@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard Copilot CLI entry point.
+Threnody Copilot CLI entry point.
 
 Thin wrapper that initialises the shared core with the Copilot provider
 and exposes CLI commands. Called by the shell wrapper (ghc.sh).

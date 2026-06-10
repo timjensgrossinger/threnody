@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""CLI utility for Switchyard database maintenance."""
+"""CLI utility for Threnody database maintenance."""
 
 import argparse
 import sys
@@ -70,9 +70,9 @@ def cmd_prune(args):
 
 def main():
     """Main CLI entry point."""
-    default_db = Path.home() / ".local/lib/switchyard/cache.db"
+    default_db = Path.home() / ".local/lib/threnody/cache.db"
 
-    parser = argparse.ArgumentParser(description="Switchyard DB maintenance CLI")
+    parser = argparse.ArgumentParser(description="Threnody DB maintenance CLI")
     parser.add_argument("--db", type=Path, default=default_db, help="Path to cache.db")
 
     subparsers = parser.add_subparsers(dest="subcmd")

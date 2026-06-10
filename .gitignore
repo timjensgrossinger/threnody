@@ -14,6 +14,7 @@ cache.db.bak-shm
 .runtime/
 audit_secret
 providers.json
+threnody-status.json
 switchyard-status.json
 tgs-router-status.json
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard Claude Code provider.
+Threnody Claude Code provider.
 
 Maps tier labels to models available via Claude Code CLI.
 Detects cross-provider availability (Copilot CLI) for free-tier fallback.

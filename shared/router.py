@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard complexity classifier with intent modifier.
+Threnody complexity classifier with intent modifier.
 
 Fast keyword-based classification — no LLM call, instant response.
 Returns tier labels (low/medium/high), not model names.

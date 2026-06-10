@@ -1,14 +1,14 @@
 """
-Switchyard remote server.
+Threnody remote server.
 
 Exposes routing, planning, and execution over HTTP(S) with Bearer token auth.
-Start with:  switchyard serve [--port 8765] [--no-tls] [--token TOKEN]
+Start with:  threnody serve [--port 8765] [--no-tls] [--token TOKEN]
 
-Supports multiple users: register users via ``switchyard users add``.  Each user
+Supports multiple users: register users via ``threnody users add``.  Each user
 authenticates with their own Bearer token and executes tasks through their own
 stored CLI credentials.
 
-Requires the Switchyard install dir on sys.path (set by switchyard serve / install.sh).
+Requires the Threnody install dir on sys.path (set by threnody serve / install.sh).
 """
 from __future__ import annotations
 
@@ -627,8 +627,8 @@ def build_server(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="switchyard serve",
-        description="Start Switchyard as an HTTP(S) server.",
+        prog="threnody serve",
+        description="Start Threnody as an HTTP(S) server.",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8765, help="Listen port (default: 8765)")
@@ -647,14 +647,14 @@ def main() -> None:
         format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     )
 
-    token = args.token or os.environ.get("SWITCHYARD_SERVER_TOKEN", "")
+    token = args.token or os.environ.get("THRENODY_SERVER_TOKEN") or os.environ.get("SWITCHYARD_SERVER_TOKEN", "")
     if not token:
         token = secrets.token_urlsafe(32)
-        print(f"[switchyard serve] No token provided — generated token: {token}")
-        print("[switchyard serve] Set SWITCHYARD_SERVER_TOKEN or pass --token to reuse this token.")
+        print(f"[threnody serve] No token provided — generated token: {token}")
+        print("[threnody serve] Set THRENODY_SERVER_TOKEN (or deprecated SWITCHYARD_SERVER_TOKEN) or pass --token to reuse this token.")
 
     scheme = "http" if args.no_tls or not (args.tls_cert and args.tls_key) else "https"
-    log.info("Starting Switchyard remote server %s on %s://%s:%d", _VERSION, scheme, args.host, args.port)
+    log.info("Starting Threnody remote server %s on %s://%s:%d", _VERSION, scheme, args.host, args.port)
 
     server = build_server(
         args.host,
@@ -665,14 +665,14 @@ def main() -> None:
         no_tls=args.no_tls,
     )
 
-    print(f"[switchyard serve] Listening on {scheme}://{args.host}:{args.port}")
-    print(f"[switchyard serve] Health: {scheme}://127.0.0.1:{args.port}/health")
-    print("[switchyard serve] Press Ctrl+C to stop.")
+    print(f"[threnody serve] Listening on {scheme}://{args.host}:{args.port}")
+    print(f"[threnody serve] Health: {scheme}://127.0.0.1:{args.port}/health")
+    print("[threnody serve] Press Ctrl+C to stop.")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[switchyard serve] Shutting down.")
+        print("\n[threnody serve] Shutting down.")
         server.shutdown()
 
 

@@ -2,27 +2,27 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Switchyard installer
+# Threnody installer
 #
 # Three modes:
-#   1. Run from inside a cloned repo   → copies files to ~/.local/lib/switchyard
+#   1. Run from inside a cloned repo   → copies files to ~/.local/lib/threnody
 #   2. Run from a downloaded zip/tar   → same as above
 #   3. Run standalone (curl | bash)    → clones the repo first, then installs
 #
 # Usage:
-#   git clone git@github.com:timjensgrossinger/switchyard.git && cd switchyard && ./install.sh
+#   git clone git@github.com:timjensgrossinger/threnody.git && cd threnody && ./install.sh
 #   — or —
-#   curl -fsSL https://raw.githubusercontent.com/timjensgrossinger/switchyard/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/timjensgrossinger/threnody/main/install.sh | bash
 # ─────────────────────────────────────────────────────────────────────────────
 
-INSTALL_DIR="${SWITCHYARD_INSTALL_DIR:-$HOME/.local/lib/switchyard}"
-REPO_URL="${SWITCHYARD_REPO_URL:-https://github.com/timjensgrossinger/switchyard.git}"
-SWITCHYARD_ALLOW_NO_HOST="${SWITCHYARD_ALLOW_NO_HOST:-0}"
-SWITCHYARD_SKIP_DEPENDENCIES="${SWITCHYARD_SKIP_DEPENDENCIES:-0}"
-SWITCHYARD_SKIP_WIZARD="${SWITCHYARD_SKIP_WIZARD:-0}"
-SWITCHYARD_TEST_FAIL_AFTER_COPY="${SWITCHYARD_TEST_FAIL_AFTER_COPY:-0}"
-SWITCHYARD_PROVIDER_SCAN_TEST_MODE="${SWITCHYARD_PROVIDER_SCAN_TEST_MODE:-0}"
-SWITCHYARD_FORCE_PORTABLE_COPY="${SWITCHYARD_FORCE_PORTABLE_COPY:-0}"
+INSTALL_DIR="${THRENODY_INSTALL_DIR:-${SWITCHYARD_INSTALL_DIR:-$HOME/.local/lib/threnody}}"
+REPO_URL="${THRENODY_REPO_URL:-${SWITCHYARD_REPO_URL:-https://github.com/timjensgrossinger/threnody.git}}"
+THRENODY_ALLOW_NO_HOST="${THRENODY_ALLOW_NO_HOST:-${SWITCHYARD_ALLOW_NO_HOST:-0}}"
+THRENODY_SKIP_DEPENDENCIES="${THRENODY_SKIP_DEPENDENCIES:-${SWITCHYARD_SKIP_DEPENDENCIES:-0}}"
+THRENODY_SKIP_WIZARD="${THRENODY_SKIP_WIZARD:-${SWITCHYARD_SKIP_WIZARD:-0}}"
+THRENODY_TEST_FAIL_AFTER_COPY="${THRENODY_TEST_FAIL_AFTER_COPY:-${SWITCHYARD_TEST_FAIL_AFTER_COPY:-0}}"
+THRENODY_PROVIDER_SCAN_TEST_MODE="${THRENODY_PROVIDER_SCAN_TEST_MODE:-${SWITCHYARD_PROVIDER_SCAN_TEST_MODE:-0}}"
+THRENODY_FORCE_PORTABLE_COPY="${THRENODY_FORCE_PORTABLE_COPY:-${SWITCHYARD_FORCE_PORTABLE_COPY:-0}}"
 
 TMPDIR_CLONE=""
 PROVIDER_SCAN_JSON=""
@@ -60,25 +60,31 @@ elif [[ -f "./mcp_server.py" ]]; then
 else
     # Standalone mode — clone the repo first
     echo ""
-    echo "📦 Switchyard — standalone installer"
+    echo "📦 Threnody — standalone installer"
     echo ""
 
     command -v git >/dev/null 2>&1 || error "git is required but not found on PATH"
 
     TMPDIR_CLONE="$(mktemp -d)"
     echo "  Cloning from $REPO_URL ..."
-    git clone --quiet "$REPO_URL" "$TMPDIR_CLONE/switchyard" || error "Clone failed — do you have access to the repo?"
-    SOURCE_DIR="$TMPDIR_CLONE/switchyard"
+    git clone --quiet "$REPO_URL" "$TMPDIR_CLONE/threnody" || error "Clone failed — do you have access to the repo?"
+    SOURCE_DIR="$TMPDIR_CLONE/threnody"
     info "Cloned to temporary directory"
 fi
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
 
 echo ""
-echo "🔧 Switchyard installer"
+echo "🔧 Threnody installer"
 echo "   Source:  $SOURCE_DIR"
 echo "   Target:  $INSTALL_DIR"
 echo ""
+
+LEGACY_INSTALL_DIR="$HOME/.local/lib/switchyard"
+if [[ "$INSTALL_DIR" == "$HOME/.local/lib/threnody" && -d "$LEGACY_INSTALL_DIR" && ! -e "$INSTALL_DIR" ]]; then
+    mv "$LEGACY_INSTALL_DIR" "$INSTALL_DIR"
+    info "Migrated previous Switchyard install → $INSTALL_DIR"
+fi
 
 command -v python3 >/dev/null 2>&1 || error "python3 is required but not found on PATH"
 
@@ -114,7 +120,7 @@ if not env_path.is_absolute():
 
 sys.path.insert(0, str(source_dir))
 
-if os.environ.get("SWITCHYARD_PROVIDER_SCAN_TEST_MODE") == "1":
+if os.environ.get("THRENODY_PROVIDER_SCAN_TEST_MODE") == "1" or os.environ.get("SWITCHYARD_PROVIDER_SCAN_TEST_MODE") == "1":
     providers = []
 else:
     from shared.discovery import installer_provider_inventory
@@ -218,8 +224,8 @@ for provider in payload.get("providers", []):
 PY
 
 if [[ "$HOST_COUNT" -eq 0 ]]; then
-    if [[ "$SWITCHYARD_ALLOW_NO_HOST" == "1" ]]; then
-        warn "No host CLI detected; continuing because SWITCHYARD_ALLOW_NO_HOST=1"
+    if [[ "$THRENODY_ALLOW_NO_HOST" == "1" ]]; then
+        warn "No host CLI detected; continuing because THRENODY_ALLOW_NO_HOST=1"
     else
         error "At least one host CLI ('gh', 'claude', 'gemini', 'codex', 'cursor-agent', 'junie', or 'opencode') must be installed"
     fi
@@ -227,7 +233,7 @@ fi
 
 # ── Install pyyaml dependency ────────────────────────────────────────────────
 
-if [[ "$SWITCHYARD_SKIP_DEPENDENCIES" != "1" ]] && ! python3 -c "import yaml" 2>/dev/null; then
+if [[ "$THRENODY_SKIP_DEPENDENCIES" != "1" ]] && ! python3 -c "import yaml" 2>/dev/null; then
     echo ""
     echo "  Installing pyyaml..."
     python3 -m pip install --quiet --user pyyaml || { warn "pip install pyyaml failed — install it manually"; true; }
@@ -235,7 +241,7 @@ fi
 info "pyyaml available"
 
 # ── Install wizard UI dependencies ─────────────────────────────────────────
-if [[ "$SWITCHYARD_SKIP_DEPENDENCIES" != "1" ]] && ! python3 -c "import rich, questionary" 2>/dev/null; then
+if [[ "$THRENODY_SKIP_DEPENDENCIES" != "1" ]] && ! python3 -c "import rich, questionary" 2>/dev/null; then
     echo ""
     echo "  Installing UI dependencies (rich, questionary)..."
     python3 -m pip install --quiet --user rich questionary || { warn "pip install failed -- wizard falls back to plain prompts"; true; }
@@ -272,7 +278,7 @@ PYEOF
 fi
 
 copy_source_tree() {
-    if [[ "$SWITCHYARD_FORCE_PORTABLE_COPY" != "1" ]] && command -v rsync >/dev/null 2>&1; then
+    if [[ "$THRENODY_FORCE_PORTABLE_COPY" != "1" ]] && command -v rsync >/dev/null 2>&1; then
         rsync -a --delete \
             --exclude='__pycache__/' \
             --exclude='.pytest_cache/' \
@@ -332,7 +338,7 @@ copy_source_tree
 
 info "Files installed to $INSTALL_DIR"
 
-if [[ "$SWITCHYARD_TEST_FAIL_AFTER_COPY" == "1" ]]; then
+if [[ "$THRENODY_TEST_FAIL_AFTER_COPY" == "1" ]]; then
     error "Injected test failure after source copy"
 fi
 
@@ -362,7 +368,7 @@ if [[ "$HAS_CLAUDE" -eq 1 ]]; then
     CLAUDE_CONFIG="$HOME/.claude.json"
 
     if [[ -f "$CLAUDE_CONFIG" ]]; then
-        if grep -q "Switchyard" "$CLAUDE_CONFIG" 2>/dev/null; then
+        if grep -q "Threnody" "$CLAUDE_CONFIG" 2>/dev/null; then
             info "Claude Code MCP already registered"
         else
             # Add to existing config using python for safe JSON manipulation
@@ -372,7 +378,7 @@ import json, sys
 with open('$CLAUDE_CONFIG') as f:
     cfg = json.load(f)
 mcps = cfg.setdefault('mcpServers', {})
-mcps['Switchyard'] = {
+mcps['Threnody'] = {
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py'],
     'type': 'stdio'
@@ -385,7 +391,7 @@ with open('$CLAUDE_CONFIG', 'w') as f:
         # shellcheck disable=SC2015
         python3 -c "
 import json
-cfg = {'mcpServers': {'Switchyard': {
+cfg = {'mcpServers': {'Threnody': {
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py'],
     'type': 'stdio'
@@ -398,7 +404,7 @@ fi
 
 # OpenCode MCP registration is currently interactive and project-scoped.
 if [[ "$HAS_OPENCODE" -eq 1 ]]; then
-    info "OpenCode detected — register Switchyard manually inside each project with:"
+    info "OpenCode detected — register Threnody manually inside each project with:"
     echo "       cd /path/to/project && opencode mcp add"
     echo "       Then choose 'Current project' and point it at: python3 $INSTALL_DIR/mcp_server.py"
 fi
@@ -408,7 +414,7 @@ COPILOT_MCP_CONFIG="$HOME/.copilot/mcp-config.json"
 mkdir -p "$HOME/.copilot"
 
 if [[ -f "$COPILOT_MCP_CONFIG" ]]; then
-    if grep -q "Switchyard" "$COPILOT_MCP_CONFIG" 2>/dev/null; then
+    if grep -q "Threnody" "$COPILOT_MCP_CONFIG" 2>/dev/null; then
         info "Copilot CLI MCP already registered"
     else
         # shellcheck disable=SC2015
@@ -417,7 +423,7 @@ import json
 with open('$COPILOT_MCP_CONFIG') as f:
     cfg = json.load(f)
 mcps = cfg.setdefault('mcpServers', {})
-mcps['Switchyard'] = {
+mcps['Threnody'] = {
     'type': 'stdio',
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py'],
@@ -430,7 +436,7 @@ with open('$COPILOT_MCP_CONFIG', 'w') as f:
 else
     python3 -c "
 import json
-cfg = {'mcpServers': {'Switchyard': {
+cfg = {'mcpServers': {'Threnody': {
     'type': 'stdio',
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py'],
@@ -447,7 +453,7 @@ if [[ "$HAS_GEMINI" -eq 1 ]]; then
     mkdir -p "$HOME/.gemini"
 
     if [[ -f "$GEMINI_SETTINGS" ]]; then
-        if grep -q "Switchyard" "$GEMINI_SETTINGS" 2>/dev/null; then
+        if grep -q "Threnody" "$GEMINI_SETTINGS" 2>/dev/null; then
             info "Gemini CLI MCP already registered"
         else
             # shellcheck disable=SC2015
@@ -456,7 +462,7 @@ import json
 with open('$GEMINI_SETTINGS') as f:
     cfg = json.load(f)
 mcps = cfg.setdefault('mcpServers', {})
-mcps['Switchyard'] = {
+mcps['Threnody'] = {
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py'],
     'trust': True
@@ -468,7 +474,7 @@ with open('$GEMINI_SETTINGS', 'w') as f:
     else
         python3 -c "
 import json
-cfg = {'mcpServers': {'Switchyard': {
+cfg = {'mcpServers': {'Threnody': {
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py'],
     'trust': True
@@ -484,7 +490,7 @@ if [[ "$HAS_CODEX" -eq 1 ]]; then
     CODEX_CONFIG="$HOME/.codex/config.toml"
     mkdir -p "$HOME/.codex"
 
-    if [[ -f "$CODEX_CONFIG" ]] && grep -q "Switchyard" "$CODEX_CONFIG" 2>/dev/null; then
+    if [[ -f "$CODEX_CONFIG" ]] && grep -q "Threnody" "$CODEX_CONFIG" 2>/dev/null; then
         info "Codex CLI MCP already registered"
     else
         # shellcheck disable=SC2015
@@ -499,11 +505,11 @@ config_path = Path(sys.argv[1]).resolve()
 if not str(config_path).startswith(str(_home)):
     raise SystemExit(f"config_path outside home: {config_path}")
 mcp_server_path = sys.argv[2]
-start_marker = "# Switchyard:codex-mcp:start"
-end_marker = "# Switchyard:codex-mcp:end"
+start_marker = "# Threnody:codex-mcp:start"
+end_marker = "# Threnody:codex-mcp:end"
 managed = (
     f"{start_marker}\n"
-    "[mcp_servers.Switchyard]\n"
+    "[mcp_servers.Threnody]\n"
     'command = "python3"\n'
     f'args = ["{mcp_server_path}"]\n'
     f"{end_marker}\n"
@@ -545,7 +551,7 @@ if [[ "$HAS_CURSOR" -eq 1 ]]; then
     mkdir -p "$HOME/.cursor"
 
     if [[ -f "$CURSOR_MCP_CONFIG" ]]; then
-        if grep -q "Switchyard" "$CURSOR_MCP_CONFIG" 2>/dev/null; then
+        if grep -q "Threnody" "$CURSOR_MCP_CONFIG" 2>/dev/null; then
             info "Cursor MCP already registered"
         else
             # shellcheck disable=SC2015
@@ -554,7 +560,7 @@ import json
 with open('$CURSOR_MCP_CONFIG') as f:
     cfg = json.load(f)
 mcps = cfg.setdefault('mcpServers', {})
-mcps['Switchyard'] = {
+mcps['Threnody'] = {
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py'],
     'env': {}
@@ -566,7 +572,7 @@ with open('$CURSOR_MCP_CONFIG', 'w') as f:
     else
         python3 -c "
 import json
-cfg = {'mcpServers': {'Switchyard': {
+cfg = {'mcpServers': {'Threnody': {
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py'],
     'env': {}
@@ -583,7 +589,7 @@ if [[ "$HAS_JUNIE" -eq 1 ]]; then
     mkdir -p "$HOME/.junie/mcp"
 
     if [[ -f "$JUNIE_MCP_CONFIG" ]]; then
-        if grep -q "Switchyard" "$JUNIE_MCP_CONFIG" 2>/dev/null; then
+        if grep -q "Threnody" "$JUNIE_MCP_CONFIG" 2>/dev/null; then
             info "Junie MCP already registered"
         else
             # shellcheck disable=SC2015
@@ -592,7 +598,7 @@ import json
 with open('$JUNIE_MCP_CONFIG') as f:
     cfg = json.load(f)
 mcps = cfg.setdefault('mcpServers', {})
-mcps['Switchyard'] = {
+mcps['Threnody'] = {
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py']
 }
@@ -603,7 +609,7 @@ with open('$JUNIE_MCP_CONFIG', 'w') as f:
     else
         python3 -c "
 import json
-cfg = {'mcpServers': {'Switchyard': {
+cfg = {'mcpServers': {'Threnody': {
     'command': 'python3',
     'args': ['$INSTALL_DIR/mcp_server.py']
 }}}
@@ -628,12 +634,12 @@ elif [[ -n "${BASH_VERSION:-}" ]] || [[ "$SHELL" == */bash ]]; then
 fi
 
 if [[ -n "$SHELL_RC" ]]; then
-    if grep -qF "Switchyard" "$SHELL_RC" 2>/dev/null; then
+    if grep -qF "Threnody" "$SHELL_RC" 2>/dev/null; then
         info "Shell integration already in $SHELL_RC"
     else
         {
             echo ""
-            echo "# Switchyard — AI orchestration"
+            echo "# Threnody — AI orchestration"
             echo "$SHELL_SOURCE"
         } >> "$SHELL_RC"
         info "Added to $SHELL_RC — restart your shell or run: source $SHELL_RC"
@@ -645,7 +651,7 @@ fi
 
 # Symlink shell entry points to ~/.local/bin for CLI access
 mkdir -p "$HOME/.local/bin"
-for entry_point in switchyard-watch switchyard ghc; do
+for entry_point in threnody-watch threnody switchyard-watch switchyard ghc; do
     if [[ -f "$INSTALL_DIR/shell/$entry_point" ]]; then
         chmod +x "$INSTALL_DIR/shell/$entry_point"
         ln -sf "$INSTALL_DIR/shell/$entry_point" "$HOME/.local/bin/$entry_point"
@@ -655,10 +661,10 @@ done
 
 # ── First-run configuration wizard ──────────────────────────────────────────
 
-if [[ ! -f "$INSTALL_DIR/config.yaml" && "$SWITCHYARD_SKIP_WIZARD" != "1" ]]; then
+if [[ ! -f "$INSTALL_DIR/config.yaml" && "$THRENODY_SKIP_WIZARD" != "1" ]]; then
     echo ""
     echo "  First-time setup -- configure providers and routing"
-    echo "   (Ctrl+C to skip -- run 'switchyard settings' anytime later)"
+    echo "   (Ctrl+C to skip -- run 'threnody settings' anytime later)"
     echo ""
     python3 "$INSTALL_DIR/shared/settings_wizard.py" "$INSTALL_DIR/config.yaml" || true
 fi
@@ -675,7 +681,7 @@ SYNCED_GEMINI_INSTRUCTIONS=0
 SYNCED_CODEX_INSTRUCTIONS=0
 SYNCED_CURSOR_INSTRUCTIONS=0
 SYNCED_JUNIE_INSTRUCTIONS=0
-INSTRUCTION_RENDER_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t switchyard-instructions)"
+INSTRUCTION_RENDER_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t threnody-instructions)"
 
 render_instruction_artifacts() {
     (cd "$INSTALL_DIR" && python3 - "$INSTRUCTION_RENDER_DIR" "$INSTALL_DIR/config.yaml" <<'PY'
@@ -756,9 +762,9 @@ if not body:
 path = Path(target)
 existing = path.read_text(encoding="utf-8") if path.exists() else ""
 
-start = f"<!-- Switchyard:{block_id}:start -->"
-end = f"<!-- Switchyard:{block_id}:end -->"
-legacy_heading = "# Global Instructions — Switchyard Integration"
+start = f"<!-- Threnody:{block_id}:start -->"
+end = f"<!-- Threnody:{block_id}:end -->"
+legacy_heading = "# Global Instructions — Threnody Integration"
 start_index = existing.find(start)
 end_index = existing.find(end, start_index + len(start)) if start_index != -1 else -1
 
@@ -894,7 +900,7 @@ managed_entry = {
     "hooks": [
         {
             "type": "mcp_tool",
-            "server": "Switchyard",
+            "server": "Threnody",
             "tool": "validate_routing_guard",
             "input": {
                 "target_file": "${tool_input.file_path}",
@@ -918,7 +924,7 @@ for group in pre_tool_use:
                 continue
             if (
                 hook.get("type") == "mcp_tool"
-                and hook.get("server") == "Switchyard"
+                and hook.get("server") == "Threnody"
                 and hook.get("tool") == "validate_routing_guard"
             ):
                 managed = True
@@ -996,7 +1002,7 @@ fi
 
 # --- Cursor instructions ---
 if [[ "$HAS_CURSOR" -eq 1 ]]; then
-    CURSOR_RULE_FILE="$HOME/.cursor/rules/switchyard.mdc"
+    CURSOR_RULE_FILE="$HOME/.cursor/rules/threnody.mdc"
     CURSOR_INSTRUCTIONS=$(render_instruction_block "cursor" 2>/dev/null)
 
     if [[ -n "$CURSOR_INSTRUCTIONS" ]]; then
@@ -1028,7 +1034,7 @@ info "Full instructions reference: $INSTALL_DIR/INSTRUCTIONS.md"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  🚀 Switchyard installed successfully!"
+echo "  🚀 Threnody installed successfully!"
 echo ""
 echo "  Managed instruction files:"
 if [[ "$SYNCED_CLAUDE_INSTRUCTIONS" -eq 1 ]]; then
@@ -1050,7 +1056,7 @@ if [[ "$SYNCED_CODEX_INSTRUCTIONS" -eq 1 ]]; then
     echo "    ~/.codex/AGENTS.md                  OpenAI Codex"
 fi
 if [[ "$SYNCED_CURSOR_INSTRUCTIONS" -eq 1 ]]; then
-    echo "    ~/.cursor/rules/switchyard.mdc      Cursor"
+    echo "    ~/.cursor/rules/threnody.mdc      Cursor"
 fi
 if [[ "$SYNCED_JUNIE_INSTRUCTIONS" -eq 1 ]]; then
     echo "    ~/.junie/AGENTS.md                  JetBrains Junie"
@@ -1061,9 +1067,9 @@ echo "    ghc agent \"task\"     Orchestrated multi-agent ensemble"
 echo "    ghcs \"question\"      Quick suggest (routed)"
 echo "    ghce \"question\"      Quick explain (routed)"
 echo "    ghcw                  Cache stats"
-echo "    switchyard inspect status --project .      Readiness + current limits"
-echo "    switchyard inspect approvals --project .   Pending approval queue"
-echo "    switchyard tune show --project .           Persisted operator controls"
+echo "    threnody inspect status --project .      Readiness + current limits"
+echo "    threnody inspect approvals --project .   Pending approval queue"
+echo "    threnody tune show --project .           Persisted operator controls"
 echo ""
 if [[ "$HOST_COUNT" -ge 2 ]]; then
     echo "  🔗 $HOST_COUNT host CLIs detected — cross-routing enabled!"
@@ -1076,5 +1082,7 @@ fi
 if [[ "$HAS_OPENCODE" -eq 1 ]]; then
     echo "     OpenCode is available as a low-tier host/provider via opencode/nemotron-3-super-free"
 fi
+echo "  Provider terms: see $INSTALL_DIR/docs/LEGAL.md"
+echo "  Provider policies may change at any time; use at your own risk."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""

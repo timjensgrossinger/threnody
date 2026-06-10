@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-os.environ.setdefault("SWITCHYARD_TEST_MODE", "1")
+os.environ.setdefault("THRENODY_TEST_MODE", "1")
 
 from shared.resilience import (
     AuthProbe,
@@ -119,7 +119,7 @@ def test_classify_unknown_nonzero():
 
 
 # ---------------------------------------------------------------------------
-# AuthProbe (SWITCHYARD_TEST_MODE=1 → always True)
+# AuthProbe (THRENODY_TEST_MODE=1 → always True)
 # ---------------------------------------------------------------------------
 
 def test_auth_probe_test_mode():
@@ -143,7 +143,7 @@ def test_claude_auth_probe_uses_cli_status():
         "",
     )
     with (
-        patch.dict(os.environ, {"SWITCHYARD_TEST_MODE": "0"}, clear=False),
+        patch.dict(os.environ, {"THRENODY_TEST_MODE": "0"}, clear=False),
         patch("shared.resilience.subprocess.run", return_value=result) as run,
     ):
         assert AuthProbe._probe("claude-code") is True

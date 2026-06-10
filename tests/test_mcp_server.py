@@ -2111,7 +2111,7 @@ def test_inspect_status_readiness_summary(monkeypatch) -> None:
             "fanout_cap": 2,
             "pending_approval_limit": 5,
         }
-        assert inspection["explainability_link"] == "switchyard inspect status --details"
+        assert inspection["explainability_link"] == "threnody inspect status --details"
         assert len(inspection["pending_approvals"]) == 1
         assert "draft" not in inspection["pending_approvals"][0]
         assert inspection["pending_approvals"][0]["instructions_preview"].startswith("## Context")

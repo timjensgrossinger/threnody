@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard speculative execution engine — Phase 6.
+Threnody speculative execution engine — Phase 6.
 
 For subtasks whose complexity score falls within SPECULATION_MARGIN of a tier
 boundary, this module immediately runs the cheaper (lower-tier) model while
@@ -205,7 +205,7 @@ class SpeculativeExecutor:
     provider:
         A :class:`~shared.orchestrator.Provider` implementation.
     config:
-        Full Switchyard config (used for threshold access).
+        Full Threnody config (used for threshold access).
     db:
         Optional :class:`~shared.db.Database` instance.  When provided, each
         speculation attempt is logged to the ``speculation_log`` table.

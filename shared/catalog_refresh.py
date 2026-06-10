@@ -59,7 +59,7 @@ class CatalogRefresher:
         try:
             req = urllib.request.Request(
                 self.LITELLM_URL,
-                headers={"User-Agent": "Switchyard/catalog-refresh"},
+                headers={"User-Agent": "Threnody/catalog-refresh"},
             )
             with urllib.request.urlopen(req, timeout=self._FETCH_TIMEOUT) as resp:
                 raw_bytes = resp.read(10 * 1024 * 1024)

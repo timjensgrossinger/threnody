@@ -7,7 +7,7 @@ Evaluation date: 2026-06-08
 Command:
 
 ```bash
-SWITCHYARD_TEST_MODE=1 python3 -m shared.routing_eval
+THRENODY_TEST_MODE=1 python3 -m shared.routing_eval
 ```
 
 Result:

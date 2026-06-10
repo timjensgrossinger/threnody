@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_DIR="${SWITCHYARD_INSTALL_DIR:-$HOME/.local/lib/switchyard}"
-DATA_BACKUP_DIR="${SWITCHYARD_DATA_BACKUP_DIR:-$HOME/.local/share/switchyard}"
+INSTALL_DIR="${THRENODY_INSTALL_DIR:-${SWITCHYARD_INSTALL_DIR:-$HOME/.local/lib/threnody}}"
+DATA_BACKUP_DIR="${THRENODY_DATA_BACKUP_DIR:-${SWITCHYARD_DATA_BACKUP_DIR:-$HOME/.local/share/threnody}}"
 PURGE_DATA=0
 
 info() { echo "  ✅ $*"; }
@@ -12,9 +12,9 @@ usage() {
     cat <<'EOF'
 Usage: ./uninstall.sh [--purge-data]
 
-Removes Switchyard code, registrations, symlinks, hooks, and managed
+Removes Threnody code, registrations, symlinks, hooks, and managed
 instruction blocks. By default, config.yaml and cache.db* are preserved under
-~/.local/share/switchyard/. Use --purge-data to remove them instead.
+~/.local/share/threnody/. Use --purge-data to remove them instead.
 EOF
 }
 
@@ -35,7 +35,7 @@ case "${1:-}" in
 esac
 
 echo ""
-echo "🧹 Switchyard uninstaller"
+echo "🧹 Threnody uninstaller"
 echo "   Install: $INSTALL_DIR"
 echo ""
 
@@ -67,9 +67,9 @@ def remove_json_mcp(path_value: str) -> None:
     if not isinstance(data, dict):
         return
     servers = data.get("mcpServers")
-    if not isinstance(servers, dict) or "Switchyard" not in servers:
+    if not isinstance(servers, dict) or "Threnody" not in servers:
         return
-    servers.pop("Switchyard", None)
+    servers.pop("Threnody", None)
     if not servers:
         data.pop("mcpServers", None)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -80,8 +80,8 @@ def remove_managed_block(path_value: str, block_id: str) -> None:
     if not path.exists():
         return
     text = path.read_text(encoding="utf-8")
-    start = f"<!-- Switchyard:{block_id}:start -->"
-    end = f"<!-- Switchyard:{block_id}:end -->"
+    start = f"<!-- Threnody:{block_id}:start -->"
+    end = f"<!-- Threnody:{block_id}:end -->"
     start_index = text.find(start)
     if start_index == -1:
         return
@@ -102,8 +102,8 @@ def remove_codex_mcp(path_value: str) -> None:
     if not path.exists():
         return
     text = path.read_text(encoding="utf-8")
-    start = "# Switchyard:codex-mcp:start"
-    end = "# Switchyard:codex-mcp:end"
+    start = "# Threnody:codex-mcp:start"
+    end = "# Threnody:codex-mcp:end"
     start_index = text.find(start)
     if start_index == -1:
         return
@@ -141,7 +141,7 @@ def remove_claude_hook(path_value: str) -> None:
         is_managed = any(
             isinstance(hook, dict)
             and hook.get("type") == "mcp_tool"
-            and hook.get("server") == "Switchyard"
+            and hook.get("server") == "Threnody"
             and hook.get("tool") == "validate_routing_guard"
             for hook in (group_hooks if isinstance(group_hooks, list) else [])
         )
@@ -164,7 +164,7 @@ def remove_shell_lines(path_value: str) -> None:
     source = f"source {install_dir}/shell/ghc.sh"
     filtered = []
     for line in lines:
-        if line == source or line == "# Switchyard — AI orchestration":
+        if line == source or line == "# Threnody — AI orchestration":
             continue
         filtered.append(line)
     path.write_text("\n".join(filtered).rstrip() + ("\n" if filtered else ""), encoding="utf-8")
@@ -188,7 +188,7 @@ for path, block_id in (
 ):
     remove_managed_block(str(path), block_id)
 
-cursor_rule = within_home(home / ".cursor/rules/switchyard.mdc")
+cursor_rule = within_home(home / ".cursor/rules/threnody.mdc")
 if cursor_rule.exists():
     cursor_rule.unlink()
 
@@ -196,7 +196,7 @@ remove_shell_lines(str(home / ".zshrc"))
 remove_shell_lines(str(home / ".bashrc"))
 PY
 
-for entry_point in switchyard-watch switchyard ghc; do
+for entry_point in threnody-watch threnody ghc; do
     link="$HOME/.local/bin/$entry_point"
     if [[ -L "$link" ]]; then
         target="$(readlink "$link")"
@@ -227,4 +227,4 @@ fi
 
 warn "Project-local opencode.json registrations must be removed from each project manually."
 echo ""
-info "Switchyard uninstall complete"
+info "Threnody uninstall complete"

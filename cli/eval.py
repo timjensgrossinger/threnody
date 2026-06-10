@@ -1,8 +1,8 @@
 """
-switchyard eval bandit — Contextual bandit shadow win-rate reporter (plan 11).
+threnody eval bandit — Contextual bandit shadow win-rate reporter (plan 11).
 
 Usage:
-    switchyard eval bandit [--last N] [--since HOURS_AGO] [--json]
+    threnody eval bandit [--last N] [--since HOURS_AGO] [--json]
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def _load_db():
     try:
         from shared.db import Database
         import os
-        db_path = os.path.expanduser("~/.local/lib/switchyard/cache.db")
+        db_path = os.path.expanduser("~/.local/lib/threnody/cache.db")
         return Database(db_path)
     except Exception as exc:
         print(f"error: could not open DB: {exc}", file=sys.stderr)
@@ -37,7 +37,7 @@ def _wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 def cmd_bandit(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="switchyard eval bandit",
+        prog="threnody eval bandit",
         description="Contextual bandit shadow win-rate vs heuristic",
     )
     parser.add_argument("--last", type=int, default=500, metavar="N",
@@ -129,7 +129,7 @@ def cmd_bandit(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="switchyard eval", add_help=False)
+    parser = argparse.ArgumentParser(prog="threnody eval", add_help=False)
     parser.add_argument("subcommand", nargs="?", default="bandit")
     args, rest = parser.parse_known_args(argv)
     if args.subcommand == "bandit":

@@ -1,7 +1,7 @@
 """
-Switchyard remote client.
+Threnody remote client.
 
-Thin urllib-based HTTP client for calling a remote Switchyard server.
+Thin urllib-based HTTP client for calling a remote Threnody server.
 No external dependencies — stdlib only.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ class RemoteClientError(Exception):
 
 
 class RemoteClient:
-    """HTTP client for a remote Switchyard server."""
+    """HTTP client for a remote Threnody server."""
 
     def __init__(
         self,
@@ -66,7 +66,7 @@ class RemoteClient:
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.token}",
-            "User-Agent": f"Switchyard-client/{_VERSION}",
+            "User-Agent": f"Threnody-client/{_VERSION}",
         }
         if extra_headers:
             headers.update(extra_headers)
@@ -99,7 +99,7 @@ class RemoteClient:
             method="GET",
             headers={
                 "Authorization": f"Bearer {self.token}",
-                "User-Agent": f"Switchyard-client/{_VERSION}",
+                "User-Agent": f"Threnody-client/{_VERSION}",
             },
         )
         try:

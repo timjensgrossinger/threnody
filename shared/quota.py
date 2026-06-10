@@ -181,7 +181,7 @@ class CodexQuotaAdapter(ProviderQuotaAdapter):
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "switchyard", "title": "Switchyard", "version": "1"},
+                    "clientInfo": {"name": "threnody", "title": "Threnody", "version": "1"},
                     "capabilities": {"experimentalApi": True},
                 },
             },

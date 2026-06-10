@@ -15,7 +15,7 @@
 
 ## Comparison Boundaries
 
-Switchyard is not positioned as a replacement for a specific AI coding tool.
+Threnody is not positioned as a replacement for a specific AI coding tool.
 It is a local routing and orchestration layer for operators who already use one
 or more AI CLIs. Comparisons should be limited to observable behavior:
 
@@ -28,9 +28,35 @@ or more AI CLIs. Comparisons should be limited to observable behavior:
 Avoid unsupported market claims, provider quality rankings, or claims about
 private provider quotas that are not available through stable APIs.
 
+## Provider compliance boundaries
+
+Threnody cannot certify routing patterns as fully compliant with every provider
+terms of service. Provider terms, policies, and enforcement may change at any
+time without notice; Threnody cannot guarantee continued compatibility with any
+provider's rules. See [docs/LEGAL.md](LEGAL.md) for the full risk-tier guide.
+
+- **Highest risk:** routing Claude Pro/Max subscription OAuth from a non-Claude
+  host (for example Copilot, Cursor, or Codex) to `claude -p`
+- **Grey zone:** Claude Code host → Claude Code subprocess on the same
+  subscription; blocked by default via adapter opt-out; explicit operator
+  opt-in only
+- **Lower risk:** routing through each host's own official CLI, local loopback
+  LLMs, or explicitly configured HTTPS network endpoints you operate
+- **Team use:** each operator should use their own subscriptions; do not run a
+  shared routing service that executes provider CLIs on behalf of others
+
+Do not claim affiliation with or endorsement by any AI provider.
+
+## Deprecated remote HTTP server
+
+`threnody serve`, `remote_dispatch`, and `remote_job_status` are deprecated
+and unsupported in this release line. The code may remain for compatibility, but
+operators should use local MCP stdio only. Exposing Threnody over HTTP increases
+both provider-policy and security risk.
+
 ## Privacy Model
 
-- Switchyard does not require central service credentials.
+- Threnody does not require central service credentials.
 - Provider CLIs receive the prompts they are asked to execute.
 - Local telemetry, routing history, learning state, and caches stay in SQLite
   unless the operator exports or prompts with them.
@@ -41,7 +67,7 @@ private provider quotas that are not available through stable APIs.
 
 Cost rank is a routing hint, not a bill estimator. It combines bundled defaults,
 provider metadata, and operator overrides. Subscription status and provider
-quota windows can change independently from Switchyard.
+quota windows can change independently from Threnody.
 
 ## Roadmap
 

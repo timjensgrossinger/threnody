@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Switchyard MCP server.
+Threnody MCP server.
 
 Exposes planning, routing, and cache via Model Context Protocol (JSON-RPC/stdio).
 Supports both Copilot and Claude Code backends depending on what's available.
 
 Register with:
-  gh copilot mcp add Switchyard -- python3 ~/.local/lib/switchyard/mcp_server.py
-  claude mcp add Switchyard -- python3 ~/.local/lib/switchyard/mcp_server.py
+  gh copilot mcp add Threnody -- python3 ~/.local/lib/threnody/mcp_server.py
+  claude mcp add Threnody -- python3 ~/.local/lib/threnody/mcp_server.py
 """
 from __future__ import annotations
 
@@ -341,7 +341,7 @@ _EXPLICIT_EFFORT_SUPPORTED_PROVIDERS = frozenset({
 })
 
 # Live status file for external monitoring (tail from another terminal)
-_STATUS_FILE = Path("/tmp/switchyard-status.json")
+_STATUS_FILE = Path("/tmp/threnody-status.json")
 _MODEL_CATALOG_EXECUTOR = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="model-catalog-refresh",
@@ -1736,8 +1736,8 @@ TOOLS = [
     {
         "name": "remote_dispatch",
         "description": (
-            "Dispatch a task to a remote Switchyard server.\n\n"
-            "Sends the task to a remote HTTP(S) server running \'switchyard serve\'. "
+            "Dispatch a task to a remote Threnody server.\n\n"
+            "Sends the task to a remote HTTP(S) server running \'threnody serve\'. "
             "The remote server runs the full plan+execute pipeline using its own AI CLI providers.\n\n"
             "Falls back to config.yaml remote_client settings when remote_url/remote_token are omitted.\n\n"
             "Returns:\n"
@@ -7251,7 +7251,7 @@ def handle_execute_subtask(args: dict) -> dict:
                         f"Path {normalized_target} is outside workspace root "
                         f"{Path(workspace_root).resolve()}. "
                         "Use allow_out_of_workspace=true, set write_safety.extra_paths "
-                        "in config.yaml, or run 'switchyard tune set allow_out_of_workspace_writes true'."
+                        "in config.yaml, or run 'threnody tune set allow_out_of_workspace_writes true'."
                     ),
                     "requested_path": str(normalized_target),
                 }
@@ -8949,7 +8949,7 @@ def handle_learning_audit_log(args: dict) -> dict:
 
 
 def handle_remote_dispatch(args: dict) -> dict:
-    """Dispatch a task to a remote Switchyard HTTP server."""
+    """Dispatch a task to a remote Threnody HTTP server."""
     from shared.remote_client import RemoteClient, RemoteClientError
     config, db, router, planner, orchestrator = _ensure_init()
 
@@ -9072,7 +9072,7 @@ def handle_request(request: dict) -> None:
         send_response(req_id, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "Switchyard", "version": get_version()},
+            "serverInfo": {"name": "Threnody", "version": get_version()},
         })
     elif method == "notifications/initialized":
         pass
@@ -9161,7 +9161,7 @@ _RETRY_LIMIT = 2  # up to 2 retries = 3 total attempts
 
 
 def main() -> None:
-    log.info("Switchyard MCP server %s — cross-provider orchestrator", get_version())
+    log.info("Threnody MCP server %s — cross-provider orchestrator", get_version())
     dispatch_threads: list[threading.Thread] = []
     try:
         for line in sys.stdin:

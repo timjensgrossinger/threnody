@@ -11,12 +11,17 @@ Versioning for public releases.
 
 - Visual README with architecture, routing, wave, and learning-loop diagrams (`docs/assets/`)
 - Reference docs: [docs/MCP_TOOLS.md](docs/MCP_TOOLS.md), [docs/CLI.md](docs/CLI.md), [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+- `shared/env.py` — centralized env resolution with deprecated prefix fallbacks
+- Legacy CLI wrappers: `switchyard`, `switchyard-watch` → `threnody`, `threnody-watch`
+- Installer migrates `~/.local/lib/switchyard` → `~/.local/lib/threnody` when present
+- README discoverability section (MCP / LLM router / multi-agent search terms)
 
 ### Changed
 
-- **Rebrand:** TGs-router → **Switchyard** — new install path (`~/.local/lib/switchyard`), MCP name, CLI command (`switchyard`), and env prefix (`SWITCHYARD_*`)
-- Public repository: `timjensgrossinger/switchyard`
-- `TGSROUTER_TEST_MODE` deprecated in favor of `SWITCHYARD_TEST_MODE` (old name still accepted one beta cycle)
+- **Rebrand:** Switchyard → **Threnody** — install path (`~/.local/lib/threnody`), MCP name, CLI (`threnody`), env prefix (`THRENODY_*`)
+- Public repository: `timjensgrossinger/threnody`
+- `switchyard` / `SWITCHYARD_*` deprecated for one beta cycle (wrappers and env fallbacks remain)
+- Prior beta shipped as Switchyard (`timjensgrossinger/switchyard`); `TGSROUTER_*` still accepted where documented
 
 ## [1.0.0-beta.1] - 2026-06-10
 
@@ -25,7 +30,7 @@ Versioning for public releases.
 - Apache License 2.0 with `NOTICE` for third-party attributions
 - `VERSION` file and `shared/version.py` as single source of truth for MCP serverInfo
 - Routing eval fixture alignment for low-tier override and urgency scoring behavior
-- Deterministic routing eval via default config in `SWITCHYARD_TEST_MODE` (ignores local `config.yaml`)
+- Deterministic routing eval via default config in `THRENODY_TEST_MODE` (ignores local `config.yaml`)
 
 ### Changed
 
@@ -78,7 +83,7 @@ Versioning for public releases.
 
 - Last internal milestone before the public release hardening cycle.
 
-[Unreleased]: https://github.com/timjensgrossinger/switchyard/compare/v1.0.0-beta.1...HEAD
-[1.0.0-beta.1]: https://github.com/timjensgrossinger/switchyard/releases/tag/v1.0.0-beta.1
-[v3.2.0-alpha.1]: https://github.com/timjensgrossinger/switchyard/compare/v1.9...v3.2.0-alpha.1
-[1.9]: https://github.com/timjensgrossinger/switchyard/releases/tag/v1.9
+[Unreleased]: https://github.com/timjensgrossinger/threnody/compare/v1.0.0-beta.1...HEAD
+[1.0.0-beta.1]: https://github.com/timjensgrossinger/threnody/releases/tag/v1.0.0-beta.1
+[v3.2.0-alpha.1]: https://github.com/timjensgrossinger/threnody/compare/v1.9...v3.2.0-alpha.1
+[1.9]: https://github.com/timjensgrossinger/threnody/releases/tag/v1.9

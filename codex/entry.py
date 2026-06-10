@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard Codex CLI entry point (Wave 2 — Legacy Compatibility Wrapper).
+Threnody Codex CLI entry point (Wave 2 — Legacy Compatibility Wrapper).
 
 Thin wrapper that initialises the shared core with the Codex provider
 and exposes CLI commands. Follows copilot/entry.py pattern with registry fallback.

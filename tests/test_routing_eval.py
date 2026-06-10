@@ -6,7 +6,7 @@ Covers:
 - _compare_fixture unit tests (ordering, first-failure reasons)
 - run_eval integration: PASS/SKIP/FAIL behavior, boundary skipping, exit codes
 - CLI unknown --filter → exit code 1
-- SWITCHYARD_TEST_MODE set before classify
+- THRENODY_TEST_MODE set before classify
 """
 import builtins
 import os
@@ -510,7 +510,7 @@ def test_cli_unknown_filter_exits_1():
 
 
 def test_tgsrouter_test_mode_set_before_classify(monkeypatch, capsys):
-    """Verifies SWITCHYARD_TEST_MODE == '1' is set when classify is called."""
+    """Verifies THRENODY_TEST_MODE == '1' is set when classify is called."""
     test_mode_verified = []
 
     class TestModeCheckRouter:
@@ -518,7 +518,7 @@ def test_tgsrouter_test_mode_set_before_classify(monkeypatch, capsys):
             pass
 
         def classify(self, prompt, project_path=None):
-            test_mode_verified.append(os.environ.get("SWITCHYARD_TEST_MODE"))
+            test_mode_verified.append(os.environ.get("THRENODY_TEST_MODE"))
             return FakeDecision(tier="low", score=0.25)
 
     seed_fixtures = [
@@ -538,7 +538,7 @@ def test_tgsrouter_test_mode_set_before_classify(monkeypatch, capsys):
 
     assert test_mode_verified, "classify was never called"
     assert all(v == "1" for v in test_mode_verified), (
-        f"SWITCHYARD_TEST_MODE not set correctly: {test_mode_verified}"
+        f"THRENODY_TEST_MODE not set correctly: {test_mode_verified}"
     )
 
 

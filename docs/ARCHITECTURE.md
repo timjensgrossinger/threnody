@@ -1,6 +1,6 @@
 # Architecture and Trust Boundaries
 
-Switchyard is a local MCP server that routes work to AI CLIs already installed
+Threnody is a local MCP server that routes work to AI CLIs already installed
 on the operator's machine.
 
 ```text
@@ -9,7 +9,7 @@ MCP host shell
         |
         | JSON-RPC over stdio
         v
-Switchyard mcp_server.py
+Threnody mcp_server.py
         |
         +-- shared.router        task tier classification
         +-- shared.discovery     provider detection and execution
@@ -35,7 +35,7 @@ Switchyard mcp_server.py
 
 ## Local State
 
-Switchyard stores routing cache, telemetry, provider readiness, approval
+Threnody stores routing cache, telemetry, provider readiness, approval
 queues, learned agents, and memory snapshots in local SQLite. The database is
 not sent to provider CLIs except through task prompts explicitly created by the
 operator or the MCP host.

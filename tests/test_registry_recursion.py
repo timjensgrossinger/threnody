@@ -96,7 +96,7 @@ def test_recursion_depth_enforced() -> None:
 
 def test_provider_opt_out(monkeypatch) -> None:
     """Registry skips adapters that opt out of handling the current caller."""
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
     skipped = MagicMock(spec=CLIProvider)
     skipped.name = "claude-code"
@@ -145,7 +145,7 @@ def test_provider_opt_out(monkeypatch) -> None:
 
 def test_safe_self_hosted_code_only_prefers_free_copilot(monkeypatch) -> None:
     """Sandboxed code-only execution may use self-hosted Copilot to keep low tier free."""
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
     copilot = MagicMock(spec=CLIProvider)
     copilot.name = "github-copilot"
@@ -203,7 +203,7 @@ def test_safe_self_hosted_code_only_prefers_free_copilot(monkeypatch) -> None:
 
 def test_self_hosted_code_only_bypass_stays_low_tier_only(monkeypatch) -> None:
     """Medium-tier code-only work must still honor self-hosted opt-out."""
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
     copilot = MagicMock(spec=CLIProvider)
     copilot.name = "github-copilot"

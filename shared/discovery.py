@@ -1,8 +1,8 @@
 """
-discovery.py — Universal cross-provider execution bridge for Switchyard.
+discovery.py — Universal cross-provider execution bridge for Threnody.
 
 Discovers which AI CLI tools are installed and routes work to the cheapest
-available provider.  Self-contained: no imports from other Switchyard modules.
+available provider.  Self-contained: no imports from other Threnody modules.
 """
 
 from __future__ import annotations
@@ -49,11 +49,11 @@ logger = logging.getLogger(__name__)
 # Copilot sandbox — isolated config dir for subprocess code generation
 # ---------------------------------------------------------------------------
 # When gh copilot is called as a subprocess for raw code generation, it must
-# NOT load the user's MCP servers (which may include Switchyard itself —
+# NOT load the user's MCP servers (which may include Threnody itself —
 # circular!) or custom instructions (which trigger agentic tool-use behavior).
 _COPILOT_DISABLE_BUILTINS: bool | None = None
 _COPILOT_HAS_MODEL_FLAG: bool | None = None
-_COPILOT_SANDBOX = Path.home() / ".local" / "share" / "Switchyard" / "copilot-sandbox"
+_COPILOT_SANDBOX = Path.home() / ".local" / "share" / "Threnody" / "copilot-sandbox"
 _COPILOT_AUTH_FILE_NAMES = (
     "auth.json",
     "token.json",
@@ -163,7 +163,7 @@ def _resolve_claude_agent_path(project_path: str, agent_name: str) -> Path:
 # ---------------------------------------------------------------------------
 # Per-user sandboxes — isolated environments for multi-user remote server
 # ---------------------------------------------------------------------------
-_USER_SANDBOXES_DIR = Path.home() / ".local" / "share" / "Switchyard" / "user-sandboxes"
+_USER_SANDBOXES_DIR = Path.home() / ".local" / "share" / "Threnody" / "user-sandboxes"
 
 
 def _ensure_user_sandbox(user_id: str, providers_json_str: str) -> Path:
@@ -2204,7 +2204,7 @@ def _build_mistral_command_safe(provider, action, model, prompt, effort=None):
         logger.debug("Mistral command builder failed", exc_info=True)
         candidate_bases = [Path(tempfile.gettempdir())]
         try:
-            candidate_bases.insert(0, Path.home() / ".cache" / "Switchyard" / "tmp")
+            candidate_bases.insert(0, Path.home() / ".cache" / "Threnody" / "tmp")
         except RuntimeError:
             logger.debug("Path.home() unavailable for Mistral fallback base", exc_info=True)
         for base in candidate_bases:
@@ -2214,7 +2214,7 @@ def _build_mistral_command_safe(provider, action, model, prompt, effort=None):
                     base.chmod(0o700)
                 except OSError:
                     logger.debug("Could not tighten Mistral fallback base permissions", exc_info=True)
-                fallback_dir = tempfile.mkdtemp(prefix="switchyard-vibe-", dir=str(base))
+                fallback_dir = tempfile.mkdtemp(prefix="threnody-vibe-", dir=str(base))
                 return ["vibe", "-p", prompt, "--output", "text", "--workdir", fallback_dir]
             except OSError:
                 logger.debug("Could not prepare Mistral fallback base %s", base, exc_info=True)
@@ -2856,11 +2856,13 @@ class ProviderRegistry:
         self._usage_checker = ProviderUsageChecker(self._quota_service)
         self.last_usage_window_rationale: list[dict[str, object]] = []
 
-        # Wave 3: TEST-01 - Check for SWITCHYARD_TEST_MODE to isolate tests
-        test_mode = os.getenv("SWITCHYARD_TEST_MODE", "").lower() in ("1", "true", "yes")
+        # Wave 3: TEST-01 - Check for test mode to isolate tests
+        from shared.env import test_mode_enabled
+
+        test_mode = test_mode_enabled()
 
         if test_mode:
-            logger.info("SWITCHYARD_TEST_MODE enabled — using test providers only")
+            logger.info("THRENODY_TEST_MODE enabled — using test providers only")
             for provider in self._get_test_providers():
                 provider = self._apply_provider_cost_overrides(provider)
                 self.register_detected(
@@ -2992,7 +2994,7 @@ class ProviderRegistry:
     def _get_test_providers(self) -> list[CLIProvider]:
         """Return stub providers for test mode isolation.
 
-        Wave 3: TEST-01 - SWITCHYARD_TEST_MODE stub providers.
+        Wave 3: TEST-01 - THRENODY_TEST_MODE stub providers.
         Prevents tests from depending on real CLI installations.
         """
         return [
@@ -3710,7 +3712,9 @@ class ProviderRegistry:
         # builtin provider templates for ordering decisions while leaving
         # registry.available_providers unchanged. This keeps test-mode discovery
         # hermetic (only test-provider registered) but preserves ordering tests' expectations.
-        if os.environ.get("SWITCHYARD_TEST_MODE") == "1" and len(candidates) == 1 and candidates[0].name == "test-provider":
+        from shared.env import test_mode_enabled
+
+        if test_mode_enabled() and len(candidates) == 1 and candidates[0].name == "test-provider":
             # Preserve the test-provider instance (with any applied overrides)
             # but position builtins before or after it depending on whether the
             # test-provider was modified by config_overrides for this tier.

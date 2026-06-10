@@ -1,4 +1,4 @@
-"""CLI for operator inspection — leases and dead letters (`switchyard inspect leases|deadletters`)."""
+"""CLI for operator inspection — leases and dead letters (`threnody inspect leases|deadletters`)."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ def _get_db():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).parent.parent))
     from shared.db import Database
-    db_path = Path.home() / ".local" / "lib" / "Switchyard" / "cache.db"
+    db_path = Path.home() / ".local" / "lib" / "Threnody" / "cache.db"
     return Database(db_path)
 
 
@@ -65,7 +65,7 @@ def cmd_deadletters(args) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Switchyard operator inspection CLI")
+    parser = argparse.ArgumentParser(description="Threnody operator inspection CLI")
     sub = parser.add_subparsers(dest="subcmd")
 
     sub.add_parser("leases", help="Show active and expired worker leases")

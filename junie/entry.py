@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard Junie CLI entry point (Wave 2 — Legacy Compatibility Wrapper).
+Threnody Junie CLI entry point (Wave 2 — Legacy Compatibility Wrapper).
 
 Thin wrapper that initialises the shared core with the Junie provider
 and exposes CLI commands. Follows copilot/entry.py pattern with registry fallback.

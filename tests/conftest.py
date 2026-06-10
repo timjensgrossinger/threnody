@@ -105,7 +105,7 @@ def mock_provider_fixture() -> CLIProvider:
     
     Notes:
         - detect() returns True without requiring real CLI binary
-        - Used in discovery tests under SWITCHYARD_TEST_MODE
+        - Used in discovery tests under THRENODY_TEST_MODE
         - Cost rank values are relative; matches BUILTIN_PROVIDERS pattern
     
     Usage in Phase 5 tests:
@@ -154,7 +154,7 @@ def test_config_fixture() -> Iterator[TGsConfig]:
         - Path validation tests (trusted vs untrusted paths)
         - Parallel wave execution config
         - Warm-path scheduling behavior
-        - Test isolation via SWITCHYARD_TEST_MODE checks
+        - Test isolation via THRENODY_TEST_MODE checks
     
     Note:
         - write_safety config will be added in Phase 5 Wave 2
@@ -194,7 +194,7 @@ def _auto_reset_singletons():
 
     Ensures that provider registry and mcp_server module-level globals
     don't carry state between tests. Critical for hermetic test isolation
-    in SWITCHYARD_TEST_MODE.
+    in THRENODY_TEST_MODE.
 
     Also saves/restores:
     - mcp_server._ensure_init (test_inspect_extensions replaces it with a lambda)
@@ -442,9 +442,9 @@ def mock_env(monkeypatch):
 @pytest.fixture(scope="function")
 def isolation_test_mode(monkeypatch):
     """
-    Enable SWITCHYARD_TEST_MODE for hermetic provider discovery tests.
+    Enable THRENODY_TEST_MODE for hermetic provider discovery tests.
     
-    Sets SWITCHYARD_TEST_MODE=1 to stub real provider detection and uses
+    Sets THRENODY_TEST_MODE=1 to stub real provider detection and uses
     only test-provider instances instead of scanning PATH for actual CLIs.
     
     Also clears real auth env vars to prevent accidental live API calls:
@@ -453,15 +453,15 @@ def isolation_test_mode(monkeypatch):
     - Any CLAUDE_* vars cleared
     
     Cleanup:
-    - SWITCHYARD_TEST_MODE is unset after test completes
+    - THRENODY_TEST_MODE is unset after test completes
     - Real env vars are restored
     
     Usage in tests:
         def test_something(isolation_test_mode):
-            # Test runs with SWITCHYARD_TEST_MODE=1
+            # Test runs with THRENODY_TEST_MODE=1
             # and no real auth credentials visible
     """
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("JUNIE_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE", raising=False)
@@ -469,7 +469,7 @@ def isolation_test_mode(monkeypatch):
     
     yield monkeypatch
     
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
 
 
 # ============================================================================

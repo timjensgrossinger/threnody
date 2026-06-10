@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard SQLite database layer.
+Threnody SQLite database layer.
 
 WAL mode — concurrent reads from hot/warm/cold paths.
 Stores: result cache, plan cache, telemetry, adaptive thresholds,
@@ -92,7 +92,7 @@ def _schema_lock_for_path(path: Path) -> threading.Lock:
 
 
 class Database:
-    """Unified SQLite database for all Switchyard state."""
+    """Unified SQLite database for all Threnody state."""
 
     def __init__(
         self,

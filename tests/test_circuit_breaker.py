@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-os.environ.setdefault("SWITCHYARD_TEST_MODE", "1")
+os.environ.setdefault("THRENODY_TEST_MODE", "1")
 
 from shared.db import Database
 from shared.health import (

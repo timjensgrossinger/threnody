@@ -1,4 +1,4 @@
-"""CLI for HMAC-chained audit log — `switchyard audit {verify,export}`."""
+"""CLI for HMAC-chained audit log — `threnody audit {verify,export}`."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,7 @@ def _get_db():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).parent.parent))
     from shared.db import Database
-    db_path = Path.home() / ".local" / "lib" / "Switchyard" / "cache.db"
+    db_path = Path.home() / ".local" / "lib" / "Threnody" / "cache.db"
     return Database(db_path)
 
 
@@ -91,7 +91,7 @@ def cmd_export(args) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Switchyard HMAC-chained audit log")
+    parser = argparse.ArgumentParser(description="Threnody HMAC-chained audit log")
     sub = parser.add_subparsers(dest="subcmd")
 
     verify_p = sub.add_parser("verify", help="Verify HMAC chain integrity")

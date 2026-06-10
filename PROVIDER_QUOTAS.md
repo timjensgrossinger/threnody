@@ -1,6 +1,6 @@
 # Provider-Reported Quotas
 
-Switchyard can use provider-reported subscription quota windows when a provider
+Threnody can use provider-reported subscription quota windows when a provider
 offers a documented, authenticated, machine-readable interface. It does not
 scrape web pages, read credential stores, parse terminal UI rendering, or infer
 subscription limits from model context windows.
@@ -18,7 +18,7 @@ subscription limits from model context windows.
 | OpenCode | Usage only | `opencode stats` reads local token/cost telemetry, not an upstream subscription allowance |
 | Amazon Q/Kiro | Interactive only | `/usage` shows current usage and remaining credits; no documented structured quota output |
 | Aider | Unsupported | Uses separately configured upstream providers |
-| Mistral Vibe | Unsupported | No documented CLI subscription-quota contract used by Switchyard |
+| Mistral Vibe | Unsupported | No documented CLI subscription-quota contract used by Threnody |
 | Blackbox AI | Unsupported | No documented CLI subscription-quota contract |
 | Windsurf | Unsupported | No documented CLI subscription-quota contract |
 
@@ -41,7 +41,7 @@ Each `ProviderQuotaSnapshot` records:
 - source
 - confidence and freshness
 
-Codex currently reports `usedPercent`. Switchyard stores this as
+Codex currently reports `usedPercent`. Threnody stores this as
 `unit: percent`, `limit: 100`, and derives the remaining percentage. It does
 not invent token or request limits.
 
@@ -71,7 +71,7 @@ For each configured window, routing:
 1. Uses a fresh provider-reported ratio when available.
 2. Applies `prefer_alternatives`, `cost_rank_boost`, or `hard_exclude` at the
    configured threshold.
-3. Falls back to Switchyard token telemetry divided by `budget_tokens` when
+3. Falls back to Threnody token telemetry divided by `budget_tokens` when
    provider quota is unsupported, unavailable, stale, or malformed.
 4. Returns no ratio when neither source is available.
 
@@ -84,7 +84,7 @@ is never used by this feature.
 ## Caching, diagnostics, and privacy
 
 Quota adapter results are cached briefly to avoid repeatedly invoking provider
-CLIs. Normalized observations are appended to the private Switchyard SQLite
+CLIs. Normalized observations are appended to the private Threnody SQLite
 database for diagnostics. No access tokens, cookies, authorization headers, or
 raw provider responses are persisted.
 

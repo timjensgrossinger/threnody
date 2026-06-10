@@ -8,7 +8,7 @@ for non-interactive AI code generation.
 Tests D-01 through D-05 locked decisions:
 - D-01: Cursor is first-class `cursor-agent` execution adapter
 - D-02: Cursor may use richer workspace-write behavior
-- D-03: Cursor must honor Switchyard trust boundary
+- D-03: Cursor must honor Threnody trust boundary
 - D-04: Cursor must claim only truthful tier coverage
 - D-05: Detection must be strict: only headless executable counts, not app-only installs
 

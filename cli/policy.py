@@ -1,8 +1,8 @@
 """
-switchyard policy — Runtime policy management CLI (plan 12).
+threnody policy — Runtime policy management CLI (plan 12).
 
 Subcommands:
-    list               List policy files in ~/.local/lib/switchyard/policies/
+    list               List policy files in ~/.local/lib/threnody/policies/
     show <name>        Show a policy file
     test <policy.yaml> --path <path> --tool <tool> --command <cmd> --host <host>
 """
@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 
-POLICIES_DIR = Path.home() / ".local/lib/switchyard/policies"
+POLICIES_DIR = Path.home() / ".local/lib/threnody/policies"
 
 
 def _list_policies(args: argparse.Namespace) -> int:
@@ -102,7 +102,7 @@ def _test_policy(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="switchyard policy")
+    parser = argparse.ArgumentParser(prog="threnody policy")
     sub = parser.add_subparsers(dest="subcmd")
 
     sub.add_parser("list", help="List available policy files")

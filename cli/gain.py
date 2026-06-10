@@ -1,4 +1,4 @@
-"""CLI for cost savings dashboard — `switchyard gain`."""
+"""CLI for cost savings dashboard — `threnody gain`."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ def _get_db():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).parent.parent))
     from shared.db import Database
-    db_path = Path.home() / ".local" / "lib" / "Switchyard" / "cache.db"
+    db_path = Path.home() / ".local" / "lib" / "Threnody" / "cache.db"
     return Database(db_path)
 
 
@@ -110,7 +110,7 @@ def cmd_gain(args) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Switchyard cost savings dashboard")
+    parser = argparse.ArgumentParser(description="Threnody cost savings dashboard")
     parser.add_argument("--since", default="7d", help="Time window (e.g. 7d, 30d, 24h)")
     parser.add_argument("--by", choices=["tier", "provider", "model"], default="tier")
     parser.add_argument("--json", action="store_true", help="Output JSON")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render shell-specific Switchyard managed instruction blocks."""
+"""Render shell-specific Threnody managed instruction blocks."""
 from __future__ import annotations
 
 import argparse
@@ -40,14 +40,14 @@ def render_shell_instructions(
     *,
     verbatim: bool = False,
 ) -> str:
-    """Render a managed Switchyard instruction block for one shell."""
+    """Render a managed Threnody instruction block for one shell."""
     profile = config.routing_policy.effective_profile(shell_id)
     label = SHELL_LABELS.get(profile.shell_id, profile.shell_id)
     lines: list[str] = []
     if not verbatim:
-        lines.extend([f"## Switchyard Integration for {label}", ""])
+        lines.extend([f"## Threnody Integration for {label}", ""])
     else:
-        lines.extend([f"# Switchyard Integration for {label}", ""])
+        lines.extend([f"# Threnody Integration for {label}", ""])
 
     lines.append(f"These instructions apply only to **{label}** (`{profile.shell_id}`).")
     lines.append("")
@@ -111,7 +111,7 @@ def render_shell_instructions(
                 "### Direct edit/write hook enforcement",
                 "",
                 f"{label} should enforce direct `Edit`/`Write` calls with a `PreToolUse` hook.",
-                "The managed hook calls Switchyard `validate_routing_guard` with `target_file`, `tool_name`, and `cwd`.",
+                "The managed hook calls Threnody `validate_routing_guard` with `target_file`, `tool_name`, and `cwd`.",
                 "Do not bypass this hook for code edits unless the user explicitly disables strict routing.",
                 "",
             ]
@@ -121,7 +121,7 @@ def render_shell_instructions(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Render Switchyard instructions for one AI shell")
+    parser = argparse.ArgumentParser(description="Render Threnody instructions for one AI shell")
     parser.add_argument("shell", help="Shell id, e.g. claude-code or github-copilot-cli")
     parser.add_argument(
         "--config",

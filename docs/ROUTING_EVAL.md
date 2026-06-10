@@ -1,6 +1,6 @@
-# Switchyard Routing Eval
+# Threnody Routing Eval
 
-Reproducible benchmark for Switchyard's cost-tier routing decisions.
+Reproducible benchmark for Threnody's cost-tier routing decisions.
 
 ## Methodology
 
@@ -44,17 +44,17 @@ Accuracy = `pass / (pass + fail)`.
 
 ```bash
 # Full suite
-switchyard eval run
+threnody eval run
 
 # With report
-switchyard eval run --report markdown > docs/EVAL_REPORT.md
-switchyard eval run --report html > docs/eval_report.html
+threnody eval run --report markdown > docs/EVAL_REPORT.md
+threnody eval run --report html > docs/eval_report.html
 
 # Filter by category
-switchyard eval run --filter low,urgency
+threnody eval run --filter low,urgency
 
 # Update baseline (run after intentional routing changes)
-switchyard eval baseline
+threnody eval baseline
 python3 -m shared.eval_baseline
 ```
 
@@ -71,5 +71,5 @@ High accuracy (>90%) means the keyword/signal scoring correctly identifies task 
 ## Extending the suite
 
 1. Add a `.json` file to the appropriate `tests/eval/<category>/` directory.
-2. Run `switchyard eval run --filter <category>` to verify it passes.
-3. Run `switchyard eval baseline` to update the baseline if you changed routing logic.
+2. Run `threnody eval run --filter <category>` to verify it passes.
+3. Run `threnody eval baseline` to update the baseline if you changed routing logic.

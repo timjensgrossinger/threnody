@@ -1,1 +1,1 @@
-"""Switchyard shared core."""
+"""Threnody shared core."""

@@ -26,7 +26,7 @@ def _copy_source(target: Path) -> Path:
             ".runtime",
             "providers.json",
             "audit_secret",
-            "switchyard-status.json",
+            "threnody-status.json",
         ),
     )
     return target
@@ -39,10 +39,10 @@ def _installer_env(home: Path, temp_dir: Path, **overrides: str) -> dict[str, st
             "HOME": str(home),
             "SHELL": "/bin/bash",
             "TMPDIR": str(temp_dir),
-            "SWITCHYARD_ALLOW_NO_HOST": "1",
-            "SWITCHYARD_SKIP_DEPENDENCIES": "1",
-            "SWITCHYARD_SKIP_WIZARD": "1",
-            "SWITCHYARD_PROVIDER_SCAN_TEST_MODE": "1",
+            "THRENODY_ALLOW_NO_HOST": "1",
+            "THRENODY_SKIP_DEPENDENCIES": "1",
+            "THRENODY_SKIP_WIZARD": "1",
+            "THRENODY_PROVIDER_SCAN_TEST_MODE": "1",
         }
     )
     env.update(overrides)
@@ -76,15 +76,15 @@ def test_clean_install_with_spaces_and_portable_copy(tmp_path: Path) -> None:
         source,
         home,
         temp_dir,
-        SWITCHYARD_FORCE_PORTABLE_COPY="1",
+        THRENODY_FORCE_PORTABLE_COPY="1",
     )
 
     assert result.returncode == 0, result.stderr
-    install_dir = home / ".local/lib/switchyard"
+    install_dir = home / ".local/lib/threnody"
     assert (install_dir / "mcp_server.py").is_file()
     assert (install_dir / "uninstall.sh").is_file()
     assert (install_dir / "providers.json").is_file()
-    assert (home / ".local/bin/switchyard").is_symlink()
+    assert (home / ".local/bin/threnody").is_symlink()
     assert "using portable Python copy fallback" in result.stderr
     assert not list(temp_dir.iterdir())
 
@@ -99,7 +99,7 @@ def test_reinstall_is_idempotent_and_preserves_runtime_data(tmp_path: Path) -> N
     first = _run_installer(source, home, temp_dir)
     assert first.returncode == 0, first.stderr
 
-    install_dir = home / ".local/lib/switchyard"
+    install_dir = home / ".local/lib/threnody"
     config = install_dir / "config.yaml"
     database = install_dir / "cache.db"
     stale = install_dir / "stale-generated-file.txt"
@@ -133,7 +133,7 @@ def test_interrupted_install_cleans_temps_and_reinstall_recovers(tmp_path: Path)
         source,
         home,
         temp_dir,
-        SWITCHYARD_TEST_FAIL_AFTER_COPY="1",
+        THRENODY_TEST_FAIL_AFTER_COPY="1",
     )
 
     assert failed.returncode != 0
@@ -142,7 +142,7 @@ def test_interrupted_install_cleans_temps_and_reinstall_recovers(tmp_path: Path)
 
     recovered = _run_installer(source, home, temp_dir)
     assert recovered.returncode == 0, recovered.stderr
-    assert (home / ".local/lib/switchyard/mcp_server.py").is_file()
+    assert (home / ".local/lib/threnody/mcp_server.py").is_file()
 
 
 def test_uninstall_preserves_unrelated_configuration_and_runtime_data(
@@ -172,7 +172,7 @@ def test_uninstall_preserves_unrelated_configuration_and_runtime_data(
 
     installed = _run_installer(source, home, temp_dir)
     assert installed.returncode == 0, installed.stderr
-    install_dir = home / ".local/lib/switchyard"
+    install_dir = home / ".local/lib/threnody"
     (install_dir / "config.yaml").write_text("custom: keep\n", encoding="utf-8")
     (install_dir / "cache.db").write_bytes(b"database")
 
@@ -186,14 +186,14 @@ def test_uninstall_preserves_unrelated_configuration_and_runtime_data(
 
     assert result.returncode == 0, result.stderr
     assert not install_dir.exists()
-    backup_dir = home / ".local/share/switchyard"
+    backup_dir = home / ".local/share/threnody"
     assert (backup_dir / "config.yaml").read_text(encoding="utf-8") == "custom: keep\n"
     assert (backup_dir / "cache.db").read_bytes() == b"database"
     preserved = json.loads(copilot_config.read_text(encoding="utf-8"))
     assert preserved["unrelated"] == {"keep": True}
     assert preserved["mcpServers"] == {"Other": {"command": "other"}}
     assert (home / ".bashrc").read_text(encoding="utf-8").strip() == "export KEEP_ME=1"
-    assert not (home / ".local/bin/switchyard").exists()
+    assert not (home / ".local/bin/threnody").exists()
 
 
 @pytest.mark.parametrize("flag", ["--help", "-h"])

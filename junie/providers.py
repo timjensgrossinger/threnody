@@ -1,5 +1,5 @@
 """
-junie/providers.py — JetBrains Junie provider implementation for Switchyard.
+junie/providers.py — JetBrains Junie provider implementation for Threnody.
 
 Implements command building, dual-auth detection (BYOK + JetBrains-managed),
 JSON parsing with telemetry extraction, and output cleaning using the Phase 6

@@ -1,1 +1,1 @@
-# Mistral Vibe provider package for Switchyard.
+# Mistral Vibe provider package for Threnody.

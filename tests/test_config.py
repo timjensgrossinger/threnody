@@ -648,7 +648,7 @@ def test_load_eval_config_falls_back_to_defaults_in_test_mode(monkeypatch) -> No
         config_path.write_text("planner_model: custom-model\n", encoding="utf-8")
 
         monkeypatch.setattr(config_module, "yaml", None)
-        monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+        monkeypatch.setenv("THRENODY_TEST_MODE", "1")
 
         cfg = load_eval_config(config_path)
 
@@ -714,7 +714,7 @@ def test_load_eval_config_raises_without_test_mode(monkeypatch) -> None:
         config_path.write_text("planner_model: custom-model\n", encoding="utf-8")
 
         monkeypatch.setattr(config_module, "yaml", None)
-        monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+        monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
 
         with pytest.raises(RuntimeError, match="PyYAML is required"):
             load_eval_config(config_path)

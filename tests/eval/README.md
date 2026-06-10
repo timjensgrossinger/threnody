@@ -35,15 +35,15 @@ Field reminders:
 Use the shipped shell wrapper when it is available:
 
 ```bash
-switchyard eval run
+threnody eval run
 ```
 
 Useful variants:
 
 ```bash
-switchyard eval run --filter low
-switchyard eval run --filter low,urgency
-switchyard eval run --filter high --filter fanout
+threnody eval run --filter low
+threnody eval run --filter low,urgency
+threnody eval run --filter high --filter fanout
 ```
 
 If you are not sourcing `shell/ghc.sh`, use the direct Python fallback:
@@ -60,7 +60,7 @@ Run the suite before you change `config.yaml`, adjust fixture expectations, or r
 When you intentionally want a fresh working snapshot of normalized routing output, run:
 
 ```bash
-switchyard eval baseline
+threnody eval baseline
 ```
 
 Fallback:
@@ -80,11 +80,11 @@ This writes `tests/eval/baseline.json`. The file is local-only, already gitignor
 
 ## Maintainer notes
 
-`switchyard eval baseline` and `python -m shared.eval_baseline` write a deterministic snapshot with top-level `config_hash` and `schema_version`, plus normalized per-fixture actuals. The baseline is a local working artifact, not a shared golden file.
+`threnody eval baseline` and `python -m shared.eval_baseline` write a deterministic snapshot with top-level `config_hash` and `schema_version`, plus normalized per-fixture actuals. The baseline is a local working artifact, not a shared golden file.
 
 Before you open a PR:
 
-1. Run `switchyard eval run` (or `python -m shared.routing_eval`) and review failures.
+1. Run `threnody eval run` (or `python -m shared.routing_eval`) and review failures.
 2. Refresh the baseline only when you intentionally want a new local snapshot.
 
 Suggested CI smoke check:

@@ -2,7 +2,7 @@
   "id": "fixtures-swarm-star",
   "category": "urgency",
   "tags": ["stable", "swarm"],
-  "test_mode": "SWITCHYARD_TEST_MODE",
+  "test_mode": "THRENODY_TEST_MODE",
   "prompt": "Production incident blocking release today: coordinate a swarm-style authentication middleware fix across auth, api, and session layers, synthesize worker output, and define a rollback threshold.",
   "expected": {
     "tier": "medium",

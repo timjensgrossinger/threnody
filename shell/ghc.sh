@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Switchyard — orchestrated agent ensemble
-# Source this in ~/.zshrc:  source ~/.local/lib/switchyard/shell/ghc.sh
+# Threnody — orchestrated agent ensemble
+# Source this in ~/.zshrc:  source ~/.local/lib/threnody/shell/ghc.sh
 #
 # Every `ghcag "task"` call auto-triggers:
 #   1. PLAN:       sonnet 4.6 reasons about the task, produces execution plan
@@ -9,7 +9,10 @@
 #
 # No API keys — everything goes through `gh copilot`.
 
-_ROUTER_DIR="$HOME/.local/lib/switchyard"
+_ROUTER_DIR="$HOME/.local/lib/threnody"
+if [[ ! -d "$_ROUTER_DIR" && -d "$HOME/.local/lib/switchyard" ]]; then
+    _ROUTER_DIR="$HOME/.local/lib/switchyard"
+fi
 _ROUTER_CLI="python3 $_ROUTER_DIR/copilot/entry.py"
 
 # ---------------------------------------------------------------------------
@@ -380,7 +383,7 @@ ghca() {
 }
 
 # ---------------------------------------------------------------------------
-# switchyard inspect — CLI-first operator surface for readiness and task inspection
+# threnody inspect — CLI-first operator surface for readiness and task inspection
 # ---------------------------------------------------------------------------
 _TGS_PYTHON=""
 
@@ -407,49 +410,49 @@ PY
         fi
     done
 
-    echo "switchyard inspect: no compatible Python interpreter found (need Python 3.10+)" >&2
+    echo "threnody inspect: no compatible Python interpreter found (need Python 3.10+)" >&2
     return 1
 }
 
 _tgs_usage() {
     cat >&2 <<'EOF'
 Usage:
-  switchyard inspect status [--project PATH] [--details]
-  switchyard inspect task <task_id> [--details]
-  switchyard inspect approvals [--project PATH] [--limit N] [--details]
-  switchyard inspect write-audit [--limit N]
-  switchyard inspect approvals approve <id> --project PATH --operator OP
-  switchyard inspect approvals reject <id> --project PATH --operator OP --reason TEXT
-  switchyard inspect approvals merge <id> <target_agent_id> --project PATH --operator OP [--reason TEXT]
-  switchyard tune show [key] --project PATH
-  switchyard tune set <key> <value> --project PATH [--force]
-  switchyard tune reset [key] --project PATH
-  switchyard settings
-  switchyard eval run [--filter CATEGORY]
-  switchyard eval baseline
-  switchyard except list
-  switchyard except add <type> <pattern> [--note TEXT]
-  switchyard except remove <type> <pattern>
-  switchyard db check [--db PATH]
-  switchyard db repair [--db PATH]
-  switchyard db backup [--db PATH]
-  switchyard db prune [--db PATH] [--keep N]
+  threnody inspect status [--project PATH] [--details]
+  threnody inspect task <task_id> [--details]
+  threnody inspect approvals [--project PATH] [--limit N] [--details]
+  threnody inspect write-audit [--limit N]
+  threnody inspect approvals approve <id> --project PATH --operator OP
+  threnody inspect approvals reject <id> --project PATH --operator OP --reason TEXT
+  threnody inspect approvals merge <id> <target_agent_id> --project PATH --operator OP [--reason TEXT]
+  threnody tune show [key] --project PATH
+  threnody tune set <key> <value> --project PATH [--force]
+  threnody tune reset [key] --project PATH
+  threnody settings
+  threnody eval run [--filter CATEGORY]
+  threnody eval baseline
+  threnody except list
+  threnody except add <type> <pattern> [--note TEXT]
+  threnody except remove <type> <pattern>
+  threnody db check [--db PATH]
+  threnody db repair [--db PATH]
+  threnody db backup [--db PATH]
+  threnody db prune [--db PATH] [--keep N]
 
 Examples:
-  switchyard inspect status --project .
-  switchyard inspect status --project . --details
-  switchyard inspect task execute-1234
-  switchyard inspect approvals --project .
-  switchyard inspect write-audit --limit 20
-  switchyard tune set concurrency_limit 5 --project .
-  switchyard eval run --filter low
-  switchyard eval baseline
-  switchyard except add skill "auto-time"
-  switchyard except add skill "tgsd-*"
-  switchyard except add filetype ".md"
-  switchyard except add project "/home/me/notes"
-  switchyard except list
-  switchyard except remove skill "auto-time"
+  threnody inspect status --project .
+  threnody inspect status --project . --details
+  threnody inspect task execute-1234
+  threnody inspect approvals --project .
+  threnody inspect write-audit --limit 20
+  threnody tune set concurrency_limit 5 --project .
+  threnody eval run --filter low
+  threnody eval baseline
+  threnody except add skill "auto-time"
+  threnody except add skill "tgsd-*"
+  threnody except add filetype ".md"
+  threnody except add project "/home/me/notes"
+  threnody except list
+  threnody except remove skill "auto-time"
 EOF
 }
 
@@ -462,7 +465,7 @@ _tgs_inspect_status() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --project)
-                [[ $# -lt 2 ]] && { echo "switchyard inspect status: --project requires a path" >&2; return 1; }
+                [[ $# -lt 2 ]] && { echo "threnody inspect status: --project requires a path" >&2; return 1; }
                 project="$2"
                 shift 2
                 ;;
@@ -479,7 +482,7 @@ _tgs_inspect_status() {
                 return 0
                 ;;
             *)
-                echo "switchyard inspect status: unknown argument: $1" >&2
+                echo "threnody inspect status: unknown argument: $1" >&2
                 _tgs_usage
                 return 1
                 ;;
@@ -570,7 +573,7 @@ if outcome_details:
                     work = counts.get("reworked", 0)
                     print(f"    {tier_model}: {acc} accepted, {rev} revised, {rej} rejected, {work} reworked")
 
-print(f"details: {result.get('explainability_link', 'switchyard inspect status --details')}")
+print(f"details: {result.get('explainability_link', 'threnody inspect status --details')}")
 PY
 }
 
@@ -594,7 +597,7 @@ _tgs_inspect_task() {
                     task_id="$1"
                     shift
                 else
-                    echo "switchyard inspect task: unknown argument: $1" >&2
+                    echo "threnody inspect task: unknown argument: $1" >&2
                     _tgs_usage
                     return 1
                 fi
@@ -603,7 +606,7 @@ _tgs_inspect_task() {
     done
 
     if [[ -z "$task_id" ]]; then
-        echo "switchyard inspect task: task_id is required" >&2
+        echo "threnody inspect task: task_id is required" >&2
         _tgs_usage
         return 1
     fi
@@ -646,7 +649,7 @@ print(
     f"fallback={'yes' if fallback else 'no'} "
     f"speculation={'yes' if speculation else 'no'}"
 )
-print("details: switchyard inspect task <task_id> --details")
+print("details: threnody inspect task <task_id> --details")
 PY
 }
 
@@ -673,22 +676,22 @@ _tgs_inspect_approvals() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --project)
-                [[ $# -lt 2 ]] && { echo "switchyard inspect approvals: --project requires a path" >&2; return 1; }
+                [[ $# -lt 2 ]] && { echo "threnody inspect approvals: --project requires a path" >&2; return 1; }
                 project="$2"
                 shift 2
                 ;;
             --limit)
-                [[ $# -lt 2 ]] && { echo "switchyard inspect approvals: --limit requires a value" >&2; return 1; }
+                [[ $# -lt 2 ]] && { echo "threnody inspect approvals: --limit requires a value" >&2; return 1; }
                 limit="$2"
                 shift 2
                 ;;
             --operator)
-                [[ $# -lt 2 ]] && { echo "switchyard inspect approvals: --operator requires a value" >&2; return 1; }
+                [[ $# -lt 2 ]] && { echo "threnody inspect approvals: --operator requires a value" >&2; return 1; }
                 operator="$2"
                 shift 2
                 ;;
             --reason)
-                [[ $# -lt 2 ]] && { echo "switchyard inspect approvals: --reason requires a value" >&2; return 1; }
+                [[ $# -lt 2 ]] && { echo "threnody inspect approvals: --reason requires a value" >&2; return 1; }
                 reason="$2"
                 shift 2
                 ;;
@@ -722,7 +725,7 @@ _tgs_inspect_approvals() {
                         fi
                         ;;
                 esac
-                echo "switchyard inspect approvals: unknown argument: $1" >&2
+                echo "threnody inspect approvals: unknown argument: $1" >&2
                 _tgs_usage
                 return 1
                 ;;
@@ -732,13 +735,13 @@ _tgs_inspect_approvals() {
     case "$action" in
         approve|reject)
             [[ -z "$queue_id" || -z "$operator" ]] && {
-                echo "switchyard inspect approvals $action: queue id and --operator are required" >&2
+                echo "threnody inspect approvals $action: queue id and --operator are required" >&2
                 return 1
             }
             ;;
         merge)
             [[ -z "$queue_id" || -z "$canonical_id" || -z "$operator" ]] && {
-                echo "switchyard inspect approvals merge: queue id, target agent id, and --operator are required" >&2
+                echo "threnody inspect approvals merge: queue id, target agent id, and --operator are required" >&2
                 return 1
             }
             ;;
@@ -820,19 +823,19 @@ _tgs_learning_summary() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --project)
-                [[ $# -lt 2 ]] && { echo "switchyard learning summary: --project requires a path" >&2; return 1; }
+                [[ $# -lt 2 ]] && { echo "threnody learning summary: --project requires a path" >&2; return 1; }
                 project="$2"
                 shift 2
                 ;;
             -h|--help)
-                echo "switchyard learning summary [--project PATH]"
+                echo "threnody learning summary [--project PATH]"
                 echo ""
                 echo "Display learning outcome summary over 1-hour window"
                 echo "  --project PATH  use project at PATH (default: .)"
                 return 0
                 ;;
             *)
-                echo "switchyard learning summary: unknown argument: $1" >&2
+                echo "threnody learning summary: unknown argument: $1" >&2
                 return 1
                 ;;
         esac
@@ -928,7 +931,7 @@ _tgs_tune() {
     case "$mode" in
         show|set|reset) ;;
         *)
-            echo "switchyard tune: subcommand must be show, set, or reset" >&2
+            echo "threnody tune: subcommand must be show, set, or reset" >&2
             _tgs_usage
             return 1
             ;;
@@ -937,7 +940,7 @@ _tgs_tune() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --project)
-                [[ $# -lt 2 ]] && { echo "switchyard tune: --project requires a path" >&2; return 1; }
+                [[ $# -lt 2 ]] && { echo "threnody tune: --project requires a path" >&2; return 1; }
                 project="$2"
                 shift 2
                 ;;
@@ -978,7 +981,7 @@ _tgs_tune() {
                         fi
                         ;;
                 esac
-                echo "switchyard tune: unknown argument: $1" >&2
+                echo "threnody tune: unknown argument: $1" >&2
                 _tgs_usage
                 return 1
                 ;;
@@ -986,7 +989,7 @@ _tgs_tune() {
     done
 
     if [[ "$mode" == "set" && ( -z "$key" || -z "$value" ) ]]; then
-        echo "switchyard tune set: key and value are required" >&2
+        echo "threnody tune set: key and value are required" >&2
         return 1
     fi
 
@@ -1058,7 +1061,7 @@ _tgs_serve() {
     exec "$pybin" "$_ROUTER_DIR/shared/remote_server.py" "$@"
 }
 
-switchyard() {
+threnody() {
     local area="${1:-}"
     shift || true
 
@@ -1069,16 +1072,16 @@ _tgs_inspect_write_audit() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --limit)
-                [[ $# -lt 2 ]] && { echo "switchyard inspect write-audit: --limit requires a value" >&2; return 1; }
+                [[ $# -lt 2 ]] && { echo "threnody inspect write-audit: --limit requires a value" >&2; return 1; }
                 limit="$2"
                 shift 2
                 ;;
             -h|--help)
-                echo "Usage: switchyard inspect write-audit [--limit N]" >&2
+                echo "Usage: threnody inspect write-audit [--limit N]" >&2
                 return 0
                 ;;
             *)
-                echo "switchyard inspect write-audit: unknown argument: $1" >&2
+                echo "threnody inspect write-audit: unknown argument: $1" >&2
                 return 1
                 ;;
         esac
@@ -1139,7 +1142,7 @@ PY
                     ;;
                 ""|-h|--help) _tgs_usage ;;
                 *)
-                    echo "switchyard inspect: unknown subcommand: $mode" >&2
+                    echo "threnody inspect: unknown subcommand: $mode" >&2
                     _tgs_usage
                     return 1
                     ;;
@@ -1152,7 +1155,7 @@ PY
                 summary) _tgs_learning_summary "$@" ;;
                 ""|-h|--help) _tgs_usage ;;
                 *)
-                    echo "switchyard learning: subcommand must be summary" >&2
+                    echo "threnody learning: subcommand must be summary" >&2
                     return 1
                     ;;
             esac
@@ -1176,7 +1179,7 @@ PY
                 run)
                     # Forward all args to the python runner; ensure test mode
                     pybin=$(_tgs_python) || return 1
-                    export SWITCHYARD_TEST_MODE=1
+                    export THRENODY_TEST_MODE=1
                     # Invoke runner module, preserving stdout/stderr and exit code
                     (
                         cd "$_ROUTER_DIR" || exit 1
@@ -1186,7 +1189,7 @@ PY
                     ;;
                 baseline)
                     pybin=$(_tgs_python) || return 1
-                    export SWITCHYARD_TEST_MODE=1
+                    export THRENODY_TEST_MODE=1
                     (
                         cd "$_ROUTER_DIR" || exit 1
                         "$pybin" -m shared.eval_baseline
@@ -1218,7 +1221,7 @@ PY
                     return $summary_exit
                     ;;
                 ""|-h|--help)
-                    echo "Usage: switchyard eval {run|baseline} [--filter ...]" >&2
+                    echo "Usage: threnody eval {run|baseline} [--filter ...]" >&2
                     return 0
                     ;;
                 bandit)
@@ -1227,7 +1230,7 @@ PY
                     return $?
                     ;;
                 *)
-                    echo "Usage: switchyard eval {run|baseline|bandit} [--filter ...]" >&2
+                    echo "Usage: threnody eval {run|baseline|bandit} [--filter ...]" >&2
                     return 2
                     ;;
             esac
@@ -1273,11 +1276,11 @@ PY
                     return $?
                     ;;
                 ""|-h|--help)
-                    echo "Usage: switchyard audit {verify|export} [--tables TABLE...] [--quiet] [--output FILE]" >&2
+                    echo "Usage: threnody audit {verify|export} [--tables TABLE...] [--quiet] [--output FILE]" >&2
                     return 0
                     ;;
                 *)
-                    echo "switchyard audit: unknown subcommand: $subcmd" >&2
+                    echo "threnody audit: unknown subcommand: $subcmd" >&2
                     return 1
                     ;;
             esac
@@ -1293,11 +1296,11 @@ PY
                     return $?
                     ;;
                 ""|-h|--help)
-                    echo "Usage: switchyard db {check|repair|backup|prune} [--db PATH] [--keep N]" >&2
+                    echo "Usage: threnody db {check|repair|backup|prune} [--db PATH] [--keep N]" >&2
                     return 0
                     ;;
                 *)
-                    echo "switchyard db: unknown subcommand: $subcmd" >&2
+                    echo "threnody db: unknown subcommand: $subcmd" >&2
                     return 1
                     ;;
             esac
@@ -1313,8 +1316,13 @@ PY
     esac
 }
 
+switchyard() {
+    echo "switchyard is deprecated; use threnody" >&2
+    threnody "$@"
+}
+
 # ---------------------------------------------------------------------------
-# switchyard except — manage routing bypass rules
+# threnody except — manage routing bypass rules
 # ---------------------------------------------------------------------------
 
 _tgs_except() {
@@ -1345,7 +1353,7 @@ if "error" in result:
 rows = result.get("exceptions", [])
 if not rows:
     print("No routing exceptions configured.")
-    print("  Add one with: switchyard except add <type> <pattern>")
+    print("  Add one with: threnody except add <type> <pattern>")
     raise SystemExit(0)
 
 import datetime
@@ -1365,11 +1373,11 @@ PY
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --note)
-                        [[ $# -lt 2 ]] && { echo "switchyard except add: --note requires a value" >&2; return 1; }
+                        [[ $# -lt 2 ]] && { echo "threnody except add: --note requires a value" >&2; return 1; }
                         note="$2"; shift 2 ;;
                     -h|--help)
                         cat >&2 <<'HELP'
-Usage: switchyard except add <type> <pattern> [--note TEXT]
+Usage: threnody except add <type> <pattern> [--note TEXT]
 
 Types:
   skill      Match the skill name passed to validate_routing_guard (glob ok)
@@ -1380,21 +1388,21 @@ Types:
   path       Match the target file path prefix
 
 Examples:
-  switchyard except add skill "auto-time"
-  switchyard except add skill "tgsd-*"
-  switchyard except add filetype ".md"
-  switchyard except add project "/home/me/notes"
-  switchyard except add caller "github-copilot"
+  threnody except add skill "auto-time"
+  threnody except add skill "tgsd-*"
+  threnody except add filetype ".md"
+  threnody except add project "/home/me/notes"
+  threnody except add caller "github-copilot"
 HELP
                         return 0 ;;
                     *)
                         if [[ -z "$exc_type" ]]; then exc_type="$1"; shift
                         elif [[ -z "$pattern" ]]; then pattern="$1"; shift
-                        else echo "switchyard except add: unexpected argument: $1" >&2; return 1; fi ;;
+                        else echo "threnody except add: unexpected argument: $1" >&2; return 1; fi ;;
                 esac
             done
-            [[ -z "$exc_type" ]] && { echo "switchyard except add: <type> is required" >&2; return 1; }
-            [[ -z "$pattern" ]] && { echo "switchyard except add: <pattern> is required" >&2; return 1; }
+            [[ -z "$exc_type" ]] && { echo "threnody except add: <type> is required" >&2; return 1; }
+            [[ -z "$pattern" ]] && { echo "threnody except add: <pattern> is required" >&2; return 1; }
             ROUTER_DIR="$_ROUTER_DIR" "$pybin" - "$exc_type" "$pattern" "$note" <<'PY'
 import json, os, sys
 from pathlib import Path
@@ -1427,16 +1435,16 @@ PY
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     -h|--help)
-                        echo "Usage: switchyard except remove <type> <pattern>" >&2
+                        echo "Usage: threnody except remove <type> <pattern>" >&2
                         return 0 ;;
                     *)
                         if [[ -z "$exc_type" ]]; then exc_type="$1"; shift
                         elif [[ -z "$pattern" ]]; then pattern="$1"; shift
-                        else echo "switchyard except remove: unexpected argument: $1" >&2; return 1; fi ;;
+                        else echo "threnody except remove: unexpected argument: $1" >&2; return 1; fi ;;
                 esac
             done
-            [[ -z "$exc_type" ]] && { echo "switchyard except remove: <type> is required" >&2; return 1; }
-            [[ -z "$pattern" ]] && { echo "switchyard except remove: <pattern> is required" >&2; return 1; }
+            [[ -z "$exc_type" ]] && { echo "threnody except remove: <type> is required" >&2; return 1; }
+            [[ -z "$pattern" ]] && { echo "threnody except remove: <pattern> is required" >&2; return 1; }
             ROUTER_DIR="$_ROUTER_DIR" "$pybin" - "$exc_type" "$pattern" <<'PY'
 import json, os, sys
 from pathlib import Path
@@ -1466,7 +1474,7 @@ PY
             ;;
         ""|-h|--help)
             cat >&2 <<'HELP'
-Usage: switchyard except <subcommand>
+Usage: threnody except <subcommand>
 
 Subcommands:
   list                       Show all active routing exceptions
@@ -1476,23 +1484,23 @@ Subcommands:
 Exception types: skill, filetype, project, command, caller, path
 
 Examples:
-  switchyard except list
-  switchyard except add skill "auto-time"
-  switchyard except add skill "tgsd-*"
-  switchyard except add filetype ".md"
-  switchyard except add project "/home/me/notes"
-  switchyard except remove skill "auto-time"
+  threnody except list
+  threnody except add skill "auto-time"
+  threnody except add skill "tgsd-*"
+  threnody except add filetype ".md"
+  threnody except add project "/home/me/notes"
+  threnody except remove skill "auto-time"
 HELP
             ;;
         *)
-            echo "switchyard except: unknown subcommand: $subcmd" >&2
-            echo "  Use 'switchyard except --help' for usage." >&2
+            echo "threnody except: unknown subcommand: $subcmd" >&2
+            echo "  Use 'threnody except --help' for usage." >&2
             return 1 ;;
     esac
 }
 
 # ---------------------------------------------------------------------------
-# switchyard users — multi-user management for switchyard serve
+# threnody users — multi-user management for threnody serve
 # ---------------------------------------------------------------------------
 
 _tgs_users() {
@@ -1508,18 +1516,18 @@ _tgs_users() {
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --providers)
-                        [[ $# -lt 2 ]] && { echo "switchyard users add: --providers requires a file path" >&2; return 1; }
+                        [[ $# -lt 2 ]] && { echo "threnody users add: --providers requires a file path" >&2; return 1; }
                         providers_file="$2"; shift 2 ;;
                     -h|--help)
-                        echo "Usage: switchyard users add <username> [--providers FILE]" >&2
-                        echo "  FILE: JSON file with provider credentials (see switchyard users --help)" >&2
+                        echo "Usage: threnody users add <username> [--providers FILE]" >&2
+                        echo "  FILE: JSON file with provider credentials (see threnody users --help)" >&2
                         return 0 ;;
                     *)
                         if [[ -z "$username" ]]; then username="$1"; shift
-                        else echo "switchyard users add: unexpected argument: $1" >&2; return 1; fi ;;
+                        else echo "threnody users add: unexpected argument: $1" >&2; return 1; fi ;;
                 esac
             done
-            [[ -z "$username" ]] && { echo "switchyard users add: username is required" >&2; return 1; }
+            [[ -z "$username" ]] && { echo "threnody users add: username is required" >&2; return 1; }
             ROUTER_DIR="$_ROUTER_DIR" "$pybin" - "$username" "$providers_file" <<'PY'
 import json, os, secrets, sys
 from pathlib import Path
@@ -1544,7 +1552,7 @@ if providers_file:
         raise SystemExit(1)
 
 token = secrets.token_urlsafe(32)
-admin_secret = os.environ.get("SWITCHYARD_SERVER_TOKEN", "")
+admin_secret = os.environ.get("THRENODY_SERVER_TOKEN", "")
 db = Database()
 try:
     user_id = db.create_user(username, token, providers_json, secret=admin_secret)
@@ -1558,8 +1566,8 @@ print(f"  username: {username}")
 print(f"  token:    {token}")
 print()
 if not admin_secret:
-    print("WARNING: SWITCHYARD_SERVER_TOKEN not set — token stored unhashed.")
-    print("Set SWITCHYARD_SERVER_TOKEN before starting 'switchyard serve' for secure operation.")
+    print("WARNING: THRENODY_SERVER_TOKEN not set — token stored unhashed.")
+    print("Set THRENODY_SERVER_TOKEN before starting 'threnody serve' for secure operation.")
 else:
     print("Share the token with the user — it cannot be retrieved later.")
 PY
@@ -1594,7 +1602,7 @@ PY
             ;;
         show)
             local target="${1:-}"
-            [[ -z "$target" ]] && { echo "switchyard users show: username or id required" >&2; return 1; }
+            [[ -z "$target" ]] && { echo "threnody users show: username or id required" >&2; return 1; }
             ROUTER_DIR="$_ROUTER_DIR" "$pybin" - "$target" <<'PY'
 import json, os, sys
 from pathlib import Path
@@ -1631,7 +1639,7 @@ PY
             ;;
         token)
             local target="${1:-}"
-            [[ -z "$target" ]] && { echo "switchyard users token: username or id required" >&2; return 1; }
+            [[ -z "$target" ]] && { echo "threnody users token: username or id required" >&2; return 1; }
             ROUTER_DIR="$_ROUTER_DIR" "$pybin" - "$target" <<'PY'
 import json, os, secrets, sys
 from pathlib import Path
@@ -1644,7 +1652,7 @@ sys.path.insert(0, str(base))
 from shared.db import Database
 
 target = sys.argv[1]
-admin_secret = os.environ.get("SWITCHYARD_SERVER_TOKEN", "")
+admin_secret = os.environ.get("THRENODY_SERVER_TOKEN", "")
 db = Database()
 user = db.get_user_by_username(target) or db.get_user_by_id(target)
 if user is None:
@@ -1655,14 +1663,14 @@ new_token = secrets.token_urlsafe(32)
 db.update_user_token_hmac(user.get("user_id", ""), new_token, secret=admin_secret)
 print(f"new token for {user.get('username', target)}: {new_token}")
 if not admin_secret:
-    print("WARNING: SWITCHYARD_SERVER_TOKEN not set — token stored unhashed.")
+    print("WARNING: THRENODY_SERVER_TOKEN not set — token stored unhashed.")
 else:
     print("Previous token is now invalid. Share this token with the user.")
 PY
             ;;
         disable)
             local target="${1:-}"
-            [[ -z "$target" ]] && { echo "switchyard users disable: username or id required" >&2; return 1; }
+            [[ -z "$target" ]] && { echo "threnody users disable: username or id required" >&2; return 1; }
             ROUTER_DIR="$_ROUTER_DIR" "$pybin" - "$target" "0" <<'PY'
 import os, sys
 from pathlib import Path
@@ -1687,7 +1695,7 @@ PY
             ;;
         enable)
             local target="${1:-}"
-            [[ -z "$target" ]] && { echo "switchyard users enable: username or id required" >&2; return 1; }
+            [[ -z "$target" ]] && { echo "threnody users enable: username or id required" >&2; return 1; }
             ROUTER_DIR="$_ROUTER_DIR" "$pybin" - "$target" "1" <<'PY'
 import os, sys
 from pathlib import Path
@@ -1712,7 +1720,7 @@ PY
             ;;
         remove)
             local target="${1:-}"
-            [[ -z "$target" ]] && { echo "switchyard users remove: username or id required" >&2; return 1; }
+            [[ -z "$target" ]] && { echo "threnody users remove: username or id required" >&2; return 1; }
             ROUTER_DIR="$_ROUTER_DIR" "$pybin" - "$target" <<'PY'
 import os, sys
 from pathlib import Path
@@ -1736,9 +1744,9 @@ PY
             ;;
         -h|--help|"")
             cat >&2 <<'HELP'
-Usage: switchyard users <subcommand> [args]
+Usage: threnody users <subcommand> [args]
 
-Manage users for the switchyard serve remote server.
+Manage users for the threnody serve remote server.
 
 Subcommands:
   add <username> [--providers FILE]   Register a new user, print their token
@@ -1760,8 +1768,8 @@ Provider credentials file format (--providers FILE):
 HELP
             ;;
         *)
-            echo "switchyard users: unknown subcommand: $subcmd" >&2
-            echo "Run 'switchyard users --help' for usage." >&2
+            echo "threnody users: unknown subcommand: $subcmd" >&2
+            echo "Run 'threnody users --help' for usage." >&2
             return 1
             ;;
     esac

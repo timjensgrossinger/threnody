@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard Claude Code entry point.
+Threnody Claude Code entry point.
 
 Thin wrapper that initialises the shared core with the Claude Code provider.
 Called via `claude -p` or as a standalone CLI.

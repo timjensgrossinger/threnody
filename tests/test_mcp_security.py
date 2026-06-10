@@ -200,7 +200,7 @@ def test_aider_enforces_no_git_via_mcp():
     """MCP execution of Aider enforces --no-git and --no-auto-commits flags.
     
     Per D-05: Aider must always force --no-git and --no-auto-commits when run
-    through Switchyard to prevent automatic git commits that bypass the
+    through Threnody to prevent automatic git commits that bypass the
     project's write safety guards.
     """
     from shared.discovery import BUILTIN_PROVIDERS
@@ -329,7 +329,7 @@ def test_check_providers_compact_structure():
     import os
     from shared.discovery import ProviderRegistry, DetectReason, ProviderReadiness
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     registry = ProviderRegistry()
     compact = registry.to_compact_dict()
     
@@ -359,7 +359,7 @@ def test_check_providers_compact_detect_reason_is_string():
     import os
     from shared.discovery import ProviderRegistry
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     registry = ProviderRegistry()
     compact = registry.to_compact_dict()
     
@@ -379,7 +379,7 @@ def test_check_providers_compact_models_summary_shape():
     import os
     from shared.discovery import ProviderRegistry
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     registry = ProviderRegistry()
     compact = registry.to_compact_dict()
     
@@ -403,7 +403,7 @@ def test_check_providers_compact_includes_billing_metadata():
     import os
     from shared.discovery import ProviderRegistry
 
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     registry = ProviderRegistry()
     compact = registry.to_compact_dict()
 
@@ -419,7 +419,7 @@ def test_check_providers_compact_marks_user_billing_override():
     import os
     from shared.discovery import ProviderRegistry
 
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     registry = ProviderRegistry(config_overrides={
         "provider_cost_overrides": {
             "test-provider": {
@@ -443,7 +443,7 @@ def test_check_providers_compact_health_labels():
     import os
     from shared.discovery import ProviderRegistry
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     registry = ProviderRegistry()
     compact = registry.to_compact_dict()
     
@@ -464,7 +464,7 @@ def test_check_providers_compact_no_secrets():
     import re
     from shared.discovery import ProviderRegistry
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     registry = ProviderRegistry()
     compact = registry.to_compact_dict()
     json_str = json.dumps(compact)
@@ -498,7 +498,7 @@ def test_check_providers_compact_json_serializable():
     import os
     from shared.discovery import ProviderRegistry
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     registry = ProviderRegistry()
     compact = registry.to_compact_dict()
     
@@ -518,7 +518,7 @@ def test_check_providers_windsurf_visible_not_routeable():
     import os
     from shared.discovery import ProviderRegistry, DetectReason
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     registry = ProviderRegistry()
     compact = registry.to_compact_dict()
     
@@ -549,7 +549,7 @@ def test_check_providers_handler_returns_compact_format():
     import os
     from mcp_server import handle_check_providers
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     result = handle_check_providers({})
     
     # Verify compact format (new)
@@ -571,7 +571,7 @@ def test_check_providers_handler_no_secrets_in_output():
     import re
     from mcp_server import handle_check_providers
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     result = handle_check_providers({})
     json_str = json.dumps(result)
     
@@ -609,7 +609,7 @@ def test_mcp_provider_listing_is_public_updated():
     import pytest
     from mcp_server import handle_check_providers
     
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
     result = handle_check_providers({})
     
     # Verify JSON serializable
@@ -657,7 +657,7 @@ cache_db: ":memory:"
 """)
     
     # Load config
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
     config = TGsConfig.from_yaml(config_yaml)
     
     # Verify config loaded tier pins
@@ -690,7 +690,7 @@ def test_phase9_integration_windsurf_in_compact_output(monkeypatch):
     from shared.discovery import ProviderRegistry, DetectReason
     
     # Disable test mode to get real provider discovery
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     
     # Mock windsurf binary as found
     import shutil
@@ -744,7 +744,7 @@ def test_phase9_no_secrets_across_all_surfaces(monkeypatch):
     from shared.discovery import ProviderRegistry
     from mcp_server import handle_check_providers
     
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
     
     # Test 1: ProviderRegistry.to_compact_dict() surface
     registry = ProviderRegistry()

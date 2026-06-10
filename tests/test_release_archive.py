@@ -42,26 +42,26 @@ def test_inspect_paths_returns_all_findings() -> None:
 def test_zip_archive_paths(tmp_path) -> None:
     archive = tmp_path / "release.zip"
     with zipfile.ZipFile(archive, "w") as handle:
-        handle.writestr("Switchyard/README.md", "ok")
-        handle.writestr("Switchyard/providers.json", "{}")
+        handle.writestr("Threnody/README.md", "ok")
+        handle.writestr("Threnody/providers.json", "{}")
 
     paths, link_findings = archive_paths(str(archive))
 
     assert link_findings == []
     assert inspect_paths(paths) == [
-        ("Switchyard/providers.json", "runtime, secret, or machine-specific file")
+        ("Threnody/providers.json", "runtime, secret, or machine-specific file")
     ]
 
 
 def test_tar_rejects_unsafe_symlink_target(tmp_path) -> None:
     archive = tmp_path / "release.tar"
     with tarfile.open(archive, "w") as handle:
-        readme = tarfile.TarInfo("Switchyard/README.md")
+        readme = tarfile.TarInfo("Threnody/README.md")
         payload = b"ok"
         readme.size = len(payload)
         handle.addfile(readme, io.BytesIO(payload))
 
-        link = tarfile.TarInfo("Switchyard/latest")
+        link = tarfile.TarInfo("Threnody/latest")
         link.type = tarfile.SYMTYPE
         link.linkname = "../../outside"
         handle.addfile(link)
@@ -70,5 +70,5 @@ def test_tar_rejects_unsafe_symlink_target(tmp_path) -> None:
 
     assert inspect_paths(paths) == []
     assert link_findings == [
-        ("Switchyard/latest", "unsafe link target: ../../outside")
+        ("Threnody/latest", "unsafe link target: ../../outside")
     ]

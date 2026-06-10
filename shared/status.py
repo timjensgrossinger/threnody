@@ -100,7 +100,7 @@ def build_status_snapshot(
             ),
             "last_integrity_ok": getattr(db, 'last_integrity_ok', None),
         },
-        "explainability_link": "switchyard inspect status --details",
+        "explainability_link": "threnody inspect status --details",
     }
 
 

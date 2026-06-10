@@ -1,5 +1,5 @@
 """
-mistral/providers.py — Mistral Vibe provider implementation for Switchyard.
+mistral/providers.py — Mistral Vibe provider implementation for Threnody.
 
 Implements command building, auth detection, and output cleaning for the
 Mistral Vibe CLI (`vibe`).
@@ -130,7 +130,7 @@ def _detect_mistral_tier_models(config_text: str) -> dict[str, str]:
 def _mistral_workdir() -> str:
     candidate_bases = [Path(tempfile.gettempdir())]
     try:
-        candidate_bases.insert(0, Path.home() / ".cache" / "Switchyard" / "tmp")
+        candidate_bases.insert(0, Path.home() / ".cache" / "Threnody" / "tmp")
     except RuntimeError:
         log.debug("Mistral Vibe: Path.home() unavailable for sandbox base", exc_info=True)
     for base in candidate_bases:
@@ -140,7 +140,7 @@ def _mistral_workdir() -> str:
                 base.chmod(0o700)
             except OSError:
                 log.debug("Mistral Vibe: could not tighten workdir base permissions", exc_info=True)
-            return tempfile.mkdtemp(prefix="switchyard-vibe-", dir=str(base))
+            return tempfile.mkdtemp(prefix="threnody-vibe-", dir=str(base))
         except OSError:
             log.debug("Mistral Vibe: could not prepare sandbox base %s", base, exc_info=True)
     raise RuntimeError("Unable to create a private sandbox for Mistral Vibe")

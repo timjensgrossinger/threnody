@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "claude-code"))
 
-os.environ.setdefault("SWITCHYARD_TEST_MODE", "1")
+os.environ.setdefault("THRENODY_TEST_MODE", "1")
 
 import providers as claude_providers  # noqa: E402
 from providers import ClaudeCodeProvider  # noqa: E402

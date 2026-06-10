@@ -13,7 +13,7 @@ def test_spillover_defaults(monkeypatch):
     assert cfg.spillover.get_provider_capacity("anything") is None
 
     # Ensure registry in test mode exposes adapter metadata with concurrency key
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
     registry = ProviderRegistry()
     adapters = registry.list_adapters()
     assert adapters, "Expected at least one test adapter in test mode"
@@ -25,7 +25,7 @@ def test_spillover_defaults(monkeypatch):
 
 def test_spillover_parsing_and_override(monkeypatch):
     """Config overrides with per_provider_concurrency are respected by registry."""
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
 
     overrides = {
         "providers": {
@@ -51,7 +51,7 @@ def test_spillover_parsing_and_override(monkeypatch):
 
 
 def test_selection_metadata_includes_concurrency(monkeypatch):
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
     overrides = {
         "providers": {
             "spillover": {

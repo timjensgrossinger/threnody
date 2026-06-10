@@ -1,5 +1,5 @@
 """
-codex — OpenAI Codex CLI adapter for Switchyard.
+codex — OpenAI Codex CLI adapter for Threnody.
 
 Thin entry point for Codex provider detection and execution.
 """

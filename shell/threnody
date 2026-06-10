@@ -1,6 +1,5 @@
 #!/usr/bin/env zsh
-# Deprecated wrapper — use `threnody` instead.
 
 SCRIPT_DIR="${0:A:h}"
 source "$SCRIPT_DIR/ghc.sh"
-switchyard "$@"
+threnody "$@"

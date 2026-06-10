@@ -1,5 +1,5 @@
-# Safe example configuration for Switchyard.
-# Copy to ~/.local/lib/switchyard/config.yaml after installation and customize.
+# Safe example configuration for Threnody.
+# Copy to ~/.local/lib/threnody/config.yaml after installation and customize.
 # Do not add API keys, bearer tokens, passwords, or machine-specific secrets.
 
 parallelism:
@@ -18,6 +18,54 @@ cache:
   backup_keep: 3
 
 providers:
+  # Safer routing for non-Claude hosts: avoid selecting claude-code when Copilot,
+  # Cursor, or Codex is the MCP host. See docs/LEGAL.md.
+  #
+  # preferred_routing_by_caller:
+  #   github-copilot:
+  #     low:
+  #       - provider: github-copilot
+  #       - provider: gemini-cli
+  #     medium:
+  #       - provider: github-copilot
+  #       - provider: codex
+  #   cursor:
+  #     low:
+  #       - provider: cursor
+  #       - provider: github-copilot
+  #     medium:
+  #       - provider: cursor
+  #       - provider: codex
+  #   codex:
+  #     low:
+  #       - provider: codex
+  #       - provider: github-copilot
+  #     medium:
+  #       - provider: codex
+  #
+  # Hard allowlist (optional): only these providers may execute for a caller.
+  # caller_allowlists:
+  #   github-copilot:
+  #     - github-copilot
+  #     - gemini-cli
+  #     - codex
+  #   cursor:
+  #     - cursor
+  #     - github-copilot
+  #     - codex
+  #   codex:
+  #     - codex
+  #     - github-copilot
+  #     - cursor
+  #
+  # Claude Code host → Claude Code is blocked by default. To override (Anthropic
+  # ToS risk; prefer API keys for automated cross-session routing):
+  #
+  # preferred_routing_by_caller:
+  #   claude-code:
+  #     low:
+  #       - provider: claude-code
+  #
   effort_defaults:
     claude-code:
       low: low

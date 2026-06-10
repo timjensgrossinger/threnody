@@ -1,5 +1,5 @@
 """
-switchyard trace — Trace replay + state forking CLI (plan 13).
+threnody trace — Trace replay + state forking CLI (plan 13).
 
 Subcommands:
     show   <run_id>          Checkpoint timeline
@@ -18,7 +18,7 @@ def _load_db():
     try:
         from shared.db import Database
         import os
-        db_path = os.path.expanduser("~/.local/lib/switchyard/cache.db")
+        db_path = os.path.expanduser("~/.local/lib/threnody/cache.db")
         return Database(db_path)
     except Exception as exc:
         print(f"error: could not open DB: {exc}", file=sys.stderr)
@@ -122,7 +122,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="switchyard trace")
+    parser = argparse.ArgumentParser(prog="threnody trace")
     sub = parser.add_subparsers(dest="subcmd")
 
     show_p = sub.add_parser("show", help="Checkpoint timeline for a run")

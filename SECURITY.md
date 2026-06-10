@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Switchyard is currently pre-release software. Security fixes are applied to
+Threnody is currently pre-release software. Security fixes are applied to
 the latest commit on the default branch and to the latest published release
 when one exists.
 
@@ -22,7 +22,7 @@ the issue to be reproduced and fixed before public disclosure.
 
 ## Security Boundaries
 
-Switchyard launches locally installed AI CLIs, reads local configuration, and
+Threnody launches locally installed AI CLIs, reads local configuration, and
 may write files requested by an MCP client. Provider CLIs and configured
 verification commands execute with the permissions of the current user.
 
@@ -40,13 +40,20 @@ Anyone who can modify the host configuration or spawn the server process has
 full access to all MCP tools. Run only on trusted machines with trusted host
 shell configurations.
 
-### Remote server (`switchyard serve`)
+### Remote server (`threnody serve`) — deprecated
+
+`threnody serve`, `remote_dispatch`, and `remote_job_status` are **deprecated
+and unsupported** in this release line. Prefer local MCP stdio only. If you must
+run the legacy HTTP server:
 
 - Bind to `127.0.0.1` unless you explicitly need LAN/WAN exposure
-- Set a stable `SWITCHYARD_SERVER_TOKEN` before sharing access; do not rely on
+- Set a stable `THRENODY_SERVER_TOKEN` before sharing access; do not rely on
   auto-generated tokens printed to stdout
 - Prefer TLS (`--tls-cert` / `--tls-key`) for non-loopback deployments
 - Create user tokens only after the admin token is configured
+
+See [docs/LEGAL.md](docs/LEGAL.md) for provider-policy implications of shared
+remote routing.
 
 ### Dangerous environment variables
 

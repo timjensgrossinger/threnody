@@ -73,7 +73,7 @@ FIXTURE_FILES = [
 def test_fixtures_loadable() -> None:
     for path in FIXTURE_FILES:
         fixture = routing_eval.load_fixture(path)
-        assert fixture["test_mode"] == "SWITCHYARD_TEST_MODE"
+        assert fixture["test_mode"] == "THRENODY_TEST_MODE"
         assert fixture["tags"] == ["stable", "swarm"]
         assert isinstance(fixture["simulated_result"], dict)
 

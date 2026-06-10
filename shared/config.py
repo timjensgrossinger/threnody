@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard shared configuration.
+Threnody shared configuration.
 
 All configurable values with sane defaults. Threshold bounds, template
 definitions, TTLs, token ceilings, intent modifier weights.
@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-BASE_DIR = Path("~/.local/lib/switchyard").expanduser()
+BASE_DIR = Path("~/.local/lib/threnody").expanduser()
 DB_PATH = BASE_DIR / "cache.db"
 CONFIG_YAML = BASE_DIR / "config.yaml"
 
@@ -640,7 +640,7 @@ class EndpointProviderConfig:
 
 @dataclass(frozen=True)
 class RemoteServerConfig:
-    """Configuration for running Switchyard as an HTTP server."""
+    """Configuration for running Threnody as an HTTP server."""
     enabled: bool = False
     host: str = "0.0.0.0"
     port: int = 8765
@@ -652,7 +652,7 @@ class RemoteServerConfig:
 
 @dataclass(frozen=True)
 class RemoteClientConfig:
-    """Configuration for connecting to a remote Switchyard HTTP server."""
+    """Configuration for connecting to a remote Threnody HTTP server."""
     url: str = ""
     token: str = ""
     verify_tls: bool = True
@@ -684,7 +684,7 @@ class WorktreeConfig:
     """Worktree isolation settings for execute_subtask."""
     enabled: bool = False
     ttl_hours: float = 24.0
-    base_path: str = ""  # empty → default ~/.local/lib/switchyard/worktrees
+    base_path: str = ""  # empty → default ~/.local/lib/threnody/worktrees
 
 
 @dataclass(frozen=True)
@@ -1199,7 +1199,7 @@ class RoutingExceptions:
 # ---------------------------------------------------------------------------
 @dataclass
 class TGsConfig:
-    """Complete Switchyard configuration."""
+    """Complete Threnody configuration."""
     # Complexity scoring
     signals: dict[str, list[str]] = field(default_factory=lambda: dict(DEFAULT_COMPLEXITY_SIGNALS))
     signal_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SIGNAL_WEIGHTS))
@@ -2342,10 +2342,9 @@ class TGsConfig:
 
 
 def _test_mode_enabled() -> bool:
-    for key in ("SWITCHYARD_TEST_MODE", "TGSROUTER_TEST_MODE"):
-        if os.getenv(key, "").lower() in {"1", "true", "yes"}:
-            return True
-    return False
+    from shared.env import test_mode_enabled
+
+    return test_mode_enabled()
 
 
 def load_eval_config(path: Path | None = None) -> TGsConfig:

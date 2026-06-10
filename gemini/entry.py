@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Switchyard Gemini CLI entry point."""
+"""Threnody Gemini CLI entry point."""
 from __future__ import annotations
 
 import json

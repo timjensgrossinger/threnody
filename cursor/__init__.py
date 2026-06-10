@@ -1,5 +1,5 @@
 """
-cursor — Cursor CLI adapter for Switchyard.
+cursor — Cursor CLI adapter for Threnody.
 
 Thin entry point for Cursor provider detection and execution with
 strict headless binary verification per D-05.

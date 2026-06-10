@@ -1,5 +1,5 @@
 """
-cursor/providers.py — Cursor CLI provider implementation for Switchyard.
+cursor/providers.py — Cursor CLI provider implementation for Threnody.
 
 Implements strict headless binary detection, command building with model support,
 and output cleaning using the Phase 6 CLIProvider pluggable hooks pattern.

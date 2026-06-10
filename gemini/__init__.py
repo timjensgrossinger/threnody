@@ -1,1 +1,1 @@
-"""Gemini entrypoint package for Switchyard."""
+"""Gemini entrypoint package for Threnody."""

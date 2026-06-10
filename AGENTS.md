@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Switchyard is a plain Python 3.10+ project with a shared core and thin provider adapters.
+Threnody is a plain Python 3.10+ project with a shared core and thin provider adapters.
 
 - `shared/`: routing, planning, orchestration, persistence, evaluation, and provider discovery.
 - `codex/`, `copilot/`, `claude-code/`, `gemini/`, `cursor/`, and other provider directories: provider-specific entry points and model mappings.
@@ -20,7 +20,7 @@ There is no package build step or project manifest. Use:
 ```bash
 ./install.sh
 python3 -m pytest tests/ -v
-SWITCHYARD_TEST_MODE=1 python3 -m pytest tests/ -v
+THRENODY_TEST_MODE=1 python3 -m pytest tests/ -v
 python3 -m pytest tests/test_router.py::test_base_score_low_tier -v
 python3 -m py_compile mcp_server.py shared/router.py
 python3 mcp_server.py
@@ -42,4 +42,4 @@ Recent history follows Conventional Commits, for example `feat(router): ...` and
 
 ## Configuration & Security
 
-Runtime configuration lives at `~/.local/lib/switchyard/config.yaml`; editing the repository template does not update an existing installation. Reuse path-normalization, snapshot, and preview helpers for file writes. Never commit credentials, bearer tokens, local databases, or generated backups.
+Runtime configuration lives at `~/.local/lib/threnody/config.yaml`; editing the repository template does not update an existing installation. Reuse path-normalization, snapshot, and preview helpers for file writes. Never commit credentials, bearer tokens, local databases, or generated backups.

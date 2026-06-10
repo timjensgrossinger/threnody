@@ -22,43 +22,43 @@ ghc agent --no-plan "add a docstring to this function"
 ghcw
 ```
 
-## Operator CLI (`switchyard`)
+## Operator CLI (`threnody`)
 
 ```bash
 # Inspect router / provider status
-switchyard inspect status --project .
-switchyard inspect status --project . --details
-switchyard inspect task execute-1234
+threnody inspect status --project .
+threnody inspect status --project . --details
+threnody inspect task execute-1234
 
 # Review and act on pending approvals
-switchyard inspect approvals --project .
-switchyard inspect approvals approve 12 --project . --operator alice
-switchyard inspect approvals reject 12 --project . --operator alice --reason "too broad"
-switchyard inspect approvals merge 12 existing-agent-id --project . --operator alice
+threnody inspect approvals --project .
+threnody inspect approvals approve 12 --project . --operator alice
+threnody inspect approvals reject 12 --project . --operator alice --reason "too broad"
+threnody inspect approvals merge 12 existing-agent-id --project . --operator alice
 
 # Tuning
-switchyard tune show --project .
-switchyard tune set concurrency_limit 5 --project .
-switchyard tune reset concurrency_limit --project .
+threnody tune show --project .
+threnody tune set concurrency_limit 5 --project .
+threnody tune reset concurrency_limit --project .
 
 # Routing eval
-switchyard eval run
-switchyard eval run --filter low,urgency
-switchyard eval baseline
+threnody eval run
+threnody eval run --filter low,urgency
+threnody eval baseline
 
 # Provider health
-switchyard doctor
-switchyard doctor --repair
+threnody doctor
+threnody doctor --repair
 
 # Database maintenance
-switchyard db check
-switchyard db backup
+threnody db check
+threnody db backup
 ```
 
 ## Live monitoring
 
 ```bash
-switchyard-watch
+threnody-watch
 ```
 
-Reads `/tmp/switchyard-status.json` (written by the MCP server on each subtask).
+Reads `/tmp/threnody-status.json` (written by the MCP server on each subtask).

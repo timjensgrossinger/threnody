@@ -1,1 +1,1 @@
-"""Switchyard Copilot CLI version."""
+"""Threnody Copilot CLI version."""

@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Switchyard exposes **43 public MCP tools** over JSON-RPC/stdio. Tests enforce that every published schema has a callable handler.
+Threnody exposes **43 public MCP tools** over JSON-RPC/stdio. Tests enforce that every published schema has a callable handler.
 
 ## Routing & Planning
 
@@ -54,13 +54,18 @@ Optional `effort` on `execute_subtask` is a provider-level reasoning hint (e.g. 
 | `learning_outcome_stats()` | Recent outcome distribution and feedback coverage |
 | `record_outcome(task_id, outcome, operator_id?, note?)` | Persist an explicit routed-task outcome |
 
-## Approval, Memory, and Remote
+## Approval and Memory
 
 - Approval: `agent_queue_list`, `agent_queue_approve`, `agent_queue_reject`, `agent_queue_merge`, and `approval_queue_*` aliases.
 - Memory: `memory_list`, `memory_get`, `memory_set`, `memory_delete`.
-- Remote: `remote_dispatch`, `remote_job_status`.
 
-Operator tuning: `switchyard tune set|reset` via the shell wrapper.
+## Deprecated remote tools (unsupported)
+
+`remote_dispatch` and `remote_job_status` remain in the tree for compatibility
+but are **deprecated and unsupported**. Use local MCP stdio only. See
+[docs/LEGAL.md](LEGAL.md).
+
+Operator tuning: `threnody tune set|reset` via the shell wrapper.
 
 ## `execute_subtask` example
 

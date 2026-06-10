@@ -198,7 +198,7 @@ def test_mistral_workdir_is_cleaned_up_after_execute(monkeypatch):
 def test_execute_cheapest_allows_claude_code_for_explicit_claude_preference(monkeypatch):
     from shared.discovery import ProviderRegistry, CLIProvider, DetectReason, ProviderReadiness
 
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
 
     def _mp(name, cost):
@@ -243,7 +243,7 @@ def test_ordered_candidates_prefers_claude_then_mistral_for_claude_caller(monkey
     from shared.discovery import ProviderRegistry, CLIProvider, DetectReason, ProviderReadiness
     from unittest.mock import MagicMock
 
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
 
     def _mp(name, cost):
@@ -283,7 +283,7 @@ def test_low_tier_routing_mistral_then_claude_when_claude_degraded(monkeypatch):
     from shared.discovery import ProviderRegistry, CLIProvider, DetectReason, ProviderReadiness
     from unittest.mock import MagicMock
 
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
 
     def _mp(name, cost):

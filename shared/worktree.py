@@ -2,7 +2,7 @@
 Worktree isolation for execute_subtask.
 
 Each task gets a dedicated git worktree under
-~/.local/lib/switchyard/worktrees/<task_id>.
+~/.local/lib/threnody/worktrees/<task_id>.
 After execution, the caller calls release() with "merge" or "discard".
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-_WORKTREE_ROOT = Path.home() / ".local" / "lib" / "Switchyard" / "worktrees"
+_WORKTREE_ROOT = Path.home() / ".local" / "lib" / "Threnody" / "worktrees"
 _lock = threading.Lock()
 
 

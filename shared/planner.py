@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard task planner.
+Threnody task planner.
 
 Extracts the planning logic from the original orchestrator.
 Uses CLI backends (gh copilot or claude) as the reasoning brain.

@@ -1,5 +1,5 @@
 """
-Routing evaluation framework for Switchyard.
+Routing evaluation framework for Threnody.
 
 Phase 26: schema validation stub.
 Full runner (route_task integration) implemented in Phase 27.
@@ -509,7 +509,7 @@ def format_markdown_report(results: list[dict], date_str: str = "") -> str:
     accuracy = (passed / max(total, 1)) * 100
 
     lines = [
-        f"# Switchyard Routing Eval Report",
+        f"# Threnody Routing Eval Report",
         f"",
         f"**Date:** {date_str}  ",
         f"**Fixtures:** {total}  ",
@@ -569,11 +569,11 @@ def format_html_report(results: list[dict], date_str: str = "") -> str:
         )
 
     return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Switchyard Eval {date_str}</title>
+<html lang="en"><head><meta charset="utf-8"><title>Threnody Eval {date_str}</title>
 <style>body{{font-family:monospace;margin:2em}}table{{border-collapse:collapse;width:100%}}
 th,td{{border:1px solid #ccc;padding:6px 12px;text-align:left}}
 th{{background:#f0f0f0}}</style></head><body>
-<h1>Switchyard Routing Eval</h1>
+<h1>Threnody Routing Eval</h1>
 <p><strong>Date:</strong> {date_str} &nbsp;
 <strong>Fixtures:</strong> {total} &nbsp;
 <strong>Accuracy:</strong> {accuracy:.1f}%</p>
@@ -607,10 +607,10 @@ def run_eval(
 ) -> int | dict[str, Any]:
     """Run the eval suite in-process.
 
-    Sets SWITCHYARD_TEST_MODE before any router construction to prevent
+    Sets THRENODY_TEST_MODE before any router construction to prevent
     real CLI calls.  Returns exit code (0 = all stable pass, 1 = any failure).
     """
-    os.environ["SWITCHYARD_TEST_MODE"] = "1"
+    os.environ["THRENODY_TEST_MODE"] = "1"
 
     # Resolve filter aliases.
     categories: list[str] | None = None
@@ -731,7 +731,7 @@ if __name__ == "__main__":
     import sys
 
     parser = argparse.ArgumentParser(
-        description="Run the Switchyard routing-correctness eval suite."
+        description="Run the Threnody routing-correctness eval suite."
     )
     parser.add_argument(
         "--filter",

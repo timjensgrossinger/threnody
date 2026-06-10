@@ -433,7 +433,7 @@ def test_cross_provider_routing_discovery(provider_name, monkeypatch):
     from shared.discovery import ProviderRegistry
     
     # Use test mode to mock availability
-    monkeypatch.setenv("SWITCHYARD_TEST_MODE", "1")
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
     
     registry = ProviderRegistry()
     available_names = [p.name for p in registry.available_providers]
@@ -650,7 +650,7 @@ def test_windsurf_entrypoint_not_routeable(monkeypatch):
     import shutil
     
     # Disable test mode to get real provider discovery
-    monkeypatch.delenv("SWITCHYARD_TEST_MODE", raising=False)
+    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     
     # Save original shutil.which before mocking
     original_which = shutil.which

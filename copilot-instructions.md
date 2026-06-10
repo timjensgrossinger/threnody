@@ -1,9 +1,9 @@
 <!-- GSD:project-start source:PROJECT.md -->
 ## Project
 
-**Switchyard**
+**Threnody**
 
-Switchyard is a CLI-native orchestration layer for AI coding workflows. It routes work to the cheapest capable model across installed AI shells, decomposes complex tasks into parallel workstreams, and shares one core brain across multiple CLI entry points.
+Threnody is a CLI-native orchestration layer for AI coding workflows. It routes work to the cheapest capable model across installed AI shells, decomposes complex tasks into parallel workstreams, and shares one core brain across multiple CLI entry points.
 
 This project is now focused on making that orchestration adapt better to your coding behavior, deepen cross-shell interoperability, and split complex prompts into smarter parallel routers without losing quality.
 
@@ -30,7 +30,7 @@ This project is now focused on making that orchestration adapt better to your co
 - No Node/npm/Cargo/Go manifests detected (no `package.json`, `pyproject.toml` or `go.mod` in the repository root).
 ## Frameworks & Libraries
 - No web/application framework. The project is a collection of CLI tools and a stdio JSON-RPC MCP server implemented in pure Python.
-- SQLite (via Python stdlib `sqlite3`) with WAL mode. Database wrapper: `shared/db.py`. Default DB path is `~/.local/lib/switchyard/cache.db` (see `shared/config.py` and `config.yaml`). The repo also contains an instance `cache.db` at the repository root (development artifact).
+- SQLite (via Python stdlib `sqlite3`) with WAL mode. Database wrapper: `shared/db.py`. Default DB path is `~/.local/lib/threnody/cache.db` (see `shared/config.py` and `config.yaml`). The repo also contains an instance `cache.db` at the repository root (development artifact).
 - `pyyaml` used to load `config.yaml` via `shared/config.py::TGsConfig.from_yaml()`.
 - pytest-style tests present in `tests/` (e.g. `tests/test_db.py`, `tests/test_discovery.py`). No explicit `pytest.ini` or `tox` config detected.
 ## Key Dependencies (observed in code)
@@ -39,11 +39,11 @@ This project is now focused on making that orchestration adapt better to your co
 - `json`, `logging`, `re`, `hashlib`, `pathlib`, `time` — used across `shared/`.
 - `pyyaml` — configuration loader used by `shared/config.py` and referenced in `install.sh`. No other third-party packages are imported.
 ## Build / Dev / CLI tooling
-- `install.sh` — installs files to `~/.local/lib/switchyard`, ensures `pyyaml` is present, performs provider discovery, registers the MCP server with host CLIs, writes provider discovery JSON (`providers.json`), and syncs managed instruction blocks into `~/.claude/CLAUDE.md` and `~/.copilot/copilot-instructions.md`. See `install.sh` for exact steps.
-- Shell helpers / aliases: `shell/ghc.sh` is sourced by the installer and provides the user-facing CLI wrappers (`ghc`, `ghcs`, `ghce`, `ghcw`) plus operator controls such as `switchyard inspect ...` and `switchyard tune ...`.
+- `install.sh` — installs files to `~/.local/lib/threnody`, ensures `pyyaml` is present, performs provider discovery, registers the MCP server with host CLIs, writes provider discovery JSON (`providers.json`), and syncs managed instruction blocks into `~/.claude/CLAUDE.md` and `~/.copilot/copilot-instructions.md`. See `install.sh` for exact steps.
+- Shell helpers / aliases: `shell/ghc.sh` is sourced by the installer and provides the user-facing CLI wrappers (`ghc`, `ghcs`, `ghce`, `ghcw`) plus operator controls such as `threnody inspect ...` and `threnody tune ...`.
 ## Execution and Entry Points
-- `mcp_server.py` — main MCP server run as `python3 ~/.local/lib/switchyard/mcp_server.py`. It exposes JSON-RPC tools over stdio. It is registered by `install.sh` with host CLIs (GitHub Copilot and Claude Code) for MCP usage.
-- Copilot CLI entry: `copilot/entry.py` — thin CLI wrapper that bootstraps shared core with Copilot provider. Typical invocation: `gh copilot mcp add Switchyard -- python3 ~/.local/lib/switchyard/mcp_server.py` (see `mcp_server.py` docs and `install.sh`).
+- `mcp_server.py` — main MCP server run as `python3 ~/.local/lib/threnody/mcp_server.py`. It exposes JSON-RPC tools over stdio. It is registered by `install.sh` with host CLIs (GitHub Copilot and Claude Code) for MCP usage.
+- Copilot CLI entry: `copilot/entry.py` — thin CLI wrapper that bootstraps shared core with Copilot provider. Typical invocation: `gh copilot mcp add Threnody -- python3 ~/.local/lib/threnody/mcp_server.py` (see `mcp_server.py` docs and `install.sh`).
 - Claude Code entry: `claude-code/entry.py` — same pattern for Claude.
 ## Concurrency & Parallelism
 - The orchestrator (`shared/orchestrator.py`) is wave-based and runs subtasks in parallel waves using subprocess-driven CLI calls. Planner decomposes tasks into waves (`shared/planner.py::build_waves`).
@@ -151,7 +151,7 @@ This project is now focused on making that orchestration adapt better to your co
 - Purpose: Universal cross-provider execution bridge — detect installed CLIs, route to cheapest available
 - Location: `shared/discovery.py`
 - Contains: `CLIProvider` dataclass, `ProviderRegistry` singleton, `BUILTIN_PROVIDERS` list (github-copilot, claude-code, gemini-cli), output cleaning regexes, caller auto-detection, sandbox isolation for subprocess calls
-- Depends on: None (self-contained — no imports from other Switchyard modules)
+- Depends on: None (self-contained — no imports from other Threnody modules)
 - Used by: `mcp_server.py`, `copilot/providers.py`, `claude-code/providers.py`
 - Purpose: SQLite WAL database for caching, telemetry, thresholds, agent definitions, style profiles
 - Location: `shared/db.py`
@@ -174,7 +174,7 @@ This project is now focused on making that orchestration adapt better to your co
 - Depends on: `shared/orchestrator.Provider`, `shared/config.py`, `shared/db.py`
 - Used by: `shared/orchestrator.py`
 ## Data Flow
-- All persistent state lives in SQLite WAL at `~/.local/lib/switchyard/cache.db`
+- All persistent state lives in SQLite WAL at `~/.local/lib/threnody/cache.db`
 - Tables: result cache, plan cache, telemetry, adaptive thresholds, agent definitions, style profiles, project routing profiles, rework events, subtask patterns, escalations, speculation_log
 - Concurrent reads from hot/warm/cold paths supported via WAL mode
 - Lazy globals in `mcp_server.py` — components initialized on first tool call
@@ -209,11 +209,11 @@ This project is now focused on making that orchestration adapt better to your co
 - Triggers: Called directly or via Claude Code custom instructions
 - Responsibilities: Same as Copilot entry but with `ClaudeCodeProvider` + `ClaudeCodeBackend`
 - Location: `shell/ghc.sh`
-- Triggers: Sourced in `~/.zshrc`; user runs `ghc agent "task"`, `ghcs "question"`, `ghce "explain"`, or `switchyard inspect status --project .`
-- Responsibilities: Shell-level orchestration — calls `copilot/entry.py plan`, spawns parallel agents per wave using `_ghc_run_wave()`, calls synthesize, prints transparency tables, and exposes `switchyard inspect ...` / `switchyard tune ...` operator controls
+- Triggers: Sourced in `~/.zshrc`; user runs `ghc agent "task"`, `ghcs "question"`, `ghce "explain"`, or `threnody inspect status --project .`
+- Responsibilities: Shell-level orchestration — calls `copilot/entry.py plan`, spawns parallel agents per wave using `_ghc_run_wave()`, calls synthesize, prints transparency tables, and exposes `threnody inspect ...` / `threnody tune ...` operator controls
 - Location: `install.sh`
 - Triggers: Manual run or `curl | bash`
-- Responsibilities: Copy files to `~/.local/lib/switchyard`, install pyyaml, register MCP server, append shell source to `~/.zshrc`, and sync managed custom-instruction blocks for Claude and Copilot
+- Responsibilities: Copy files to `~/.local/lib/threnody`, install pyyaml, register MCP server, append shell source to `~/.zshrc`, and sync managed custom-instruction blocks for Claude and Copilot
 ## Error Handling
 - **Planner failures** → single-agent fallback (`Planner._single_agent_fallback()` returns one medium-tier subtask)
 - **Provider failures** → next-cheapest provider via `ProviderRegistry.execute_cheapest()` fallback chain

@@ -105,7 +105,7 @@ def test_cli_provider_subprocess_does_not_inherit_mcp_stdin(monkeypatch) -> None
 
 
 def test_snapshot_ignores_router_runtime_files(tmp_path: Path) -> None:
-    status_file = tmp_path / "switchyard-status.json"
+    status_file = tmp_path / "threnody-status.json"
     db_wal = tmp_path / "cache.db-wal"
     status_file.write_text("{}")
     db_wal.write_bytes(b"before")

@@ -1,4 +1,4 @@
-"""Release version — single source of truth for Switchyard."""
+"""Release version — single source of truth for Threnody."""
 from __future__ import annotations
 
 from pathlib import Path

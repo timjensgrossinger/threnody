@@ -28,7 +28,7 @@ def _send_lines(*requests: dict) -> list[str]:
         "\n".join(json.dumps(r) for r in requests) + "\n"
     ).encode()
 
-    env = {**os.environ, "SWITCHYARD_TEST_MODE": "1"}
+    env = {**os.environ, "THRENODY_TEST_MODE": "1"}
 
     proc = subprocess.run(
         [sys.executable, str(MCP_SERVER)],
@@ -103,7 +103,7 @@ def test_tools_list_includes_swarm_tools() -> None:
 
 
 def test_server_exits_cleanly_on_stdin_close() -> None:
-    env = {**os.environ, "SWITCHYARD_TEST_MODE": "1"}
+    env = {**os.environ, "THRENODY_TEST_MODE": "1"}
 
     proc = subprocess.run(
         [sys.executable, str(MCP_SERVER)],

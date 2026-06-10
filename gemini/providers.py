@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Switchyard Gemini CLI provider."""
+"""Threnody Gemini CLI provider."""
 from __future__ import annotations
 
 import logging

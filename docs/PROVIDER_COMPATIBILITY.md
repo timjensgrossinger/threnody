@@ -36,7 +36,7 @@ on every machine.
 Run:
 
 ```bash
-SWITCHYARD_TEST_MODE=1 python3 -m pytest \
+THRENODY_TEST_MODE=1 python3 -m pytest \
   tests/test_discovery.py \
   tests/test_provider_execution.py \
   tests/test_provider_quota.py \

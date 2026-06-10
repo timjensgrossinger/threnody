@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Switchyard OpenCode CLI entry point.
+Threnody OpenCode CLI entry point.
 
 Thin wrapper that initialises the shared core with the OpenCode provider and
 exposes CLI commands. OpenCode is intentionally low-tier-only in the initial

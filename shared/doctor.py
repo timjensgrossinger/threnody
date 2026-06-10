@@ -3,8 +3,8 @@
 Provider health diagnostics and bounded self-repair.
 
 Entry points:
-  switchyard doctor            — diagnose all providers, exit 1 if any QUARANTINED
-  switchyard doctor --repair   — diagnose + run bounded self-repair
+  threnody doctor            — diagnose all providers, exit 1 if any QUARANTINED
+  threnody doctor --repair   — diagnose + run bounded self-repair
 """
 from __future__ import annotations
 
@@ -160,7 +160,7 @@ def diagnose(db, repair: bool = False, dry_run: bool = False) -> int:
     print()
 
     if not db_ok:
-        print("DB: integrity check FAILED — run: switchyard db repair")
+        print("DB: integrity check FAILED — run: threnody db repair")
     elif db is not None:
         print("DB: ok")
 
@@ -226,14 +226,14 @@ def run_self_repair(db, dry_run: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="Switchyard provider health diagnostics")
+    parser = argparse.ArgumentParser(description="Threnody provider health diagnostics")
     parser.add_argument("--repair", action="store_true", help="Run bounded self-repair after diagnosis")
     parser.add_argument("--dry-run", action="store_true", help="Show repair actions without applying")
     parser.add_argument("--db", type=Path, default=None, help="Path to cache.db (optional)")
     args = parser.parse_args(argv)
 
     db = None
-    db_path = args.db or (Path.home() / ".local/lib/switchyard/cache.db")
+    db_path = args.db or (Path.home() / ".local/lib/threnody/cache.db")
     if db_path.exists():
         try:
             from .db import Database

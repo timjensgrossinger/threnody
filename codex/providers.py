@@ -1,5 +1,5 @@
 """
-codex/providers.py — OpenAI Codex provider implementation for Switchyard.
+codex/providers.py — OpenAI Codex provider implementation for Threnody.
 
 Implements command building, auth detection, and output cleaning for Codex
 CLI using the Phase 6 CLIProvider pluggable hooks pattern.
@@ -42,7 +42,7 @@ def _build_codex_command(provider, action: str, model: str, prompt: str, effort:
 
     Notes:
         - Uses -o FILE instead of --json to avoid JSONL parsing.
-        - Runs read-only because Switchyard consumes stdout and owns file writes.
+        - Runs read-only because Threnody consumes stdout and owns file writes.
         - Ignores user config so a nested Codex process cannot reconnect to this MCP.
         - Temp file cleanup is responsibility of caller (provider.execute() handles this)
         - If `effort` is provided, map it to Codex's config override.

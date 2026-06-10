@@ -1,5 +1,5 @@
 """
-blackbox/providers.py — Blackbox AI provider implementation for Switchyard.
+blackbox/providers.py — Blackbox AI provider implementation for Threnody.
 
 Implements command building, auth detection, and output cleaning for the
 Blackbox AI CLI (`blackbox`).
@@ -37,7 +37,7 @@ def _build_blackbox_command(
 ) -> list[str]:
     """Build a Blackbox AI CLI command.
 
-    Passes ``--model MODEL`` when a model name is provided so that Switchyard
+    Passes ``--model MODEL`` when a model name is provided so that Threnody
     can route different cost tiers to different Blackbox-accessible models.
     Falls back to the user-configured default when model is empty.
     """

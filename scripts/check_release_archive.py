@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject runtime state and unsafe paths from a Switchyard source archive."""
+"""Reject runtime state and unsafe paths from a Threnody source archive."""
 from __future__ import annotations
 
 import argparse
@@ -20,7 +20,7 @@ FORBIDDEN_NAMES = {
     "config.yaml",
     "credentials.json",
     "providers.json",
-    "switchyard-status.json",
+    "threnody-status.json",
 }
 FORBIDDEN_COMPONENTS = {
     ".copilot-sandbox",

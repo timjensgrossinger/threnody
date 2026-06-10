@@ -1,1 +1,1 @@
-"""Switchyard Claude Code version."""
+"""Threnody Claude Code version."""
