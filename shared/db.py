@@ -323,19 +323,6 @@ class Database:
              CREATE INDEX IF NOT EXISTS idx_preview_tokens_expires
                  ON preview_tokens (expires_ts);
 
-             -- Remote server: async job tracking
-             CREATE TABLE IF NOT EXISTS remote_jobs (
-                 job_id     TEXT PRIMARY KEY,
-                 status     TEXT NOT NULL DEFAULT 'pending',
-                 task       TEXT NOT NULL,
-                 result     TEXT,
-                 error      TEXT,
-                 created_ts REAL NOT NULL,
-                 updated_ts REAL NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_remote_jobs_status
-                 ON remote_jobs (status);
-
              -- Phase 37+ routing guard records (deduplicate write-file guard decisions).
              CREATE TABLE IF NOT EXISTS routing_guards (
                  guard_key TEXT PRIMARY KEY,
@@ -654,18 +641,6 @@ class Database:
              );
              CREATE INDEX IF NOT EXISTS idx_learning_queue_status ON learning_queue(status);
 
-             -- Multi-user server support: one row per registered remote-server user.
-             CREATE TABLE IF NOT EXISTS users (
-                 user_id        TEXT PRIMARY KEY,
-                 username       TEXT UNIQUE NOT NULL,
-                 token_hmac     TEXT UNIQUE NOT NULL,
-                 providers_json TEXT NOT NULL DEFAULT '{}',
-                 enabled        INTEGER NOT NULL DEFAULT 1,
-                 created_ts     REAL NOT NULL,
-                 updated_ts     REAL NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_users_username    ON users (username);
-             CREATE INDEX IF NOT EXISTS idx_users_token_hmac  ON users (token_hmac);
         """)
         self._ensure_parent_scoped_schema(conn)
         self._ensure_telemetry_columns(conn)
@@ -675,7 +650,6 @@ class Database:
         self._ensure_phase18_memory_table(conn)
         self._ensure_phase31_swarm_columns(conn)
         self._ensure_project_settings_oow_column(conn)
-        self._ensure_users_columns(conn)
         self._ensure_resilience_schema(conn)
         self._ensure_preview_records_mode_column(conn)
         self._ensure_model_catalog_url_source(conn)
@@ -1271,18 +1245,6 @@ class Database:
             )
 
     @staticmethod
-    def _ensure_users_columns(conn: sqlite3.Connection) -> None:
-        """Add user_id column to remote_jobs for multi-user server support."""
-        remote_job_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(remote_jobs)").fetchall()
-        }
-        if "user_id" not in remote_job_cols:
-            conn.execute("ALTER TABLE remote_jobs ADD COLUMN user_id TEXT")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_remote_jobs_user_id ON remote_jobs (user_id)"
-            )
-
-    @staticmethod
     def _ensure_preview_records_mode_column(conn: sqlite3.Connection) -> None:
         """Add mode column to preview_records for surgical-edit mode tracking."""
         existing = {row[1] for row in conn.execute("PRAGMA table_info(preview_records)").fetchall()}
@@ -1312,12 +1274,6 @@ class Database:
             ("op_class", "ALTER TABLE swarm_events ADD COLUMN op_class TEXT NOT NULL DEFAULT 'side_effecting'"),
             ("chain_hmac", "ALTER TABLE swarm_events ADD COLUMN chain_hmac TEXT NOT NULL DEFAULT ''"),
         ]
-        _remote_jobs_alters: list[tuple[str, str]] = [
-            ("idempotency_key", "ALTER TABLE remote_jobs ADD COLUMN idempotency_key TEXT"),
-            ("attempt", "ALTER TABLE remote_jobs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0"),
-            ("first_seen_at", "ALTER TABLE remote_jobs ADD COLUMN first_seen_at REAL"),
-            ("last_attempt_at", "ALTER TABLE remote_jobs ADD COLUMN last_attempt_at REAL"),
-        ]
         _approval_queue_alters: list[tuple[str, str]] = [
             ("idempotency_key", "ALTER TABLE approval_queue ADD COLUMN idempotency_key TEXT"),
             ("attempt", "ALTER TABLE approval_queue ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0"),
@@ -1332,7 +1288,6 @@ class Database:
         ]
         for pragma_sql, alters in (
             ("PRAGMA table_info(swarm_events)", _swarm_alters),
-            ("PRAGMA table_info(remote_jobs)", _remote_jobs_alters),
             ("PRAGMA table_info(approval_queue)", _approval_queue_alters),
             ("PRAGMA table_info(coordinator_round_checkpoints)", _ckpt_alters),
         ):
@@ -5340,254 +5295,6 @@ class Database:
                 "subtask_count": int(row[5] or 0),
             })
         return result
-
-    def create_remote_job(
-        self,
-        job_id: str,
-        task: str,
-        user_id: str | None = None,
-        idempotency_key: str | None = None,
-    ) -> None:
-        """Create a new remote_jobs record with status='pending'.
-
-        *user_id* associates the job with a registered server user.  Pass
-        ``None`` for admin-submitted jobs (backward-compatible default).
-        *idempotency_key* deduplicates concurrent submits of the same job.
-        """
-        now = __import__("time").time()
-        with self.conn() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO remote_jobs"
-                " (job_id, status, task, user_id, idempotency_key, created_ts, updated_ts)"
-                " VALUES (?, 'pending', ?, ?, ?, ?, ?)",
-                (job_id, task, user_id, idempotency_key, now, now),
-            )
-
-    def update_remote_job(
-        self,
-        job_id: str,
-        status: str,
-        result: str | None = None,
-        error: str | None = None,
-    ) -> None:
-        """Update status, result, and/or error for a remote_jobs record."""
-        now = __import__("time").time()
-        with self.conn() as conn:
-            conn.execute(
-                "UPDATE remote_jobs SET status=?, result=?, error=?, updated_ts=? WHERE job_id=?",
-                (status, result, error, now, job_id),
-            )
-
-    def get_remote_job(self, job_id: str, user_id: str | None = None) -> dict | None:
-        """Return the remote_jobs row for job_id, or None if not found.
-
-        If *user_id* is provided the row is only returned when it belongs to
-        that user (admin callers pass ``user_id=None`` to bypass the filter).
-        """
-        with self.conn() as conn:
-            if user_id is not None:
-                # Strict ownership: only return if user_id matches exactly
-                row = conn.execute(
-                    "SELECT job_id, status, task, result, error, created_ts, updated_ts, user_id"
-                    " FROM remote_jobs WHERE job_id=? AND user_id=?",
-                    (job_id, user_id),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT job_id, status, task, result, error, created_ts, updated_ts, user_id"
-                    " FROM remote_jobs WHERE job_id=?",
-                    (job_id,),
-                ).fetchone()
-        if row is None:
-            return None
-        return {
-            "job_id": row[0],
-            "status": row[1],
-            "task": row[2],
-            "result": row[3],
-            "error": row[4],
-            "created_ts": row[5],
-            "updated_ts": row[6],
-            "user_id": row[7],
-        }
-
-    def list_user_jobs(self, user_id: str) -> list[dict]:
-        """Return all remote_jobs rows owned by *user_id*, newest first."""
-        with self.conn() as conn:
-            rows = conn.execute(
-                "SELECT job_id, status, task, result, error, created_ts, updated_ts, user_id"
-                " FROM remote_jobs WHERE user_id=? ORDER BY created_ts DESC",
-                (user_id,),
-            ).fetchall()
-        return [
-            {
-                "job_id": r[0], "status": r[1], "task": r[2],
-                "result": r[3], "error": r[4],
-                "created_ts": r[5], "updated_ts": r[6], "user_id": r[7],
-            }
-            for r in rows
-        ]
-
-    def list_all_jobs(self) -> list[dict]:
-        """Return all remote_jobs rows, newest first (admin view)."""
-        with self.conn() as conn:
-            rows = conn.execute(
-                "SELECT job_id, status, task, result, error, created_ts, updated_ts, user_id"
-                " FROM remote_jobs ORDER BY created_ts DESC"
-            ).fetchall()
-        return [
-            {
-                "job_id": r[0], "status": r[1], "task": r[2],
-                "result": r[3], "error": r[4],
-                "created_ts": r[5], "updated_ts": r[6], "user_id": r[7],
-            }
-            for r in rows
-        ]
-
-    # ------------------------------------------------------------------
-    # User management (multi-user remote server)
-    # ------------------------------------------------------------------
-
-    def create_user(
-        self,
-        username: str,
-        raw_token: str,
-        providers_json: str = "{}",
-        *,
-        secret: str = "",
-    ) -> str:
-        """Register a new user.  Returns the generated user_id.
-
-        Args:
-            username:      Unique display name for the user.
-            raw_token:     The bearer token the user will authenticate with.
-            providers_json: JSON string of per-provider credentials.
-            secret:        If provided, the token is stored as
-                           ``hmac(secret, raw_token)`` rather than in plain
-                           text.  Pass the server's admin token here.
-        """
-        import uuid as _uuid, hashlib as _hashlib, hmac as _hmac_mod
-        user_id = str(_uuid.uuid4())
-        token_hmac = (
-            _hmac_mod.new(secret.encode(), raw_token.encode(), _hashlib.sha256).hexdigest()
-            if secret else raw_token
-        )
-        now = __import__("time").time()
-        try:
-            with self.conn() as conn:
-                conn.execute(
-                    "INSERT INTO users"
-                    " (user_id, username, token_hmac, providers_json, enabled, created_ts, updated_ts)"
-                    " VALUES (?, ?, ?, ?, 1, ?, ?)",
-                    (user_id, username, token_hmac, providers_json, now, now),
-                )
-        except Exception as exc:
-            raise ValueError(f"create_user failed: {exc}") from exc
-        return user_id
-
-    def get_user_by_token_hmac(self, token_hmac: str) -> dict | None:
-        """Return the users row whose token_hmac matches, or None."""
-        with self.conn() as conn:
-            row = conn.execute(
-                "SELECT user_id, username, providers_json, enabled, created_ts, updated_ts"
-                " FROM users WHERE token_hmac=?",
-                (token_hmac,),
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "user_id": row[0], "username": row[1],
-            "providers_json": row[2], "enabled": bool(row[3]),
-            "created_ts": row[4], "updated_ts": row[5],
-        }
-
-    def get_user_by_id(self, user_id: str) -> dict | None:
-        """Return the users row for user_id, or None."""
-        with self.conn() as conn:
-            row = conn.execute(
-                "SELECT user_id, username, providers_json, enabled, created_ts, updated_ts"
-                " FROM users WHERE user_id=?",
-                (user_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "user_id": row[0], "username": row[1],
-            "providers_json": row[2], "enabled": bool(row[3]),
-            "created_ts": row[4], "updated_ts": row[5],
-        }
-
-    def get_user_by_username(self, username: str) -> dict | None:
-        """Return the users row for username, or None."""
-        with self.conn() as conn:
-            row = conn.execute(
-                "SELECT user_id, username, providers_json, enabled, created_ts, updated_ts"
-                " FROM users WHERE username=?",
-                (username,),
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "user_id": row[0], "username": row[1],
-            "providers_json": row[2], "enabled": bool(row[3]),
-            "created_ts": row[4], "updated_ts": row[5],
-        }
-
-    def list_users(self) -> list[dict]:
-        """Return all user rows ordered by username."""
-        with self.conn() as conn:
-            rows = conn.execute(
-                "SELECT user_id, username, providers_json, enabled, created_ts, updated_ts"
-                " FROM users ORDER BY username"
-            ).fetchall()
-        return [
-            {
-                "user_id": r[0], "username": r[1],
-                "providers_json": r[2], "enabled": bool(r[3]),
-                "created_ts": r[4], "updated_ts": r[5],
-            }
-            for r in rows
-        ]
-
-    def set_user_enabled(self, user_id: str, enabled: bool) -> None:
-        """Enable or disable a user account."""
-        now = __import__("time").time()
-        with self.conn() as conn:
-            conn.execute(
-                "UPDATE users SET enabled=?, updated_ts=? WHERE user_id=?",
-                (1 if enabled else 0, now, user_id),
-            )
-
-    def update_user_token_hmac(self, user_id: str, raw_token: str, *, secret: str = "") -> None:
-        """Replace the stored token HMAC for a user (token rotation).
-
-        Args:
-            user_id:   The target user's UUID.
-            raw_token: The new bearer token (plain text).
-            secret:    If provided, the token is stored as
-                       ``hmac(secret, raw_token)``.  Pass the server's admin
-                       token here to match the authentication logic.
-        """
-        import hashlib as _hashlib, hmac as _hmac_mod
-        token_hmac = (
-            _hmac_mod.new(secret.encode(), raw_token.encode(), _hashlib.sha256).hexdigest()
-            if secret else raw_token
-        )
-        now = __import__("time").time()
-        try:
-            with self.conn() as conn:
-                conn.execute(
-                    "UPDATE users SET token_hmac=?, updated_ts=? WHERE user_id=?",
-                    (token_hmac, now, user_id),
-                )
-        except Exception as exc:
-            raise ValueError(f"update_user_token_hmac failed: {exc}") from exc
-
-    def delete_user(self, user_id: str) -> None:
-        """Permanently remove a user and their jobs."""
-        with self.conn() as conn:
-            conn.execute("DELETE FROM remote_jobs WHERE user_id=?", (user_id,))
-            conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
 
     def close(self) -> None:
         """Close all database connections

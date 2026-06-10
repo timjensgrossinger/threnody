@@ -51,7 +51,6 @@ threnody inspect approvals approve <id> --project . --operator <name>
 threnody tune show --project .
 threnody tune set concurrency_limit 5 --project .
 threnody tune reset concurrency_limit --project .
-threnody users --help
 
 # DB maintenance
 threnody db check [--db PATH]        # integrity check + report
@@ -134,8 +133,6 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 | `shared/outcomes.py` | Outcome recording, scoring, and aggregation for routing feedback |
 | `shared/settings_wizard.py` | Interactive first-run and reconfiguration wizard |
 | `shared/provider_factory.py` | Registry-driven resolver that maps `CLIProvider.name` → concrete `Provider` subclass for `Orchestrator` construction |
-| `shared/remote_client.py` | Deprecated HTTP client for legacy `remote_dispatch` / `remote_job_status` tools |
-| `shared/remote_server.py` | Deprecated threaded HTTP(S) server (`threnody serve`; unsupported) |
 | `mcp_server.py` | MCP server (JSON-RPC/stdio) — lazy-init, ~41 public tools |
 | `shell/ghc.sh` | Multi-agent shell script backing the `ghc` / `ghcs` / `ghce` aliases |
 | `shell/threnody-watch` | Live monitoring daemon; run in a separate terminal alongside the MCP server |
@@ -156,9 +153,9 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 ### Data layer
 
 - Single SQLite WAL at `~/.local/lib/threnody/cache.db`
-- WAL mode + `synchronous=NORMAL` is intentional — routing cache data loss on crash is acceptable; for `remote_jobs` and `approval_queue` tables, durability is operator responsibility via backup rotation (configurable via `cache.backup_keep` in `config.yaml`)
+- WAL mode + `synchronous=NORMAL` is intentional — routing cache data loss on crash is acceptable; for `approval_queue` and other durable tables, durability is operator responsibility via backup rotation (configurable via `cache.backup_keep` in `config.yaml`)
 - All schema changes go through `Database._init_schema()` — no ad-hoc connections elsewhere
-- Tables: `cache`, `plan_cache`, `artifacts`, `telemetry`, `adaptive_thresholds`, `agent_definitions`, `agent_audit`, `style_profiles`, `project_routing`, `project_settings`, `rework_events`, `subtask_patterns`, `escalations`, `speculation_log`, `swarm_runs`, `swarm_workers`, `swarm_events`, `routing_guards`, `routing_guard_executions`, `remote_jobs`, `approval_queue`, `coordinator_round_checkpoints`, `plan_revisions`, `coordinator_amendments`, `fanout_telemetry`, `preview_tokens`, `memory`, and more
+- Tables: `cache`, `plan_cache`, `artifacts`, `telemetry`, `adaptive_thresholds`, `agent_definitions`, `agent_audit`, `style_profiles`, `project_routing`, `project_settings`, `rework_events`, `subtask_patterns`, `escalations`, `speculation_log`, `swarm_runs`, `swarm_workers`, `swarm_events`, `routing_guards`, `routing_guard_executions`, `approval_queue`, `coordinator_round_checkpoints`, `plan_revisions`, `coordinator_amendments`, `fanout_telemetry`, `preview_tokens`, `memory`, and more
 
 ## Key conventions
 
@@ -168,7 +165,6 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 - **DB access**: always use `db.conn()` — never access `_db._conn` directly. WAL mode + thread-local connections require the `conn()` accessor.
 - **Schema changes**: add to `Database._init_schema()` only; use existing `_ensure_*` helpers for follow-up column/index migrations.
 - **Write-safety boundary**: file-targeted flows must reuse `normalize_target_path()` / `is_within_repo()` from `shared/context.py` plus the snapshot/preview helpers — never write arbitrary paths directly.
-- **Remote server writes**: use `_safe_write_text()` from `shared/remote_server.py` for symlink-safe file writes in server-side handlers — it checks the full parent chain for symlinks and opens with `O_NOFOLLOW`.
 - **Preferred routing sort**: when `preferred_routing` is configured for a tier, operator preference rank is the primary sort key and overrides `cost_rank`. `preferred_routing_by_caller` applies the same ordering to one host shell/caller only. Cost rank only dominates when no matching global or caller-specific preference is set.
 - **Provider metadata is a contract**: routed/executed results carry `provider`, `provider_id`, `model`, `billing_tier`, `cost_rank`, `billing_source`, and sometimes effort metadata. Tests assert these end-to-end.
 - **Learning is approval-gated**: pattern tracking in `shared/agents.py` flows through draft readiness and the approval queue before local activation or cross-CLI registration. Do not bypass the approval step.
@@ -192,7 +188,7 @@ Routing eval fixtures live in `tests/eval/` organised by tier (`low_tier/`, `med
 
 ## Config
 
-`config.yaml` controls complexity-scoring signals, tier bounds, parallelism, speculation, per-provider effort defaults, and legacy `remote_server` / `remote_client` settings (deprecated). Loaded via `TGsConfig.from_yaml()` in `shared/config.py`.
+`config.yaml` controls complexity-scoring signals, tier bounds, parallelism, speculation, and per-provider effort defaults. Loaded via `TGsConfig.from_yaml()` in `shared/config.py`.
 
 ## Legal and provider compliance
 
@@ -200,7 +196,6 @@ Routing eval fixtures live in `tests/eval/` organised by tier (`low_tier/`, `med
 - Provider terms, policies, and enforcement may change at any time without notice
 - Cross-routing Claude Pro/Max OAuth from non-Claude hosts is the highest provider-policy risk
 - Claude Code → Claude Code routing is blocked by default; see `docs/LEGAL.md`
-- `threnody serve` and remote MCP tools are deprecated; use local MCP stdio only
 
 `routing_exceptions` is an exemption list, not a code-file allowlist. Add only extra non-code surfaces; do not enumerate code languages or config formats. Built-in exemptions cover `.md`, `.mdc`, and known AI assistant instruction files; every other filetype remains routed by default unless explicitly exempted.
 

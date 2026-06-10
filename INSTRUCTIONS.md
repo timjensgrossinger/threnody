@@ -99,6 +99,4 @@ guarantee continued compatibility with any provider's rules.
 - Cross-routing Claude Pro/Max subscription OAuth from non-Claude hosts carries
   the highest provider-policy risk
 - Claude Code → Claude Code routing is blocked by default; explicit opt-in only
-- `threnody serve` and remote MCP tools (`remote_dispatch`, `remote_job_status`)
-  are deprecated; use local MCP stdio only
 - Safer routing examples live in [config.example.yaml](config.example.yaml)

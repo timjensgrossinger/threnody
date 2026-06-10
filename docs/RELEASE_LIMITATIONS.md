@@ -64,13 +64,6 @@ provider's rules. See [docs/LEGAL.md](LEGAL.md) for the full risk-tier guide.
 
 Do not claim affiliation with or endorsement by any AI provider.
 
-## Deprecated remote HTTP server
-
-`threnody serve`, `remote_dispatch`, and `remote_job_status` are deprecated
-and unsupported in this release line. The code may remain for compatibility, but
-operators should use local MCP stdio only. Exposing Threnody over HTTP increases
-both provider-policy and security risk.
-
 ## Privacy Model
 
 - Threnody does not require central service credentials.

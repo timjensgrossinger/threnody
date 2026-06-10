@@ -51,7 +51,7 @@ Docs: [limitations](docs/RELEASE_LIMITATIONS.md) · [legal](docs/LEGAL.md) · [a
 
 ## What is Threnody?
 
-**Threnody** is a local-first **AI agent orchestration** layer and **MCP server** for developer workflows. It acts as an **LLM router** and **multi-agent CLI** coordinator: score task complexity, pick the cheapest authenticated provider per tier, decompose hard work into parallel waves, and expose ~43 MCP tools to any compatible host shell.
+**Threnody** is a local-first **AI agent orchestration** layer and **MCP server** for developer workflows. It acts as an **LLM router** and **multi-agent CLI** coordinator: score task complexity, pick the cheapest authenticated provider per tier, decompose hard work into parallel waves, and expose ~41 MCP tools to any compatible host shell.
 
 Search terms that describe the same project: **model routing**, **agent router**, **MCP orchestrator**, **multi-agent coding**, **CLI model selection**, **cost-aware AI routing**, **Copilot / Claude / Gemini orchestration**.
 
@@ -119,7 +119,7 @@ By default, Threnody is local-first:
 - The MCP server talks to your host shell over stdio — no Threnody-hosted control plane
 - Outbound traffic comes from the provider CLIs you invoke (Anthropic, OpenAI, GitHub, Google, etc.)
 
-If you route to a network LLM endpoint or enable the deprecated remote HTTP server, re-do the network review. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/LEGAL.md](docs/LEGAL.md).
+If you route to a network LLM endpoint, re-do the network review. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/LEGAL.md](docs/LEGAL.md).
 
 ### Honest limitations
 
@@ -139,7 +139,7 @@ Full list: [docs/RELEASE_LIMITATIONS.md](docs/RELEASE_LIMITATIONS.md)
 | 🎯 | **Tier routing** | Heuristic complexity scoring + intent modifiers (`quick` → cheaper, `production` → higher quality) |
 | 🔍 | **Live discovery** | Scans installed CLIs, checks auth, ranks models by bundled cost data, caches in SQLite |
 | 🌊 | **Wave orchestration** | `decompose_task` → parallel waves → integration verify; linear, DAG, hierarchical, and star topologies |
-| 🔌 | **MCP-native** | ~43 tools over stdio JSON-RPC; works with any MCP-compatible host shell |
+| 🔌 | **MCP-native** | ~41 tools over stdio JSON-RPC; works with any MCP-compatible host shell |
 | 🧠 | **Warm-path eval** | Background rework detection and quality scoring after subtasks complete |
 | 📈 | **Adaptive thresholds** | EMA-based threshold learning from routing outcomes |
 | 🛡️ | **Write safety** | Path validation, outside-workspace preview gate, audit trail |
@@ -213,7 +213,7 @@ Full reference: [docs/CLI.md](docs/CLI.md)
 
 | Doc | Contents |
 |---|---|
-| [MCP Tools](docs/MCP_TOOLS.md) | All 43 MCP tool surfaces |
+| [MCP Tools](docs/MCP_TOOLS.md) | All 41 MCP tool surfaces |
 | [CLI Reference](docs/CLI.md) | Shell aliases and operator commands |
 | [Architecture](docs/ARCHITECTURE.md) | Trust boundaries and local-first design |
 | [Configuration](config.example.yaml) | Safe starting config (copy to `~/.local/lib/threnody/config.yaml`) |

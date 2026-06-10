@@ -57,10 +57,9 @@ Outbound network traffic usually comes from:
 ### Higher-risk paths
 
 - Cross-provider routing of consumer subscription OAuth (especially Claude)
-- The deprecated remote HTTP server (`threnody serve`) — shared routing surface
 
 Re-do the network and policy review whenever you change hosts, providers, or
-expose Threnody beyond local stdio.
+routing endpoints.
 
 ## Honest limitations
 
@@ -195,15 +194,6 @@ For open-source distribution with free internal team use:
   shared machines
 - Treat account suspension or rate limiting as the realistic enforcement outcome,
   not necessarily litigation
-
-## Deprecated remote HTTP server
-
-`threnody serve`, `remote_dispatch`, and `remote_job_status` are **deprecated
-and unsupported** in this release line. They remain in the tree for compatibility
-but are not documented as a supported operator surface.
-
-Exposing Threnody over HTTP increases the risk of operating routing "on behalf
-of users" and expands the attack surface. Use local MCP stdio only.
 
 ## Commercial use warning
 

@@ -59,12 +59,6 @@ Optional `effort` on `execute_subtask` is a provider-level reasoning hint (e.g. 
 - Approval: `agent_queue_list`, `agent_queue_approve`, `agent_queue_reject`, `agent_queue_merge`, and `approval_queue_*` aliases.
 - Memory: `memory_list`, `memory_get`, `memory_set`, `memory_delete`.
 
-## Deprecated remote tools (unsupported)
-
-`remote_dispatch` and `remote_job_status` remain in the tree for compatibility
-but are **deprecated and unsupported**. Use local MCP stdio only. See
-[docs/LEGAL.md](LEGAL.md).
-
 Operator tuning: `threnody tune set|reset` via the shell wrapper.
 
 ## `execute_subtask` example

@@ -53,21 +53,6 @@ Anyone who can modify the host configuration or spawn the server process has
 full access to all MCP tools. Run only on trusted machines with trusted host
 shell configurations.
 
-### Remote server (`threnody serve`) — deprecated
-
-`threnody serve`, `remote_dispatch`, and `remote_job_status` are **deprecated
-and unsupported** in this release line. Prefer local MCP stdio only. If you must
-run the legacy HTTP server:
-
-- Bind to `127.0.0.1` unless you explicitly need LAN/WAN exposure
-- Set a stable `THRENODY_SERVER_TOKEN` before sharing access; do not rely on
-  auto-generated tokens printed to stdout
-- Prefer TLS (`--tls-cert` / `--tls-key`) for non-loopback deployments
-- Create user tokens only after the admin token is configured
-
-See [docs/LEGAL.md](docs/LEGAL.md) for provider-policy implications of shared
-remote routing.
-
 ### Dangerous environment variables
 
 - `TGS_AUTO_APPROVE=1` skips the write-approval gate for `execute_subtask`.

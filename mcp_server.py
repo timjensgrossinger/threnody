@@ -1733,69 +1733,6 @@ TOOLS = [
             "properties": {},
         },
     },
-    {
-        "name": "remote_dispatch",
-        "description": (
-            "Dispatch a task to a remote Threnody server.\n\n"
-            "Sends the task to a remote HTTP(S) server running \'threnody serve\'. "
-            "The remote server runs the full plan+execute pipeline using its own AI CLI providers.\n\n"
-            "Falls back to config.yaml remote_client settings when remote_url/remote_token are omitted.\n\n"
-            "Returns:\n"
-            "- If async_mode=false: {status: completed, result: ...}\n"
-            "- If async_mode=true:  {job_id: ..., status: pending} — poll with remote_job_status"
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "task": {"type": "string", "description": "The task to execute on the remote server"},
-                "topology": {"type": "string", "description": "Optional execution topology hint (linear/dag/hierarchical/star)"},
-                "async_mode": {
-                    "type": "boolean",
-                    "description": "If true, submit async and return a job_id for polling (default: false)",
-                },
-                "remote_url": {
-                    "type": "string",
-                    "description": "Remote server URL, e.g. https://myhost:8765 or http://192.168.1.5:8765. Overrides config.yaml.",
-                },
-                "remote_token": {
-                    "type": "string",
-                    "description": "Bearer token for the remote server. Overrides config.yaml.",
-                },
-                "verify_tls": {
-                    "type": "boolean",
-                    "description": "If false, skip TLS certificate verification (for self-signed certs or IP-based URLs). Default: true.",
-                },
-            },
-            "required": ["task"],
-        },
-    },
-    {
-        "name": "remote_job_status",
-        "description": (
-            "Poll the status of an async remote_dispatch job.\n\n"
-            "Returns {status, result, error, created_ts, updated_ts}.\n"
-            "status is one of: pending, running, completed, failed."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "job_id": {"type": "string", "description": "Job ID returned by remote_dispatch with async_mode=true"},
-                "remote_url": {
-                    "type": "string",
-                    "description": "Remote server URL. Overrides config.yaml.",
-                },
-                "remote_token": {
-                    "type": "string",
-                    "description": "Bearer token for the remote server. Overrides config.yaml.",
-                },
-                "verify_tls": {
-                    "type": "boolean",
-                    "description": "If false, skip TLS certificate verification. Default: true.",
-                },
-            },
-            "required": ["job_id"],
-        },
-    },
 ]
 
 
@@ -8948,59 +8885,6 @@ def handle_learning_audit_log(args: dict) -> dict:
         return {"error": str(e), "success": False}
 
 
-def handle_remote_dispatch(args: dict) -> dict:
-    """Dispatch a task to a remote Threnody HTTP server."""
-    from shared.remote_client import RemoteClient, RemoteClientError
-    config, db, router, planner, orchestrator = _ensure_init()
-
-    url = args.get("remote_url") or getattr(getattr(config, "remote_client", None), "url", "")
-    token = args.get("remote_token") or getattr(getattr(config, "remote_client", None), "token", "")
-    verify_tls = args.get("verify_tls")
-    if verify_tls is None:
-        verify_tls = getattr(getattr(config, "remote_client", None), "verify_tls", True)
-    timeout = getattr(getattr(config, "remote_client", None), "timeout", 300)
-
-    if not url:
-        return {"error": "remote_url is required (or set remote_client.url in config.yaml)"}
-    if not token:
-        return {"error": "remote_token is required (or set remote_client.token in config.yaml)"}
-
-    client = RemoteClient(url, token, verify_tls=bool(verify_tls), timeout=int(timeout))
-    try:
-        result = client.dispatch(
-            args.get("task", ""),
-            async_mode=bool(args.get("async_mode", False)),
-            topology=str(args.get("topology", "")),
-        )
-        return result
-    except RemoteClientError as exc:
-        return {"error": str(exc), "status_code": exc.status}
-
-
-def handle_remote_job_status(args: dict) -> dict:
-    """Poll status of an async remote_dispatch job."""
-    from shared.remote_client import RemoteClient, RemoteClientError
-    config, db, router, planner, orchestrator = _ensure_init()
-
-    url = args.get("remote_url") or getattr(getattr(config, "remote_client", None), "url", "")
-    token = args.get("remote_token") or getattr(getattr(config, "remote_client", None), "token", "")
-    verify_tls = args.get("verify_tls")
-    if verify_tls is None:
-        verify_tls = getattr(getattr(config, "remote_client", None), "verify_tls", True)
-    timeout = getattr(getattr(config, "remote_client", None), "timeout", 300)
-
-    if not url:
-        return {"error": "remote_url is required (or set remote_client.url in config.yaml)"}
-    if not token:
-        return {"error": "remote_token is required (or set remote_client.token in config.yaml)"}
-
-    client = RemoteClient(url, token, verify_tls=bool(verify_tls), timeout=int(timeout))
-    try:
-        return client.job_status(args.get("job_id", ""))
-    except RemoteClientError as exc:
-        return {"error": str(exc), "status_code": exc.status}
-
-
 HANDLERS = {
     "plan_task":      handle_plan_task,
     "decompose_task": handle_plan_task,
@@ -9047,8 +8931,6 @@ HANDLERS = {
     "session_start": handle_session_start,
     "session_send": handle_session_send,
     "session_close": handle_session_close,
-    "remote_dispatch": handle_remote_dispatch,
-    "remote_job_status": handle_remote_job_status,
     "routing_exception_add": handle_routing_exception_add,
     "routing_exception_remove": handle_routing_exception_remove,
     "routing_exception_list": handle_routing_exception_list,

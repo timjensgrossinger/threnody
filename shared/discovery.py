@@ -160,97 +160,6 @@ def _resolve_claude_agent_path(project_path: str, agent_name: str) -> Path:
     return resolved_target
 
 
-# ---------------------------------------------------------------------------
-# Per-user sandboxes — isolated environments for multi-user remote server
-# ---------------------------------------------------------------------------
-_USER_SANDBOXES_DIR = Path.home() / ".local" / "share" / "Threnody" / "user-sandboxes"
-
-
-def _ensure_user_sandbox(user_id: str, providers_json_str: str) -> Path:
-    """Create an isolated sandbox for *user_id* and populate credential files.
-
-    The sandbox is (re)created from *providers_json_str* on every call so that
-    stale state never persists between requests.
-
-    providers_json format::
-
-        {
-          "copilot": {"auth_files": {"auth.json": "<file content>"}},
-          "claude":  {"env": {"ANTHROPIC_API_KEY": "sk-..."}},
-          "gemini":  {"env": {"GEMINI_API_KEY": "AIza..."}},
-          "codex":   {"env": {"OPENAI_API_KEY": "sk-..."}}
-        }
-
-    Only the ``auth_files`` keys are written to disk here; ``env`` entries are
-    handled by :func:`_user_subprocess_env`.
-    """
-    if not user_id or "/" in user_id or "\\" in user_id or user_id.startswith("."):
-        raise ValueError(f"Invalid user_id for sandbox: {user_id!r}")
-
-    sandbox = _USER_SANDBOXES_DIR.joinpath(user_id).resolve()
-    # Verify the resolved path is still under _USER_SANDBOXES_DIR (traversal guard)
-    try:
-        sandbox.relative_to(_USER_SANDBOXES_DIR.resolve())
-    except ValueError as exc:
-        raise ValueError(f"Sandbox path traversal detected for user_id {user_id!r}") from exc
-
-    sandbox.mkdir(parents=True, mode=0o700, exist_ok=True)
-
-    try:
-        providers: dict[str, Any] = json.loads(providers_json_str or "{}")
-    except (json.JSONDecodeError, TypeError):
-        providers = {}
-
-    copilot_creds = providers.get("copilot", {})
-    auth_files: dict[str, str] = copilot_creds.get("auth_files", {})
-    for file_name, content in auth_files.items():
-        # Only allow simple filenames — no path components
-        safe = Path(file_name).name
-        if not safe or safe != file_name:
-            logger.warning("Skipping unsafe auth_file name %r for user %s", file_name, user_id)
-            continue
-        dest = sandbox.joinpath(safe)
-        if dest.is_symlink():
-            dest.unlink()
-        dest.write_text(content, encoding="utf-8")
-        dest.chmod(0o600)
-
-    # Ensure a minimal config.json exists so gh copilot doesn't crash
-    cfg_file = sandbox / "config.json"
-    if cfg_file.is_symlink():
-        cfg_file.unlink()
-    if not cfg_file.exists():
-        cfg_file.write_text("{}", encoding="utf-8")
-
-    return sandbox
-
-
-def _user_subprocess_env(user_id: str, providers_json_str: str) -> dict[str, str]:
-    """Return an env dict for subprocess calls scoped to *user_id*.
-
-    Writes auth files to the user's sandbox (via :func:`_ensure_user_sandbox`),
-    then overlays any ``env`` entries from *providers_json* on top of
-    ``os.environ``.
-    """
-    sandbox = _ensure_user_sandbox(user_id, providers_json_str)
-    env = os.environ.copy()
-    # Point gh copilot at the user's isolated sandbox
-    env["COPILOT_HOME"] = str(sandbox)
-
-    try:
-        providers: dict[str, Any] = json.loads(providers_json_str or "{}")
-    except (json.JSONDecodeError, TypeError):
-        providers = {}
-
-    # Overlay env entries for each provider
-    for _provider_name, creds in providers.items():
-        for k, v in creds.get("env", {}).items():
-            if isinstance(k, str) and isinstance(v, str):
-                env[k] = v
-
-    return env
-
-
 def _copilot_auth_failed(result: subprocess.CompletedProcess[str]) -> bool:
     text = f"{result.stdout}\n{result.stderr}".lower()
     markers = (
@@ -1298,9 +1207,7 @@ class CLIProvider:
                           translate it directly, and custom provider builders
                           receive it as an optional argument.
             env_overrides: Optional mapping of environment variable overrides
-                          applied to the subprocess environment.  Used by the
-                          multi-user remote server to inject per-user CLI
-                          credentials without affecting other callers.
+                          applied to the subprocess environment.
 
         Returns:
             Stripped stdout on success, or *None* if the command failed,

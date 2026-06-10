@@ -46,13 +46,6 @@ def test_idempotency_columns_on_swarm_events(db):
     assert "last_attempt_at" in cols
 
 
-def test_idempotency_columns_on_remote_jobs(db):
-    with db.conn() as conn:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(remote_jobs)").fetchall()}
-    assert "idempotency_key" in cols
-    assert "attempt" in cols
-
-
 def test_idempotency_columns_on_approval_queue(db):
     with db.conn() as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(approval_queue)").fetchall()}
@@ -134,41 +127,6 @@ def test_record_file_write_without_lines(db):
     result = db.get_file_write("fw_scope", "key-102")
     assert result is not None
     assert result["lines_written"] is None
-
-
-# ---------------------------------------------------------------------------
-# create_remote_job with idempotency_key
-# ---------------------------------------------------------------------------
-
-def test_create_remote_job_stores_idempotency_key(db):
-    db.create_remote_job("job-001", "some task", idempotency_key="ikey-job-001")
-    with db.conn() as conn:
-        row = conn.execute(
-            "SELECT idempotency_key FROM remote_jobs WHERE job_id=?", ("job-001",)
-        ).fetchone()
-    assert row is not None
-    assert row[0] == "ikey-job-001"
-
-
-def test_create_remote_job_without_idempotency_key(db):
-    db.create_remote_job("job-002", "some task")
-    with db.conn() as conn:
-        row = conn.execute(
-            "SELECT idempotency_key FROM remote_jobs WHERE job_id=?", ("job-002",)
-        ).fetchone()
-    assert row is not None
-    assert row[0] is None
-
-
-def test_create_remote_job_insert_or_ignore_on_duplicate(db):
-    db.create_remote_job("job-003", "task A", idempotency_key="ikey-job-003")
-    db.create_remote_job("job-003", "task B", idempotency_key="other-key")  # ignored
-    with db.conn() as conn:
-        row = conn.execute(
-            "SELECT task, idempotency_key FROM remote_jobs WHERE job_id=?", ("job-003",)
-        ).fetchone()
-    assert row[0] == "task A"
-    assert row[1] == "ikey-job-003"
 
 
 # ---------------------------------------------------------------------------

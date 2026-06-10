@@ -639,27 +639,6 @@ class EndpointProviderConfig:
 
 
 @dataclass(frozen=True)
-class RemoteServerConfig:
-    """Configuration for running Threnody as an HTTP server."""
-    enabled: bool = False
-    host: str = "0.0.0.0"
-    port: int = 8765
-    token: str = ""
-    tls_enabled: bool = False
-    tls_cert: str = ""
-    tls_key: str = ""
-
-
-@dataclass(frozen=True)
-class RemoteClientConfig:
-    """Configuration for connecting to a remote Threnody HTTP server."""
-    url: str = ""
-    token: str = ""
-    verify_tls: bool = True
-    timeout: int = 300
-
-
-@dataclass(frozen=True)
 class VerifyGateSignalConfig:
     """Config for a single verify gate signal (lint, types, tests)."""
     command: str = "auto"
@@ -1292,10 +1271,6 @@ class TGsConfig:
     # Globally disabled providers — skipped during routing regardless of detection.
     # Populated by settings wizard. Format: list of lowercase provider IDs.
     disabled_providers: list[str] = field(default_factory=list)
-
-    # Remote server and client configuration.
-    remote_server: RemoteServerConfig = field(default_factory=RemoteServerConfig)
-    remote_client: RemoteClientConfig = field(default_factory=RemoteClientConfig)
 
     # Janitor-style verify gate (plan 04).
     verify_gate: VerifyGateConfig = field(default_factory=VerifyGateConfig)
@@ -2048,43 +2023,6 @@ class TGsConfig:
             cfg.thresholds.low_max = t.get("mini_max", cfg.thresholds.low_max)
         if "sonnet_max" in t:
             cfg.thresholds.medium_max = t.get("sonnet_max", cfg.thresholds.medium_max)
-
-        # Remote server config
-        _rs_raw = raw.get("remote_server", {})
-        if isinstance(_rs_raw, Mapping):
-            _tls_raw = _rs_raw.get("tls", {})
-            if not isinstance(_tls_raw, Mapping):
-                _tls_raw = {}
-            cfg.remote_server = RemoteServerConfig(
-                enabled=_rs_raw.get("enabled", False) is True,
-                host=str(_rs_raw.get("host", "0.0.0.0")),
-                port=_coerce_config_int(
-                    _rs_raw.get("port", 8765),
-                    default=8765,
-                    field_name="remote_server.port",
-                    minimum=1,
-                ),
-                token=str(_rs_raw.get("token", "")),
-                tls_enabled=_tls_raw.get("enabled", False) is True,
-                tls_cert=str(_tls_raw.get("cert", "")),
-                tls_key=str(_tls_raw.get("key", "")),
-            )
-
-        # Remote client config
-        _rc_raw = raw.get("remote_client", {})
-        if isinstance(_rc_raw, Mapping):
-            _rc_verify = _rc_raw.get("verify_tls", True)
-            cfg.remote_client = RemoteClientConfig(
-                url=str(_rc_raw.get("url", "")),
-                token=str(_rc_raw.get("token", "")),
-                verify_tls=_rc_verify if isinstance(_rc_verify, bool) else True,
-                timeout=_coerce_config_int(
-                    _rc_raw.get("timeout", 300),
-                    default=300,
-                    field_name="remote_client.timeout",
-                    minimum=1,
-                ),
-            )
 
         _re_raw = raw.get("routing_exceptions", {})
         if isinstance(_re_raw, Mapping):
