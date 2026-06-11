@@ -8,6 +8,9 @@ description: >-
 
 # Threnody task orchestration
 
+**Execution phase** after planning — see **`threnody-plan`** for plan-only vs
+plan-then-execute routing.
+
 Use this skill for **planning + host wave execution** without the full swarm
 persistence contract (`swarm_id`, budget preview, resume checkpoints).
 
@@ -22,6 +25,7 @@ persistence contract (`swarm_id`, budget preview, resume checkpoints).
 
 ## Workflow
 
+0. Prefer **`threnody-plan`** first unless the user already approved a wave plan.
 1. **`route_task(task)`** — tier, `execution_hint`, optional single `host_spawn`.
 2. **Decompose** (multi-concern work):
    - Prefer `decompose_task(task)` (alias of `plan_task`).

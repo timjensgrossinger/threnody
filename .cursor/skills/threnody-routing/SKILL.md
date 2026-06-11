@@ -50,7 +50,8 @@ When `routing_policy` is `guarded` (default for Claude Code):
 
 ## Related skills
 
-- Normal multi-step work: `threnody-task`
+- **Planning entry (start here for multi-step work):** `threnody-plan`
+- Normal execution after plan: `threnody-task`
 - Large parallel fanout with persistence: `threnody-swarm`
 - Full-stack frontend + backend + API: `threnody-fullstack`
 - Monitor utility `execute_subtask`: `threnody-subtasks`

@@ -80,6 +80,7 @@ swarms rely on contract + integration subtask + human/agent review.
 
 ## Related skills
 
-- `threnody-task` — plan/decompose without swarm persistence
+- Planning entry: `threnody-plan`
+- Normal execution: `threnody-task`
 - `threnody-swarm` — `execute_swarm`, topology, budget preview
 - `threnody-routing` — host-native vs utility delegation

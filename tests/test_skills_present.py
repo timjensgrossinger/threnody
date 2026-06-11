@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SKILLS_DIR = ROOT / ".cursor" / "skills"
 
 EXPECTED_SKILLS = (
+    "threnody-plan",
     "threnody-routing",
     "threnody-task",
     "threnody-swarm",

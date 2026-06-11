@@ -22,6 +22,7 @@ This path is **unaffected** by utility-only delegation rules.
 
 ## Workflow
 
+0. If not already planned, follow **`threnody-plan`** (plan-only swarm preview stops before spawn).
 1. Optionally `route_task` for tier context.
 2. **`execute_swarm(task, topology?, max_agents?, budget_limit?)`**
 3. Handle response:

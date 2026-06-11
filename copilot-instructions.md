@@ -232,6 +232,7 @@ Threnody MCP workflows (CLI-agnostic — use from any connected host):
 
 | Skill | When |
 |-------|------|
+| [threnody-plan](../.cursor/skills/threnody-plan/SKILL.md) | Plan-only or plan-then-execute; decompose vs swarm choice |
 | [threnody-routing](../.cursor/skills/threnody-routing/SKILL.md) | `route_task`, routing guard, host-native vs utility delegation |
 | [threnody-task](../.cursor/skills/threnody-task/SKILL.md) | `plan_task`, `decompose_task`, `fleet_plan`, `host_spawn_waves` |
 | [threnody-swarm](../.cursor/skills/threnody-swarm/SKILL.md) | `execute_swarm`, topology, budget preview, resume |

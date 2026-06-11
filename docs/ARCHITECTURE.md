@@ -68,8 +68,24 @@ Default for MCP hosts: `swarm.host_execution_mode: host_native` — Threnody pla
 the host shell spawns agents. Set `host_execution_mode: delegate` only for
 legacy subprocess orchestrator fanout.
 
-Project skills in `.cursor/skills/` document workflows: `threnody-task`,
-`threnody-swarm`, `threnody-fullstack`, `threnody-routing`, `threnody-subtasks`.
+Project skills in `.cursor/skills/` document workflows: `threnody-plan`,
+`threnody-task`, `threnody-swarm`, `threnody-fullstack`, `threnody-routing`,
+`threnody-subtasks`.
+
+## Positioning (vs heavy swarm platforms)
+
+Threnody optimizes for **token-cheap coordination** on the CLIs you already use:
+
+| Approach | Threnody default |
+|----------|------------------|
+| Alignment | **Contract-first DAG** (`consumes` / `produces`) + integration wave |
+| Execution | **Host-native** `host_spawn_waves` — host Task/Agent, not subprocess fanout |
+| Swarm consensus | **Not** multi-queen voting or BFT/Raft — optional single coordinator in legacy delegate mode only |
+| Scale | Tier routing + waves, not 100+ fixed agent types |
+
+See [COMPETITIVE.md](COMPETITIVE.md) for operator-oriented comparison with
+large swarm meta-harnesses. Federation and hive-mind consensus remain out of
+scope ([RELEASE_LIMITATIONS.md](RELEASE_LIMITATIONS.md)).
 
 ## Full-stack parallel pattern (contract-first DAG)
 

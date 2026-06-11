@@ -31,6 +31,20 @@ Read `execution_hint.economics` on every `route_task` response for
 `is_free`, `cost_rank`, `cheapest_path_rationale`, and optional
 `why_not_delegate`.
 
+## Why not coordinator-round consensus by default
+
+Heavy swarm platforms often run **queen-led rounds** (synthesis, voting, gossip)
+that add multiple LLM calls per wave. Threnody's default avoids that token burn:
+
+1. **One planner call** produces `host_spawn_waves`.
+2. **Host-native execution** bills through your existing CLI subscription — no Threnody subprocess per agent.
+3. **Alignment** uses shared artifacts (OpenAPI, types) and optional **verify gates** — hard pass/fail without extra LLM rounds.
+4. **Star coordinator rounds** exist only in expert **delegate** swarm mode — not the meta-harness default.
+
+For parallel full-stack work, prefer contract wave → parallel workers →
+integration subtask over multi-agent voting consensus. See
+[COMPETITIVE.md](COMPETITIVE.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Typical savings patterns by host
 
 | Host | Prefer | Delegate when |
