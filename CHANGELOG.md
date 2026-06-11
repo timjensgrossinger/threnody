@@ -7,9 +7,52 @@ Versioning for public releases.
 
 ## [Unreleased]
 
+## [0.2.0-alpha.1] - 2026-06-11
+
+Second public alpha — host-native swarm orchestration, richer learning ingest, and
+heuristic multi-file planning without external planner LLM calls for common webapp
+tasks.
+
+### Added
+
+- **Host-native heuristic planning** — `execute_swarm` / `plan_task` fan out one host
+  `Task`/`Agent` per file for webapp and fullstack intent; DAG waves for integration
+  files (`index.html`, `app.js`, etc.)
+- **`expand_host_plan`** MCP tool — mid-run file fanout when scaffold waves discover
+  additional paths
+- **`learning_report_contract`** on swarm and plan handoffs — documents required
+  `report_host_wave` fields (`workspace_root`, `output_excerpt`, per-agent telemetry)
+- **Richer host learning ingest** — resolves `workspace_root` from handoff meta,
+  normalizes absolute/relative `touched_files`, auto-fills `output_excerpt` from disk,
+  and enables rework/style detection across waves
+- **CLI-neutral project skills** under `skills/` (`threnody-swarm`, `threnody-task`,
+  `threnody-plan`, `threnody-fullstack`, `threnody-routing`, `threnody-subtasks`)
+- Vienna weather webapp fixture at `tests/fixtures/vienna-weather-app/` for swarm demos
+- Adaptive routing threshold wiring and end-to-end route telemetry persistence
+
 ### Changed
 
-- **Routing policy defaults:** `routing_policy.mode: default` now recommends **advisory** routing for all shells (including Claude Code). Guarded coordination and Claude PreToolUse hooks remain available via `mode: guarded` or per-shell overrides. Re-run `./install.sh` to refresh managed instruction blocks and hook registration.
+- **Routing policy defaults:** `routing_policy.mode: default` now recommends **advisory**
+  routing for all shells (including Claude Code). Guarded coordination and Claude
+  PreToolUse hooks remain available via `mode: guarded` or per-shell overrides.
+  Re-run `./install.sh` to refresh managed instruction blocks and hook registration.
+- **`execute_swarm`** defaults to `host_native` — returns `host_spawn_waves` for host
+  execution instead of subprocess orchestration; improved Cursor spawn model normalization
+- **Host spawn enforcement** — plan and swarm handoffs require host `Task`/`Agent`
+  subagents; direct `Write`/`Edit` on planned `target_files` is blocked during active
+  handoffs
+- **`report_host_wave`** documentation and skills now require `workspace_root` and
+  `output_excerpt` for learning quality (server backfills when omitted)
+
+### Fixed
+
+- `execute_swarm` host-native response and handoff registration edge cases
+- Test fixtures using fake API key patterns that triggered secret scanning
+
+### Notes
+
+- MCP tool schemas may change between alpha releases; pin `v0.2.0-alpha.1` for stability
+- See [KNOWN_BOTTLENECKS.md](KNOWN_BOTTLENECKS.md) for documented performance limits
 
 ## [0.1.0-alpha.1] - 2026-06-11
 
@@ -49,7 +92,7 @@ hardening (older internal tags such as `v3.2.0-alpha.1` remain in git history).
 ### Retired
 
 - GitHub release and tag **removed** on 2026-06-11 — Switchyard branding and missing
-  provider-compliance documentation. Do not use; install `v0.1.0-alpha.1` or later.
+  provider-compliance documentation. Do not use; install `v0.2.0-alpha.1` or later.
 
 ### Added
 
@@ -109,7 +152,8 @@ hardening (older internal tags such as `v3.2.0-alpha.1` remain in git history).
 
 - Last internal milestone before the public release hardening cycle.
 
-[Unreleased]: https://github.com/timjensgrossinger/threnody/compare/v0.1.0-alpha.1...HEAD
+[Unreleased]: https://github.com/timjensgrossinger/threnody/compare/v0.2.0-alpha.1...HEAD
+[0.2.0-alpha.1]: https://github.com/timjensgrossinger/threnody/releases/tag/v0.2.0-alpha.1
 [0.1.0-alpha.1]: https://github.com/timjensgrossinger/threnody/releases/tag/v0.1.0-alpha.1
 [1.0.0-beta.1]: https://github.com/timjensgrossinger/threnody/commit/4fbf8629301a7a557e9cc16ace00e9e85f9495a8
 [v3.2.0-alpha.1]: https://github.com/timjensgrossinger/threnody/compare/v1.9...v3.2.0-alpha.1
