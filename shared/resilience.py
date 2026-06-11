@@ -197,10 +197,6 @@ class AuthProbe:
                 ]
                 return any(p.exists() and p.stat().st_size > 10 for p in cred_paths)
 
-            if key in ("gemini-cli", "gemini"):
-                cred = pathlib.Path.home() / ".gemini" / "oauth_creds.json"
-                return cred.exists() or bool(os.environ.get("GEMINI_API_KEY"))
-
         except Exception:
             log.warning("auth probe failed for provider %r", key, exc_info=True)
             return False

@@ -8,7 +8,6 @@ on every machine.
 |---|---|---|---|
 | GitHub Copilot | low, medium, high | detection, command construction, isolated env, execution parsing, auth failure, generic timeout path | passed 2026-06-08 |
 | Claude Code | low, medium, high | command construction, effort mapping, execution parsing, timeout, auth-status preflight, caller opt-out/preference | passed 2026-06-08 |
-| Gemini CLI | low, medium, high | command construction, caller detection, entrypoint adapter, model tiering | yes |
 | OpenAI Codex | low, medium, high | noninteractive command contract, output cleanup, API-key detection, login probe, quota parsing, timeout, adapter metadata | yes |
 | Cursor | low, medium, high | entrypoint adapter, host instructions, MCP registration shape, caller detection, routing policy | yes |
 | JetBrains Junie | medium-only by default | entrypoint adapter, medium-only model projection, caller detection, instructions, routeability diagnostics | yes |

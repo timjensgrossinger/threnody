@@ -272,7 +272,6 @@ VALID_ROUTING_POLICY_MODES = frozenset({"default", "guarded", "advisory", "custo
 SUPPORTED_ROUTING_POLICY_SHELLS = (
     "claude-code",
     "github-copilot-cli",
-    "gemini-cli",
     "cursor",
     "codex",
     "junie",
@@ -285,8 +284,6 @@ ROUTING_POLICY_SHELL_ALIASES = {
     "github-copilot-cli": "github-copilot-cli",
     "copilot": "github-copilot-cli",
     "gh-copilot": "github-copilot-cli",
-    "gemini": "gemini-cli",
-    "gemini-cli": "gemini-cli",
     "cursor": "cursor",
     "codex": "codex",
     "openai-codex": "codex",
@@ -297,7 +294,6 @@ ROUTING_POLICY_HOOK_CAPABLE_SHELLS = frozenset({"claude-code"})
 ROUTING_POLICY_SHELL_BOOTSTRAP_IDS = {
     "claude-code": "claude-code",
     "github-copilot-cli": "github-copilot",
-    "gemini-cli": "gemini-cli",
     "cursor": "cursor",
     "codex": "codex",
     "junie": "junie",
@@ -498,8 +494,6 @@ def normalize_caller_id(caller_id: str | None) -> str | None:
         return "github-copilot"
     if normalized == "claude":
         return "claude-code"
-    if normalized == "gemini":
-        return "gemini-cli"
     if normalized == "openai-codex":
         return "codex"
     return normalized
@@ -1309,8 +1303,12 @@ class TGsConfig:
     disabled_providers: list[str] = field(default_factory=list)
 
     # Providers that may execute via subprocess despite router-only defaults.
-    # Format: list of lowercase provider IDs (e.g. claude-code, gemini-cli).
+    # Format: list of lowercase provider IDs (e.g. claude-code).
     router_only_allow_execution: list[str] = field(default_factory=list)
+
+    # execute_swarm host execution: host_native (plan handoff) or delegate (subprocess).
+    swarm_host_execution_mode: str = "host_native"
+    swarm_host_execution_mode_by_caller: dict[str, str] = field(default_factory=dict)
 
     # Janitor-style verify gate (plan 04).
     verify_gate: VerifyGateConfig = field(default_factory=VerifyGateConfig)
@@ -2052,6 +2050,23 @@ class TGsConfig:
                     str(p).strip().lower() for p in raw_router_only_allow if p is not None
                 ]
 
+        raw_swarm_host_mode = swarm_raw.get("host_execution_mode", "host_native")
+        if isinstance(raw_swarm_host_mode, str) and raw_swarm_host_mode.strip().lower() in {
+            "host_native",
+            "delegate",
+        }:
+            cfg.swarm_host_execution_mode = raw_swarm_host_mode.strip().lower()
+        raw_swarm_host_by_caller = swarm_raw.get("host_execution_mode_by_caller", {})
+        if isinstance(raw_swarm_host_by_caller, Mapping):
+            cfg.swarm_host_execution_mode_by_caller = {
+                str(caller).strip().lower(): str(mode).strip().lower()
+                for caller, mode in raw_swarm_host_by_caller.items()
+                if isinstance(caller, str)
+                and isinstance(mode, str)
+                and str(mode).strip().lower() in {"host_native", "delegate"}
+            }
+
+        if isinstance(providers_section, dict):
             # Optional: per-provider usage-window thresholds
             raw_usage_windows = providers_section.get("usage_windows", {})
             if isinstance(raw_usage_windows, Mapping):
@@ -2343,6 +2358,10 @@ class TGsConfig:
             },
             "swarm": {
                 "max_agents": self.swarm_max_agents,
+                "host_execution_mode": self.swarm_host_execution_mode,
+                "host_execution_mode_by_caller": dict(
+                    sorted(self.swarm_host_execution_mode_by_caller.items())
+                ),
             },
             "budgets": {
                 "default_hard_cap_tokens": self.budgets.default_hard_cap_tokens,

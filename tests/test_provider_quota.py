@@ -69,7 +69,6 @@ def test_unsupported_adapter_is_explicit():
     ("provider", "surface"),
     [
         ("github-copilot", "/usage"),
-        ("gemini-cli", "/stats"),
         ("amazon-q", "/usage"),
         ("opencode", "local token and cost telemetry"),
         ("junie", "IDE"),

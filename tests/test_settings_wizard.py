@@ -27,7 +27,7 @@ def test_write_config_works_without_pyyaml(tmp_path, monkeypatch) -> None:
 
     settings_wizard._write_config(
         config_path,
-        disabled=["gemini-cli"],
+        disabled=["windsurf"],
         caller_allowlists={},
         preferred_routing={},
         routing_policy={"mode": "advisory"},
@@ -36,3 +36,18 @@ def test_write_config_works_without_pyyaml(tmp_path, monkeypatch) -> None:
     body = config_path.read_text(encoding="utf-8")
     assert "routing_policy:" in body
     assert "mode: \"advisory\"" in body
+
+
+def test_host_native_policy_warnings_surface_risky_overrides() -> None:
+    warnings = settings_wizard._host_native_policy_warnings(
+        {
+            "providers": {"router_only_allow_execution": ["claude-code"]},
+            "swarm": {
+                "host_execution_mode": "delegate",
+                "host_execution_mode_by_caller": {"github-copilot": "delegate"},
+            },
+        }
+    )
+    assert any("router_only_allow_execution" in item for item in warnings)
+    assert any("host_execution_mode is delegate" in item for item in warnings)
+    assert any("github-copilot" in item for item in warnings)

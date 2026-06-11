@@ -11,17 +11,20 @@ receipts.
 ## Decision tree: host-native vs delegate
 
 ```text
+route_task / plan_task  →  host_spawn / host_spawn_waves  →  host Agent/Task
+execute_subtask         →  cross-backend only (explicit provider_id)
+execute_swarm           →  host_native default; delegate opt-in
+
 route_task(task)
   │
   ├─ execution_hint.mode == host_native
-  │    ├─ low tier  → direct edits or host Task tool (avoid subprocess billing)
-  │    ├─ medium     → host Task agent (sonnet-class)
-  │    └─ high       → host Task agent or execute_swarm
+  │    ├─ low tier  → direct edits or host_spawn.method direct_edit
+  │    ├─ medium/high → host_spawn / host_spawn_waves via Agent or Task tool
+  │    └─ swarms     → execute_swarm returns awaiting_host_execution + waves
   │
-  └─ execution_hint.mode == delegate
-       └─ execute_subtask → cheapest routable backend in delegation_targets
-            (Copilot, Codex, Cursor, endpoints, Aider, …)
-            NOT claude-code / gemini-cli by default (router-only hosts)
+  └─ cross-backend only
+       └─ execute_subtask(provider_id=...) when target is in delegation_targets
+            Same-host execute_subtask returns HostNativeRequired
 ```
 
 Read `execution_hint.economics` on every `route_task` response for
@@ -34,7 +37,6 @@ Read `execution_hint.economics` on every `route_task` response for
 |------|--------|---------------|
 | **GitHub Copilot** | Host edits; `gpt-5-mini` for low tier | Cross-backend work needs Codex/Cursor |
 | **Claude Code** | Task tool; router-only — no subprocess to `claude` | Explicit opt-in only (`router_only_allow_execution`) |
-| **Gemini CLI** | Task tool; router-only host | Delegate to Copilot/Codex for cross-backend |
 | **Codex / Cursor** | Host-native Task + edits | Another CLI is cheaper for low-tier boilerplate |
 | **Junie / OpenCode** | Host defaults for their tier pins | Medium/high work via swarm or delegate |
 

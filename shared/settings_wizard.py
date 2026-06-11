@@ -29,7 +29,6 @@ HOST_CLIS = [
     "claude-code",
     "github-copilot",
     "github-copilot-cli",
-    "gemini-cli",
     "codex",
     "cursor",
     "opencode",
@@ -48,17 +47,6 @@ FALLBACK_PROVIDERS: list[dict] = [
         "available": True,
         "routeable": True,
         "models": {"low": "haiku", "medium": "sonnet", "high": "opus"},
-        "billing": "subscription",
-    },
-    {
-        "name": "gemini-cli",
-        "available": True,
-        "routeable": True,
-        "models": {
-            "low": "gemini-2.5-flash-lite",
-            "medium": "gemini-2.5-flash",
-            "high": "gemini-2.5-pro",
-        },
         "billing": "subscription",
     },
     {
@@ -97,7 +85,6 @@ except Exception:
     SUPPORTED_ROUTING_POLICY_SHELLS = (  # type: ignore[assignment]
         "claude-code",
         "github-copilot-cli",
-        "gemini-cli",
         "cursor",
         "codex",
     )
@@ -162,7 +149,7 @@ def _provider_models(p: Mapping) -> Mapping:
     return {}
 
 
-ROUTER_ONLY_HOSTS = frozenset({"claude-code", "gemini-cli"})
+ROUTER_ONLY_HOSTS = frozenset({"claude-code"})
 
 
 def _provider_label(p: dict) -> str:
@@ -651,6 +638,37 @@ def _write_config(
     log.debug("Config written to %s", config_path)
 
 
+
+def _host_native_policy_warnings(config: Mapping) -> list[str]:
+    """Return operator warnings for risky host-native policy overrides."""
+    warnings: list[str] = []
+    providers = config.get("providers")
+    if isinstance(providers, Mapping):
+        allow = providers.get("router_only_allow_execution")
+        if isinstance(allow, list) and allow:
+            warnings.append(
+                "providers.router_only_allow_execution is set — subprocess delegation to router-only hosts "
+                "(e.g. claude-code) may violate Anthropic subscription/OAuth policy. See docs/LEGAL.md."
+            )
+    swarm = config.get("swarm")
+    if isinstance(swarm, Mapping):
+        mode = str(swarm.get("host_execution_mode") or "").strip().lower()
+        by_caller = swarm.get("host_execution_mode_by_caller")
+        if mode == "delegate":
+            warnings.append(
+                "swarm.host_execution_mode is delegate — execute_swarm will subprocess other CLIs instead of "
+                "returning host_spawn_waves (higher billing and policy surface)."
+            )
+        if isinstance(by_caller, Mapping):
+            for caller_id, caller_mode in by_caller.items():
+                if str(caller_mode or "").strip().lower() == "delegate":
+                    warnings.append(
+                        f"swarm.host_execution_mode_by_caller.{caller_id} is delegate — that host will use "
+                        "legacy subprocess swarm fanout."
+                    )
+    return warnings
+
+
 # ---------------------------------------------------------------------------
 # Page 4 — Review and confirm
 # ---------------------------------------------------------------------------
@@ -684,6 +702,9 @@ def _page4_rich(
     )
     preview_yaml = _dump_yaml(preview)
     console.print(Syntax(preview_yaml, "yaml", theme="monokai"))
+    existing_cfg = _load_yaml_mapping(config_path)
+    for warning in _host_native_policy_warnings(existing_cfg):
+        console.print(f"[yellow]Policy warning:[/yellow] {warning}")
 
     confirm = questionary.confirm("Write config.yaml?", default=True).ask()
     if not confirm:
@@ -716,6 +737,9 @@ def _page4_plain(
     print("\n=== Step 4/4 — Review & Confirm ===")
     print(f"Will write: {config_path}\n")
     print(_dump_yaml(preview))
+    existing_cfg = _load_yaml_mapping(config_path)
+    for warning in _host_native_policy_warnings(existing_cfg):
+        print(f"Policy warning: {warning}")
 
     raw = input("Write config.yaml? (Y/n): ").strip().lower()
     if raw in ("n", "no"):

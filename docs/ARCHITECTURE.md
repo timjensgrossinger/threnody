@@ -29,12 +29,14 @@ Threnody mcp_server.py  (coordination layer)
 | **Host-native** | Default for MCP host shells | Host Task tool, direct edits, host-configured local/API backends |
 | **Delegated** | Operator routes to another backend | `execute_subtask` → Copilot, Codex, Cursor, endpoints, Aider, etc. |
 
-Claude Code and Gemini CLI are **router-only hosts** by default: Threnody registers
-as MCP inside them but does not subprocess their CLIs for delegated work unless
-the operator opts in via `providers.router_only_allow_execution`.
+Claude Code is a **router-only host** by default: Threnody registers as MCP
+inside it but does not subprocess `claude` for delegated work unless the
+operator opts in via `providers.router_only_allow_execution`.
 
-`route_task` returns `execution_hint` with `mode: host_native | delegate` and
-`delegation_targets` listing routable backends for the tier.
+`route_task` and `plan_task` return `host_spawn` / `host_spawn_waves` plus
+`execution_hint` with `mode: host_native | delegate` and `delegation_targets`.
+`execute_subtask` is cross-backend only for host callers (`HostNativeRequired` otherwise).
+`execute_swarm` defaults to `host_native` plan handoff (`awaiting_host_execution`).
 
 ## Guarded vs advisory routing
 
@@ -77,4 +79,4 @@ created by the operator or the MCP host.
 - Missing required verify-gate tools fail instead of passing silently.
 - OpenCode is low-only by default; Junie is medium-only by default.
 - Windsurf is detect-only and never selected for execution.
-- `claude-code` and `gemini-cli` are router-only by default for delegated execution.
+- `claude-code` is router-only by default for delegated execution.

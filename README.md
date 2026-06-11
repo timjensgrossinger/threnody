@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/hero.svg" alt="Threnody — local-first MCP meta-harness for AI coding CLIs" width="100%">
+  <img src="docs/assets/hero.svg" alt="Threnody — local-first MCP meta-harness — plan in Threnody, execute via `host_spawn` / `host_spawn_waves` in the host shell; `execute_subtask` is cross-backend only for AI coding CLIs" width="100%">
 </p>
 
 <h1 align="center">Threnody</h1>
@@ -53,7 +53,7 @@ Docs: [limitations](docs/RELEASE_LIMITATIONS.md) · [legal](docs/LEGAL.md) · [a
 
 **Threnody** is a local-first **MCP meta-harness** for developer workflows. Register it in Claude Code, Copilot CLI, Gemini, Codex, Cursor, or Junie — the **host shell executes** work while Threnody **coordinates** routing, planning, swarms, cross-session memory, and approval-gated learned agents.
 
-Optional **delegation** via `execute_subtask` routes to other installed CLIs (Copilot, Codex, Cursor, endpoints, Aider, …). Claude Code and Gemini CLI are **router-only hosts** by default: coordination anchors, not subprocess delegation targets.
+Optional **delegation** via `execute_subtask` routes to other installed CLIs (Copilot, Codex, Cursor, endpoints, Aider, …). Claude Code is a **router-only host** by default: a coordination anchor, not a subprocess delegation target.
 
 Search terms that describe the same project: **MCP orchestrator**, **meta-harness**, **multi-agent coding**, **swarm coordination**, **self-learning agents**, **Copilot / Claude / Gemini orchestration**.
 
@@ -179,7 +179,6 @@ Workflow guide: [docs/COST_SAVINGS.md](docs/COST_SAVINGS.md)
 | Provider | Binary | Role | Notes |
 |---|---|---|---|
 | **Claude Code** | `claude` | Host (router-only) | MCP coordination anchor; host executes by default |
-| **Gemini CLI** | `gemini` | Host (router-only) | MCP coordination anchor; host executes by default |
 | **GitHub Copilot** | `gh` | Host + delegation | Core host; routable for cross-backend work |
 | **OpenAI Codex** | `codex` | Host + delegation | Host shell + subprocess execution |
 | **Cursor** | `cursor-agent` | Host + delegation | Host shell + subprocess execution |
@@ -207,7 +206,7 @@ Full compatibility matrix: [docs/PROVIDER_COMPATIBILITY.md](docs/PROVIDER_COMPAT
 │ Agent # │ Tier │ Model               │ Provider         │ Target files                │
 ├─────────┼──────┼─────────────────────┼──────────────────┼─────────────────────────────┤
 │ 1       │ low  │ gpt-5-mini          │ GitHub Copilot   │ config.py                   │
-│ 2       │ low  │ gemini-2.5-flash-lite│ Gemini CLI      │ models.py                   │
+│ 2       │ low  │ o4-mini             │ OpenAI Codex     │ models.py                   │
 │ 3       │ med  │ sonnet              │ Claude Code      │ main.py                     │
 └─────────┴──────┴─────────────────────┴──────────────────┴─────────────────────────────┘
 ```
@@ -217,8 +216,8 @@ Full compatibility matrix: [docs/PROVIDER_COMPATIBILITY.md](docs/PROVIDER_COMPAT
 ```
 📊 Build complete — 3 agents, 1 wave
    GitHub Copilot: 1 agent (gpt-5-mini, free)
+   OpenAI Codex:   1 agent (o4-mini)
    Claude Code:    1 agent (sonnet, ~13k tokens)
-   Gemini CLI:     1 agent (flash-lite, free)
 ```
 
 ---
@@ -295,7 +294,7 @@ warranty; limitation of liability). You are solely responsible for determining
 whether your routing patterns comply with each provider's current terms.
 
 **Default execution model:** host shells execute via Task tool and direct edits.
-Claude Code and Gemini CLI are router-only coordination anchors — not default
+Claude Code is a router-only coordination anchor — not a default
 `execute_subtask` targets. Override only via `providers.router_only_allow_execution`.
 
 Operator responsibilities and provider links: [docs/LEGAL.md](docs/LEGAL.md)

@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 _PROVIDER_CLASS_MAP: dict[str, tuple[str, str]] = {
     "github-copilot": ("copilot.providers", "CopilotProvider"),
     "claude-code":    ("claude-code.providers", "ClaudeCodeProvider"),
-    "gemini-cli":     ("gemini.providers", "GeminiProvider"),
     "codex":          ("codex.providers", "CodexProvider"),
 }
 

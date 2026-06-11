@@ -34,11 +34,6 @@ _SUGGEST: dict[str, dict[str, str]] = {
         "binary_missing":  "run install.sh",
         "quota_exceeded":  "check Anthropic billing",
     },
-    "gemini-cli": {
-        "auth_expired":    "gemini auth login  (or set GEMINI_API_KEY)",
-        "binary_missing":  "run install.sh",
-        "quota_exceeded":  "check Google AI quota",
-    },
 }
 _DEFAULT_SUGGEST = {
     "auth_expired":   "re-authenticate the provider",

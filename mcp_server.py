@@ -114,6 +114,14 @@ from shared.discovery import (
     get_registry,
 )
 from shared.config import normalize_caller_id, normalize_routing_policy_shell_id
+from shared.host_spawn import (
+    COMPLIANCE_WARNING,
+    build_host_native_required_response,
+    build_host_spawn,
+    build_host_spawn_waves,
+    effective_swarm_host_execution_mode,
+    would_self_delegate,
+)
 from shared.quota import ProviderQuotaService
 from shared.adapters import ProviderCapability
 from shared.snapshot import FileDiff, FileSnapshot, apply_unified_diff
@@ -1108,7 +1116,7 @@ TOOLS = [
         "description": (
             "Execute a prompt via the cheapest available AI CLI provider.\n\n"
             "Routes to the cheapest model for the given tier across all installed "
-            "CLI tools (GitHub Copilot, Claude Code, Gemini CLI). Falls back to "
+            "CLI tools (GitHub Copilot, Codex, Cursor, and others). Falls back to "
             "next cheapest on failure.\n\n"
             "When target_file is provided, writes the result directly to that path "
             "and returns file metadata. This is the preferred way to create files "
@@ -1800,6 +1808,7 @@ def handle_plan_task(args: dict) -> dict:
             )
             if guard is not None:
                 result["routing_guard"] = guard
+            _attach_host_spawn_metadata(result, config=config, caller=caller, task=task)
             return result
         except (json.JSONDecodeError, TypeError):
             pass
@@ -1852,6 +1861,7 @@ def handle_plan_task(args: dict) -> dict:
     )
     if guard is not None:
         result["routing_guard"] = guard
+    _attach_host_spawn_metadata(result, config=config, caller=caller, task=task)
     cacheable_result = dict(result)
     cacheable_result.pop("routing_guard", None)
     db.cache_put(task, json.dumps(cacheable_result), "planner")
@@ -1885,6 +1895,14 @@ def handle_fleet_plan(args: dict) -> dict:
                 )
                 if guard is not None:
                     cached_result["routing_guard"] = guard
+                _attach_host_spawn_metadata(cached_result.get("plan") or cached_result, config=config, caller=caller, task=task)
+                if isinstance(cached_result.get("fleet_waves"), list):
+                    cached_result["fleet_waves"] = _enrich_fleet_waves_with_host_spawn(
+                        cached_result["fleet_waves"],
+                        cached_result.get("plan") or cached_result,
+                        config=config,
+                        caller=caller,
+                    )
                 return cached_result
             if "subtasks" in cached_result:
                 cached_result = _attach_models_to_subtasks(cached_result)
@@ -1897,6 +1915,13 @@ def handle_fleet_plan(args: dict) -> dict:
                     "execution_note": _fleet_note(len(fleet_waves)),
                     "cache_hit": True,
                 }
+                _attach_host_spawn_metadata(cached_result, config=config, caller=caller, task=task)
+                result["fleet_waves"] = _enrich_fleet_waves_with_host_spawn(
+                    fleet_waves,
+                    cached_result,
+                    config=config,
+                    caller=caller,
+                )
                 guard = _issue_routing_guard(
                     db,
                     caller=caller,
@@ -1907,6 +1932,14 @@ def handle_fleet_plan(args: dict) -> dict:
                 )
                 if guard is not None:
                     result["routing_guard"] = guard
+                _attach_host_spawn_metadata(result.get("plan") or result, config=config, caller=caller, task=task)
+                if isinstance(result.get("fleet_waves"), list):
+                    result["fleet_waves"] = _enrich_fleet_waves_with_host_spawn(
+                        result["fleet_waves"],
+                        result.get("plan") or result,
+                        config=config,
+                        caller=caller,
+                    )
                 return result
         except (json.JSONDecodeError, TypeError):
             pass
@@ -1921,9 +1954,16 @@ def handle_fleet_plan(args: dict) -> dict:
             "task": task,
         }
     plan_dict = _attach_models_to_subtasks(planner.plan_to_dict(plan))
+    _attach_host_spawn_metadata(plan_dict, config=config, caller=caller, task=task)
 
     fleet_waves = _attach_plan_routing_to_fleet_waves(
         plan_dict,
+    )
+    fleet_waves = _enrich_fleet_waves_with_host_spawn(
+        fleet_waves,
+        plan_dict,
+        config=config,
+        caller=caller,
     )
     result = {
         "plan": plan_dict,
@@ -1941,6 +1981,7 @@ def handle_fleet_plan(args: dict) -> dict:
     )
     if guard is not None:
         result["routing_guard"] = guard
+    _attach_host_spawn_metadata(result.get("plan") or result, config=config, caller=caller, task=task)
     cacheable_result = dict(result)
     cacheable_result.pop("routing_guard", None)
     db.cache_put(task, json.dumps(cacheable_result), "planner")
@@ -2473,6 +2514,154 @@ def _routing_profile_for_caller(config: TGsConfig, caller: str | None) -> Any:
         return None
     return config.routing_policy.effective_profile(shell_id)
 
+
+
+
+def _attach_host_spawn_metadata(
+    payload: dict[str, object],
+    *,
+    config: TGsConfig,
+    caller: str | None,
+    task: str | None = None,
+    tier: str | None = None,
+    execution_hint: dict[str, object] | None = None,
+) -> None:
+    """Attach host_spawn or host_spawn_waves for MCP host callers."""
+    if normalize_caller_id(caller) not in HOST_PROVIDER_NAMES:
+        return
+    if isinstance(payload.get("subtasks"), list) and isinstance(payload.get("waves"), list):
+        waves = build_host_spawn_waves(payload, config=config, caller=caller)
+        if waves:
+            payload["host_spawn_waves"] = waves
+        return
+    hint = execution_hint if isinstance(execution_hint, dict) else {}
+    if hint.get("mode") != "host_native":
+        return
+    resolved_tier = tier if isinstance(tier, str) and tier else "medium"
+    host_model = hint.get("host_native_model")
+    model = host_model if isinstance(host_model, str) and host_model.strip() else None
+    prompt = task if isinstance(task, str) else ""
+    payload["host_spawn"] = build_host_spawn(
+        config=config,
+        caller=caller,
+        tier=resolved_tier,
+        prompt=prompt,
+        model=model,
+    ).to_dict()
+
+
+def _enrich_fleet_waves_with_host_spawn(
+    fleet_waves: list[dict[str, object]],
+    plan_payload: dict[str, object],
+    *,
+    config: TGsConfig,
+    caller: str | None,
+) -> list[dict[str, object]]:
+    if normalize_caller_id(caller) not in HOST_PROVIDER_NAMES:
+        return fleet_waves
+    spawn_waves = build_host_spawn_waves(plan_payload, config=config, caller=caller)
+    spawn_by_id: dict[str, dict[str, object]] = {}
+    for wave in spawn_waves:
+        for agent in wave.get("agents", []):
+            if isinstance(agent, dict) and agent.get("id") is not None:
+                spawn_by_id[str(agent["id"])] = agent
+    enriched: list[dict[str, object]] = []
+    for wave in fleet_waves:
+        if not isinstance(wave, dict):
+            enriched.append(wave)
+            continue
+        next_wave = dict(wave)
+        agents = next_wave.get("agents")
+        if isinstance(agents, list):
+            next_agents: list[dict[str, object]] = []
+            for index, agent in enumerate(agents):
+                if not isinstance(agent, dict):
+                    next_agents.append(agent)
+                    continue
+                next_agent = dict(agent)
+                subtasks = plan_payload.get("subtasks")
+                spawn_key = None
+                if isinstance(subtasks, list) and index < len(subtasks):
+                    st = subtasks[index]
+                    if isinstance(st, dict) and st.get("id") is not None:
+                        spawn_key = str(st["id"])
+                if spawn_key and spawn_key in spawn_by_id:
+                    next_agent["host_spawn"] = spawn_by_id[spawn_key]
+                next_agents.append(next_agent)
+            next_wave["agents"] = next_agents
+        enriched.append(next_wave)
+    return enriched
+
+
+def _execute_swarm_host_native_response(
+    *,
+    config: TGsConfig,
+    db: Database,
+    planner: Planner,
+    swarm_id: str,
+    task_text: str,
+    caller: str | None,
+    request_meta: Mapping[str, object],
+    estimated_cost: float,
+) -> dict[str, object]:
+    try:
+        plan = planner.plan(task_text)
+    except PlannerParseError as exc:
+        return {
+            "error": "PlannerParseError",
+            "details": str(exc),
+            "parse_diagnostics_id": exc.parse_diagnostics_id,
+            "swarm_id": swarm_id,
+        }
+    plan_dict = _attach_models_to_subtasks(planner.plan_to_dict(plan))
+    _attach_host_spawn_metadata(plan_dict, config=config, caller=caller)
+    host_waves = plan_dict.get("host_spawn_waves")
+    if not isinstance(host_waves, list):
+        host_waves = []
+    try:
+        db.persist_swarm_run(
+            {
+                "swarm_id": swarm_id,
+                "task_hash": hashlib.sha256(task_text.encode()).hexdigest()[:16],
+                "status": "awaiting_host_execution",
+                "requested_agents": int(request_meta.get("requested_agents") or plan.total_agents),
+                "effective_agents": int(request_meta.get("effective_agents") or plan.total_agents),
+                "progress_counters": {"host_waves_total": len(host_waves)},
+                "topology": str(request_meta.get("topology") or plan.topology or "linear"),
+                "round": 0,
+                "resumable": False,
+                "resume_status": "awaiting_host_execution",
+            }
+        )
+    except Exception:
+        log.warning("host-native execute_swarm persist failed", exc_info=True)
+    _log_swarm_event_safe(
+        db,
+        swarm_id,
+        "host_native_handoff",
+        {"wave_count": len(host_waves), "task_chars": len(task_text)},
+    )
+    return {
+        "result": {
+            "swarm_id": swarm_id,
+            "host_execution_mode": "host_native",
+            "started": False,
+            "awaiting_host_execution": True,
+            "host_spawn_waves": host_waves,
+            "plan": plan_dict,
+            "cost_estimate": {
+                "estimated": float(estimated_cost),
+                "currency": "USD",
+                "unit": "credits",
+                "method": "fast_heuristic",
+            },
+            "execution_note": (
+                "Execute each host_spawn_waves entry via the host Agent/Task tool; "
+                "do not call execute_subtask for same-host work."
+            ),
+        },
+        "started": False,
+    }
 
 def _host_native_model_for_tier(
     config: TGsConfig,
@@ -3285,6 +3474,14 @@ def handle_route_task(args: dict) -> dict:
     )
     if guard is not None:
         result["routing_guard"] = guard
+    _attach_host_spawn_metadata(
+        result,
+        config=config,
+        caller=caller,
+        task=task,
+        tier=decision.tier,
+        execution_hint=execution_hint,
+    )
     _print_dispatch_info(
         tier=result.get("tier", decision.tier),
         model=result.get("model", model),
@@ -4701,6 +4898,20 @@ def handle_execute_swarm(args: dict) -> dict:
             },
         )
         
+        swarm_mode = effective_swarm_host_execution_mode(config, caller_id)
+        if swarm_mode == "host_native":
+            _, _, _, planner, _ = _ensure_init()
+            return _execute_swarm_host_native_response(
+                config=config,
+                db=db,
+                planner=planner,
+                swarm_id=swarm_id,
+                task_text=normalized_task_text,
+                caller=caller_id,
+                request_meta=request_meta,
+                estimated_cost=float(estimated_cost),
+            )
+
         # Spawn background runtime handoff (D-01, D-02) — preserve immediate return semantics
         _spawn_execute_swarm_runtime_handoff(
             db,
@@ -4710,6 +4921,20 @@ def handle_execute_swarm(args: dict) -> dict:
         )
         
         return {"result": initial_response, "started": True}
+
+    swarm_mode = effective_swarm_host_execution_mode(config, caller_id)
+    if swarm_mode == "host_native":
+        _, _, _, planner, _ = _ensure_init()
+        return _execute_swarm_host_native_response(
+            config=config,
+            db=db,
+            planner=planner,
+            swarm_id=swarm_id,
+            task_text=normalized_task_text,
+            caller=caller_id,
+            request_meta=request_meta,
+            estimated_cost=float(estimated_cost),
+        )
 
     started = True
     if budget_limit is not None and estimated_cost > budget_limit:
@@ -4829,14 +5054,12 @@ def _register_shell_adapters(registry: object) -> None:
     if not callable(register):
         return
     from copilot.providers_legacy import adapter_from_legacy as copilot_adapter
-    from gemini.providers_legacy import adapter_from_legacy as gemini_adapter
     from codex.providers_legacy import adapter_from_legacy as codex_adapter_from_legacy
     from junie.providers_legacy import adapter_from_legacy as junie_adapter_from_legacy
     from opencode.providers_legacy import adapter_from_legacy as opencode_adapter_from_legacy
     from cursor.providers_legacy import adapter_from_legacy as cursor_adapter_from_legacy
 
     register(copilot_adapter())
-    register(gemini_adapter())
     try:
         claude_adapter = importlib.import_module(
             "claude-code.providers_legacy"
@@ -7619,6 +7842,29 @@ def handle_execute_subtask(args: dict) -> dict:
     provenance_caller_id = str(provenance.get("caller_id", ""))
     routing_caller = caller or "mcp"
     caller_allowlists = getattr(_config, "caller_provider_allowlists", None) or None
+    if would_self_delegate(
+        registry,
+        caller=routing_caller,
+        tier=tier,
+        provider_id=provider_id,
+        caller_allowlists=caller_allowlists,
+        prefer_free=prefer_free,
+    ):
+        delegation_targets = _delegation_targets_for_tier(
+            registry,
+            tier,
+            caller=routing_caller,
+            caller_allowlists=caller_allowlists,
+        )
+        return build_host_native_required_response(
+            config=_config,
+            caller=routing_caller,
+            tier=tier,
+            prompt=str(prompt),
+            delegation_targets=delegation_targets,
+            target_file=target_file if isinstance(target_file, str) else None,
+        )
+
     if provenance_depth > 2:
         db.log_agent_result(
             session_id=caller or "mcp",

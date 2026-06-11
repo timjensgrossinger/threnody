@@ -12,7 +12,6 @@ from .config import CONFIG_YAML, ShellRoutingProfile, TGsConfig
 SHELL_LABELS = {
     "claude-code": "Claude Code",
     "github-copilot-cli": "GitHub Copilot CLI",
-    "gemini-cli": "Gemini CLI",
     "cursor": "Cursor",
     "codex": "OpenAI Codex",
     "junie": "JetBrains Junie",
@@ -59,7 +58,7 @@ def render_shell_instructions(
             "(Task tool, direct edits, host-configured backends).",
             "Use coordination tools first: `route_task`, `plan_task`, `execute_swarm`, `memory_*`, `learning_*`.",
             "`execute_subtask` is **delegation to other backends** (Copilot, Codex, Cursor, endpoints, Aider, …) — "
-            "not for subprocess routing to Claude Code or Gemini CLI host shells unless explicitly configured.",
+            "not for subprocess routing to Claude Code host shells unless explicitly configured.",
         ]
     )
     lines.append("")
@@ -101,9 +100,31 @@ def render_shell_instructions(
 
     lines.append("")
     lines.append(
-        "For low-tier work, prefer host-native edits or the Task tool; "
+        "For low-tier work, prefer direct edits or the host subagent tool from `host_spawn`; "
         "use `execute_subtask` only for cross-backend delegation."
     )
+
+    host_tool = "Agent" if profile.shell_id == "claude-code" else "Task"
+    lines.extend(
+        [
+            "",
+            "### Host-native execution contract",
+            "",
+            "After `route_task`, `plan_task`, or `fleet_plan`, consume `host_spawn` / `host_spawn_waves` from the MCP response.",
+            f"Spawn each wave with the host `{host_tool}` tool (or direct edits when `host_native_method` is `direct_edit`).",
+            "Do **not** call `execute_subtask` for same-host work — Threnody returns `HostNativeRequired` with an actionable `host_spawn` payload.",
+            "Use `execute_subtask(provider_id=...)` only for explicit cross-backend delegation when the provider appears in `delegation_targets`.",
+            "`execute_swarm` defaults to `host_native`: execute `host_spawn_waves` in the host shell; Threnody persists the plan as `awaiting_host_execution` without subprocess fanout.",
+        ]
+    )
+    if profile.shell_id == "claude-code":
+        lines.extend(
+            [
+                "",
+                "Claude Code uses the **`Agent`** tool for medium/high subtasks (`Task` is an alias when available).",
+                "Subprocess `claude -p` via `execute_subtask` requires `providers.router_only_allow_execution` and carries Anthropic subscription/OAuth policy risk — see docs/LEGAL.md.",
+            ]
+        )
 
     lines.append("")
     if profile.agent_transparency_required:
@@ -133,7 +154,6 @@ def render_shell_instructions(
         )
 
     return "\n".join(lines).rstrip() + "\n"
-
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Render Threnody instructions for one AI shell")

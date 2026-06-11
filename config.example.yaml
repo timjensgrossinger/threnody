@@ -11,6 +11,12 @@ parallelism:
 
 swarm:
   max_agents: 12
+  # host_native (default for MCP host shells): plan in Threnody, execute waves via host Agent/Task
+  # delegate: legacy subprocess orchestrator fanout (higher billing/policy surface)
+  host_execution_mode: host_native
+  # host_execution_mode_by_caller:
+  #   claude-code: host_native
+  #   github-copilot: host_native
 
 budgets:
   default_hard_cap_tokens: 1000
@@ -21,15 +27,17 @@ cache:
   backup_keep: 3
 
 providers:
-  # Router-only hosts (claude-code, gemini-cli) coordinate in the MCP host shell by default.
-  # They are excluded from execute_subtask delegation unless explicitly overridden:
+  # Router-only host (claude-code) coordinates in the MCP host shell by default.
+  # It is excluded from execute_subtask delegation unless explicitly overridden:
   #
   # router_only_allow_execution:
   #   - claude-code
-  #   - gemini-cli
+  #
+  # Override is lower risk when Claude Code uses API-key billing (pay-per-token).
+  # Subscription OAuth (Pro/Max) subprocess delegation carries provider-policy risk.
+  # Threnody cannot detect auth mode — verify before enabling. See docs/LEGAL.md.
   #
   # Safer delegation for non-Claude hosts: prefer copilot, codex, cursor — not host shells.
-  # See docs/LEGAL.md.
   #
   # preferred_routing_by_caller:
   #   github-copilot:

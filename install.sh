@@ -150,7 +150,6 @@ host_count = sum(
 env_lines = [
     f"HAS_GH={available('github-copilot')}",
     f"HAS_CLAUDE={available('claude-code')}",
-    f"HAS_GEMINI={available('gemini-cli')}",
     f"HAS_CODEX={available('codex')}",
     f"HAS_CURSOR={available('cursor')}",
     f"HAS_JUNIE={available('junie')}",
@@ -177,7 +176,6 @@ from pathlib import Path
 INSTALL_URLS = {
     "github-copilot": "https://cli.github.com",
     "claude-code": "https://docs.anthropic.com/en/docs/claude-code",
-    "gemini-cli": "https://github.com/google-gemini/gemini-cli",
     "codex": "https://developers.openai.com/codex/",
     "cursor": "https://www.cursor.com",
     "junie": "https://junie.jetbrains.com",
@@ -227,7 +225,7 @@ if [[ "$HOST_COUNT" -eq 0 ]]; then
     if [[ "$THRENODY_ALLOW_NO_HOST" == "1" ]]; then
         warn "No host CLI detected; continuing because THRENODY_ALLOW_NO_HOST=1"
     else
-        error "At least one host CLI ('gh', 'claude', 'gemini', 'codex', 'cursor-agent', 'junie', or 'opencode') must be installed"
+        error "At least one host CLI ('gh', 'claude', 'codex', 'cursor-agent', 'junie', or 'opencode') must be installed"
     fi
 fi
 
@@ -447,44 +445,6 @@ with open('$COPILOT_MCP_CONFIG', 'w') as f:
 " && info "Created $COPILOT_MCP_CONFIG with MCP registration"
 fi
 
-# Gemini CLI MCP registration via ~/.gemini/settings.json
-if [[ "$HAS_GEMINI" -eq 1 ]]; then
-    GEMINI_SETTINGS="$HOME/.gemini/settings.json"
-    mkdir -p "$HOME/.gemini"
-
-    if [[ -f "$GEMINI_SETTINGS" ]]; then
-        if grep -q "Threnody" "$GEMINI_SETTINGS" 2>/dev/null; then
-            info "Gemini CLI MCP already registered"
-        else
-            # shellcheck disable=SC2015
-            python3 -c "
-import json
-with open('$GEMINI_SETTINGS') as f:
-    cfg = json.load(f)
-mcps = cfg.setdefault('mcpServers', {})
-mcps['Threnody'] = {
-    'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py'],
-    'trust': True
-}
-with open('$GEMINI_SETTINGS', 'w') as f:
-    json.dump(cfg, f, indent=2)
-" && info "Registered MCP server in Gemini CLI" || warn "Could not update $GEMINI_SETTINGS — register manually"
-        fi
-    else
-        python3 -c "
-import json
-cfg = {'mcpServers': {'Threnody': {
-    'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py'],
-    'trust': True
-}}}
-with open('$GEMINI_SETTINGS', 'w') as f:
-    json.dump(cfg, f, indent=2)
-" && info "Created $GEMINI_SETTINGS with MCP registration"
-    fi
-fi
-
 # Codex CLI MCP registration via ~/.codex/config.toml
 if [[ "$HAS_CODEX" -eq 1 ]]; then
     CODEX_CONFIG="$HOME/.codex/config.toml"
@@ -677,7 +637,6 @@ echo "📝 Custom instructions (shell-specific coordination policy)"
 SYNCED_CLAUDE_INSTRUCTIONS=0
 SYNCED_CLAUDE_HOOKS=0
 SYNCED_COPILOT_INSTRUCTIONS=0
-SYNCED_GEMINI_INSTRUCTIONS=0
 SYNCED_CODEX_INSTRUCTIONS=0
 SYNCED_CURSOR_INSTRUCTIONS=0
 SYNCED_JUNIE_INSTRUCTIONS=0
@@ -707,7 +666,6 @@ except Exception as exc:
 shells = {
     "claude-code": ("claude-code", False),
     "github-copilot-cli": ("github-copilot-cli", False),
-    "gemini-cli": ("gemini-cli", False),
     "codex": ("codex", False),
     "cursor": ("cursor", True),
     "junie": ("junie", False),
@@ -816,6 +774,20 @@ path.write_text(new_content + "\n", encoding="utf-8")
 PY
 }
 
+
+install_threnody_tier_agents() {
+    local target_dir="$1"
+    if [[ ! -d "$INSTALL_DIR/shell/agents" ]]; then
+        return 0
+    fi
+    mkdir -p "$target_dir"
+    for tier_file in "$INSTALL_DIR/shell/agents"/threnody-*.md; do
+        [[ -f "$tier_file" ]] || continue
+        cp "$tier_file" "$target_dir/$(basename "$tier_file")"
+    done
+    info "Installed Threnody tier agent templates to $target_dir"
+}
+
 write_managed_file() {
     local target="$1"
     local body="$2"
@@ -848,6 +820,7 @@ if [[ "$HAS_CLAUDE" -eq 1 ]]; then
         sync_instruction_block "$CLAUDE_MD" "claude" "$CLAUDE_INSTRUCTIONS"
         info "Synced managed routing instructions to $CLAUDE_MD"
         SYNCED_CLAUDE_INSTRUCTIONS=1
+        install_threnody_tier_agents "$HOME/.claude/agents"
     fi
 
     if routing_hooks_enabled "claude-code"; then
@@ -982,20 +955,6 @@ if [[ -n "$COPILOT_INSTRUCTIONS" ]]; then
     fi
 fi
 
-# --- Gemini CLI instructions ---
-if [[ "$HAS_GEMINI" -eq 1 ]]; then
-    GEMINI_MD="$HOME/.gemini/GEMINI.md"
-    mkdir -p "$(dirname "$GEMINI_MD")"
-
-    GEMINI_INSTRUCTIONS=$(render_instruction_block "gemini-cli" 2>/dev/null)
-
-    if [[ -n "$GEMINI_INSTRUCTIONS" ]]; then
-        sync_instruction_block "$GEMINI_MD" "gemini" "$GEMINI_INSTRUCTIONS"
-        info "Synced managed routing instructions to $GEMINI_MD"
-        SYNCED_GEMINI_INSTRUCTIONS=1
-    fi
-fi
-
 # --- Codex instructions ---
 if [[ "$HAS_CODEX" -eq 1 ]]; then
     CODEX_AGENTS_MD="$HOME/.codex/AGENTS.md"
@@ -1019,6 +978,7 @@ if [[ "$HAS_CURSOR" -eq 1 ]]; then
         write_managed_file "$CURSOR_RULE_FILE" "$CURSOR_INSTRUCTIONS"
         info "Synced managed routing instructions to $CURSOR_RULE_FILE"
         SYNCED_CURSOR_INSTRUCTIONS=1
+        install_threnody_tier_agents "$HOME/.cursor/agents"
     fi
 fi
 
@@ -1059,9 +1019,6 @@ fi
 if [[ "$SYNCED_COPILOT_INSTRUCTIONS" -eq 1 && -e "$LEGACY_COPILOT_INSTRUCTIONS_MD" ]]; then
     echo "    ~/.github/copilot-instructions.md   Legacy Copilot copy"
 fi
-if [[ "$SYNCED_GEMINI_INSTRUCTIONS" -eq 1 ]]; then
-    echo "    ~/.gemini/GEMINI.md                  Gemini CLI"
-fi
 if [[ "$SYNCED_CODEX_INSTRUCTIONS" -eq 1 ]]; then
     echo "    ~/.codex/AGENTS.md                  OpenAI Codex"
 fi
@@ -1086,7 +1043,7 @@ if [[ "$HOST_COUNT" -ge 2 ]]; then
 elif [[ "$HOST_COUNT" -eq 1 ]]; then
     echo "  📎 Single host CLI detected — install another CLI to unlock delegation targets"
 fi
-if [[ "$HAS_GH" -eq 1 || "$HAS_GEMINI" -eq 1 ]]; then
+if [[ "$HAS_GH" -eq 1 ]]; then
     echo "     Host-native execution uses your CLI auth; delegate via execute_subtask when needed"
 fi
 if [[ "$HAS_OPENCODE" -eq 1 ]]; then

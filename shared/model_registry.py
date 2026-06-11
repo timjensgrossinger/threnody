@@ -102,11 +102,6 @@ BOOTSTRAP_REGISTRY: dict[str, tuple[DiscoveredModel, ...]] = {
         _model("sonnet", "medium", aliases=("claude-sonnet-4.6",)),
         _model("opus", "high", aliases=("claude-opus-4.6",)),
     ),
-    "gemini-cli": (
-        _model("gemini-2.5-flash-lite", "low"),
-        _model("gemini-2.5-flash", "medium"),
-        _model("gemini-2.5-pro", "high"),
-    ),
     "codex": (
         _model(
             "gpt-5.5",
@@ -392,21 +387,6 @@ def normalize_copilot_catalog(payload: dict[str, Any] | list[Any]) -> DiscoveryR
         provider_id="github-copilot",
         models=normalize_models(
             "github-copilot",
-            entries,
-            source="live_provider_catalog",
-        ),
-        source="live_provider_catalog",
-    )
-
-
-def normalize_gemini_catalog(payload: dict[str, Any] | list[Any]) -> DiscoveryResult | None:
-    entries = payload.get("models") if isinstance(payload, dict) else payload
-    if not isinstance(entries, list):
-        return None
-    return DiscoveryResult(
-        provider_id="gemini-cli",
-        models=normalize_models(
-            "gemini-cli",
             entries,
             source="live_provider_catalog",
         ),

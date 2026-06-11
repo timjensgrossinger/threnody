@@ -10,9 +10,8 @@ subscription limits from model context windows.
 | Provider | Status | Source |
 |---|---|---|
 | OpenAI Codex | Supported | `codex app-server` RPC `account/rateLimits/read` |
-| Claude Code | Interactive only | Usage views and limit errors exist, but no documented structured subscription-quota command |
+| Claude Code | Interactive only | Usage views and limit errors exist, but no documented structured subscription-quota command. When `router_only_allow_execution` is active on subscription auth, provider usage caps (e.g. June 2026 Agent SDK credits) may apply; Threnody does not read subscription quota programmatically |
 | GitHub Copilot CLI | Interactive only | `/usage`, footer, and status-line quota displays exist; billing REST usage does not universally include allowance or remaining quota |
-| Gemini CLI | Interactive only | `/stats` documents quota-limit information, but no stable structured remaining-quota output is documented |
 | Cursor | UI only | Account usage is visible in product UI; no documented structured CLI quota API |
 | JetBrains Junie | UI only | IDE/Junie license UI shows remaining AI Credits and reset timing; no documented structured CLI quota command |
 | OpenCode | Usage only | `opencode stats` reads local token/cost telemetry, not an upstream subscription allowance |

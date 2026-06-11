@@ -59,7 +59,7 @@ class TestOrderedExecutionCandidatesAllowlist:
 
     def test_allowlist_filters_to_allowed_only(self):
         pa = _make_provider("claude-code")
-        pb = _make_provider("gemini-cli")
+        pb = _make_provider("codex")
         pc = _make_provider("blackbox-ai")
         reg = _make_registry(pa, pb, pc)
         with patch.object(reg, "get_providers_for_tier", return_value=[pa, pb, pc]):
@@ -70,19 +70,19 @@ class TestOrderedExecutionCandidatesAllowlist:
                 )
         assert [p.name for p in selected] == ["claude-code", "blackbox-ai"]
         assert len(excluded) == 1
-        assert excluded[0]["provider"] == "Gemini Cli"
+        assert excluded[0]["provider"] == "Codex"
         assert (
             "not in caller allowlist for github-copilot" in excluded[0]["reason"]
             or "router-only host" in excluded[0]["reason"]
         )
 
     def test_exclusion_reason_includes_caller(self):
-        pa, pb = _make_provider("claude-code"), _make_provider("gemini-cli")
+        pa, pb = _make_provider("claude-code"), _make_provider("codex")
         reg = _make_registry(pa, pb)
         with patch.object(reg, "get_providers_for_tier", return_value=[pa, pb]):
             with patch.object(reg, "list_adapters", return_value=[]):
                 _, excluded = reg._ordered_execution_candidates("low", caller="my-caller", caller_allowlists={"my-caller": ["claude-code"]})
-        assert excluded[0]["provider"] == "Gemini Cli"
+        assert excluded[0]["provider"] == "Codex"
         assert (
             "my-caller" in excluded[0]["reason"]
             or "router-only host" in excluded[0]["reason"]
@@ -100,7 +100,7 @@ class TestOrderedExecutionCandidatesAllowlist:
 
     def test_case_insensitive(self):
         pa = _make_provider("Claude-Code")
-        pb = _make_provider("gemini-cli")
+        pb = _make_provider("codex")
         reg = _make_registry(pa, pb)
         with patch.object(reg, "get_providers_for_tier", return_value=[pa, pb]):
             with patch.object(reg, "list_adapters", return_value=[]):
@@ -109,7 +109,7 @@ class TestOrderedExecutionCandidatesAllowlist:
 
     def test_allowlist_applies_to_caller_aliases(self):
         pa = _make_provider("claude-code")
-        pb = _make_provider("gemini-cli")
+        pb = _make_provider("codex")
         reg = _make_registry(pa, pb)
         with patch.object(reg, "get_providers_for_tier", return_value=[pa, pb]):
             with patch.object(reg, "list_adapters", return_value=[]):
@@ -121,7 +121,7 @@ class TestOrderedExecutionCandidatesAllowlist:
 
         assert [p.name for p in selected] == ["claude-code"]
         assert len(excluded) == 1
-        assert excluded[0]["provider"] == "Gemini Cli"
+        assert excluded[0]["provider"] == "Codex"
         assert (
             "not in caller allowlist for github-copilot-cli" in excluded[0]["reason"]
             or "router-only host" in excluded[0]["reason"]

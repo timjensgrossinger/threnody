@@ -34,14 +34,14 @@ def temp_catalog(temp_db_fixture):
 
 def test_successful_refresh_does_not_merge_static_bootstrap(temp_catalog: ModelCatalog):
     temp_catalog.refresh(
-        "gemini-cli",
-        [{"model_id": "gemini-2.5-flash-lite"}],
+        "catalog-test-provider",
+        [{"model_id": "test-model-a"}],
     )
 
-    stored = temp_catalog.get("gemini-cli")
+    stored = temp_catalog.get("catalog-test-provider")
     model_ids = {entry["model_id"] for entry in stored}
 
-    assert model_ids == {"gemini-2.5-flash-lite"}
+    assert model_ids == {"test-model-a"}
     assert all(entry["source"] == "live_provider_catalog" for entry in stored)
 
 
@@ -57,22 +57,22 @@ def test_unknown_cost_models_not_auto_routeable(temp_catalog: ModelCatalog):
 
 
 def test_stale_while_refresh_non_blocking(temp_catalog: ModelCatalog, temp_db_fixture):
-    temp_catalog.refresh("gemini-cli", [{"model_id": "gemini-2.5-flash-lite"}])
+    temp_catalog.refresh("catalog-test-provider", [{"model_id": "test-model-a"}])
 
     with temp_db_fixture.conn() as conn:
         conn.execute(
             "UPDATE model_catalog SET stale_until = ? WHERE provider = ?",
-            (int(time.time()) - 1, "gemini-cli"),
+            (int(time.time()) - 1, "catalog-test-provider"),
         )
 
     provider = CLIProvider(
-        name="gemini-cli",
-        binary="gemini",
-        display_name="Gemini CLI",
-        tier_models={"low": "gemini-2.5-flash-lite"},
+        name="catalog-test-provider",
+        binary="catalog-test-bin",
+        display_name="Catalog Test Provider",
+        tier_models={"low": "test-model-a"},
         cost_rank={"low": 0},
-        model_discovery_cmd=["gemini", "models"],
-        model_discovery_parser=lambda p, raw: {"gemini-cli": [raw.strip()]},
+        model_discovery_cmd=["catalog-test-bin", "models"],
+        model_discovery_parser=lambda p, raw: {"catalog-test-provider": [raw.strip()]},
         readiness=ProviderReadiness(
             routeable=True,
             reason=DetectReason.READY,
@@ -83,7 +83,7 @@ def test_stale_while_refresh_non_blocking(temp_catalog: ModelCatalog, temp_db_fi
 
     def slow_run(*_args, **_kwargs):
         time.sleep(0.05)
-        return MagicMock(returncode=0, stdout="gemini-2.5-flash-lite")
+        return MagicMock(returncode=0, stdout="test-model-a")
 
     with patch("shared.model_catalog.subprocess.run", side_effect=slow_run):
         worker = threading.Thread(
@@ -92,29 +92,29 @@ def test_stale_while_refresh_non_blocking(temp_catalog: ModelCatalog, temp_db_fi
             daemon=True,
         )
         worker.start()
-        stale_models = temp_catalog.get("gemini-cli")
+        stale_models = temp_catalog.get("catalog-test-provider")
         worker.join(timeout=1)
 
-    assert any(entry["model_id"] == "gemini-2.5-flash-lite" for entry in stale_models)
+    assert any(entry["model_id"] == "test-model-a" for entry in stale_models)
     assert all("stale_until" in entry for entry in stale_models)
 
 
 def test_refresh_cooldown_keeps_last_good_catalog(temp_catalog: ModelCatalog):
-    temp_catalog.refresh("gemini-cli", [{"model_id": "gemini-2.5-flash-lite"}])
+    temp_catalog.refresh("catalog-test-provider", [{"model_id": "test-model-a"}])
     with temp_catalog._db.conn() as conn:
         conn.execute(
             "UPDATE model_catalog SET stale_until = ? WHERE provider = ?",
-            (int(time.time()) - 1, "gemini-cli"),
+            (int(time.time()) - 1, "catalog-test-provider"),
         )
 
     provider = CLIProvider(
-        name="gemini-cli",
-        binary="gemini",
-        display_name="Gemini CLI",
-        tier_models={"low": "gemini-2.5-flash-lite"},
+        name="catalog-test-provider",
+        binary="catalog-test-bin",
+        display_name="Catalog Test Provider",
+        tier_models={"low": "test-model-a"},
         cost_rank={"low": 0},
-        model_discovery_cmd=["gemini", "models"],
-        model_discovery_parser=lambda p, raw: {"gemini-cli": [raw.strip()]},
+        model_discovery_cmd=["catalog-test-bin", "models"],
+        model_discovery_parser=lambda p, raw: {"catalog-test-provider": [raw.strip()]},
         readiness=ProviderReadiness(
             routeable=True,
             reason=DetectReason.READY,
@@ -128,24 +128,24 @@ def test_refresh_cooldown_keeps_last_good_catalog(temp_catalog: ModelCatalog):
         for _ in range(3):
             temp_catalog.refresh_all(registry)
 
-    state = temp_catalog.provider_state("gemini-cli")
-    stored = temp_catalog.get("gemini-cli")
+    state = temp_catalog.provider_state("catalog-test-provider")
+    stored = temp_catalog.get("catalog-test-provider")
 
     assert state["failed_refresh_count"] == 3
     assert float(state["cooldown_until"]) >= float(state["last_failure_ts"])
-    assert any(entry["model_id"] == "gemini-2.5-flash-lite" for entry in stored)
+    assert any(entry["model_id"] == "test-model-a" for entry in stored)
     assert provider.readiness.reason is DetectReason.STALE_BUT_ROUTEABLE
 
 
 def test_refresh_all_marks_pending_provider_ready_after_success(temp_catalog: ModelCatalog):
     provider = CLIProvider(
-        name="gemini-cli",
-        binary="gemini",
-        display_name="Gemini CLI",
-        tier_models={"low": "gemini-2.5-flash-lite"},
+        name="catalog-test-provider",
+        binary="catalog-test-bin",
+        display_name="Catalog Test Provider",
+        tier_models={"low": "test-model-a"},
         cost_rank={"low": 0},
-        model_discovery_cmd=["gemini", "models"],
-        model_discovery_parser=lambda p, raw: {"gemini-cli": [raw.strip()]},
+        model_discovery_cmd=["catalog-test-bin", "models"],
+        model_discovery_parser=lambda p, raw: {"catalog-test-provider": [raw.strip()]},
         readiness=ProviderReadiness(
             routeable=False,
             reason=DetectReason.CATALOG_PENDING,
@@ -156,7 +156,7 @@ def test_refresh_all_marks_pending_provider_ready_after_success(temp_catalog: Mo
 
     with patch(
         "shared.model_catalog.subprocess.run",
-        return_value=MagicMock(returncode=0, stdout="gemini-2.5-flash-lite"),
+        return_value=MagicMock(returncode=0, stdout="test-model-a"),
     ):
         temp_catalog.refresh_all(registry)
 
@@ -328,16 +328,16 @@ def test_refresh_all_seeds_catalog_for_endpoint_provider_without_discovery_cmd(t
 
 def test_refresh_skips_malformed_discovered_entries(temp_catalog: ModelCatalog):
     temp_catalog.refresh(
-        "gemini-cli",
+        "catalog-test-provider",
         [
-            {"model_id": "gemini-2.5-flash-lite"},
+            {"model_id": "test-model-a"},
             {"broken": "entry"},
         ],
     )
 
-    stored = temp_catalog.get("gemini-cli")
+    stored = temp_catalog.get("catalog-test-provider")
 
-    assert any(entry["model_id"] == "gemini-2.5-flash-lite" for entry in stored)
+    assert any(entry["model_id"] == "test-model-a" for entry in stored)
 
 
 def test_rank_models_with_price_data_uses_bundled_snapshot():
@@ -350,7 +350,7 @@ def test_rank_models_with_price_data_uses_bundled_snapshot():
 
 def test_rank_models_with_price_data_rejects_missing_model_id():
     with pytest.raises(ValueError, match="model_id"):
-        rank_models_with_price_data([{"provider": "gemini-cli"}])
+        rank_models_with_price_data([{"provider": "catalog-test-provider"}])
 
 
 def test_load_price_data_caches_empty_snapshot(tmp_path, monkeypatch):

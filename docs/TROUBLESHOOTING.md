@@ -7,7 +7,6 @@ Check registration in your host shell config:
 ```bash
 cat ~/.copilot/mcp-config.json   # Copilot
 cat ~/.claude.json                # Claude Code
-cat ~/.gemini/settings.json       # Gemini CLI
 cat ./opencode.json              # OpenCode (project-local)
 cat ~/.codex/config.toml          # Codex
 cat ~/.cursor/mcp.json            # Cursor
@@ -23,8 +22,7 @@ Threnody requires Python 3.10+. Ensure `python3` is on your PATH.
 ## Models not available
 
 - **GitHub Copilot**: Requires a Copilot subscription.
-- **Gemini CLI**: Free tier includes flash models. Run `gemini` → `/model`.
-- **Claude Code**: Requires Claude Pro or Team.
+- **Claude Code**: Requires Claude Pro or Team (or API-key billing when configured).
 - **OpenCode**: Auto-routes low-tier only by default.
 
 Use `threnody inspect status --project . --details` or MCP `check_providers()` for live diagnostics.

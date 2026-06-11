@@ -288,7 +288,6 @@ def caller_from_client_name(client_name: str | None) -> str | None:
     aliases = (
         ("claude", "claude-code"),
         ("copilot", "github-copilot"),
-        ("gemini", "gemini-cli"),
         ("codex", "codex"),
         ("cursor", "cursor"),
         ("junie", "junie"),
@@ -1120,7 +1119,6 @@ class CLIProvider:
           (model flag omitted; the default model is gpt-5-mini)
         * **claude-code**    — ``claude -p "<prompt>" --model <model>``
           with optional ``--effort <value>`` when provided
-        * **gemini-cli**     — ``gemini -p "<prompt>"`` (ignores effort)
 
         When *code_only* is True, provider-specific flags are added to
         suppress agentic behaviour (tool use, MCP loading) so the model
@@ -1161,11 +1159,6 @@ class CLIProvider:
             if effort:
                 cmd.extend(["--effort", effort])
             return cmd
-
-        if self.name == "gemini-cli":
-            # Gemini CLI supports --model to select a specific model.
-            # No effort flag is added here; keep the built-in path truthful.
-            return ["gemini", "-p", prompt, "--model", model]
 
         # Generic fallback: binary -p prompt --model model
         logger.warning(
@@ -2317,22 +2310,6 @@ BUILTIN_PROVIDERS: list[CLIProvider] = [
         model_discovery_adapter=ClaudeModelDiscoveryAdapter(),
     ),
     CLIProvider(
-        name="gemini-cli",
-        binary="gemini",
-        display_name="Gemini CLI",
-        tier_models=bootstrap_tier_map("gemini-cli"),
-        cost_rank={
-            "low": 0,    # FREE
-            "medium": 1,
-            "high": 2,
-        },
-        billing_model="subscription",
-        detect_cmd=None,
-        model_discovery_adapter=CallbackModelDiscoveryAdapter(
-            "gemini-cli", source="gemini_provider_catalog"
-        ),
-    ),
-    CLIProvider(
         name="codex",
         binary="codex",
         display_name="OpenAI Codex",
@@ -2485,7 +2462,6 @@ BUILTIN_PROVIDERS: list[CLIProvider] = [
 HOST_PROVIDER_NAMES = frozenset({
     "github-copilot",
     "claude-code",
-    "gemini-cli",
     "codex",
     "cursor",
     "junie",
@@ -2493,7 +2469,7 @@ HOST_PROVIDER_NAMES = frozenset({
 })
 
 # Host CLIs used for MCP coordination; not subprocess execution targets by default.
-ROUTER_ONLY_PROVIDERS = frozenset({"claude-code", "gemini-cli"})
+ROUTER_ONLY_PROVIDERS = frozenset({"claude-code"})
 
 
 def installer_provider_inventory(
@@ -2598,7 +2574,6 @@ def installer_provider_inventory(
 _SHELL_NAME_ALIASES: dict[str, list[str]] = {
     "github-copilot": ["copilot", "github-copilot", "github-copilot-cli", "gh"],
     "claude-code": ["claude", "claude-code"],
-    "gemini-cli": ["gemini", "gemini-cli"],
     "codex": ["codex", "openai-codex"],
     "junie": ["junie", "jetbrains-junie"],
     "opencode": ["opencode"],

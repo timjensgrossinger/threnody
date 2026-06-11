@@ -49,14 +49,14 @@ def test_codex_cache_drives_low_tier_without_one_off_model_pin(tmp_path):
 
 def test_new_and_removed_live_models_replace_previous_catalog(tmp_path):
     catalog = ModelCatalog(Database(tmp_path / "catalog.db"))
-    catalog.refresh("gemini-cli", [
+    catalog.refresh("catalog-test-provider", [
         {"model_id": "old-model", "capabilities": ["fast"]},
     ])
-    catalog.refresh("gemini-cli", [
+    catalog.refresh("catalog-test-provider", [
         {"model_id": "new-model", "capabilities": ["fast"]},
     ])
 
-    assert [row["model_id"] for row in catalog.get("gemini-cli")] == ["new-model"]
+    assert [row["model_id"] for row in catalog.get("catalog-test-provider")] == ["new-model"]
 
 
 def test_alias_resolves_renamed_model():

@@ -99,36 +99,6 @@ def test_claude_entry_falls_back_when_adapter_callable_missing() -> None:
     assert isinstance(entry._resolve_provider(), entry.ClaudeCodeProvider)
 
 
-def test_gemini_entry_uses_adapter() -> None:
-    """gemini.entry resolves its provider through ProviderRegistry.resolve_adapter()."""
-    import gemini.entry as entry
-
-    provider = entry.GeminiProvider()
-    registry = StubRegistry(_adapter_for(provider, "gemini"))
-    entry.get_registry = lambda: registry
-    entry.adapter_from_legacy = lambda _provider=None: registry.adapter
-
-    assert entry._resolve_provider() is provider
-    assert registry.resolved_shells == ["gemini"]
-
-
-def test_gemini_entry_falls_back_when_adapter_callable_missing() -> None:
-    import gemini.entry as entry
-
-    adapter = ProviderAdapter(
-        name="gemini",
-        version="legacy-1",
-        capabilities=[ProviderCapability.EXECUTE],
-        metadata={"shell_names": ["gemini"]},
-        callables={},
-    )
-    registry = StubRegistry(adapter)
-    entry.get_registry = lambda: registry
-    entry.adapter_from_legacy = lambda _provider=None: registry.adapter
-
-    assert isinstance(entry._resolve_provider(), entry.GeminiProvider)
-
-
 # ---------------------------------------------------------------------------
 # codex / cursor / junie: registry resolution + _open_db config path
 # ---------------------------------------------------------------------------

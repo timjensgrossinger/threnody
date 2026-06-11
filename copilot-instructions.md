@@ -12,7 +12,7 @@ This project is now focused on making that orchestration adapt better to your co
 ### Constraints
 
 - **Tech stack**: Keep the current Python + shell + SQLite architecture — improvements should extend the existing shared core rather than replace it
-- **Compatibility**: First-class support must cover Claude Code CLI, GitHub Copilot CLI, and Gemini CLI
+- **Compatibility**: First-class support must cover Claude Code CLI and GitHub Copilot CLI
 - **Quality**: Cheapest execution is only acceptable when it still satisfies the task's quality requirements
 - **Cost**: Token spend should be minimized under the quality bar, not optimized in isolation
 - **Architecture**: Preserve the shared-brain / multiple-entry-point pattern already established in `shared/`, `copilot/`, `claude-code/`, and `mcp_server.py`
@@ -150,7 +150,7 @@ This project is now focused on making that orchestration adapt better to your co
 - Used by: Entry points, `mcp_server.py`
 - Purpose: Universal cross-provider execution bridge — detect installed CLIs, route to cheapest available
 - Location: `shared/discovery.py`
-- Contains: `CLIProvider` dataclass, `ProviderRegistry` singleton, `BUILTIN_PROVIDERS` list (github-copilot, claude-code, gemini-cli), output cleaning regexes, caller auto-detection, sandbox isolation for subprocess calls
+- Contains: `CLIProvider` dataclass, `ProviderRegistry` singleton, `BUILTIN_PROVIDERS` list (github-copilot, claude-code, codex, …), output cleaning regexes, caller auto-detection, sandbox isolation for subprocess calls
 - Depends on: None (self-contained — no imports from other Threnody modules)
 - Used by: `mcp_server.py`, `copilot/providers.py`, `claude-code/providers.py`
 - Purpose: SQLite WAL database for caching, telemetry, thresholds, agent definitions, style profiles
@@ -189,7 +189,7 @@ This project is now focused on making that orchestration adapt better to your co
 - Pattern: `call(prompt, model, timeout) → str | None` via subprocess
 - Purpose: Self-describing provider with detection, command construction, and execution
 - Defined in: `shared/discovery.py` (`CLIProvider` dataclass)
-- Instances: `BUILTIN_PROVIDERS` list — github-copilot, claude-code, gemini-cli
+- Instances: `BUILTIN_PROVIDERS` list — github-copilot, claude-code, codex, …
 - Pattern: Each provider defines `name`, `binary`, `tier_models`, `cost_rank`, `detect_cmd`; `ProviderRegistry` auto-discovers which are installed
 - Three tiers: `low`, `medium`, `high`
 - Tier boundaries are adaptive (EMA) with hard-coded floors/ceilings that can never collapse

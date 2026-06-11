@@ -273,7 +273,7 @@ def test_basic_yaml_fallback_parses_floats_lists_and_policy(monkeypatch: pytest.
                     "  sonnet_max: 0.8",
                     "providers:",
                     "  disabled:",
-                    "    - gemini-cli",
+                    "    - windsurf",
                     "routing_policy:",
                     "  mode: custom",
                     "  shells:",
@@ -289,7 +289,7 @@ def test_basic_yaml_fallback_parses_floats_lists_and_policy(monkeypatch: pytest.
 
         assert cfg.thresholds.low_max == 0.55
         assert cfg.thresholds.medium_max == 0.8
-        assert cfg.disabled_providers == ["gemini-cli"]
+        assert cfg.disabled_providers == ["windsurf"]
         assert cfg.routing_policy.effective_profile("github-copilot-cli").route_task_mandatory is True
 
 
@@ -365,7 +365,7 @@ def test_preferred_routing_by_caller_overrides_global() -> None:
                     "        - provider: mistral-vibe",
                     "    github-copilot-cli:",
                     "      low:",
-                    "        - provider: gemini-cli",
+                    "        - provider: codex",
                 ]
             ),
             encoding="utf-8",
@@ -379,7 +379,7 @@ def test_preferred_routing_by_caller_overrides_global() -> None:
             "mistral-vibe",
         ]
         assert [p.provider for p in cfg.get_preferred_routing("low", caller="github-copilot")] == [
-            "gemini-cli",
+            "codex",
         ]
         assert cfg.to_legacy_dict()["providers"]["preferred_routing_by_caller"]["claude-code"]["low"] == [
             {"provider": "claude-code"},

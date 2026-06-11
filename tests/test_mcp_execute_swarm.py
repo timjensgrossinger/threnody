@@ -196,3 +196,49 @@ def test_execute_swarm_init_failures_are_controlled(monkeypatch) -> None:
         "error": "execution_error",
         "details": "execute_swarm initialization failed",
     }
+
+
+def test_execute_swarm_host_native_skips_runtime_handoff(monkeypatch, tmp_path: Path) -> None:
+    db = _stub_init(monkeypatch, tmp_path)
+    mcp_server._execute_swarm_rate_limit.clear()
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+    class FakePlan:
+        total_agents = 2
+        topology = "linear"
+
+    class FakePlanner:
+        def plan(self, _task_text: str) -> FakePlan:
+            return FakePlan()
+
+        def plan_to_dict(self, _plan: FakePlan) -> dict[str, object]:
+            return {
+                "subtasks": [
+                    {"id": "st-1", "description": "auth module", "tier": "medium", "depends_on": []},
+                    {"id": "st-2", "description": "tests", "tier": "low", "depends_on": ["st-1"]},
+                ],
+                "waves": [["st-1"], ["st-2"]],
+                "topology": "linear",
+            }
+
+    handoff_calls: list[str] = []
+
+    def _record_handoff(_db, swarm_id, *_args, **_kwargs) -> None:
+        handoff_calls.append(swarm_id)
+
+    monkeypatch.setattr(mcp_server, "_spawn_execute_swarm_runtime_handoff", _record_handoff)
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (TGsConfig(db_path=tmp_path / "execute-swarm.db"), db, None, FakePlanner(), None),
+    )
+
+    result = mcp_server.handle_execute_swarm({"task": "refactor auth module", "max_agents": 2})
+
+    assert handoff_calls == []
+    assert result["started"] is False
+    payload = result["result"]
+    assert payload["host_execution_mode"] == "host_native"
+    assert payload["awaiting_host_execution"] is True
+    assert isinstance(payload.get("host_spawn_waves"), list)
+    assert payload["host_spawn_waves"]

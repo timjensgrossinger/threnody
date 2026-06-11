@@ -69,13 +69,18 @@ terms of service. Provider terms, policies, and enforcement may change at any
 time without notice; Threnody cannot guarantee continued compatibility with any
 provider's rules. See [docs/LEGAL.md](LEGAL.md) for the full risk-tier guide.
 
-- **Highest risk:** routing Claude Pro/Max subscription OAuth from a non-Claude
-  host (for example Copilot, Cursor, or Codex) to `claude -p`
-- **Grey zone:** Claude Code host → Claude Code subprocess on the same
-  subscription; blocked by default via adapter opt-out; explicit operator
-  opt-in only
-- **Lower risk:** routing through each host's own official CLI, local loopback
-  LLMs, or explicitly configured HTTPS network endpoints you operate
+- **Highest risk:** routing Claude Pro/Max subscription OAuth to `claude -p`
+  subprocesses (from any host, including Claude Code when
+  `router_only_allow_execution` is enabled). June 2026 Agent SDK credit caps
+  may apply.
+- **Lower risk (operator-accepted):** `router_only_allow_execution` with
+  Claude Code configured for API-key billing — pay-per-token, not subscription
+  quota. Threnody cannot detect auth mode; verify before enabling.
+- **Lower risk:** routing through each host's own official CLI on its own
+  subscription, local loopback LLMs, or explicitly configured HTTPS network
+  endpoints you operate
+- **Google models:** use Vertex AI or Google AI Studio API directly — not CLI
+  subprocess delegation
 - **Team use:** each operator should use their own subscriptions; do not run a
   shared routing service that executes provider CLIs on behalf of others
 

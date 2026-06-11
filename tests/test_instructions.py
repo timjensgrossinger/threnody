@@ -29,7 +29,9 @@ def test_claude_default_instructions_are_guarded() -> None:
     assert "`.md`" in body
     assert "`.mdc`" in body
     assert "All other filetypes remain routed by default" in body
-    assert "prefer host-native edits or the Task tool" in body
+    assert "host_spawn_waves" in body
+    assert "HostNativeRequired" in body
+    assert "prefer direct edits or the host subagent tool" in body
     assert "Agent transparency is required" in body
     assert "PreToolUse" in body
     assert "validate_routing_guard" in body
@@ -87,7 +89,7 @@ def test_custom_copilot_guarded_opt_in_emits_mandatory_instructions() -> None:
 
     assert "Routing mode: guarded" in body
     assert "`route_task` or `decompose_task`" in body
-    assert "prefer host-native edits or the Task tool" in body
+    assert "host_spawn_waves" in body
     assert "PreToolUse" not in body
 
 

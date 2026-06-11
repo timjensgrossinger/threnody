@@ -51,7 +51,7 @@ def test_provenance_injected() -> None:
             patch.object(mcp_server, "_ensure_init", return_value=(cfg, db, None, None, None)),
             patch.object(mcp_server, "get_registry", return_value=registry),
         ):
-            result = mcp_server.handle_execute_subtask({"prompt": "hello"})
+            result = mcp_server.handle_execute_subtask({"prompt": "hello", "provider_id": "codex"})
 
         assert result["provenance"]["depth"] == 1
         assert result["provenance"]["caller_id"] == "github-copilot"
@@ -294,36 +294,3 @@ def test_router_only_blocks_claude_cross_host(monkeypatch) -> None:
         for e in result.get("excluded_providers", [])
     )
 
-
-def test_router_only_gemini_cross_host(monkeypatch) -> None:
-    """Router-only gemini-cli is excluded for non-Gemini callers."""
-    monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
-    monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
-    gemini = MagicMock(spec=CLIProvider)
-    gemini.name = "gemini-cli"
-    gemini.display_name = "Gemini CLI"
-    gemini.binary = "gemini"
-    gemini.tier_models = {"low": "flash-lite"}
-    gemini.cost_rank = {"low": 0}
-    gemini.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
-    gemini.execute.return_value = "should-not-run"
-
-    codex = MagicMock(spec=CLIProvider)
-    codex.name = "codex"
-    codex.display_name = "OpenAI Codex"
-    codex.binary = "codex"
-    codex.tier_models = {"low": "o4-mini"}
-    codex.cost_rank = {"low": 1}
-    codex.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
-    codex.execute.return_value = "ok"
-
-    with patch("shared.discovery.BUILTIN_PROVIDERS", [gemini, codex]):
-        registry = ProviderRegistry()
-
-    result = registry.execute_cheapest("hello", tier="low", caller="github-copilot")
-
-    gemini.execute.assert_not_called()
-    codex.execute.assert_called_once()
-    assert result["provider"] == "OpenAI Codex"
-    excluded = result.get("excluded_providers", [])
-    assert any(e.get("provider") == "Gemini CLI" for e in excluded)

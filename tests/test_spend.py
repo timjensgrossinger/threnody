@@ -90,7 +90,7 @@ def test_inspect_spend_mcp_handler(monkeypatch, tmp_path):
     cfg = TGsConfig(db_path=db_path)
     db = Database(db_path=db_path)
     db.record_cost_telemetry(
-        "task-a", "low", "gemini-cli", "flash-lite",
+        "task-a", "low", "codex", "o4-mini",
         800, 100, 0.0001, counterfactual_cost_usd=0.005,
     )
     monkeypatch.setattr(

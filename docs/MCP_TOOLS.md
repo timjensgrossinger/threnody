@@ -7,26 +7,26 @@ Tools are grouped by role: **coordination** (plan and route), **delegation** (op
 ## Coordination
 
 Plan, classify, and orchestrate work. Prefer host-native execution using
-`route_task` → `execution_hint` before delegating.
+`route_task` → `host_spawn` / `host_spawn_waves` before cross-backend delegation.
 
 | Tool | Description |
 |---|---|
-| `route_task(task)` | Classify complexity → `{tier, model, host_model?, execution_hint, quick_action}`; `execution_hint` includes `host_native_model`, `host_native_method`, and `mode: host_native \| delegate` |
-| `plan_task(task)` | Planner-based decomposition for multi-file work |
+| `route_task(task)` | Classify complexity → `{tier, model, execution_hint, host_spawn?}`; includes `host_native_model`, `host_native_method`, and `mode: host_native \| delegate` |
+| `plan_task(task)` | Planner-based decomposition; returns `host_spawn_waves` for host execution |
 | `decompose_task(task)` | Alias for `plan_task`; preferred entry point for multi-concern tasks |
-| `fleet_plan(task)` | Like decompose but returns ready-to-run parallel agent commands |
-| `execute_swarm(task, topology?, max_agents?)` | Plan and start a bounded multi-agent swarm |
+| `fleet_plan(task)` | Like decompose but returns fleet waves with embedded `host_spawn` per agent |
+| `execute_swarm(task, topology?, max_agents?)` | Plan swarm; default `host_native` returns `host_spawn_waves` without subprocess fanout |
 | `validate_routing_guard(...)` | Check whether a host edit/write is allowed by the active routing policy |
 | `apply_preview(preview_token, approve)` | Approve/deny file writes outside workspace |
 
 ## Delegation
 
 Optional subprocess routing to **other** installed CLIs or configured endpoints.
-Not used for Claude Code / Gemini CLI host shells by default (router-only).
+Same-host MCP shells receive `HostNativeRequired` unless `provider_id` names a different backend.
 
 | Tool | Description |
 |---|---|
-| `execute_subtask(prompt, tier, target_file?, effort?)` | Delegate prompt to a routable backend (Copilot, Codex, Cursor, endpoints, …) |
+| `execute_subtask(prompt, tier, provider_id?, target_file?, effort?)` | Cross-backend delegation only; same-host callers get `HostNativeRequired` + `host_spawn` |
 
 Optional `effort` is a provider-level reasoning hint (e.g. `"low"`, `"high"`, `"max"`, `"xhigh"`). Honored by Claude Code, Codex, and Cursor when explicitly delegated; unsupported providers reject explicit overrides.
 

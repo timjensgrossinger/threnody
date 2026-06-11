@@ -17,7 +17,6 @@ SUPPORTED_PROVIDER_IDS = frozenset({"codex"})
 BUILTIN_PROVIDER_IDS = frozenset({
     "github-copilot",
     "claude-code",
-    "gemini-cli",
     "codex",
     "junie",
     "opencode",
@@ -37,10 +36,6 @@ UNSUPPORTED_REASONS = {
     "github-copilot": (
         "Copilot CLI exposes interactive /usage and status-line quota displays, "
         "but no documented structured quota command"
-    ),
-    "gemini-cli": (
-        "Gemini CLI documents interactive /stats quota information, but no "
-        "documented structured remaining-quota command"
     ),
     "junie": (
         "JetBrains exposes quota in IDE and Junie license UI, but no documented "

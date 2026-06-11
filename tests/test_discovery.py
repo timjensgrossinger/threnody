@@ -84,19 +84,19 @@ def test_builtin_providers_defined():
     names = [p.name for p in BUILTIN_PROVIDERS]
     assert "github-copilot" in names
     assert "claude-code" in names
-    assert "gemini-cli" in names
+    assert "codex" in names
     assert "opencode" in names
 
-    # Verify existing 3 providers have 3 tiers each
+    # Verify core host providers have 3 tiers each
     for provider in BUILTIN_PROVIDERS:
-        if provider.name in ["github-copilot", "claude-code", "gemini-cli"]:
+        if provider.name in ["github-copilot", "claude-code", "codex"]:
             assert set(provider.tier_models.keys()) == {"low", "medium", "high"}
             assert set(provider.cost_rank.keys()) == {"low", "medium", "high"}
 
     gh = next(p for p in BUILTIN_PROVIDERS if p.name == "github-copilot")
-    gemini = next(p for p in BUILTIN_PROVIDERS if p.name == "gemini-cli")
+    opencode = next(p for p in BUILTIN_PROVIDERS if p.name == "opencode")
     assert gh.cost_rank["low"] == 0, "github-copilot low tier should be free"
-    assert gemini.cost_rank["low"] == 0, "gemini-cli low tier should be free"
+    assert opencode.cost_rank["low"] == 0, "opencode low tier should be free"
 
 
 def test_installer_provider_inventory_reports_all_supported_providers():
@@ -444,13 +444,6 @@ def test_build_command_claude_code_with_effort():
     assert cmd == ["claude", "-p", "hello", "--model", "claude-sonnet-4.6", "--effort", "high"]
 
 
-def test_build_command_gemini():
-    provider = BUILTIN_PROVIDERS[2]
-    assert provider.name == "gemini-cli"
-    cmd = provider._build_command("hello", "gemini-2.5-flash-lite")
-    assert cmd == ["gemini", "-p", "hello", "--model", "gemini-2.5-flash-lite"]
-
-
 def test_build_command_opencode():
     provider = _builtin_provider("opencode")
     cmd = provider._build_command("hello", "opencode/nemotron-3-super-free")
@@ -486,7 +479,6 @@ def test_detect_caller_accepts_truthy_opencode_host(monkeypatch):
     [
         ("GitHub Copilot CLI", "github-copilot"),
         ("Claude Code", "claude-code"),
-        ("Gemini CLI", "gemini-cli"),
         ("OpenAI Codex", "codex"),
         ("Cursor Agent", "cursor"),
         ("JetBrains Junie", "junie"),
@@ -777,15 +769,15 @@ def test_execute_fresh_command_per_retry(tmp_path):
 
 
 def test_registry_get_providers_for_tier_sorted_by_cost(production_mode):
-    # Mirror real cost_ranks: gh=0, claude=1, gemini=0 for "low"
+    # Mirror real cost_ranks: gh=0, opencode=0, claude=1 for "low"
     gh = _mock_provider("github-copilot", cost_low=0, detected=True)
     gh.cost_rank = {"low": 0, "medium": 2, "high": 3}
     claude = _mock_provider("claude-code", cost_low=1, detected=True)
     claude.cost_rank = {"low": 1, "medium": 2, "high": 3}
-    gemini = _mock_provider("gemini-cli", cost_low=0, detected=True)
-    gemini.cost_rank = {"low": 0, "medium": 1, "high": 2}
+    opencode = _mock_provider("opencode", cost_low=0, detected=True)
+    opencode.cost_rank = {"low": 0}
 
-    with patch("shared.discovery.BUILTIN_PROVIDERS", [gh, claude, gemini]):
+    with patch("shared.discovery.BUILTIN_PROVIDERS", [gh, claude, opencode]):
         registry = ProviderRegistry()
 
     result = registry.get_providers_for_tier("low")
@@ -822,9 +814,9 @@ def test_registry_get_providers_for_tier_uses_caller_specific_preferences(produc
     gh = _mock_provider("github-copilot", cost_low=0, detected=True)
     claude = _mock_provider("claude-code", cost_low=1, detected=True)
     mistral = _mock_provider("mistral-vibe", cost_low=3, detected=True)
-    gemini = _mock_provider("gemini-cli", cost_low=0, detected=True)
+    codex = _mock_provider("codex", cost_low=2, detected=True)
 
-    with patch("shared.discovery.BUILTIN_PROVIDERS", [gh, claude, mistral, gemini]):
+    with patch("shared.discovery.BUILTIN_PROVIDERS", [gh, claude, mistral, codex]):
         registry = ProviderRegistry(config_overrides={
             "providers": {
                 "preferred_routing_by_caller": {
@@ -1287,7 +1279,12 @@ def test_execute_cheapest_recovers_auth_quarantine_after_successful_probe(
     record_provider_failure(db, "claude-code", "auth_expired")
 
     with patch("shared.discovery.BUILTIN_PROVIDERS", [provider]):
-        registry = ProviderRegistry(db=db)
+        registry = ProviderRegistry(
+            db=db,
+            config_overrides={
+                "providers": {"router_only_allow_execution": ["claude-code"]},
+            },
+        )
 
     monkeypatch.setattr(
         "shared.discovery.AuthProbe.check",
@@ -1329,7 +1326,11 @@ def test_registry_execute_cheapest_propagates_explicit_effort(production_mode):
     provider.tier_models = {"low": "claude-sonnet-4.6"}
 
     with patch("shared.discovery.BUILTIN_PROVIDERS", [provider]):
-        registry = ProviderRegistry()
+        registry = ProviderRegistry(
+            config_overrides={
+                "providers": {"router_only_allow_execution": ["claude-code"]},
+            },
+        )
 
     result = registry.execute_cheapest("hello", tier="low", effort="high")
 
@@ -1553,7 +1554,7 @@ def test_production_mode_detects_real_providers(monkeypatch):
     Expected behavior:
         - With THRENODY_TEST_MODE unset: registry attempts real detection
         - Available providers depend on which CLIs are installed
-        - At minimum, should try to detect github-copilot, claude-code, gemini
+        - At minimum, should try to detect github-copilot, claude-code, codex
     """
     # Ensure test mode is NOT set; isolate from local endpoint candidates (Ollama etc.)
     monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
@@ -1583,14 +1584,14 @@ def test_builtin_providers_count_includes_new_providers():
     
     Ensures Wave 1 registration (07-02), the OpenCode rollout, and Phase 8/9
     registration are complete:
-    - github-copilot, claude-code, gemini-cli (existing, Phase 5)
+    - github-copilot, claude-code (existing, Phase 5)
     - codex, junie, cursor (new, Phase 7 Wave 1)
     - opencode (new, low-tier-only host/provider)
     - aider, amazon-q (new, Phase 8 Wave 0)
     - windsurf (stub, Phase 9 Wave 1)
     - mistral-vibe, blackbox-ai (new providers)
     """
-    assert len(BUILTIN_PROVIDERS) == 12, f"Expected 12 providers, got {len(BUILTIN_PROVIDERS)}"
+    assert len(BUILTIN_PROVIDERS) == 11, f"Expected 11 providers, got {len(BUILTIN_PROVIDERS)}"
 
 
 def test_new_providers_in_builtin():
@@ -1681,9 +1682,6 @@ def test_new_provider_cost_ranking():
         ("claude-code", "low"),
         ("claude-code", "medium"),
         ("claude-code", "high"),
-        ("gemini-cli", "low"),
-        ("gemini-cli", "medium"),
-        ("gemini-cli", "high"),
         ("codex", "low"),
         ("codex", "medium"),
         ("codex", "high"),
@@ -2193,7 +2191,7 @@ def test_windsurf_not_routeable_when_detected(monkeypatch: pytest.MonkeyPatch, p
         if binary == "windsurf":
             return "/usr/bin/windsurf"
         # Return paths for other existing binaries to avoid side effects
-        if binary in ["gh", "claude", "gemini"]:
+        if binary in ["gh", "claude", "codex"]:
             return f"/usr/bin/{binary}"
         return None
     

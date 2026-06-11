@@ -59,10 +59,24 @@ class StubRegistry:
 
 
 class DelegatingStubRegistry(StubRegistry):
-    def _ordered_execution_candidates(self, tier, *, caller=None, caller_allowlists=None):
+    def _ordered_execution_candidates(
+        self,
+        tier,
+        *,
+        caller=None,
+        caller_allowlists=None,
+        prefer_free=True,
+    ):
         codex = SimpleNamespace(name="codex", display_name="OpenAI Codex")
         copilot = SimpleNamespace(name="github-copilot", display_name="GitHub Copilot")
         return [copilot, codex], []
+
+    def _caller_matches_provider(self, provider, caller) -> bool:
+        normalized_caller = str(caller or "").strip().lower()
+        provider_name = str(getattr(provider, "name", "") or "").strip().lower()
+        if normalized_caller == "github-copilot-cli":
+            normalized_caller = "github-copilot"
+        return normalized_caller == provider_name
 
 
 class WritingRegistry(StubRegistry):
@@ -74,9 +88,9 @@ class WritingRegistry(StubRegistry):
         self.target.write_text(self.content, encoding="utf-8")
         return {
             "result": "provider wrote files directly",
-            "provider": "Gemini CLI",
-            "provider_id": "gemini",
-            "model": "gemini-2.5-pro",
+            "provider": "OpenAI Codex",
+            "provider_id": "codex",
+            "model": "o3",
             "tier": "medium",
             "is_free": False,
             "billing_tier": "subscription",
@@ -546,7 +560,7 @@ def test_apply_preview_concurrent_race_only_one_write(monkeypatch) -> None:
 
 
 def test_execute_subtask_rejects_outside_workspace_before_provider_call(monkeypatch) -> None:
-    class RecordingRegistry(StubRegistry):
+    class RecordingRegistry(DelegatingStubRegistry):
         def __init__(self) -> None:
             self.execute_calls = 0
 
@@ -723,7 +737,7 @@ def test_execute_subtask_uses_snapshot_diff_for_non_native_agents(monkeypatch) -
         assert result["change_type"] == "created"
         assert result["diff"]
         assert result["all_diffs"]
-        assert printed and printed[0]["provider"] == "Gemini CLI"
+        assert printed and printed[0]["provider"] == "OpenAI Codex"
         assert any(Path(item["path"]).name == "generated.py" for item in result["all_diffs"])
 
 
@@ -1422,7 +1436,7 @@ def test_execute_subtask_provider_error_uses_compact_registry_details(monkeypatc
 
 
 def test_execute_subtask_uses_detected_caller_for_routing(monkeypatch) -> None:
-    class RecordingRegistry(StubRegistry):
+    class RecordingRegistry(DelegatingStubRegistry):
         def __init__(self) -> None:
             self.selection_callers: list[object] = []
             self.execute_callers: list[object] = []
@@ -1451,6 +1465,7 @@ def test_execute_subtask_uses_detected_caller_for_routing(monkeypatch) -> None:
 
         result = mcp_server.handle_execute_subtask({
             "prompt": "Write one line of Python",
+            "provider_id": "codex",
             "provenance": {"caller_id": "spoofed-host", "depth": 1, "trace_id": "trace-1"},
         })
 
@@ -1461,7 +1476,7 @@ def test_execute_subtask_uses_detected_caller_for_routing(monkeypatch) -> None:
 
 
 def test_handle_route_task_uses_code_only_hint_for_write_tasks(monkeypatch) -> None:
-    class RecordingRegistry(StubRegistry):
+    class RecordingRegistry(DelegatingStubRegistry):
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
@@ -1520,7 +1535,7 @@ def test_handle_route_task_uses_code_only_hint_for_write_tasks(monkeypatch) -> N
 
 
 def test_handle_route_task_avoids_code_only_for_plain_text_tasks(monkeypatch) -> None:
-    class RecordingRegistry(StubRegistry):
+    class RecordingRegistry(DelegatingStubRegistry):
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
@@ -2083,7 +2098,7 @@ def test_attach_models_to_subtasks_filters_non_primitive_selection_fields(monkey
 
 
 def test_attach_models_to_subtasks_avoids_code_only_for_read_only_low_tier(monkeypatch) -> None:
-    class RecordingRegistry(StubRegistry):
+    class RecordingRegistry(DelegatingStubRegistry):
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
@@ -3164,3 +3179,51 @@ def test_learning_pattern_health_includes_coverage(monkeypatch) -> None:
         assert "pending_proof" in result
         assert "draft_proposals" in result
         assert "active_agents" in result
+
+
+def test_execute_subtask_host_native_required_for_self_delegate(monkeypatch) -> None:
+    class SelfDelegateRegistry(DelegatingStubRegistry):
+        def _ordered_execution_candidates(self, tier, *, caller=None, caller_allowlists=None, prefer_free=True):
+            host = SimpleNamespace(name="claude-code", display_name="Claude Code")
+            return [host], [{"provider": "Claude Code", "reason": "self"}]
+
+        def _caller_matches_provider(self, provider, caller) -> bool:
+            return getattr(provider, "name", None) == "claude-code"
+
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "host-native.db"
+        cfg = TGsConfig(db_path=db_path)
+        db = Database(db_path=db_path)
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, None, None, None))
+        monkeypatch.setattr(mcp_server, "get_registry", lambda: SelfDelegateRegistry())
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+        result = mcp_server.handle_execute_subtask({"prompt": "refactor auth module", "tier": "medium"})
+
+    assert result["error"] == "HostNativeRequired"
+    assert result["host_spawn"]["tool"] == "Agent"
+
+
+def test_handle_route_task_includes_host_spawn_for_claude_host(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "route-spawn.db"
+        cfg = TGsConfig(db_path=db_path)
+        db = Database(db_path=db_path)
+        router = SimpleNamespace(
+            classify=lambda _task: SimpleNamespace(
+                tier="medium",
+                score=0.55,
+                reason="medium-tier task",
+                agents=1,
+                override=False,
+            )
+        )
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, router, None, None))
+        monkeypatch.setattr(mcp_server, "get_registry", lambda: DelegatingStubRegistry())
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+        result = mcp_server.handle_route_task({"task": "refactor auth module"})
+
+    assert result["execution_hint"]["mode"] == "host_native"
+    assert result["host_spawn"]["tool"] == "Agent"
+    assert result["host_spawn"]["tier"] == "medium"

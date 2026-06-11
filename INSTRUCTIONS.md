@@ -1,3 +1,13 @@
+### Host-native execution (default for MCP host shells)
+
+1. Call `route_task` or `plan_task` / `decompose_task`.
+2. Consume `host_spawn` or `host_spawn_waves` from the response.
+3. Spawn host subagents with **Agent** (Claude Code) or **Task** (other shells).
+4. Use `execute_subtask(provider_id=...)` only for explicit cross-backend work.
+5. `execute_swarm` defaults to `host_native` — run returned waves in the host; no subprocess fanout.
+
+Same-host `execute_subtask` returns `HostNativeRequired`.
+
 # Threnody — Custom Instructions
 
 Threnody generates AI-shell-specific instruction blocks during installation.
@@ -25,7 +35,6 @@ routing_policy:
 |---|---|
 | `claude-code` | Guarded coordination — mandatory `route_task`, host-native first after routing, transparency tables, and Claude edit/write hook |
 | `github-copilot-cli` | Advisory routing; direct edits are allowed by default |
-| `gemini-cli` | Advisory routing |
 | `cursor` | Advisory routing |
 | `codex` | Advisory routing |
 
@@ -83,7 +92,6 @@ The managed block markers remain stable:
 |---|---|
 | `<!-- Threnody:claude:start -->` | Claude Code |
 | `<!-- Threnody:copilot:start -->` | GitHub Copilot CLI |
-| `<!-- Threnody:gemini:start -->` | Gemini CLI |
 | `<!-- Threnody:codex:start -->` | OpenAI Codex |
 | `<!-- Threnody:junie:start -->` | JetBrains Junie |
 
@@ -104,6 +112,6 @@ policies, and enforcement may change at any time without notice; Threnody cannot
 guarantee continued compatibility with any provider's rules.
 
 - See [docs/LEGAL.md](docs/LEGAL.md) for operator responsibilities and provider links
-- Host shells execute by default; Claude Code and Gemini CLI are router-only coordination anchors
+- Host shells execute by default; Claude Code is a router-only coordination anchor
 - `execute_subtask` delegates to other backends; override router-only hosts via `providers.router_only_allow_execution`
 - Safer routing examples live in [config.example.yaml](config.example.yaml)

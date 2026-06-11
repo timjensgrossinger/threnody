@@ -1,3 +1,10 @@
+## Host-native MCP discipline
+
+PreToolUse routing hooks enforce **Edit/Write** coordination only. They do not
+invoke host subagents. When a host caller attempts same-host work via
+`execute_subtask`, Threnody returns `HostNativeRequired` with an actionable
+`host_spawn` payload — spawn the host `Agent` or `Task` tool instead.
+
 # Host routing hooks
 
 Threnody can enforce **guarded coordination** on code edits in Claude Code via a PreToolUse hook. The hook calls `validate_routing_guard` logic directly (SQLite + guard state) — no MCP stdio subprocess per edit.

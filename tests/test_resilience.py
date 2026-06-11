@@ -125,7 +125,7 @@ def test_classify_unknown_nonzero():
 def test_auth_probe_test_mode():
     assert AuthProbe.check("github-copilot") is True
     assert AuthProbe.check("claude-code") is True
-    assert AuthProbe.check("gemini-cli") is True
+    assert AuthProbe.check("codex") is True
 
 
 def test_auth_probe_invalidate():

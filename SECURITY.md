@@ -34,7 +34,7 @@ stores or an untracked local `config.yaml`.
 
 The following are **not** Threnody vulnerabilities — report them to the vendor:
 
-- Third-party CLI agents (Claude Code, Codex, Gemini CLI, Copilot, Cursor,
+- Third-party CLI agents (Claude Code, Codex, Copilot, Cursor,
   Junie, OpenCode, etc.)
 - Provider account suspension, quota enforcement, or terms-of-service disputes
 - Misconfigured provider credentials on the researcher's own machine
