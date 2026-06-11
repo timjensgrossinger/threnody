@@ -49,7 +49,7 @@ def test_malformed_planner_output_returns_parse_error(tmp_path: Path) -> None:
     planner = Planner(
         TGsConfig(db_path=db_path),
         MockPlannerBackend(
-            '<PLAN_JSON>{"api_key":"sk-secret-token-12345678901234567890",oops}</PLAN_JSON>'
+            '<PLAN_JSON>{"api_key":"fake_sensitive_token_12345678901234567890",oops}</PLAN_JSON>'
         ),
         db,
     )
@@ -67,7 +67,7 @@ def test_malformed_planner_output_returns_parse_error(tmp_path: Path) -> None:
         ).fetchone()
 
     assert row is not None
-    assert "sk-secret-token-12345678901234567890" not in row[0]
+    assert "fake_sensitive_token_12345678901234567890" not in row[0]
     assert "<redacted>" in row[0]
     assert "oops" in row[0]
 

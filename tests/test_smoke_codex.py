@@ -36,7 +36,7 @@ class TestCodexDetection:
         Per D-01 (truthful routing), Codex should be routeable when auth is configured.
         """
         # Set OPENAI_API_KEY for Codex auth
-        mock_env.setenv("OPENAI_API_KEY", "sk-test-codex-12345")
+        mock_env.setenv("OPENAI_API_KEY", "test-openai-key-not-real")
         
         # Create a minimal Codex provider with auth detection
         def _codex_detect_hook(provider: CLIProvider) -> ProviderReadiness:

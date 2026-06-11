@@ -427,7 +427,7 @@ def mock_env(monkeypatch):
     
     Usage in tests:
         def test_codex_with_auth(mock_env):
-            mock_env.setenv("OPENAI_API_KEY", "sk-test-123")
+            mock_env.setenv("OPENAI_API_KEY", "test-openai-key-not-real")
             # test Codex detection with auth
         
         def test_codex_without_auth(mock_env):
