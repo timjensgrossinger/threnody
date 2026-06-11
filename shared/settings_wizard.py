@@ -80,6 +80,7 @@ try:
     from shared.config import CONFIG_YAML as _DEFAULT_CONFIG_PATH
     from shared.config import _load_basic_yaml_mapping
     from shared.config import SUPPORTED_ROUTING_POLICY_SHELLS
+    from shared.discovery import HOST_PROVIDER_NAMES
 except Exception:
     _DEFAULT_CONFIG_PATH: Path = Path.home() / ".local/lib/threnody/config.yaml"  # type: ignore[assignment]
     SUPPORTED_ROUTING_POLICY_SHELLS = (  # type: ignore[assignment]
@@ -618,6 +619,8 @@ def _write_config(
     preferred_routing: dict[str, list[dict]],
     routing_policy: dict,
     usage_windows: dict[str, list[dict]] | None = None,
+    delegation_utilities_enabled: bool = False,
+    delegation_utilities: list[str] | None = None,
 ) -> None:
     existing = _load_yaml_mapping(config_path)
     providers_section: dict = existing.setdefault("providers", {})
@@ -633,6 +636,12 @@ def _write_config(
         providers_section["usage_windows"] = usage_windows
     else:
         providers_section.pop("usage_windows", None)
+    if delegation_utilities_enabled:
+        providers_section["delegation_utilities_enabled"] = True
+        providers_section["delegation_utilities"] = list(delegation_utilities or ["opencode", "aider"])
+    else:
+        providers_section.pop("delegation_utilities_enabled", None)
+        providers_section.pop("delegation_utilities", None)
     existing["routing_policy"] = routing_policy
     config_path.write_text(_dump_yaml(existing), encoding="utf-8")
     log.debug("Config written to %s", config_path)
@@ -649,6 +658,29 @@ def _host_native_policy_warnings(config: Mapping) -> list[str]:
             warnings.append(
                 "providers.router_only_allow_execution is set — subprocess delegation to router-only hosts "
                 "(e.g. claude-code) may violate Anthropic subscription/OAuth policy. See docs/LEGAL.md."
+            )
+        allowlists = providers.get("caller_allowlists")
+        if isinstance(allowlists, Mapping):
+            for caller_id, provider_list in allowlists.items():
+                if not isinstance(provider_list, list):
+                    continue
+                host_targets = [
+                    str(item).strip().lower()
+                    for item in provider_list
+                    if isinstance(item, str)
+                    and str(item).strip().lower() in HOST_PROVIDER_NAMES
+                ]
+                if host_targets:
+                    warnings.append(
+                        "providers.caller_allowlists lists host CLIs for delegation — "
+                        "host→host subprocess delegation is no longer supported. "
+                        "Use providers.delegation_utilities_enabled for OpenCode/Aider/local only."
+                    )
+                    break
+        if providers.get("delegation_utilities_enabled") is True:
+            warnings.append(
+                "providers.delegation_utilities_enabled is true — execute_subtask may delegate "
+                "to OpenCode, Aider, and local loopback endpoints only (never host CLIs)."
             )
     swarm = config.get("swarm")
     if isinstance(swarm, Mapping):
@@ -669,6 +701,50 @@ def _host_native_policy_warnings(config: Mapping) -> list[str]:
     return warnings
 
 
+
+
+def _page_delegation_utilities_rich() -> tuple[bool, list[str]]:
+    console = Console()
+    console.print(
+        Panel(
+            "[bold]Step 3.6/4 — Utility Delegation[/bold]",
+            subtitle="Optional execute_subtask targets (never host CLIs)",
+            style="blue",
+        )
+    )
+    enabled = questionary.confirm(
+        "Enable utility delegation (OpenCode, Aider, local endpoints)?",
+        default=False,
+    ).ask()
+    if enabled is None:
+        raise KeyboardInterrupt
+    if not enabled:
+        return False, ["opencode", "aider"]
+    utilities = questionary.checkbox(
+        "Utility providers:",
+        choices=[
+            questionary.Choice("opencode", checked=True),
+            questionary.Choice("aider", checked=True),
+        ],
+    ).ask()
+    if utilities is None:
+        raise KeyboardInterrupt
+    selected = [str(item).strip().lower() for item in utilities if str(item).strip()]
+    return True, selected or ["opencode", "aider"]
+
+
+def _page_delegation_utilities_plain() -> tuple[bool, list[str]]:
+    print("\n=== Step 3.6/4 — Utility Delegation ===")
+    raw = input("Enable utility delegation (OpenCode/Aider/local)? (y/N): ").strip().lower()
+    if raw not in ("y", "yes"):
+        return False, ["opencode", "aider"]
+    selected: list[str] = []
+    if input("Include opencode? (Y/n): ").strip().lower() not in ("n", "no"):
+        selected.append("opencode")
+    if input("Include aider? (Y/n): ").strip().lower() not in ("n", "no"):
+        selected.append("aider")
+    return True, selected or ["opencode", "aider"]
+
 # ---------------------------------------------------------------------------
 # Page 4 — Review and confirm
 # ---------------------------------------------------------------------------
@@ -681,6 +757,8 @@ def _page4_rich(
     preferred_routing: dict[str, list[dict]],
     routing_policy: dict,
     usage_windows: dict[str, list[dict]] | None = None,
+    delegation_utilities_enabled: bool = False,
+    delegation_utilities: list[str] | None = None,
 ) -> bool:
     disabled = [p for p in all_available if p not in enabled]
     preview: dict = {"providers": {}}
@@ -710,7 +788,7 @@ def _page4_rich(
     if not confirm:
         console.print("Aborted — no changes made.")
         return False
-    _write_config(config_path, disabled, caller_allowlists, preferred_routing, routing_policy, usage_windows)
+    _write_config(config_path, disabled, caller_allowlists, preferred_routing, routing_policy, usage_windows, delegation_utilities_enabled, delegation_utilities)
     console.print(f"[green]Config written to {config_path}[/green]")
     return True
 
@@ -723,6 +801,8 @@ def _page4_plain(
     preferred_routing: dict[str, list[dict]],
     routing_policy: dict,
     usage_windows: dict[str, list[dict]] | None = None,
+    delegation_utilities_enabled: bool = False,
+    delegation_utilities: list[str] | None = None,
 ) -> bool:
     disabled = [p for p in all_available if p not in enabled]
     preview: dict = {"providers": {}}
@@ -745,7 +825,7 @@ def _page4_plain(
     if raw in ("n", "no"):
         print("Aborted — no changes made.")
         return False
-    _write_config(config_path, disabled, caller_allowlists, preferred_routing, routing_policy, usage_windows)
+    _write_config(config_path, disabled, caller_allowlists, preferred_routing, routing_policy, usage_windows, delegation_utilities_enabled, delegation_utilities)
     print(f"Config written to {config_path}")
     return True
 
@@ -772,8 +852,9 @@ def run_wizard(config_path: Path | None = None) -> bool:
             preferred_routing = _page3_rich(enabled, providers)
             usage_windows = _page_usage_windows_rich(enabled)
             routing_policy = _page_routing_policy_rich()
+            delegation_utilities_enabled, delegation_utilities = _page_delegation_utilities_rich()
             return _page4_rich(
-                config_path, enabled, all_available, caller_allowlists, preferred_routing, routing_policy, usage_windows
+                config_path, enabled, all_available, caller_allowlists, preferred_routing, routing_policy, usage_windows, delegation_utilities_enabled, delegation_utilities
             )
         else:
             enabled = _page1_plain(providers)
@@ -784,8 +865,9 @@ def run_wizard(config_path: Path | None = None) -> bool:
             preferred_routing = _page3_plain(enabled, providers)
             usage_windows = _page_usage_windows_plain(enabled)
             routing_policy = _page_routing_policy_plain()
+            delegation_utilities_enabled, delegation_utilities = _page_delegation_utilities_plain()
             return _page4_plain(
-                config_path, enabled, all_available, caller_allowlists, preferred_routing, routing_policy, usage_windows
+                config_path, enabled, all_available, caller_allowlists, preferred_routing, routing_policy, usage_windows, delegation_utilities_enabled, delegation_utilities
             )
     except KeyboardInterrupt:
         if HAS_DEPS:

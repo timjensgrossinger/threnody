@@ -3,7 +3,7 @@
 1. Call `route_task` or `plan_task` / `decompose_task`.
 2. Consume `host_spawn` or `host_spawn_waves` from the response.
 3. Spawn host subagents with **Agent** (Claude Code) or **Task** (other shells).
-4. Use `execute_subtask(provider_id=...)` only for explicit cross-backend work.
+4. Use `execute_subtask(provider_id=...)` only for utility backends when `delegation_utilities_enabled` is true.
 5. `execute_swarm` defaults to `host_native` — run returned waves in the host; no subprocess fanout.
 
 Same-host `execute_subtask` returns `HostNativeRequired`.

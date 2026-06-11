@@ -53,7 +53,7 @@ Docs: [limitations](docs/RELEASE_LIMITATIONS.md) · [legal](docs/LEGAL.md) · [a
 
 **Threnody** is a local-first **MCP meta-harness** for developer workflows. Register it in Claude Code, Copilot CLI, Codex, Cursor, Junie, or OpenCode — Threnody **plans and routes** in MCP; the **host shell executes** via `host_spawn` / `host_spawn_waves` (Agent or Task subagents, direct edits).
 
-`execute_subtask` is **cross-backend only** for MCP host shells. Same-host work returns `HostNativeRequired` with an actionable spawn payload. Explicit `provider_id` delegates to another installed CLI (Copilot, Codex, Cursor, endpoints, Aider, …). Claude Code is a **router-only host** by default.
+`execute_subtask` is **utility delegation only** (opt-in): OpenCode, Aider, and local loopback endpoints — never to other host CLIs. Same-host work returns `HostNativeRequired` with an actionable spawn payload. Claude Code is a **router-only host** by default.
 
 Search terms that describe the same project: **MCP orchestrator**, **meta-harness**, **multi-agent coding**, **swarm coordination**, **self-learning agents**, **Copilot / Claude / Codex orchestration**.
 
@@ -66,7 +66,7 @@ Search terms that describe the same project: **MCP orchestrator**, **meta-harnes
 | **Plan in MCP, execute in host** | `route_task` / `plan_task` return `host_spawn` / `host_spawn_waves` — spawn Agent/Task subagents in the host shell. |
 | **Learn over time** | Pattern tracking, draft agents, and an approval queue before anything goes live. |
 | **Swarm when needed** | `execute_swarm` defaults to `host_native`: wave plans hand off to the host; no subprocess fanout by default. |
-| **Cross-backend only** | `execute_subtask(provider_id=…)` when another CLI should run the work; same-host calls get `HostNativeRequired`. |
+| **Utility delegation (opt-in)** | `execute_subtask(provider_id=…)` to OpenCode, Aider, or local endpoints only; host→host delegation is blocked. |
 | **Spend discipline** | Host-native execution uses existing CLI entitlements; local telemetry via `inspect_spend` and `threnody gain`. |
 
 ---
@@ -186,10 +186,10 @@ Workflow guide: [docs/COST_SAVINGS.md](docs/COST_SAVINGS.md)
 | Provider | Binary | Role | Notes |
 |---|---|---|---|
 | **Claude Code** | `claude` | Host (router-only) | MCP coordination anchor; executes via **Agent** / direct edits |
-| **GitHub Copilot** | `gh` | Host + delegation | Host executes via **Task**; routable for cross-backend work |
-| **OpenAI Codex** | `codex` | Host + delegation | Host-native by default; subprocess when explicitly delegated |
-| **Cursor** | `cursor-agent` | Host + delegation | Host-native by default; subprocess when explicitly delegated |
-| **OpenCode** | `opencode` | Delegation | Low-tier auto-route by default |
+| **GitHub Copilot** | `gh` | Host | Host executes via **Task**; coordinates in MCP |
+| **OpenAI Codex** | `codex` | Host | Host-native execution via Task tool |
+| **Cursor** | `cursor-agent` | Host | Host-native execution via Task tool |
+| **OpenCode** | `opencode` | Host + utility | Host-native when MCP host; utility delegation target when enabled |
 | **JetBrains Junie** | `junie` | Delegation | Medium-tier auto-route by default |
 | **Aider** | `aider` | Delegation | Secondary adapter |
 | **Amazon Q / Kiro** | `q` / `kiro` | Delegation | Secondary adapter |
@@ -222,14 +222,18 @@ plan_task("add JWT auth with tests")
 📋 Wave 2 — spawn Agent (haiku)  → tests/test_auth.py
 ```
 
-**3. Cross-backend only when needed**
+**3. Optional utility delegation (opt-in)**
 
 ```
-execute_subtask(prompt="…", tier="low", provider_id="codex")
-→ delegates to OpenAI Codex subprocess
+# Enable providers.delegation_utilities_enabled in config.yaml first
+execute_subtask(prompt="…", tier="low", provider_id="opencode")
+→ delegates to OpenCode utility backend
 
 execute_subtask(prompt="…", tier="medium")  # same-host caller
 → HostNativeRequired + host_spawn payload
+
+execute_subtask(provider_id="codex")  # always blocked
+→ HostDelegationBlocked
 ```
 
 ---
@@ -307,9 +311,9 @@ whether your routing patterns comply with each provider's current terms.
 
 **Default execution model:** Threnody plans in MCP; host shells execute via
 `host_spawn` / `host_spawn_waves` (Agent or Task subagents). Same-host
-`execute_subtask` returns `HostNativeRequired`. Cross-backend delegation requires
-an explicit `provider_id`. Claude Code is router-only by default — override
-subprocess delegation only via `providers.router_only_allow_execution`.
+`execute_subtask` returns `HostNativeRequired`. Optional utility delegation
+(OpenCode, Aider, local endpoints) requires `providers.delegation_utilities_enabled: true`.
+Host→host subprocess delegation is not supported.
 
 Operator responsibilities and provider links: [docs/LEGAL.md](docs/LEGAL.md)
 

@@ -12,7 +12,7 @@ receipts.
 
 ```text
 route_task / plan_task  →  host_spawn / host_spawn_waves  →  host Agent/Task
-execute_subtask         →  cross-backend only (explicit provider_id)
+execute_subtask         →  utility delegation only (opt-in; explicit provider_id)
 execute_swarm           →  host_native default; delegate opt-in
 
 route_task(task)
@@ -22,9 +22,9 @@ route_task(task)
   │    ├─ medium/high → host_spawn / host_spawn_waves via Agent or Task tool
   │    └─ swarms     → execute_swarm returns awaiting_host_execution + waves
   │
-  └─ cross-backend only
-       └─ execute_subtask(provider_id=...) when target is in delegation_targets
-            Same-host execute_subtask returns HostNativeRequired
+  └─ utility delegation (opt-in)
+       └─ execute_subtask(provider_id=...) to OpenCode/Aider/local when enabled
+            Host→host delegation blocked; same-host returns HostNativeRequired
 ```
 
 Read `execution_hint.economics` on every `route_task` response for
@@ -35,7 +35,7 @@ Read `execution_hint.economics` on every `route_task` response for
 
 | Host | Prefer | Delegate when |
 |------|--------|---------------|
-| **GitHub Copilot** | Host edits; `gpt-5-mini` for low tier | Cross-backend work needs Codex/Cursor |
+| **GitHub Copilot** | Host edits; `gpt-5-mini` for low tier | Optional utility delegation to OpenCode/Aider when enabled |
 | **Claude Code** | Task tool; router-only — no subprocess to `claude` | Explicit opt-in only (`router_only_allow_execution`) |
 | **Codex / Cursor** | Host-native Task + edits | Another CLI is cheaper for low-tier boilerplate |
 | **Junie / OpenCode** | Host defaults for their tier pins | Medium/high work via swarm or delegate |
@@ -46,7 +46,7 @@ When two or more CLIs are installed:
 
 1. Let Threnody classify tier (`route_task`).
 2. Follow `execution_hint` — host-native first.
-3. For delegation, pick the lowest `cost_rank` in `delegation_targets`.
+3. For utility delegation, pick from `delegation_targets` (OpenCode, Aider, local) when enabled.
 4. Use free paths where entitled: Copilot `gpt-5-mini`, Gemini flash-lite,
    OpenCode nemotron free tier.
 

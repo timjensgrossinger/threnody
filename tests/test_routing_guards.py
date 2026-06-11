@@ -35,7 +35,7 @@ class SelectionRegistry:
     ) -> None:
         self.provider = provider
         self.model = model
-        self.delegation_targets = delegation_targets or ["github-copilot", "codex"]
+        self.delegation_targets = delegation_targets or ["opencode", "aider"]
 
     def _ordered_execution_candidates(
         self,
@@ -966,7 +966,7 @@ def test_route_task_issues_execute_subtask_guard_for_delegate_low_tier(
         monkeypatch.setattr(
             mcp_server,
             "_delegation_targets_for_tier",
-            lambda *_a, **_k: ["github-copilot", "codex"],
+            lambda *_a, **_k: ["opencode", "aider"],
         )
         monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "external-caller")
 
@@ -1002,7 +1002,7 @@ def test_soft_hint_when_delegate_guard_not_strict(monkeypatch: pytest.MonkeyPatc
         monkeypatch.setattr(
             mcp_server,
             "_delegation_targets_for_tier",
-            lambda *_a, **_k: ["github-copilot", "codex"],
+            lambda *_a, **_k: ["opencode", "aider"],
         )
         monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "external-caller")
 
@@ -1045,7 +1045,7 @@ def test_hard_deny_when_execute_subtask_guard_strict(monkeypatch: pytest.MonkeyP
         monkeypatch.setattr(
             mcp_server,
             "_delegation_targets_for_tier",
-            lambda *_a, **_k: ["github-copilot", "codex"],
+            lambda *_a, **_k: ["opencode", "aider"],
         )
         monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "external-caller")
 

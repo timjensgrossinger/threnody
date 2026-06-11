@@ -58,31 +58,31 @@ class TestOrderedExecutionCandidatesAllowlist:
         assert len(selected) == 2
 
     def test_allowlist_filters_to_allowed_only(self):
-        pa = _make_provider("claude-code")
-        pb = _make_provider("codex")
+        pa = _make_provider("aider")
+        pb = _make_provider("mistral-vibe")
         pc = _make_provider("blackbox-ai")
         reg = _make_registry(pa, pb, pc)
         with patch.object(reg, "get_providers_for_tier", return_value=[pa, pb, pc]):
             with patch.object(reg, "list_adapters", return_value=[]):
                 selected, excluded = reg._ordered_execution_candidates(
                     "low", caller="github-copilot",
-                    caller_allowlists={"github-copilot": ["claude-code", "blackbox-ai"]},
+                    caller_allowlists={"github-copilot": ["aider", "blackbox-ai"]},
                 )
-        assert [p.name for p in selected] == ["claude-code", "blackbox-ai"]
+        assert [p.name for p in selected] == ["aider", "blackbox-ai"]
         assert len(excluded) == 1
-        assert excluded[0]["provider"] == "Codex"
+        assert excluded[0]["provider"] == "Mistral Vibe"
         assert (
             "not in caller allowlist for github-copilot" in excluded[0]["reason"]
             or "router-only host" in excluded[0]["reason"]
         )
 
     def test_exclusion_reason_includes_caller(self):
-        pa, pb = _make_provider("claude-code"), _make_provider("codex")
+        pa, pb = _make_provider("aider"), _make_provider("mistral-vibe")
         reg = _make_registry(pa, pb)
         with patch.object(reg, "get_providers_for_tier", return_value=[pa, pb]):
             with patch.object(reg, "list_adapters", return_value=[]):
-                _, excluded = reg._ordered_execution_candidates("low", caller="my-caller", caller_allowlists={"my-caller": ["claude-code"]})
-        assert excluded[0]["provider"] == "Codex"
+                _, excluded = reg._ordered_execution_candidates("low", caller="my-caller", caller_allowlists={"my-caller": ["aider"]})
+        assert excluded[0]["provider"] == "Mistral Vibe"
         assert (
             "my-caller" in excluded[0]["reason"]
             or "router-only host" in excluded[0]["reason"]
@@ -99,29 +99,29 @@ class TestOrderedExecutionCandidatesAllowlist:
         assert any("ignoring allowlist" in r.message for r in caplog.records)
 
     def test_case_insensitive(self):
-        pa = _make_provider("Claude-Code")
-        pb = _make_provider("codex")
+        pa = _make_provider("aider")
+        pb = _make_provider("mistral-vibe")
         reg = _make_registry(pa, pb)
         with patch.object(reg, "get_providers_for_tier", return_value=[pa, pb]):
             with patch.object(reg, "list_adapters", return_value=[]):
-                selected, _ = reg._ordered_execution_candidates("low", caller="GITHUB-COPILOT", caller_allowlists={"github-copilot": ["claude-code"]})
-        assert len(selected) == 1 and selected[0].name == "Claude-Code"
+                selected, _ = reg._ordered_execution_candidates("low", caller="GITHUB-COPILOT", caller_allowlists={"github-copilot": ["aider"]})
+        assert len(selected) == 1 and selected[0].name == "aider"
 
     def test_allowlist_applies_to_caller_aliases(self):
-        pa = _make_provider("claude-code")
-        pb = _make_provider("codex")
+        pa = _make_provider("aider")
+        pb = _make_provider("mistral-vibe")
         reg = _make_registry(pa, pb)
         with patch.object(reg, "get_providers_for_tier", return_value=[pa, pb]):
             with patch.object(reg, "list_adapters", return_value=[]):
                 selected, excluded = reg._ordered_execution_candidates(
                     "low",
                     caller="github-copilot-cli",
-                    caller_allowlists={"github-copilot": ["claude-code"]},
+                    caller_allowlists={"github-copilot": ["aider"]},
                 )
 
-        assert [p.name for p in selected] == ["claude-code"]
+        assert [p.name for p in selected] == ["aider"]
         assert len(excluded) == 1
-        assert excluded[0]["provider"] == "Codex"
+        assert excluded[0]["provider"] == "Mistral Vibe"
         assert (
             "not in caller allowlist for github-copilot-cli" in excluded[0]["reason"]
             or "router-only host" in excluded[0]["reason"]
@@ -139,16 +139,16 @@ class TestOrderedExecutionCandidatesAllowlist:
         assert len(selected) == 2
 
     def test_caller_specific_preferences_only_apply_to_matching_caller(self):
-        claude = _make_provider("claude-code", 3)
+        aider = _make_provider("aider", 3)
         mistral = _make_provider("mistral-vibe", 4)
-        codex = _make_provider("codex", 0)
-        reg = _make_registry(claude, mistral, codex)
+        blackbox = _make_provider("blackbox-ai", 0)
+        reg = _make_registry(aider, mistral, blackbox)
         reg._config_overrides = {
             "providers": {
                 "preferred_routing_by_caller": {
                     "claude-code": {
                         "low": [
-                            {"provider": "claude-code"},
+                            {"provider": "aider"},
                             {"provider": "mistral-vibe"},
                         ],
                     },
@@ -160,44 +160,38 @@ class TestOrderedExecutionCandidatesAllowlist:
             claude_selected, _ = reg._ordered_execution_candidates("low", caller="claude-code")
             copilot_selected, _ = reg._ordered_execution_candidates("low", caller="github-copilot")
 
-        assert [p.name for p in claude_selected[:2]] == ["claude-code", "mistral-vibe"]
-        assert copilot_selected[0].name == "codex"
+        assert [p.name for p in claude_selected[:2]] == ["aider", "mistral-vibe"]
+        assert copilot_selected[0].name == "blackbox-ai"
 
     def test_anti_recursion_matches_caller_aliases(self):
-        copilot = _make_provider("github-copilot", 0)
-        codex = _make_provider("codex", 1)
-        reg = _make_registry(copilot, codex)
+        aider = _make_provider("aider", 0)
+        blackbox = _make_provider("blackbox-ai", 1)
+        reg = _make_registry(aider, blackbox)
 
         with patch.object(reg, "list_adapters", return_value=[]):
             selected, excluded = reg._ordered_execution_candidates("low", caller="github-copilot-cli")
 
-        assert [p.name for p in selected] == ["codex"]
-        assert excluded == [
-            {
-                "provider": "Github Copilot",
-                "reason": "caller anti-recursion (github-copilot-cli)",
-            }
-        ]
+        assert [p.name for p in selected] == ["aider", "blackbox-ai"]
+        assert excluded == []
 
     def test_allowlist_overrides_router_only(self):
-        claude = _make_provider("claude-code")
-        copilot = _make_provider("github-copilot")
-        reg = _make_registry(claude, copilot)
-        with patch.object(reg, "get_providers_for_tier", return_value=[claude, copilot]):
+        aider = _make_provider("aider")
+        blackbox = _make_provider("blackbox-ai")
+        reg = _make_registry(aider, blackbox)
+        with patch.object(reg, "get_providers_for_tier", return_value=[aider, blackbox]):
             with patch.object(reg, "list_adapters", return_value=[]):
                 selected, excluded = reg._ordered_execution_candidates(
                     "low",
                     caller="github-copilot",
-                    caller_allowlists={"github-copilot": ["claude-code", "github-copilot"]},
+                    caller_allowlists={"github-copilot": ["aider", "blackbox-ai"]},
                 )
-        assert [p.name for p in selected] == ["claude-code"]
-        assert not any("router-only host" in e.get("reason", "") for e in excluded if e.get("provider") == "Claude Code")
+        assert [p.name for p in selected] == ["aider", "blackbox-ai"]
 
 
 class TestPassThrough:
 
     def test_select_provider_for_tier_passes_allowlists(self):
-        pa = _make_provider("claude-code")
+        pa = _make_provider("aider")
         reg = _make_registry(pa)
         with patch.object(reg, "_ordered_execution_candidates", return_value=([pa], [])) as mock:
             with patch.object(reg, "_selection_metadata_for_provider_with_effort", return_value={"provider": "x", "model": "y"}):

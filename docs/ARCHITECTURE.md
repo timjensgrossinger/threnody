@@ -27,7 +27,7 @@ Threnody mcp_server.py  (coordination layer)
 | Path | When | Mechanism |
 |------|------|-----------|
 | **Host-native** | Default for MCP host shells | Host Task tool, direct edits, host-configured local/API backends |
-| **Delegated** | Operator routes to another backend | `execute_subtask` → Copilot, Codex, Cursor, endpoints, Aider, etc. |
+| **Utility delegation (opt-in)** | Operator enables utility targets | `execute_subtask` → OpenCode, Aider, local loopback endpoints only |
 
 Claude Code is a **router-only host** by default: Threnody registers as MCP
 inside it but does not subprocess `claude` for delegated work unless the
@@ -35,8 +35,57 @@ operator opts in via `providers.router_only_allow_execution`.
 
 `route_task` and `plan_task` return `host_spawn` / `host_spawn_waves` plus
 `execution_hint` with `mode: host_native | delegate` and `delegation_targets`.
-`execute_subtask` is cross-backend only for host callers (`HostNativeRequired` otherwise).
+`execute_subtask` is utility-delegation only for host callers (`HostNativeRequired` for same-host; host→host blocked).
 `execute_swarm` defaults to `host_native` plan handoff (`awaiting_host_execution`).
+
+## Orchestration surfaces
+
+| Tool | Role | Host execution |
+|------|------|----------------|
+| `route_task` | Classify tier + `execution_hint` | Optional single `host_spawn` |
+| `plan_task` / `decompose_task` | LLM decomposition | `host_spawn_waves` |
+| `fleet_plan` | Decompose + fleet command strings | Embedded `host_spawn` per agent |
+| `execute_swarm` | Swarm contract (persistence, budget, resume) | `host_spawn_waves` (default) |
+| `execute_subtask` | Single utility offload (opt-in) | Blocked for same-host; utilities only |
+
+Normal orchestration is **plan → host_spawn_waves → host Task/Agent per wave**.
+Swarms add topology selection, budget preview, swarm telemetry, and optional
+delegate-mode coordinator rounds.
+
+## Swarm topologies
+
+Threnody uses a **single coordinator** per wave when star topology is active —
+not multi-queen / peer consensus.
+
+| Topology | Behavior |
+|----------|----------|
+| `linear` / `dag` | Dependency-ordered waves; default runtime loop |
+| `hierarchical` | Parent–child subtask trees |
+| `star` | One coordinator + workers; coordinator verdict rounds (**delegate mode**) |
+| `auto` | Heuristic selection from urgency/complexity |
+
+Default for MCP hosts: `swarm.host_execution_mode: host_native` — Threnody plans;
+the host shell spawns agents. Set `host_execution_mode: delegate` only for
+legacy subprocess orchestrator fanout.
+
+Project skills in `.cursor/skills/` document workflows: `threnody-task`,
+`threnody-swarm`, `threnody-fullstack`, `threnody-routing`, `threnody-subtasks`.
+
+## Full-stack parallel pattern (contract-first DAG)
+
+To build frontend, backend, and API concurrently:
+
+1. **Wave 1:** API contract (OpenAPI, shared DTOs) — `produces: api-contract`
+2. **Wave 2:** Frontend + backend **in parallel** — both `depends_on` wave 1, `consumes: api-contract`
+3. **Wave 3:** Integration / smoke tests — `depends_on` wave 2 outputs
+
+Use `topology: dag` (or `auto`) on `execute_swarm`, or ask the planner for the
+same shape via `decompose_task`.
+
+**Consensus:** no built-in multi-agent voting. Contract-first handoff is
+recommended; optional coordinator star (delegate mode) or a final integration
+wave replaces peer consensus. Host-native swarms rely on operator or lead-agent
+review after parallel waves.
 
 ## Guarded vs advisory routing
 

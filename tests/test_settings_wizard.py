@@ -51,3 +51,16 @@ def test_host_native_policy_warnings_surface_risky_overrides() -> None:
     assert any("router_only_allow_execution" in item for item in warnings)
     assert any("host_execution_mode is delegate" in item for item in warnings)
     assert any("github-copilot" in item for item in warnings)
+
+
+def test_host_native_policy_warnings_call_out_legacy_host_allowlists() -> None:
+    warnings = settings_wizard._host_native_policy_warnings(
+        {
+            "providers": {
+                "caller_allowlists": {
+                    "github-copilot": ["codex", "aider"],
+                },
+            },
+        }
+    )
+    assert any("host→host subprocess delegation is no longer supported" in item for item in warnings)

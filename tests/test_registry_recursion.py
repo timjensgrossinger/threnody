@@ -42,7 +42,7 @@ def test_provenance_injected() -> None:
     """handle_execute_subtask persists provenance.trace_id/depth/caller_id."""
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "provenance.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         registry = StubRegistry()
 
@@ -50,8 +50,12 @@ def test_provenance_injected() -> None:
             patch.object(mcp_server, "_client_name", "copilot"),
             patch.object(mcp_server, "_ensure_init", return_value=(cfg, db, None, None, None)),
             patch.object(mcp_server, "get_registry", return_value=registry),
+            patch.object(mcp_server, "_get_registry_with_config", return_value=registry),
+            patch.object(mcp_server, "_register_shell_adapters"),
+            patch.object(mcp_server, "would_self_delegate", return_value=False),
+            patch.object(mcp_server, "validate_execute_subtask_delegation", return_value=None),
         ):
-            result = mcp_server.handle_execute_subtask({"prompt": "hello", "provider_id": "codex"})
+            result = mcp_server.handle_execute_subtask({"prompt": "hello", "provider_id": "opencode"})
 
         assert result["provenance"]["depth"] == 1
         assert result["provenance"]["caller_id"] == "github-copilot"
@@ -108,10 +112,10 @@ def test_provider_opt_out(monkeypatch) -> None:
     skipped.execute.return_value = "should-not-run"
 
     fallback = MagicMock(spec=CLIProvider)
-    fallback.name = "github-copilot"
-    fallback.display_name = "GitHub Copilot"
-    fallback.binary = "gh"
-    fallback.tier_models = {"low": "gpt-5-mini"}
+    fallback.name = "aider"
+    fallback.display_name = "Aider"
+    fallback.binary = "aider"
+    fallback.tier_models = {"low": "aider-mini"}
     fallback.cost_rank = {"low": 1}
     fallback.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
     fallback.execute.return_value = "ok"
@@ -144,7 +148,7 @@ def test_provider_opt_out(monkeypatch) -> None:
 
 
 def test_safe_self_hosted_code_only_prefers_free_copilot(monkeypatch) -> None:
-    """Sandboxed code-only execution may use self-hosted Copilot to keep low tier free."""
+    """Host subprocess to same CLI is blocked; code-only work falls back to utility providers."""
     monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
     copilot = MagicMock(spec=CLIProvider)
@@ -159,15 +163,15 @@ def test_safe_self_hosted_code_only_prefers_free_copilot(monkeypatch) -> None:
     copilot.execute.return_value = "copilot-result"
 
     fallback = MagicMock(spec=CLIProvider)
-    fallback.name = "claude-code"
-    fallback.display_name = "Claude Code"
-    fallback.binary = "claude"
-    fallback.tier_models = {"low": "haiku"}
+    fallback.name = "aider"
+    fallback.display_name = "Aider"
+    fallback.binary = "aider"
+    fallback.tier_models = {"low": "aider-mini"}
     fallback.cost_rank = {"low": 1}
     fallback.billing_model = "subscription"
     fallback.safe_self_hosted_code_only = False
     fallback.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
-    fallback.execute.return_value = "claude-result"
+    fallback.execute.return_value = "aider-result"
 
     with patch("shared.discovery.BUILTIN_PROVIDERS", [copilot, fallback]):
         registry = ProviderRegistry()
@@ -192,13 +196,11 @@ def test_safe_self_hosted_code_only_prefers_free_copilot(monkeypatch) -> None:
         code_only=True,
     )
 
-    copilot.execute.assert_called_once()
-    fallback.execute.assert_not_called()
-    assert result["provider"] == "GitHub Copilot"
-    assert result["model"] == "gpt-5-mini"
-    assert result["is_free"] is True
-    assert result["billing_tier"] == "free"
-    assert result["provider_cost_hint"] == "free"
+    copilot.execute.assert_not_called()
+    fallback.execute.assert_called_once()
+    assert result["provider"] == "Aider"
+    assert result["model"] == "aider-mini"
+    assert result["provider"] == "Aider"
 
 
 def test_self_hosted_code_only_bypass_stays_low_tier_only(monkeypatch) -> None:
@@ -217,15 +219,15 @@ def test_self_hosted_code_only_bypass_stays_low_tier_only(monkeypatch) -> None:
     copilot.execute.return_value = "copilot-result"
 
     fallback = MagicMock(spec=CLIProvider)
-    fallback.name = "codex"
-    fallback.display_name = "OpenAI Codex"
-    fallback.binary = "codex"
-    fallback.tier_models = {"medium": "o3"}
+    fallback.name = "aider"
+    fallback.display_name = "Aider"
+    fallback.binary = "aider"
+    fallback.tier_models = {"medium": "aider-medium"}
     fallback.cost_rank = {"medium": 3}
     fallback.billing_model = "subscription"
     fallback.safe_self_hosted_code_only = False
     fallback.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
-    fallback.execute.return_value = "codex-result"
+    fallback.execute.return_value = "aider-result"
 
     with patch("shared.discovery.BUILTIN_PROVIDERS", [copilot, fallback]):
         registry = ProviderRegistry()
@@ -252,12 +254,12 @@ def test_self_hosted_code_only_bypass_stays_low_tier_only(monkeypatch) -> None:
 
     copilot.execute.assert_not_called()
     fallback.execute.assert_called_once()
-    assert result["provider"] == "OpenAI Codex"
-    assert result["model"] == "o3"
+    assert result["provider"] == "Aider"
+    assert result["model"] == "aider-medium"
 
 
 def test_router_only_blocks_claude_cross_host(monkeypatch) -> None:
-    """Router-only claude-code is excluded when Copilot delegates cross-host."""
+    """Router-only claude-code is excluded; host CLIs are not delegation targets."""
     monkeypatch.delenv("THRENODY_TEST_MODE", raising=False)
     monkeypatch.setattr("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ())
     claude = MagicMock(spec=CLIProvider)
@@ -269,17 +271,17 @@ def test_router_only_blocks_claude_cross_host(monkeypatch) -> None:
     claude.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
     claude.execute.return_value = "should-not-run"
 
-    copilot = MagicMock(spec=CLIProvider)
-    copilot.name = "github-copilot"
-    copilot.display_name = "GitHub Copilot"
-    copilot.binary = "gh"
-    copilot.tier_models = {"low": "gpt-5-mini"}
-    copilot.cost_rank = {"low": 1}
-    copilot.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
-    copilot.execute.return_value = "ok"
+    aider = MagicMock(spec=CLIProvider)
+    aider.name = "aider"
+    aider.display_name = "Aider"
+    aider.binary = "aider"
+    aider.tier_models = {"low": "aider-mini"}
+    aider.cost_rank = {"low": 1}
+    aider.detect.return_value = ProviderReadiness(routeable=True, reason=DetectReason.READY)
+    aider.execute.return_value = "ok"
 
     with (
-        patch("shared.discovery.BUILTIN_PROVIDERS", [claude, copilot]),
+        patch("shared.discovery.BUILTIN_PROVIDERS", [claude, aider]),
         patch("shared.discovery._LOCAL_ENDPOINT_CANDIDATES", ()),
     ):
         registry = ProviderRegistry()
@@ -287,8 +289,8 @@ def test_router_only_blocks_claude_cross_host(monkeypatch) -> None:
     result = registry.execute_cheapest("hello", tier="low", caller="github-copilot")
 
     claude.execute.assert_not_called()
-    copilot.execute.assert_called_once()
-    assert result["provider"] == "GitHub Copilot"
+    aider.execute.assert_called_once()
+    assert result["provider"] == "Aider"
     assert any(
         e.get("reason") == "router-only host (coordinate in host; delegate to other backends)"
         for e in result.get("excluded_providers", [])

@@ -59,6 +59,8 @@ class StubRegistry:
 
 
 class DelegatingStubRegistry(StubRegistry):
+    delegation_utilities_enabled = False
+
     def _ordered_execution_candidates(
         self,
         tier,
@@ -66,10 +68,16 @@ class DelegatingStubRegistry(StubRegistry):
         caller=None,
         caller_allowlists=None,
         prefer_free=True,
+        for_delegation=False,
+        provider_id=None,
     ):
-        codex = SimpleNamespace(name="codex", display_name="OpenAI Codex")
-        copilot = SimpleNamespace(name="github-copilot", display_name="GitHub Copilot")
-        return [copilot, codex], []
+        opencode = SimpleNamespace(name="opencode", display_name="OpenCode")
+        aider = SimpleNamespace(name="aider", display_name="Aider")
+        if for_delegation:
+            if not type(self).delegation_utilities_enabled:
+                return [], []
+            return [opencode, aider], []
+        return [aider], []
 
     def _caller_matches_provider(self, provider, caller) -> bool:
         normalized_caller = str(caller or "").strip().lower()
@@ -309,7 +317,7 @@ def test_execute_subtask_rejects_outside_workspace_target(monkeypatch) -> None:
         repo_root.mkdir()
         outside_path = Path(td) / "outside" / "generated.py"
         db_path = Path(td) / "preview.db"
-        cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[])
+        cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[], delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setenv("TGS_ACTIVE_WORKSPACE", str(repo_root))
@@ -344,7 +352,7 @@ def test_execute_subtask_rejects_outside_workspace_target(monkeypatch) -> None:
 def test_apply_preview_hashes_stored_token_and_redacts_not_found(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "preview.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         requested_path = Path(td).resolve() / "generated.py"
         preview_token = "secret-preview-token"
@@ -480,7 +488,7 @@ def test_ensure_init_exception_resets_all_globals(monkeypatch, tmp_path: Path) -
 def test_apply_preview_concurrent_race_only_one_write(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "preview-race.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         requested_path = Path(td).resolve() / "generated.py"
         preview_token = "race-preview-token"
@@ -573,7 +581,7 @@ def test_execute_subtask_rejects_outside_workspace_before_provider_call(monkeypa
         repo_root.mkdir()
         outside_path = Path(td) / "outside" / "generated.py"
         db_path = Path(td) / "preview.db"
-        cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[])
+        cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[], delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         registry = RecordingRegistry()
 
@@ -598,7 +606,7 @@ def test_execute_subtask_rejects_broad_workspace_override(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         outside_path = Path(td) / "outside" / "generated.py"
         db_path = Path(td) / "preview.db"
-        cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[])
+        cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[], delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setenv("TGS_ACTIVE_WORKSPACE", "/")
@@ -624,7 +632,7 @@ def test_execute_subtask_allows_workspace_target_with_workspace_override(monkeyp
         repo_root.mkdir()
         target_path = repo_root / "generated.py"
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setenv("TGS_ACTIVE_WORKSPACE", str(repo_root))
@@ -653,7 +661,7 @@ def test_execute_subtask_write_error_marks_failed(monkeypatch) -> None:
         repo_root.mkdir()
         target_path = repo_root / "generated.py"
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[])
+        cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[], delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setenv("TGS_ACTIVE_WORKSPACE", str(repo_root))
@@ -682,7 +690,7 @@ def test_execute_subtask_write_error_marks_failed(monkeypatch) -> None:
 def test_execute_subtask_rejects_invalid_timeout(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "preview.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -711,7 +719,7 @@ def test_execute_subtask_uses_snapshot_diff_for_non_native_agents(monkeypatch) -
 
         generated = repo_root / "generated.py"
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         registry = WritingRegistry(generated, "print('generated')\n")
         printed: list[dict[str, object]] = []
@@ -757,7 +765,7 @@ def test_execute_subtask_uses_validated_target_for_snapshot_diff_path(monkeypatc
         repo_root.mkdir()
         target_path = repo_root / "generated.py"
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setenv("TGS_ACTIVE_WORKSPACE", str(repo_root))
@@ -902,6 +910,7 @@ def test_execute_subtask_reverts_when_gate_denies(monkeypatch) -> None:
             code_review=True,
             code_review_tier="all",
             auto_approve_timeout=0,
+            delegation_utilities_enabled=True,
         )
         db = Database(db_path=db_path)
         target_path = repo_root / "generated.py"
@@ -964,7 +973,7 @@ def test_handle_request_sanitizes_and_clears_progress_token(monkeypatch) -> None
 def test_execute_subtask_rejects_empty_target_path(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -985,7 +994,7 @@ def test_execute_subtask_rejects_empty_target_path(monkeypatch) -> None:
 def test_handle_plan_task_cache_hit_includes_models(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "plan.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         db.cache_put(
             "plan this",
@@ -1024,7 +1033,7 @@ def test_handle_plan_task_cache_hit_includes_models(monkeypatch) -> None:
 def test_handle_plan_task_preserves_explicit_route_metadata(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "plan.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         plan = SimpleNamespace(total_agents=1, waves=[[1]])
         planner = SimpleNamespace(
@@ -1064,7 +1073,7 @@ def test_handle_plan_task_preserves_explicit_route_metadata(monkeypatch) -> None
 def test_handle_route_task_prefers_free_low_tier_metadata(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "route.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
             classify=lambda _task: SimpleNamespace(
@@ -1123,7 +1132,7 @@ def test_handle_route_task_execution_hint_host_native_for_claude(monkeypatch) ->
         assert hint.get("host_native_model") == "sonnet"
         assert hint.get("host_native_method") == "host_task"
         assert "Task agent" in str(hint["recommended_action"])
-        assert "github-copilot" in hint["delegation_targets"]
+        assert hint["delegation_targets"] == []
         economics = hint.get("economics")
         assert isinstance(economics, dict)
         assert economics.get("why_not_delegate")
@@ -1133,45 +1142,49 @@ def test_handle_route_task_execution_hint_host_native_for_claude(monkeypatch) ->
 
 
 def test_handle_route_task_execution_hint_delegate_for_copilot(monkeypatch) -> None:
-    with tempfile.TemporaryDirectory() as td:
-        db_path = Path(td) / "route-delegate.db"
-        cfg = TGsConfig(db_path=db_path)
-        db = Database(db_path=db_path)
-        router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
-                tier="low",
-                score=0.2,
-                reason="low-tier task",
-                agents=1,
-                override=False,
+    DelegatingStubRegistry.delegation_utilities_enabled = True
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "route-delegate.db"
+            cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
+            db = Database(db_path=db_path)
+            router = SimpleNamespace(
+                classify=lambda _task: SimpleNamespace(
+                    tier="low",
+                    score=0.2,
+                    reason="low-tier task",
+                    agents=1,
+                    override=False,
+                )
             )
-        )
-        monkeypatch.setattr(
-            mcp_server,
-            "_ensure_init",
-            lambda: (cfg, db, router, None, None),
-        )
-        monkeypatch.setattr(mcp_server, "get_registry", lambda: DelegatingStubRegistry())
-        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "external-caller")
+            monkeypatch.setattr(
+                mcp_server,
+                "_ensure_init",
+                lambda: (cfg, db, router, None, None),
+            )
+            monkeypatch.setattr(mcp_server, "get_registry", lambda: DelegatingStubRegistry())
+            monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "external-caller")
 
-        result = mcp_server.handle_route_task({
-            "task": "quick fix",
-            "caller": "external-caller",
-        })
+            result = mcp_server.handle_route_task({
+                "task": "quick fix",
+                "caller": "external-caller",
+            })
 
-        hint = result["execution_hint"]
-        assert hint["mode"] == "delegate"
-        assert "execute_subtask" in str(hint["recommended_action"])
-        assert hint["delegation_targets"] == ["github-copilot", "codex"]
-        economics = hint.get("economics")
-        assert isinstance(economics, dict)
-        assert economics.get("cheapest_path_rationale")
+            hint = result["execution_hint"]
+            assert hint["mode"] == "delegate"
+            assert "execute_subtask" in str(hint["recommended_action"])
+            assert hint["delegation_targets"] == ["opencode", "aider"]
+            economics = hint.get("economics")
+            assert isinstance(economics, dict)
+            assert economics.get("cheapest_path_rationale")
+    finally:
+        DelegatingStubRegistry.delegation_utilities_enabled = False
 
 
 def test_execute_subtask_returns_billing_metadata(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -1198,7 +1211,7 @@ def test_execute_subtask_returns_billing_metadata(monkeypatch) -> None:
 def test_handle_fleet_plan_agents_use_plan_route_metadata(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "fleet.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         plan = SimpleNamespace(waves=[[1]], total_agents=1)
         planner = SimpleNamespace(
@@ -1269,7 +1282,7 @@ def test_execute_subtask_returns_actual_execution_route(monkeypatch) -> None:
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -1309,7 +1322,7 @@ def test_execute_subtask_allows_partial_selection_when_execution_resolves_provid
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -1349,7 +1362,7 @@ def test_execute_subtask_allows_provider_id_only_selection(monkeypatch) -> None:
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -1382,7 +1395,7 @@ def test_execute_subtask_returns_routing_error_when_unresolved(monkeypatch) -> N
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         registry = UnresolvableRegistry()
 
@@ -1415,7 +1428,7 @@ def test_execute_subtask_provider_error_uses_compact_registry_details(monkeypatc
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -1451,7 +1464,7 @@ def test_execute_subtask_uses_detected_caller_for_routing(monkeypatch) -> None:
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "execute.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         registry = RecordingRegistry()
 
@@ -1465,7 +1478,7 @@ def test_execute_subtask_uses_detected_caller_for_routing(monkeypatch) -> None:
 
         result = mcp_server.handle_execute_subtask({
             "prompt": "Write one line of Python",
-            "provider_id": "codex",
+            "provider_id": "aider",
             "provenance": {"caller_id": "spoofed-host", "depth": 1, "trace_id": "trace-1"},
         })
 
@@ -1503,7 +1516,7 @@ def test_handle_route_task_uses_code_only_hint_for_write_tasks(monkeypatch) -> N
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "route.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
             classify=lambda _task: SimpleNamespace(
@@ -1562,7 +1575,7 @@ def test_handle_route_task_avoids_code_only_for_plain_text_tasks(monkeypatch) ->
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "route.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
             classify=lambda _task: SimpleNamespace(
@@ -1606,7 +1619,7 @@ def test_handle_route_task_does_not_fabricate_provider_metadata(monkeypatch) -> 
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "route.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
             classify=lambda _task: SimpleNamespace(
@@ -1919,7 +1932,7 @@ def test_normalize_provenance_accepts_mapping_input() -> None:
 def test_handle_route_task_ignores_invalid_model_from_selection(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "route.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
             classify=lambda _task: SimpleNamespace(
@@ -2149,7 +2162,7 @@ def test_inspect_status_readiness_summary(monkeypatch) -> None:
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = Path(td) / "status.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         with db.conn() as conn:
@@ -2218,7 +2231,7 @@ def test_inspect_status_rejects_paths_outside_workspace(monkeypatch) -> None:
         workspace_path = Path(workspace_dir).resolve()
         outside_path = Path(outside_dir).resolve()
         db_path = workspace_path / "status.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -2242,7 +2255,7 @@ def test_tune_set_show_and_reset_round_trip(monkeypatch) -> None:
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = Path(td) / "tune.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -2274,7 +2287,7 @@ def test_tune_set_allows_unbounded_concurrency_and_large_fanout_values(monkeypat
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = Path(td) / "tune.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -2303,7 +2316,7 @@ def test_tune_set_allows_zero_for_disable_style_limits(monkeypatch) -> None:
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = Path(td) / "tune-zero.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -2330,7 +2343,7 @@ def test_approval_queue_wrappers_require_operator_and_update_state(monkeypatch) 
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = Path(td) / "approvals.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         with db.conn() as conn:
@@ -2387,7 +2400,7 @@ def test_approval_queue_approve_handler_with_operator_audit(monkeypatch) -> None
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = Path(td) / "approvals-wave2b.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         # Create a draft agent in the approval_queue
@@ -2460,7 +2473,7 @@ def test_approval_queue_reject_handler_logs_reason_with_operator(monkeypatch) ->
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = Path(td) / "rejections-wave2b.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         # Create a draft agent in the approval_queue
@@ -2522,7 +2535,7 @@ def test_agent_queue_aliases_require_operator_id(monkeypatch) -> None:
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = Path(td) / "agent-queue-aliases.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         with db.conn() as conn:
@@ -2568,7 +2581,7 @@ def test_agent_queue_approve_alias_preserves_approval_flow(monkeypatch) -> None:
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = Path(td) / "agent-queue-approve.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         with db.conn() as conn:
@@ -2616,7 +2629,7 @@ def test_memory_handlers_round_trip_and_not_found(monkeypatch) -> None:
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = workspace_path / "memory.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -2698,7 +2711,7 @@ def test_memory_handlers_validate_scope_and_identifiers(monkeypatch) -> None:
         project_path.mkdir()
         project_id = str(project_path.resolve())
         db_path = workspace_path / "memory-invalid.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -2762,7 +2775,7 @@ def test_memory_get_handler_rejects_corrupted_payload(monkeypatch) -> None:
         project_path = workspace_path / "repo"
         project_path.mkdir()
         db_path = workspace_path / "memory-corrupt.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         with db.conn() as conn:
@@ -2804,7 +2817,7 @@ def test_memory_tools_are_registered() -> None:
 def test_mcp_record_outcome(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "record-outcome.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         calls: list[tuple[object, ...]] = []
 
@@ -2839,7 +2852,7 @@ def test_mcp_record_outcome(monkeypatch) -> None:
 def test_mcp_record_outcome_records_anonymous_when_operator_missing(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "record-outcome-anonymous.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         calls: list[tuple[object, ...]] = []
 
@@ -2911,7 +2924,7 @@ def test_mcp_record_outcome_rejects_invalid_enum() -> None:
 def test_mcp_record_outcome_surfaces_readonly_window(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "record-outcome-readonly.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(
@@ -2955,7 +2968,7 @@ def test_learning_outcome_stats_success(monkeypatch) -> None:
     
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "outcome-stats.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         
         monkeypatch.setattr(
@@ -3009,7 +3022,7 @@ def test_learning_outcome_stats_not_available(monkeypatch) -> None:
     """Test learning_outcome_stats returns error when snapshot not available."""
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "outcome-stats-empty.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         
         monkeypatch.setattr(
@@ -3034,7 +3047,7 @@ def test_learning_outcome_stats_response_schema(monkeypatch) -> None:
     
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "outcome-stats-schema.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         
         monkeypatch.setattr(
@@ -3119,7 +3132,7 @@ def test_learning_pattern_health_includes_coverage(monkeypatch) -> None:
     
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "pattern-health-coverage.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         
         monkeypatch.setattr(
@@ -3192,7 +3205,7 @@ def test_execute_subtask_host_native_required_for_self_delegate(monkeypatch) -> 
 
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "host-native.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, None, None, None))
         monkeypatch.setattr(mcp_server, "get_registry", lambda: SelfDelegateRegistry())
@@ -3207,7 +3220,7 @@ def test_execute_subtask_host_native_required_for_self_delegate(monkeypatch) -> 
 def test_handle_route_task_includes_host_spawn_for_claude_host(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "route-spawn.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
             classify=lambda _task: SimpleNamespace(

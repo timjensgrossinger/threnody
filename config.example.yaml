@@ -37,44 +37,15 @@ providers:
   # Subscription OAuth (Pro/Max) subprocess delegation carries provider-policy risk.
   # Threnody cannot detect auth mode — verify before enabling. See docs/LEGAL.md.
   #
-  # Safer delegation for non-Claude hosts: prefer copilot, codex, cursor — not host shells.
+  # Meta-harness default: host shells execute via host_spawn (Agent/Task).
+  # Optional utility delegation — never to other host CLIs (Copilot, Codex, Cursor, …).
   #
-  # preferred_routing_by_caller:
-  #   github-copilot:
-  #     low:
-  #       - provider: github-copilot
-  #       - provider: codex
-  #     medium:
-  #       - provider: github-copilot
-  #       - provider: codex
-  #   cursor:
-  #     low:
-  #       - provider: cursor
-  #       - provider: github-copilot
-  #     medium:
-  #       - provider: cursor
-  #       - provider: codex
-  #   codex:
-  #     low:
-  #       - provider: codex
-  #       - provider: github-copilot
-  #     medium:
-  #       - provider: codex
+  # delegation_utilities_enabled: false
+  # delegation_utilities:
+  #   - opencode
+  #   - aider
+  # Local loopback endpoints (ollama, configured local HTTPS) are allowed when enabled.
   #
-  # Hard allowlist (optional): only these providers may execute for a caller.
-  # Allowlists override router-only exclusions when listed.
-  # caller_allowlists:
-  #   github-copilot:
-  #     - github-copilot
-  #     - codex
-  #   cursor:
-  #     - cursor
-  #     - github-copilot
-  #     - codex
-  #   codex:
-  #     - codex
-  #     - github-copilot
-  #     - cursor
   effort_defaults:
     claude-code:
       low: low

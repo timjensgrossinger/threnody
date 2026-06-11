@@ -74,11 +74,11 @@ def test_build_host_native_required_response_shape() -> None:
         caller="cursor",
         tier="medium",
         prompt="refactor module",
-        delegation_targets=["codex"],
+        delegation_targets=["opencode"],
     )
     assert payload["error"] == HOST_SPAWN_ERROR
     assert payload["host_spawn"]["tool"] == "Task"
-    assert payload["delegation_targets"] == ["codex"]
+    assert payload["delegation_targets"] == ["opencode"]
 
 
 def test_effective_swarm_host_execution_mode_defaults_host_native_for_hosts() -> None:

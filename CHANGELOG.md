@@ -18,6 +18,7 @@ Versioning for public releases.
 
 ### Changed
 
+- **Utility-only delegation:** `providers.delegation_utilities_enabled` (default `false`) gates `execute_subtask` to utility backends only (OpenCode, Aider, local loopback endpoints). Host CLI subprocess delegation (Copilot → Codex, Aider → Copilot, etc.) is blocked and cannot be overridden by `caller_allowlists` or `preferred_routing_by_caller`. Settings wizard warns on legacy host allowlists; re-run `./install.sh` for updated installer hints.
 - **Routing policy:** `guarded` replaces `strict` as the canonical coordination-gate mode (`strict` remains a deprecated alias with a log warning). Guarded profiles no longer imply `low_tier_execute_subtask`; host-native execution is the default after `route_task`. Re-run `./install.sh` to refresh managed instruction blocks and Claude hooks.
 - **Routing guards:** low-tier host callers issue `direct` guards after `route_task` (not `execute_subtask`). Delegate low-tier guards remain for non-host callers or explicit `low_tier_execute_subtask` opt-in. `execute_subtask_guard_strict` defaults to `false`.
 - **`route_task` hints:** `execution_hint` now includes `host_native_model` and `host_native_method`; per-shell `tier_model_mapping` defaults come from `bootstrap_tier_map`.

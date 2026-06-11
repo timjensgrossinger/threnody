@@ -74,7 +74,7 @@ def _prepare_env(td: str) -> tuple[Path, TGsConfig, Database]:
     repo_root = Path(td) / "repo"
     repo_root.mkdir()
     db_path = Path(td) / "execute.db"
-    cfg = TGsConfig(db_path=db_path)
+    cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
     db = Database(db_path=db_path)
     return repo_root, cfg, db
 

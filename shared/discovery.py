@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .adapters import ProviderAdapter, ProviderCapability, _coerce_capability
+from .config import DEFAULT_DELEGATION_UTILITIES
 from .resilience import AuthProbe, ErrorCategory, RetryPolicy, classify
 from .health import is_available as _provider_is_available
 from .health import record_provider_failure as _record_prov_failure
@@ -2471,6 +2472,8 @@ HOST_PROVIDER_NAMES = frozenset({
 # Host CLIs used for MCP coordination; not subprocess execution targets by default.
 ROUTER_ONLY_PROVIDERS = frozenset({"claude-code"})
 
+DELEGATION_UTILITY_DEFAULTS = frozenset(DEFAULT_DELEGATION_UTILITIES)
+
 
 def installer_provider_inventory(
     *,
@@ -3460,6 +3463,60 @@ class ProviderRegistry:
     def _provider_is_router_only(self, provider: CLIProvider) -> bool:
         return self._normalize_identifier(provider.name) in ROUTER_ONLY_PROVIDERS
 
+    def _read_providers_config_value(self, key: str) -> object | None:
+        raw = self._config_overrides
+        if isinstance(raw, dict):
+            top_level = raw.get(key)
+            if top_level is not None:
+                return top_level
+            providers_section = raw.get("providers")
+            if isinstance(providers_section, dict) and key in providers_section:
+                return providers_section.get(key)
+        return None
+
+    def _delegation_utilities_enabled(self) -> bool:
+        value = self._read_providers_config_value("delegation_utilities_enabled")
+        if isinstance(value, bool):
+            return value
+        return False
+
+    def _delegation_utilities_allowlist(self) -> set[str]:
+        value = self._read_providers_config_value("delegation_utilities")
+        if isinstance(value, list):
+            normalized = {
+                self._normalize_identifier(str(provider_id))
+                for provider_id in value
+                if isinstance(provider_id, str) and provider_id.strip()
+            }
+            if normalized:
+                return normalized
+        return {self._normalize_identifier(name) for name in DELEGATION_UTILITY_DEFAULTS}
+
+    def _provider_is_host_execution_target(self, provider: CLIProvider) -> bool:
+        return self._normalize_identifier(provider.name) in HOST_PROVIDER_NAMES
+
+    def _provider_is_local_endpoint(self, provider: CLIProvider) -> bool:
+        scope = getattr(provider, "endpoint_scope", None)
+        if isinstance(scope, str) and scope.strip().lower() == "local":
+            return True
+        name = self._normalize_identifier(provider.name)
+        return bool(name and name.startswith("local-"))
+
+    def _provider_allowed_as_delegation_target(self, provider: CLIProvider) -> bool:
+        if not self._delegation_utilities_enabled():
+            return False
+        if self._provider_is_local_endpoint(provider):
+            return True
+        return self._normalize_identifier(provider.name) in self._delegation_utilities_allowlist()
+
+    def _delegation_target_exclusion_reason(self, provider: CLIProvider) -> str:
+        if not self._delegation_utilities_enabled():
+            return "delegation_utilities_enabled is false; enable in config.yaml"
+        normalized = self._normalize_identifier(provider.name)
+        if self._provider_is_host_execution_target(provider) and normalized not in self._delegation_utilities_allowlist():
+            return "host CLI executes via host_spawn; not a delegation target"
+        return "not in delegation_utilities allowlist"
+
     def _router_only_allow_execution_set(self) -> set[str]:
         raw = self._config_overrides
         allow: list[Any] = []
@@ -3630,6 +3687,7 @@ class ProviderRegistry:
         code_only: bool = False,
         caller_allowlists: dict[str, list[str]] | None = None,
         provider_id: str | None = None,
+        for_delegation: bool = False,
     ) -> tuple[list[CLIProvider], list[dict[str, str]]]:
         candidates = self.get_providers_for_tier(tier, caller=caller)
 
@@ -3763,6 +3821,26 @@ class ProviderRegistry:
                 })
                 continue
 
+            if for_delegation and not self._provider_allowed_as_delegation_target(provider):
+                excluded_providers.append({
+                    "provider": provider.display_name,
+                    "reason": self._delegation_target_exclusion_reason(provider),
+                })
+                continue
+            if (
+                not for_delegation
+                and self._provider_is_host_execution_target(provider)
+                and self._caller_matches_provider(provider, caller)
+                and not (
+                    (explicit_provider and self._matches_provider(provider, explicit_provider))
+                    or self._caller_specific_preference_matches(provider, tier, caller)
+                )
+            ):
+                excluded_providers.append({
+                    "provider": provider.display_name,
+                    "reason": "same-host CLI executes via host_spawn; not a subprocess target",
+                })
+                continue
             # If there's no known adapter for this provider but the caller name
             # matches the provider, perform a conservative anti-recursion
             # exclusion so that we don't call back into the same CLI.
@@ -3859,6 +3937,7 @@ class ProviderRegistry:
         effort: str | None = None,
         caller_allowlists: dict[str, list[str]] | None = None,
         provider_id: str | None = None,
+        for_delegation: bool = False,
     ) -> dict[str, Any] | None:
         """Return the cheapest-safe provider selection metadata for a tier."""
         ordered, excluded_providers = self._ordered_execution_candidates(
@@ -3869,6 +3948,7 @@ class ProviderRegistry:
             code_only=code_only,
             caller_allowlists=caller_allowlists,
             provider_id=provider_id,
+            for_delegation=for_delegation,
         )
         if not ordered:
             return None
@@ -4209,6 +4289,7 @@ class ProviderRegistry:
         caller_allowlists: dict[str, list[str]] | None = None,
         on_pid: Callable[[int], None] | None = None,
         provider_id: str | None = None,
+        delegation_only: bool = False,
     ) -> dict[str, Any]:
         """Try each available provider in ascending cost order; return on first success.
 
@@ -4249,6 +4330,7 @@ class ProviderRegistry:
             code_only=code_only,
             caller_allowlists=caller_allowlists,
             provider_id=provider_id,
+            for_delegation=delegation_only,
         )
 
         if not ordered:

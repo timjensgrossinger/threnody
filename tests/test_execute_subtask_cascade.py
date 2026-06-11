@@ -48,7 +48,7 @@ class _StubRegistry:
 
 def _setup(tmpdir: str) -> tuple[TGsConfig, Database]:
     db_path = Path(tmpdir) / "cascade.db"
-    cfg = TGsConfig(db_path=db_path)
+    cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
     db = Database(db_path=db_path)
     return cfg, db
 

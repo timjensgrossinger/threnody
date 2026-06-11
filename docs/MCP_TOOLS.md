@@ -2,12 +2,12 @@
 
 Threnody exposes **43 public MCP tools** over JSON-RPC/stdio. Tests enforce that every published schema has a callable handler.
 
-Tools are grouped by role: **coordination** (plan and route), **delegation** (optional subprocess to other backends), **learning**, **memory**, and **operator** surfaces.
+Tools are grouped by role: **coordination** (plan and route), **delegation** (optional subprocess to utility backends only), **learning**, **memory**, and **operator** surfaces.
 
 ## Coordination
 
 Plan, classify, and orchestrate work. Prefer host-native execution using
-`route_task` → `host_spawn` / `host_spawn_waves` before cross-backend delegation.
+`route_task` → `host_spawn` / `host_spawn_waves` before optional utility delegation.
 
 | Tool | Description |
 |---|---|
@@ -19,16 +19,49 @@ Plan, classify, and orchestrate work. Prefer host-native execution using
 | `validate_routing_guard(...)` | Check whether a host edit/write is allowed by the active routing policy |
 | `apply_preview(preview_token, approve)` | Approve/deny file writes outside workspace |
 
+### Normal orchestration (`plan_task` / `decompose_task`)
+
+1. Call `decompose_task(task)` (preferred) or `plan_task(task)`.
+2. Read `host_spawn_waves` — ordered waves of host `Task`/`Agent` spawn payloads.
+3. Execute wave 1, then wave 2, etc.; agents within a wave may run in parallel.
+4. Do not use `execute_subtask` for same-host work.
+
+`fleet_plan(task)` returns the same plan plus ready-made fleet command strings per wave.
+
+See project skill `.cursor/skills/threnody-task/SKILL.md`.
+
+### `execute_swarm`
+
+Default (**host-native**): returns `awaiting_host_execution: true`, `swarm_id`,
+`host_spawn_waves`, and cost estimate — no subprocess fanout. Execute each wave
+via the host Agent/Task tool.
+
+| Parameter | Notes |
+|-----------|-------|
+| `topology` | `auto`, `dag`, `hierarchical`, or `star` |
+| `max_agents` | Cap fanout (see `swarm.max_agents` in config) |
+| `budget_limit` | Triggers `preview_token` confirmation when estimate exceeds limit |
+
+**Delegate mode** (`swarm.host_execution_mode: delegate`): background orchestrator
+subprocess with coordinator rounds on star topology. Resume via
+`resume_swarm_inspect` / `resume_swarm_confirm`.
+
+Full-stack parallel frontend/backend/API: use contract-first DAG waves — see
+`.cursor/skills/threnody-fullstack/SKILL.md` and [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Delegation
 
-Optional subprocess routing to **other** installed CLIs or configured endpoints.
-Same-host MCP shells receive `HostNativeRequired` unless `provider_id` names a different backend.
+Optional subprocess routing to **utility backends only** when
+`providers.delegation_utilities_enabled` is true (OpenCode, Aider, local loopback
+endpoints). Threnody never subprocesses to another host CLI (Copilot, Codex,
+Cursor, Junie, Claude Code). Same-host MCP shells receive `HostNativeRequired`
+for same-host targets.
 
 | Tool | Description |
 |---|---|
-| `execute_subtask(prompt, tier, provider_id?, target_file?, effort?)` | Cross-backend delegation only; same-host callers get `HostNativeRequired` + `host_spawn` |
+| `execute_subtask(prompt, tier, provider_id?, target_file?, effort?)` | Utility delegation only when opt-in enabled; host CLI targets are hard-rejected |
 
-Optional `effort` is a provider-level reasoning hint (e.g. `"low"`, `"high"`, `"max"`, `"xhigh"`). Honored by Claude Code, Codex, and Cursor when explicitly delegated; unsupported providers reject explicit overrides.
+Optional `effort` is a provider-level reasoning hint (e.g. `"low"`, `"high"`, `"max"`, `"xhigh"`). Honored by supported utility backends when explicitly delegated; unsupported providers reject explicit overrides.
 
 ### `execute_subtask` example
 
@@ -37,13 +70,15 @@ execute_subtask(
   prompt="Create a config.py with default constants...",
   tier="low",
   target_file="/path/to/config.py",
+  provider_id="aider",
   effort="high"
 )
-→ Delegates to a routable backend (e.g. github-copilot, codex, local endpoint)
+→ Requires providers.delegation_utilities_enabled: true
+→ Delegates to a utility backend (e.g. opencode, aider, ollama/local endpoint)
 → Returns: {result, provider, model, tier, fallback_used, file_written, lines_written}
 ```
 
-See [config.example.yaml](../config.example.yaml) and [INSTRUCTIONS.md](../INSTRUCTIONS.md) for `routing_policy`, `execute_subtask_guard_strict`, `low_tier_execute_subtask`, effort defaults, and router-only overrides.
+See [config.example.yaml](../config.example.yaml) and [INSTRUCTIONS.md](../INSTRUCTIONS.md) for `delegation_utilities_enabled`, `delegation_utilities`, `routing_policy`, `execute_subtask_guard_strict`, `low_tier_execute_subtask`, effort defaults, and router-only overrides.
 
 ## Learning
 

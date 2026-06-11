@@ -345,6 +345,8 @@ DEFAULT_OVERRIDES: dict[str, list[str]] = {
 DEFAULT_PLANNER_MODEL = "claude-sonnet-4-6"
 DEFAULT_PLANNER_TIMEOUT = 120
 
+DEFAULT_DELEGATION_UTILITIES: tuple[str, ...] = ("opencode", "aider")
+
 # ---------------------------------------------------------------------------
 # Adaptive threshold defaults
 # ---------------------------------------------------------------------------
@@ -1306,6 +1308,15 @@ class TGsConfig:
     # Format: list of lowercase provider IDs (e.g. claude-code).
     router_only_allow_execution: list[str] = field(default_factory=list)
 
+    # Opt-in utility delegation for execute_subtask (meta-harness default: host-native only).
+    delegation_utilities_enabled: bool = False
+
+    # Provider ids allowed as execute_subtask targets when delegation_utilities_enabled.
+    # Local loopback endpoints (ollama, configured local HTTPS) are always allowed when enabled.
+    delegation_utilities: list[str] = field(
+        default_factory=lambda: list(DEFAULT_DELEGATION_UTILITIES),
+    )
+
     # execute_swarm host execution: host_native (plan handoff) or delegate (subprocess).
     swarm_host_execution_mode: str = "host_native"
     swarm_host_execution_mode_by_caller: dict[str, str] = field(default_factory=dict)
@@ -2049,6 +2060,18 @@ class TGsConfig:
                 cfg.router_only_allow_execution = [
                     str(p).strip().lower() for p in raw_router_only_allow if p is not None
                 ]
+
+            raw_delegation_enabled = providers_section.get("delegation_utilities_enabled")
+            if isinstance(raw_delegation_enabled, bool):
+                cfg.delegation_utilities_enabled = raw_delegation_enabled
+
+            raw_delegation_utilities = providers_section.get("delegation_utilities")
+            if isinstance(raw_delegation_utilities, list):
+                normalized_utilities = [
+                    str(p).strip().lower() for p in raw_delegation_utilities if p is not None
+                ]
+                if normalized_utilities:
+                    cfg.delegation_utilities = normalized_utilities
 
         raw_swarm_host_mode = swarm_raw.get("host_execution_mode", "host_native")
         if isinstance(raw_swarm_host_mode, str) and raw_swarm_host_mode.strip().lower() in {

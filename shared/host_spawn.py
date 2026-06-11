@@ -296,3 +296,97 @@ def effective_swarm_host_execution_mode(config: TGsConfig, caller: str | None) -
     if _caller_is_host(caller):
         return "host_native"
     return "delegate"
+
+DELEGATION_DISABLED_ERROR = "DelegationDisabled"
+HOST_DELEGATION_BLOCKED_ERROR = "HostDelegationBlocked"
+DELEGATION_NOT_ALLOWED_ERROR = "DelegationNotAllowed"
+
+
+def _normalize_delegation_provider_id(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().lower().replace("_", "-")
+
+
+def provider_is_host_execution_target(provider_id: str | None) -> bool:
+    normalized = _normalize_delegation_provider_id(provider_id)
+    return bool(normalized and normalized in HOST_PROVIDER_NAMES)
+
+
+def validate_execute_subtask_delegation(
+    registry: Any,
+    config: TGsConfig,
+    *,
+    provider_id: str | None,
+) -> dict[str, Any] | None:
+    """Return an error payload when execute_subtask delegation is not permitted."""
+    if not getattr(config, "delegation_utilities_enabled", False):
+        return {
+            "error": DELEGATION_DISABLED_ERROR,
+            "details": (
+                "Utility delegation is disabled. Host shells execute via host_spawn "
+                "(Agent/Task). Set providers.delegation_utilities_enabled: true in "
+                "config.yaml to delegate to OpenCode, Aider, or local endpoints only."
+            ),
+        }
+
+    if provider_id is None:
+        return None
+
+    normalized = _normalize_delegation_provider_id(provider_id)
+    if normalized is None:
+        return None
+
+    allowlist = {
+        str(item).strip().lower()
+        for item in getattr(config, "delegation_utilities", []) or []
+        if isinstance(item, str) and item.strip()
+    }
+    if provider_is_host_execution_target(normalized) and normalized not in allowlist:
+        return {
+            "error": HOST_DELEGATION_BLOCKED_ERROR,
+            "details": (
+                "Host CLIs execute via host_spawn; Threnody does not subprocess to "
+                "other host backends (Copilot, Codex, Cursor, Junie). OpenCode is only "
+                "allowed when listed in providers.delegation_utilities."
+            ),
+            "provider_id": normalized,
+        }
+
+    matcher = getattr(registry, "_matches_provider", None)
+    checker = getattr(registry, "_provider_allowed_as_delegation_target", None)
+    if not callable(matcher) or not callable(checker):
+        allowlist = {
+            str(item).strip().lower()
+            for item in getattr(config, "delegation_utilities", []) or []
+            if isinstance(item, str) and item.strip()
+        }
+        if normalized not in allowlist and not normalized.startswith("local-"):
+            return {
+                "error": DELEGATION_NOT_ALLOWED_ERROR,
+                "details": (
+                    f"Provider '{normalized}' is not in providers.delegation_utilities. "
+                    "Allowed utility targets: OpenCode, Aider, and local loopback endpoints."
+                ),
+                "provider_id": normalized,
+            }
+        return None
+
+    for provider in getattr(registry, "available_providers", []) or []:
+        if matcher(provider, normalized):
+            if checker(provider):
+                return None
+            reason_fn = getattr(registry, "_delegation_target_exclusion_reason", None)
+            reason = reason_fn(provider) if callable(reason_fn) else "not an allowed utility target"
+            return {
+                "error": DELEGATION_NOT_ALLOWED_ERROR,
+                "details": reason,
+                "provider_id": normalized,
+            }
+
+    return {
+        "error": DELEGATION_NOT_ALLOWED_ERROR,
+        "details": f"Provider '{normalized}' is not installed or not routable for delegation.",
+        "provider_id": normalized,
+    }
+

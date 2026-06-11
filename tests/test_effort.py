@@ -87,7 +87,7 @@ class StubCodexRegistry:
 def test_execute_subtask_rejects_explicit_effort_for_unsupported_provider(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "effort.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, None, None, None))
@@ -105,7 +105,7 @@ def test_execute_subtask_rejects_explicit_effort_for_unsupported_provider(monkey
 def test_execute_subtask_annotates_config_default_effort_for_unsupported_provider(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "effort.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         # configure a provider default for github-copilot (unsupported explicit effort)
         cfg.provider_effort_defaults = {"github-copilot": {"low": "careful"}}
         db = Database(db_path=db_path)
@@ -127,7 +127,7 @@ def test_execute_subtask_annotates_config_default_effort_for_unsupported_provide
 def test_execute_subtask_allows_explicit_effort_for_supported_provider(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "effort.db"
-        cfg = TGsConfig(db_path=db_path)
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
 
         monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, None, None, None))

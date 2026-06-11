@@ -228,7 +228,17 @@ This project is now focused on making that orchestration adapt better to your co
 <!-- GSD:skills-start source:skills/ -->
 ## Project Skills
 
-No project skills found. Add skills to any of: `.github/skills/`, `.agents/skills/`, `.cursor/skills/`, or `.github/skills/` with a `SKILL.md` index file.
+Threnody MCP workflows (CLI-agnostic — use from any connected host):
+
+| Skill | When |
+|-------|------|
+| [threnody-routing](../.cursor/skills/threnody-routing/SKILL.md) | `route_task`, routing guard, host-native vs utility delegation |
+| [threnody-task](../.cursor/skills/threnody-task/SKILL.md) | `plan_task`, `decompose_task`, `fleet_plan`, `host_spawn_waves` |
+| [threnody-swarm](../.cursor/skills/threnody-swarm/SKILL.md) | `execute_swarm`, topology, budget preview, resume |
+| [threnody-fullstack](../.cursor/skills/threnody-fullstack/SKILL.md) | Parallel frontend + backend + API (contract-first DAG) |
+| [threnody-subtasks](../.cursor/skills/threnody-subtasks/SKILL.md) | `list_subtasks` for utility `execute_subtask` monitoring |
+
+Also indexed under `.cursor/skills/` in the repo root.
 <!-- GSD:skills-end -->
 
 <!-- GSD:workflow-start source:GSD defaults -->

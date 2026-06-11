@@ -1041,10 +1041,10 @@ echo ""
 if [[ "$HOST_COUNT" -ge 2 ]]; then
     echo "  🔗 $HOST_COUNT host CLIs detected — coordination + optional delegation enabled"
 elif [[ "$HOST_COUNT" -eq 1 ]]; then
-    echo "  📎 Single host CLI detected — install another CLI to unlock delegation targets"
+    echo "  📎 Single host CLI detected — install OpenCode/Aider or enable local endpoints for optional utility delegation"
 fi
 if [[ "$HAS_GH" -eq 1 ]]; then
-    echo "     Host-native execution uses your CLI auth; delegate via execute_subtask when needed"
+    echo "     Host-native execution uses your CLI auth; enable delegation_utilities for OpenCode/Aider/local only"
 fi
 if [[ "$HAS_OPENCODE" -eq 1 ]]; then
     echo "     OpenCode is available as a low-tier host/provider via opencode/nemotron-3-super-free"

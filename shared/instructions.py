@@ -113,7 +113,7 @@ def render_shell_instructions(
             "After `route_task`, `plan_task`, or `fleet_plan`, consume `host_spawn` / `host_spawn_waves` from the MCP response.",
             f"Spawn each wave with the host `{host_tool}` tool (or direct edits when `host_native_method` is `direct_edit`).",
             "Do **not** call `execute_subtask` for same-host work — Threnody returns `HostNativeRequired` with an actionable `host_spawn` payload.",
-            "Use `execute_subtask(provider_id=...)` only for explicit cross-backend delegation when the provider appears in `delegation_targets`.",
+            "Use `execute_subtask(provider_id=...)` only for utility backends in `delegation_targets` when `providers.delegation_utilities_enabled` is true.",
             "`execute_swarm` defaults to `host_native`: execute `host_spawn_waves` in the host shell; Threnody persists the plan as `awaiting_host_execution` without subprocess fanout.",
         ]
     )

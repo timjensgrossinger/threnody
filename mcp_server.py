@@ -120,6 +120,7 @@ from shared.host_spawn import (
     build_host_spawn,
     build_host_spawn_waves,
     effective_swarm_host_execution_mode,
+    validate_execute_subtask_delegation,
     would_self_delegate,
 )
 from shared.quota import ProviderQuotaService
@@ -3148,6 +3149,7 @@ def _delegation_targets_for_tier(
             tier,
             caller=caller,
             caller_allowlists=caller_allowlists,
+            for_delegation=True,
         )
     except Exception:
         log.debug("_delegation_targets_for_tier failed", exc_info=True)
@@ -3212,10 +3214,10 @@ def _build_execution_hint_economics(
             rationale = (
                 f"Host-native Task execution uses your {normalize_caller_id(caller) or 'host'} entitlement."
             )
-        if is_free and delegation_targets:
+        if delegation_targets:
             rationale += (
-                f" If delegating, cheapest routable backend is {delegation_targets[0]}"
-                f" (cost_rank={cost_rank}, free={is_free})."
+                f" Optional utility delegation: execute_subtask(provider_id='{delegation_targets[0]}')"
+                " when providers.delegation_utilities_enabled is true."
             )
         why_not_delegate = (
             "Caller is an MCP host shell — host-native execution avoids Threnody subprocess billing."
@@ -3224,7 +3226,7 @@ def _build_execution_hint_economics(
         target = delegation_targets[0]
         if is_free:
             rationale = (
-                f"Cheapest routable backend is {target} via execute_subtask"
+                f"Utility delegation target {target} via execute_subtask(provider_id='{target}')"
                 f" (model={model or 'tier default'}, cost_rank={cost_rank}, free tier)."
             )
         else:
@@ -3234,13 +3236,15 @@ def _build_execution_hint_economics(
                 else "subscription/metered billing"
             )
             rationale = (
-                f"Cheapest routable backend is {target} ({model or 'tier default'}); "
+                f"Utility delegation target {target} ({model or 'tier default'}); "
                 f"{cost_note} for typical {tier}-tier work."
             )
         why_not_delegate = None
     else:
-        rationale = "No routable delegation targets; use host-native execution."
-        why_not_delegate = "No authenticated routable backends for this tier."
+        rationale = "Use host-native execution; utility delegation is disabled or no utility backends are routable."
+        why_not_delegate = (
+            "Enable providers.delegation_utilities_enabled for OpenCode/Aider/local utility delegation only."
+        )
 
     economics: dict[str, object] = {
         "is_free": is_free,
@@ -3299,7 +3303,10 @@ def _build_route_execution_hint(
             )
         if delegation_targets:
             preview = ", ".join(delegation_targets[:4])
-            recommended = f"{recommended}; optional delegation via execute_subtask → {preview}"
+            recommended = (
+                f"{recommended}; optional utility delegation via execute_subtask"
+                f" (provider_id from: {preview}) when delegation_utilities_enabled"
+            )
         economics = _build_execution_hint_economics(
             tier=tier,
             caller=caller,
@@ -7891,6 +7898,14 @@ def handle_execute_subtask(args: dict) -> dict:
             "provenance": provenance,
         }
 
+    delegation_error = validate_execute_subtask_delegation(
+        registry,
+        _config,
+        provider_id=provider_id,
+    )
+    if delegation_error is not None:
+        return delegation_error
+
     import time as _time
     t0 = _time.monotonic()
     selection_metadata = _select_provider_metadata(
@@ -8074,6 +8089,7 @@ def handle_execute_subtask(args: dict) -> dict:
                     effort=effort,
                     caller_allowlists=caller_allowlists,
                     on_pid=lambda pid: _store_active_pid(task_id, pid, cancel_event),
+                    delegation_only=True,
                     **({"provider_id": provider_id} if provider_id is not None else {}),
                 )
             except TypeError as exc:

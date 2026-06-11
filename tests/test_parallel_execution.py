@@ -140,7 +140,7 @@ def workspace(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     db_path = tmp_path / "test.db"
-    cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[])
+    cfg = TGsConfig(db_path=db_path, write_safety_trusted_bases=[], delegation_utilities_enabled=True)
     db = Database(db_path=db_path)
     return repo, cfg, db
 

@@ -31,7 +31,7 @@ named in documentation.
 | Path | Description |
 |------|-------------|
 | **Host-native** (default) | Host shell runs Task agents, edits, or host-configured backends |
-| **Delegated** | `execute_subtask` invokes other routable CLIs or configured endpoints |
+| **Utility delegation (opt-in)** | `execute_subtask` invokes OpenCode, Aider, or local loopback endpoints only |
 | **Router-only hosts** | Claude Code is a coordination anchor by default — not a subprocess delegation target |
 
 ### Host-native MCP contract (Meta-harness v2)
@@ -41,9 +41,9 @@ For MCP host shells, Threnody returns `host_spawn` / `host_spawn_waves` from
 via **Agent** (Claude Code) or **Task** (other shells). Same-host
 `execute_subtask` returns **`HostNativeRequired`**.
 
-Cross-backend work still uses `execute_subtask(provider_id=...)` when the target
-CLI differs from the caller. Enabling `providers.router_only_allow_execution`
-restores subprocess delegation to router-only hosts at operator policy risk.
+Utility delegation uses `execute_subtask(provider_id=...)` only for OpenCode, Aider,
+or local endpoints when `providers.delegation_utilities_enabled` is true.
+Threnody does not subprocess to other host CLIs (Copilot, Codex, Cursor, …).
 
 Override router-only defaults with `providers.router_only_allow_execution` in
 `config.yaml` only when you accept provider-policy risk. See
