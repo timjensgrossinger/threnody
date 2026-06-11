@@ -1076,7 +1076,7 @@ def test_handle_route_task_prefers_free_low_tier_metadata(monkeypatch) -> None:
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1109,7 +1109,7 @@ def test_handle_route_task_execution_hint_host_native_for_claude(monkeypatch) ->
         cfg = TGsConfig(db_path=db_path)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="medium",
                 score=0.55,
                 reason="medium-tier task",
@@ -1144,8 +1144,45 @@ def test_handle_route_task_execution_hint_host_native_for_claude(monkeypatch) ->
         assert "Task agent" in result["quick_action"]
 
 
+def test_handle_route_task_passes_cwd_and_persists_telemetry(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    db_path = tmp_path / "route-cwd.db"
+    cfg = TGsConfig(db_path=db_path)
+    db = Database(db_path=db_path)
+
+    def classify(task, project_path=None):
+        captured["project_path"] = project_path
+        return SimpleNamespace(
+            tier="low",
+            score=0.31,
+            reason="test",
+            agents=1,
+            override=False,
+        )
+
+    router = SimpleNamespace(classify=classify)
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (cfg, db, router, None, None),
+    )
+    monkeypatch.setattr(mcp_server, "get_registry", lambda: DelegatingStubRegistry())
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+    task = "fix typo in readme"
+    result = mcp_server.handle_route_task({"task": task, "cwd": str(tmp_path)})
+
+    assert captured["project_path"] == str(tmp_path.resolve())
+    assert result["task_id"] == mcp_server.shared_outcomes.route_task_id(task)
+    row = db._conn.execute(
+        "SELECT complexity_score FROM telemetry WHERE task_hash = ?",
+        (result["task_id"],),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == 0.31
+
+
 class LeakyDelegationRegistry(DelegatingStubRegistry):
-    """Simulates a stale registry that still lists host CLIs for delegation."""
 
     def _ordered_execution_candidates(
         self,
@@ -1180,7 +1217,7 @@ def test_delegation_targets_filter_host_clis_when_utilities_disabled(monkeypatch
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=False)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.2,
                 reason="low-tier task",
@@ -1215,7 +1252,7 @@ def test_delegation_targets_allow_utilities_only_when_enabled(monkeypatch) -> No
         )
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.2,
                 reason="low-tier task",
@@ -1246,7 +1283,7 @@ def test_handle_route_task_execution_hint_delegate_for_copilot(monkeypatch) -> N
             cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
             db = Database(db_path=db_path)
             router = SimpleNamespace(
-                classify=lambda _task: SimpleNamespace(
+                classify=lambda _task, project_path=None: SimpleNamespace(
                     tier="low",
                     score=0.2,
                     reason="low-tier task",
@@ -1616,7 +1653,7 @@ def test_handle_route_task_uses_code_only_hint_for_write_tasks(monkeypatch) -> N
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1675,7 +1712,7 @@ def test_handle_route_task_avoids_code_only_for_plain_text_tasks(monkeypatch) ->
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1719,7 +1756,7 @@ def test_handle_route_task_does_not_fabricate_provider_metadata(monkeypatch) -> 
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -2032,7 +2069,7 @@ def test_handle_route_task_ignores_invalid_model_from_selection(monkeypatch) -> 
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -3320,7 +3357,7 @@ def test_handle_route_task_includes_host_spawn_for_claude_host(monkeypatch) -> N
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="medium",
                 score=0.55,
                 reason="medium-tier task",

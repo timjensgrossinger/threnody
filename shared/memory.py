@@ -4,9 +4,11 @@ import json
 import math
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 from .config import BASE_DIR
+from .context import is_within_repo, normalize_target_path
 from .db import Database
 
 VALID_MEMORY_SCOPES = frozenset({"global", "project", "task"})
@@ -22,6 +24,17 @@ class MemoryRequestError(ValueError):
 
 class MemoryNotFoundError(LookupError):
     """Raised when a requested memory entry does not exist."""
+
+
+def canonical_project_id(raw: str, workspace_root: str | Path) -> str:
+    """Resolve project_id to a stable absolute path for cross-CLI sharing."""
+    normalized = str(raw or "").strip()
+    if not normalized:
+        raise MemoryRequestError("project_id is required")
+    candidate = normalize_target_path(normalized, workspace_root)
+    if not is_within_repo(candidate, workspace_root):
+        raise MemoryRequestError("project_id must resolve inside the workspace")
+    return str(candidate.resolve())
 
 
 def _get_db(db: Database | None) -> Database:
@@ -576,6 +589,7 @@ def memory_refresh_swarm_state_from_db(
 __all__ = [
     "MemoryNotFoundError",
     "MemoryRequestError",
+    "canonical_project_id",
     "memory_delete",
     "memory_get",
     "memory_get_swarm_state",

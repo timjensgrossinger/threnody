@@ -79,6 +79,7 @@ from shared.model_catalog import ModelCatalog
 from shared.memory import (
     MemoryNotFoundError,
     MemoryRequestError,
+    canonical_project_id,
     memory_delete,
     memory_get,
     memory_list,
@@ -4008,7 +4009,9 @@ def _route_quick_action(
 def handle_route_task(args: dict) -> dict:
     config, db, router, planner, orchestrator = _ensure_init()
     task = args.get("task", "")
-    decision = router.classify(task)
+    project_path = _routing_guard_cwd(args.get("cwd"))
+    decision = router.classify(task, project_path=project_path)
+    task_id = shared_outcomes.route_task_id(task)
 
     # Only preview the raw file-generation path when the task itself looks like
     # a write/edit operation. Plain low-tier text tasks still use the normal
@@ -4059,6 +4062,7 @@ def handle_route_task(args: dict) -> dict:
         "score": decision.score,
         "reason": decision.reason,
         "agents": decision.agents,
+        "task_id": task_id,
         "cache_hit": cached is not None,
         "override": decision.override,
         "execution_hint": execution_hint,
@@ -4128,6 +4132,19 @@ def handle_route_task(args: dict) -> dict:
         task=task,
         tier=decision.tier,
         execution_hint=execution_hint,
+    )
+    shared_outcomes.persist_route_telemetry(
+        db,
+        task_id=task_id,
+        tier=decision.tier,
+        complexity_score=decision.score,
+        model=str(result.get("model") or model),
+        provider=(
+            str(result.get("provider"))
+            if isinstance(result.get("provider"), str)
+            else None
+        ),
+        caller=caller,
     )
     _print_dispatch_info(
         tier=result.get("tier", decision.tier),
@@ -7403,10 +7420,10 @@ def _normalize_project_id(project_id: str) -> str:
         return ""
 
     workspace_root = _active_workspace_root()
-    candidate = normalize_target_path(normalized_project_id, workspace_root)
-    if not is_within_repo(candidate, workspace_root):
-        raise ValueError("project_path must resolve inside the active workspace")
-    return str(candidate)
+    try:
+        return canonical_project_id(normalized_project_id, workspace_root)
+    except MemoryRequestError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _require_project_id(project_id: str) -> str:

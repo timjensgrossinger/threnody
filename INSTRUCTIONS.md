@@ -106,7 +106,23 @@ of a marked block.
 
 - **Host hooks:** Claude guarded mode installs `shell/threnody-routing-hook.sh` (see [docs/HOOKS.md](docs/HOOKS.md)).
 - **Routing trust:** run `python3 -m shared.routing_report --write-docs` for fixture accuracy stats.
-- **Learned agents:** approval-gated drafts may land in the **cost_lane** when low-tier patterns recur with strong quality — prefer free/low execution metadata in drafts.
+- **Learned agents:** approval-gated drafts may land in the **cost_lane** when low-tier patterns recur with strong quality — prefer free/low execution metadata in drafts. Approved agents inject context during **planning** (`plan_task` / `decompose_task`); they do not auto-select host subagent personas at `route_task` time.
+
+## Cross-session memory (cross-CLI)
+
+All MCP hosts installed from this repo share `~/.local/lib/threnody/cache.db`. Use `memory_*` tools with:
+
+- **`global` scope** — shared machine-wide keys (no `project_id`)
+- **`project` scope** — pass a stable **absolute** project root as `project_id` so every shell hits the same namespace (avoid `"."`, which resolves per-host)
+- **`task` scope** — requires explicit shared `task_id` strings
+
+`shared/memory.canonical_project_id()` normalizes relative paths under the active workspace.
+
+## Adaptive routing feedback
+
+1. `route_task` returns `task_id` and records `complexity_score` in telemetry (pass `cwd` for project-local adaptive thresholds).
+2. Call `record_outcome(task_id=..., outcome=...)` when work finishes.
+3. Enable per-project learning: `threnody tune set learning_enabled true --project .`
 
 ## Legal and provider terms
 

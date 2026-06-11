@@ -202,15 +202,34 @@ Workflow guide: [docs/COST_SAVINGS.md](docs/COST_SAVINGS.md)
 | | Feature | What it does |
 |---|---|---|
 | 🎯 | **Tier routing** | Heuristic complexity scoring + `host_spawn` / `execution_hint` for host-native work |
-| 🧠 | **Learning loop** | Pattern tracking → draft agents → approval queue → auto-match future work |
+| 🧠 | **Learning loop** | Pattern tracking → draft agents → approval queue → plan-time context injection for matching work |
 | 🐝 | **Swarm orchestration** | `execute_swarm` returns `host_spawn_waves` by default (`awaiting_host_execution`); heuristic intent fans out one agent per file; `expand_host_plan` for mid-run discovery |
-| 💾 | **Cross-session memory** | `memory_*` MCP tools backed by local SQLite |
+| 💾 | **Cross-session memory** | `memory_*` MCP tools backed by local SQLite — shared across all MCP hosts via `~/.local/lib/threnody/cache.db` |
 | 🔌 | **MCP-native** | ~43 tools over stdio JSON-RPC; works with any MCP-compatible host shell |
 | 🔀 | **Utility delegation** | Opt-in `execute_subtask` to OpenCode, Aider, local endpoints; host→host blocked |
 | 📋 | **Planning skills** | Six repo skills under `skills/` — start with `threnody-plan` for plan-only workflows |
-| 📈 | **Adaptive thresholds** | EMA-based threshold learning from routing outcomes |
-| 🛡️ | **Write safety** | Path validation, outside-workspace preview gate, audit trail |
+| 📈 | **Adaptive thresholds** | EMA-based threshold learning from `record_outcome` (pass `task_id` from `route_task`; enable per-project learning) |
+| 🛡️ | **Write safety** | Path validation, outside-workspace grant model + audit trail |
 | 🔒 | **Guarded routing** | Optional coordination gate + Claude PreToolUse hooks (`routing_policy.mode: guarded`; advisory is default) |
+
+### Cross-CLI memory
+
+All installed MCP hosts share one SQLite store at `~/.local/lib/threnody/cache.db` (WAL). Use these conventions so Claude Code, Copilot, Cursor, and other shells read the same keys:
+
+| Scope | When to use | Cross-CLI tip |
+|---|---|---|
+| `global` | Machine-wide coordination | Fully shared — no `project_id` |
+| `project` | Repo-specific state | Pass a **stable absolute path** as `project_id`, not `"."` (each host resolves `"."` to its own active workspace) |
+| `task` | One run or wave | Share explicit `task_id` strings across hosts |
+
+`shared/memory.canonical_project_id()` resolves relative paths to absolute paths under the active workspace. Do not store secrets in memory — any connected host can read or overwrite keys.
+
+### Adaptive routing
+
+1. `route_task` returns `task_id` and persists `complexity_score` in telemetry.
+2. After work completes, call `record_outcome(task_id=..., outcome=accepted|revised|rejected|reworked)`.
+3. Enable learning per project: `threnody tune set learning_enabled true --project .`
+4. Warm-path EMA updates apply adaptive thresholds at classify time once band and project sample gates are met (requires `cwd` on `route_task`).
 
 ---
 

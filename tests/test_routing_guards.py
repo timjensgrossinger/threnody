@@ -238,7 +238,7 @@ def test_route_task_issues_low_tier_direct_guard_for_host(monkeypatch: pytest.Mo
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -284,7 +284,7 @@ def test_validate_routing_guard_allows_low_tier_direct_edit_after_host_route(
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -314,7 +314,7 @@ def test_route_task_skips_guard_for_exempt_markdown(monkeypatch: pytest.MonkeyPa
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -341,7 +341,7 @@ def test_route_task_resolves_exempt_relative_hints_against_caller_cwd(
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(td)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -439,7 +439,7 @@ def test_validate_routing_guard_allows_medium_direct_edit_in_scope(monkeypatch: 
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -657,7 +657,7 @@ def test_route_task_preserves_routed_plan_guard_during_active_handoff(
             },
         )
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.16,
                 reason="low",
@@ -696,7 +696,7 @@ def test_route_task_uses_explicit_cwd_for_guard_scope(monkeypatch: pytest.Monkey
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(td)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -729,7 +729,7 @@ def test_validate_routing_guard_denies_target_outside_workspace_without_file_hin
     with tempfile.TemporaryDirectory() as td:
         cfg, db = _prepare_db(td)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -770,7 +770,7 @@ def test_validate_routing_guard_denies_missing_target_file(monkeypatch: pytest.M
     with tempfile.TemporaryDirectory() as td:
         cfg, db = _prepare_db(td)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -798,7 +798,7 @@ def test_route_task_extracts_extensionless_and_dotfile_hints(monkeypatch: pytest
     with tempfile.TemporaryDirectory() as td:
         cfg, db = _prepare_db(td)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -823,7 +823,7 @@ def test_route_task_tolerates_guard_store_failures(monkeypatch: pytest.MonkeyPat
     with tempfile.TemporaryDirectory() as td:
         cfg, db = _prepare_db(td)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -1063,7 +1063,7 @@ def test_route_task_issues_execute_subtask_guard_for_delegate_low_tier(
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1099,7 +1099,7 @@ def test_soft_hint_when_delegate_guard_not_strict(monkeypatch: pytest.MonkeyPatc
         assert cfg.execute_subtask_guard_strict is False
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1142,7 +1142,7 @@ def test_hard_deny_when_execute_subtask_guard_strict(monkeypatch: pytest.MonkeyP
         cfg.execute_subtask_guard_strict = True
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task: SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",

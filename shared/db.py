@@ -744,6 +744,9 @@ class Database:
             "coordinator_amendment_count": (
                 "ALTER TABLE telemetry ADD COLUMN coordinator_amendment_count INTEGER DEFAULT 0"
             ),
+            "complexity_score": (
+                "ALTER TABLE telemetry ADD COLUMN complexity_score REAL"
+            ),
         }
         for column, statement in migrations.items():
             if column not in existing:
@@ -3800,6 +3803,7 @@ class Database:
         artifact_consume_count: int = 0,
         coordinator_round_count: int = 0,
         coordinator_amendment_count: int = 0,
+        complexity_score: float | None = None,
     ) -> int:
         """Persist one telemetry row.
 
@@ -3844,6 +3848,7 @@ class Database:
                 "artifact_consume_count",
                 "coordinator_round_count",
                 "coordinator_amendment_count",
+                "complexity_score",
                 "ts",
             ]
             values = [
@@ -3877,6 +3882,7 @@ class Database:
                 int(artifact_consume_count),
                 int(coordinator_round_count),
                 int(coordinator_amendment_count),
+                complexity_score,
                 time.time(),
             ]
             placeholders = ", ".join(["?"] * len(values))

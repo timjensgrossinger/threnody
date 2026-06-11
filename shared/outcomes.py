@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import logging
@@ -108,11 +109,17 @@ def _normalize_swarm_outcome_note(
     return json.dumps(compact, sort_keys=True, separators=(",", ":"))
 
 
+def route_task_id(task: str) -> str:
+    """Return a stable task_id for route_task → record_outcome correlation."""
+    digest = hashlib.sha256(task.encode()).hexdigest()[:16]
+    return f"route-{digest}"
+
+
 def _latest_telemetry_context(db: Database, task_id: str) -> dict[str, Any]:
     with db.conn() as conn:
         row = conn.execute(
             """
-            SELECT id, tier, model, provider_name
+            SELECT id, tier, model, provider_name, complexity_score
             FROM telemetry
             WHERE task_hash = ?
             ORDER BY ts DESC, id DESC
@@ -130,13 +137,13 @@ def _latest_telemetry_context(db: Database, task_id: str) -> dict[str, Any]:
             "complexity_score": None,
         }
 
-    telemetry_id, tier, model, provider_name = row
+    telemetry_id, tier, model, provider_name, complexity_score = row
     return {
         "telemetry_id": telemetry_id,
         "tier": tier,
         "model": model,
         "provider": provider_name,
-        "complexity_score": None,
+        "complexity_score": complexity_score,
     }
 
 
@@ -148,6 +155,38 @@ def _default_complexity_score_for_tier(tier: str) -> float:
         "high": 0.75,
     }
     return tier_scores.get(tier, 0.50)
+
+
+def persist_route_telemetry(
+    db: Database,
+    *,
+    task_id: str,
+    tier: str,
+    complexity_score: float,
+    model: str | None = None,
+    provider: str | None = None,
+    caller: str | None = None,
+) -> int | None:
+    """Persist a routing decision so record_outcome can correlate scores."""
+    try:
+        return db.log_agent_result(
+            session_id=caller or "mcp",
+            task_hash=task_id,
+            agent_id=0,
+            tier=tier,
+            model=model or "",
+            provider_name=provider or "mcp",
+            complexity_score=float(complexity_score),
+            reason="route_task",
+            version="route",
+        )
+    except Exception:
+        log.debug(
+            "Failed to persist route telemetry for task %s",
+            task_id,
+            exc_info=True,
+        )
+        return None
 
 
 def enqueue_learning_update(
@@ -245,6 +284,26 @@ def enqueue_learning_update(
                 """,
                 (task_id, tier, complexity_score, success, now),
             )
+        if project_id:
+            try:
+                from .adaptive import register_observation
+
+                register_observation(
+                    db,
+                    project_id,
+                    {
+                        "rework_count": 0,
+                        "token_cost": 0,
+                        "success": success,
+                        "timestamp": now,
+                    },
+                )
+            except Exception:
+                log.debug(
+                    "Failed to register project observation for %s",
+                    project_id,
+                    exc_info=True,
+                )
         log.debug(
             "Enqueued learning update for task %s: tier=%s score=%s success=%s",
             task_id,
@@ -619,6 +678,8 @@ __all__ = [
     "OUTCOME_READONLY_WINDOW_SECONDS",
     "OUTCOME_VALUES",
     "OutcomeReadonlyWindowError",
+    "persist_route_telemetry",
+    "route_task_id",
     "record_outcome",
     "record_swarm_outcome",
     "enqueue_learning_update",

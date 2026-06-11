@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import os
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -200,6 +201,104 @@ def test_router_without_db_skips_adaptive():
     assert result.tier in ("low", "medium", "high")
     # report_outcome should not crash
     router.report_outcome(score=0.5, tier="medium", success=True)
+
+
+def test_classify_applies_adaptive_thresholds_when_gates_satisfied():
+    """E2E: mature band + project samples switch classify() to adaptive thresholds."""
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(db_path=Path(td) / "test.db")
+        project_id = str(Path(td) / "project")
+        db._conn.execute(
+            """
+            INSERT INTO project_routing (project_path, overrides_json, learning_enabled, ts)
+            VALUES (?, ?, 1, ?)
+            """,
+            (project_id, '{"tier_bias": 0.0, "sample_count": 0}', 0.0),
+        )
+        db._conn.commit()
+
+        cfg = TGsConfig()
+        router = TaskRouter(cfg, db=db)
+        static_thresholds = router._get_thresholds(score=0.52, project_path=project_id)
+        assert static_thresholds.low_max == cfg.thresholds.low_max
+
+        for _ in range(5):
+            update_band(db, score=0.52, tier="low", success=False)
+        for _ in range(PROJECT_SAMPLE_MIN):
+            register_observation(
+                db,
+                project_id,
+                {"rework_count": 0, "token_cost": 0, "success": False, "timestamp": 1.0},
+            )
+
+        assert should_apply_adaptive_thresholds(
+            project_id,
+            band_sample_count=5,
+            project_sample_count=PROJECT_SAMPLE_MIN,
+        )
+        adaptive_thresholds = router._get_thresholds(score=0.52, project_path=project_id)
+        assert adaptive_thresholds.low_max < static_thresholds.low_max
+
+        decision = router.classify(
+            "update unit tests for helper module",
+            project_path=project_id,
+        )
+        expected_tier = router._tier_from_score(decision.score, project_path=project_id)
+        assert decision.tier == expected_tier
+        db.close()
+
+
+def test_persist_route_telemetry_stores_complexity_score():
+    from shared.outcomes import persist_route_telemetry, route_task_id
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(db_path=Path(td) / "test.db")
+        task = "fix typo in readme"
+        task_id = route_task_id(task)
+        persist_route_telemetry(
+            db,
+            task_id=task_id,
+            tier="low",
+            complexity_score=0.22,
+            model="test-model",
+            provider="mcp",
+            caller="test",
+        )
+        row = db._conn.execute(
+            "SELECT complexity_score, tier FROM telemetry WHERE task_hash = ?",
+            (task_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == 0.22
+        assert row[1] == "low"
+        db.close()
+
+
+def test_enqueue_learning_update_registers_project_observation():
+    from shared.outcomes import enqueue_learning_update
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(db_path=Path(td) / "test.db")
+        project_id = str(Path(td) / "project")
+        db._conn.execute(
+            """
+            INSERT INTO project_routing (project_path, overrides_json, learning_enabled, ts)
+            VALUES (?, ?, 1, ?)
+            """,
+            (project_id, '{"tier_bias": 0.0, "sample_count": 0}', 0.0),
+        )
+        db._conn.execute(
+            """
+            INSERT INTO telemetry (session_id, task_hash, agent_id, tier, model, ts)
+            VALUES ('test', 'task-1', 0, 'low', 'm', ?)
+            """,
+            (time.time(),),
+        )
+        db._conn.commit()
+
+        enqueue_learning_update(db, "task-1", "accepted", project_id=project_id)
+        assert get_project_sample_count(db, project_id) == 1
+        db.close()
 
 
 # ---------------------------------------------------------------------------
