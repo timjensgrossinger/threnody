@@ -338,7 +338,7 @@ def _subtasks_from_entries(
     if integration_ids and foundation_ids:
         foundation_set = set(foundation_ids)
         for subtask in subtasks:
-            if int(subtask["id"]) in integration_ids:
+            if int(subtask.get("id", -1)) in integration_ids:
                 subtask["depends_on"] = sorted(foundation_set)
 
     has_deps = any(subtask.get("depends_on") for subtask in subtasks)
@@ -368,6 +368,12 @@ def build_heuristic_plan_payload(
     intent_templates: bool = True,
 ) -> dict[str, object]:
     """Build planner JSON compatible with ``Planner._build_plan`` without an LLM."""
+    # Review fanout: REVIEW: sentinel → per-file × dimension DAG plan
+    from .review_fanout import is_review_intent, build_review_subtasks
+    if isinstance(task, str) and is_review_intent(task):
+        entries = extract_task_file_entries(task, intent_templates=False)
+        return build_review_subtasks(entries, task, max_agents=max_agents)  # type: ignore[return-value]
+
     task_lower = task.lower() if isinstance(task, str) else ""
     prefix = _directory_prefix_from_task(task) if isinstance(task, str) else ""
 
