@@ -142,15 +142,27 @@ def build_host_spawn(
     target_files: list[str] | None = None,
     spawn_id: str | None = None,
     model: str | None = None,
+    subagent_type: str | None = None,
+    read_only: bool = False,
 ) -> HostSpawnSpec:
+    # Review agents use named subagent types only on claude-code; other hosts fall back to tier.
+    normalized_caller = normalize_caller_id(caller)
+    is_claude_code = normalized_caller == "claude-code"
+    resolved_subagent_type = (
+        subagent_type
+        if subagent_type and is_claude_code
+        else subagent_type_for_tier(tier)
+    )
+    # read_only tasks must never use direct_edit — they read source context only.
+    method = "host_task" if read_only else host_native_method_for_tier(tier)
     return HostSpawnSpec(
         tool=host_tool_for_caller(caller),
-        method=host_native_method_for_tier(tier),
+        method=method,
         model=model or host_native_model_for_tier(config, caller, tier),
-        subagent_type=subagent_type_for_tier(tier),
+        subagent_type=resolved_subagent_type,
         prompt=prompt,
         tier=tier,
-        caller=normalize_caller_id(caller),
+        caller=normalized_caller,
         wave_id=wave_id,
         target_files=list(target_files or []),
         id=spawn_id,
@@ -209,8 +221,9 @@ def build_host_spawn_waves(
 
     subtask_by_id: dict[Any, dict[str, Any]] = {}
     for raw in subtasks:
-        if isinstance(raw, dict) and raw.get("id") is not None:
-            subtask_by_id[raw["id"]] = raw
+        raw_id = raw.get("id") if isinstance(raw, dict) else None
+        if raw_id is not None:
+            subtask_by_id[raw_id] = raw
 
     host_waves: list[dict[str, Any]] = []
     for wave_idx, wave_ids in enumerate(waves, start=1):
@@ -239,6 +252,13 @@ def build_host_spawn_waves(
                     if isinstance(raw_model, str) and str(raw_model).strip()
                     else None
                 )
+            raw_subagent_type = subtask.get("subagent_type")
+            subtask_subagent_type = (
+                str(raw_subagent_type).strip()
+                if isinstance(raw_subagent_type, str) and str(raw_subagent_type).strip()
+                else None
+            )
+            subtask_read_only = bool(subtask.get("read_only", False))
             agents.append(
                 build_host_spawn(
                     config=config,
@@ -249,6 +269,8 @@ def build_host_spawn_waves(
                     target_files=_subtask_target_files(subtask),
                     spawn_id=str(subtask.get("id") or subtask.get("stable_id") or sid),
                     model=model,
+                    subagent_type=subtask_subagent_type,
+                    read_only=subtask_read_only,
                 ).to_dict()
             )
         if agents:

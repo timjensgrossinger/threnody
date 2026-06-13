@@ -99,6 +99,8 @@ class Subtask:
     op_class: str = "side_effecting"  # replayable | side_effecting | approval_required
     session_id: str | None = None  # plan 10: reuse persistent worker session
     convergence_target: ConvergenceTarget | None = None  # plan 14: quality convergence loop
+    subagent_type: str | None = None  # override host subagent type (e.g. "review-security")
+    read_only: bool = False  # skip direct_edit; force host_task method
     _consumes_explicit: bool = False
     _produces_explicit: bool = False
     _is_coordinator_explicit: bool = False
@@ -1391,6 +1393,10 @@ class Planner:
             target_file: str | None = raw_target_file.strip() if raw_target_file else None
             single_file_insertion = bool(st_data.get("single_file_insertion", False))
 
+            raw_subagent_type = self._coerce_optional_text(st_data.get("subagent_type"))
+            subagent_type: str | None = raw_subagent_type.strip() if raw_subagent_type else None
+            read_only = bool(st_data.get("read_only", False))
+
             # Check if this subtask matches a template
             explicit_route_declared = any(
                 self._coerce_optional_text(st_data.get(key)) is not None
@@ -1426,6 +1432,8 @@ class Planner:
                 is_coordinator=is_coordinator,
                 target_file=target_file,
                 single_file_insertion=single_file_insertion,
+                subagent_type=subagent_type,
+                read_only=read_only,
                 _consumes_explicit=consumes_explicit,
                 _produces_explicit=produces_explicit,
                 _is_coordinator_explicit=is_coordinator_explicit,
@@ -1748,5 +1756,9 @@ class Planner:
                 subtask_payload["single_file_insertion"] = True
             if st.target_file is not None:
                 subtask_payload["target_file"] = st.target_file
+            if st.subagent_type is not None:
+                subtask_payload["subagent_type"] = st.subagent_type
+            if st.read_only:
+                subtask_payload["read_only"] = True
             payload.setdefault("subtasks", []).append(subtask_payload)
         return payload

@@ -153,7 +153,8 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 | `shared/replay.py` | Trace replay and state forking from coordinator checkpoints; requires idempotency keys on `SIDE_EFFECTING` subtasks |
 | `shared/routing_hook.py` | Standalone PreToolUse routing guard bridge — no MCP stdio required; backs the Claude Code `guarded` policy hook |
 | `shared/agent_export.py` | Export approved learned agent definitions as provider-native skill files |
-| `shared/host_spawn.py` | Host-native spawn contract helpers — produces `host_spawn` / `host_spawn_waves` payloads, enforces `HostNativeRequired` |
+| `shared/host_spawn.py` | Host-native spawn contract helpers — produces `host_spawn` / `host_spawn_waves` payloads, enforces `HostNativeRequired`; honors per-subtask `subagent_type` and `read_only` overrides |
+| `shared/review_fanout.py` | Per-file × dimension review fanout for `REVIEW:` tasks — complexity gating (trivial/moderate/complex), dimension selection, tier assignment, `build_review_subtasks()` |
 | `mcp_server.py` | MCP server (JSON-RPC/stdio) — lazy-init, ~41 public tools |
 | `shell/ghc.sh` | Multi-agent shell script backing the `ghc` / `ghcs` / `ghce` aliases |
 | `shell/threnody-watch` | Live monitoring daemon; run in a separate terminal alongside the MCP server |
@@ -227,7 +228,7 @@ Routing eval fixtures live in `tests/eval/` organised by tier (`low_tier/`, `med
 - Threnody is not affiliated with or endorsed by any AI provider
 - Provider terms, policies, and enforcement may change at any time without notice
 - Host shells execute via `host_spawn` / `host_spawn_waves` (Agent/Task); when `host_spawn_waves` is present, spawn subagents — do not substitute direct edits on planned `target_files`. `execute_subtask` is utility-delegation only (opt-in); host→host subprocess delegation is blocked
-- Host-native heuristic planning (`shared/heuristic_plan.py`) fans out one agent per file for webapp/fullstack intent; mid-run `expand_host_plan` adds agents for discovered files. Learning ingest merges handoff snapshots in `shared/host_learning.py`
+- Host-native heuristic planning (`shared/heuristic_plan.py`) fans out one agent per file for webapp/fullstack intent; tasks starting with `REVIEW:` route to `shared/review_fanout.py` for per-file × dimension review DAG. Mid-run `expand_host_plan` adds agents for discovered files. Learning ingest merges handoff snapshots in `shared/host_learning.py`
 - Override router-only hosts via `providers.router_only_allow_execution`; see `docs/LEGAL.md`
 
 `routing_exceptions` is an exemption list, not a code-file allowlist. Add only extra non-code surfaces there; do not enumerate code languages or config formats.
