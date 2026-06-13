@@ -1,0 +1,80 @@
+{
+  "$comment": "Source-of-truth manifest for Threnody distribution. The build process (scripts/build-manifests.py) generates registry-specific manifests from this file: server.json (official MCP registry), .claude-plugin/plugin.json + marketplace.json (Claude Code plugin), and smithery.yaml (Smithery). Edit this file; do not hand-edit the generated manifests. See docs/plugin-design.md.",
+  "name": "threnody",
+  "registry_name": "io.github.timjensgrossinger/threnody",
+  "pypi_package": "threnody-mcp",
+  "version": "0.2.0-alpha.1",
+  "pypi_version": "0.2.0a1",
+  "description": "Local-first MCP meta-harness: routes, plans, and swarms multi-agent coding work while the host shell executes via Agent/Task subagents.",
+  "homepage": "https://github.com/timjensgrossinger/threnody",
+  "repository": {
+    "url": "https://github.com/timjensgrossinger/threnody",
+    "source": "github"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Tim Grossinger",
+    "email": "tim.grossinger@movec.com"
+  },
+  "entry_command": {
+    "command": "uvx",
+    "args": ["threnody-mcp"],
+    "transport": "stdio"
+  },
+  "runtime_hint": "uvx",
+  "python_requires": ">=3.10,<3.14",
+  "dependencies": {
+    "runtime": ["pyyaml>=6.0,<7"],
+    "optional": {
+      "wizard": ["rich>=13.0,<15", "questionary>=2.0,<3"]
+    }
+  },
+  "config_schema": {
+    "type": "object",
+    "required": [],
+    "properties": {
+      "installDir": {
+        "type": "string",
+        "env": "THRENODY_INSTALL_DIR",
+        "description": "Override the data/config directory (defaults to ~/.local/lib/threnody)."
+      },
+      "allowNoHost": {
+        "type": "boolean",
+        "default": false,
+        "env": "THRENODY_ALLOW_NO_HOST",
+        "env_true": "1",
+        "env_false": "0",
+        "description": "Allow startup with no host AI CLI detected."
+      },
+      "skipWizard": {
+        "type": "boolean",
+        "default": true,
+        "env": "THRENODY_SKIP_WIZARD",
+        "env_true": "1",
+        "env_false": "0",
+        "description": "Skip the interactive first-run wizard (always true on plugin/uvx paths; no TTY)."
+      }
+    }
+  },
+  "capabilities": {
+    "mcp": {
+      "transport": "stdio",
+      "tools": true,
+      "tools_list_changed": false,
+      "remotes": false
+    },
+    "plugin": {
+      "mcp_servers": {
+        "threnody": {
+          "command": "uvx",
+          "args": ["threnody-mcp"]
+        }
+      },
+      "skills": "./skills",
+      "hooks": false,
+      "agents": false
+    }
+  },
+  "tags": ["mcp", "routing", "multi-agent", "orchestration", "swarm"],
+  "category": "productivity"
+}

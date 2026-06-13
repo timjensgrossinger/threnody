@@ -19,6 +19,7 @@ THRENODY_TEST_MODE=1 python3 -m pytest tests/ -v
 
 # Lightweight syntax check (used by installer)
 python3 -m py_compile mcp_server.py shared/router.py
+bash -n install.sh shell/*.sh
 
 # Routing eval suite — run before changing config.yaml or eval fixtures
 threnody eval run
@@ -144,6 +145,15 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 | `shared/resilience.py` | Error classification, retry policy, auth probing — used by discovery execute paths |
 | `shared/doctor.py` | Provider health diagnostics and bounded self-repair; backs `threnody doctor [--repair]` |
 | `shared/edit_blocks.py` | Aider-style SEARCH/REPLACE block parser used by `execute_subtask` `blocks` mode |
+| `shared/bandit.py` | LinUCB/Thompson sampling routing policy; shadow mode by default — logs picks but executes heuristic; promote via `config.routing.bandit_mode = 'live'` |
+| `shared/policy.py` | Runtime policy enforcement (`file_write`, `file_read`, `command`, `http_egress`, `mcp_tool`, `secret`); fail-closed — unrecognized op type → deny |
+| `shared/quota.py` | Provider subscription quota collection and normalization |
+| `shared/spend.py` | Operator-facing spend and savings snapshots from local cost telemetry |
+| `shared/worktree.py` | Git worktree isolation for `execute_subtask`; leases at `~/.local/lib/threnody/worktrees/<task_id>`, released with `merge` or `discard` |
+| `shared/replay.py` | Trace replay and state forking from coordinator checkpoints; requires idempotency keys on `SIDE_EFFECTING` subtasks |
+| `shared/routing_hook.py` | Standalone PreToolUse routing guard bridge — no MCP stdio required; backs the Claude Code `guarded` policy hook |
+| `shared/agent_export.py` | Export approved learned agent definitions as provider-native skill files |
+| `shared/host_spawn.py` | Host-native spawn contract helpers — produces `host_spawn` / `host_spawn_waves` payloads, enforces `HostNativeRequired` |
 | `mcp_server.py` | MCP server (JSON-RPC/stdio) — lazy-init, ~41 public tools |
 | `shell/ghc.sh` | Multi-agent shell script backing the `ghc` / `ghcs` / `ghce` aliases |
 | `shell/threnody-watch` | Live monitoring daemon; run in a separate terminal alongside the MCP server |
@@ -191,6 +201,12 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
   - `patch` — provider returns unified diff; applied via `apply_unified_diff()` in `shared/snapshot.py`.
   All modes use `_write_file_with_audit` as the final write primitive.
 - **Routing exceptions bypass the routing guard**: use `routing_exception_add/list/remove` MCP tools (or the DB helpers) to exempt specific calls from the guard. Valid `exception_type` values: `skill`, `filetype`, `project`, `command`, `caller`, `path`. Built-in exemptions cover `.md`, `.mdc`, and known AI assistant instruction files; every other filetype remains routed by default.
+
+## Pull requests
+
+Use scoped Conventional Commit titles: `fix(router): …`, `feat(planner): …`, `refactor(discovery): …`. Explain behavior changes and provider-contract impacts. List exact verification commands run. Call out config, schema, security, and installer changes.
+
+Do not commit generated or machine-specific files: `providers.json`, `cache.db`, `*.db-wal`, `*.db-shm`, backup files, status files, credentials, or paths containing local usernames.
 
 ## Testing
 

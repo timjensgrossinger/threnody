@@ -21,7 +21,37 @@
 
 ---
 
-## Install in 2 minutes
+## Install
+
+**Requires:** Python 3.10+, macOS or Linux, and at least one host AI CLI (`gh`, `claude`, `codex`, `cursor-agent`, `junie`, or `opencode`).
+
+### Claude Code plugin marketplace (recommended)
+
+```bash
+claude plugin marketplace add timjensgrossinger/threnody
+claude plugin install threnody@threnody
+```
+
+Bundles the MCP server and six routing skills. No shell restart needed.
+
+### MCP registry via `uvx`
+
+Works with any MCP-aware host (Claude Code, Copilot, Codex, Cursor):
+
+```bash
+claude mcp add threnody -- uvx threnody-mcp
+```
+
+Or install directly:
+
+```bash
+pip install threnody-mcp        # then: python3 -m threnody.mcp_server
+uvx threnody-mcp                # run without installing
+```
+
+On first tool call with no config present, Threnody returns setup instructions. Run `threnody settings` to complete configuration.
+
+### Full CLI install (shell aliases + ghc wrappers)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/timjensgrossinger/threnody/main/install.sh | bash
@@ -35,13 +65,17 @@ cd threnody
 ./install.sh
 ```
 
-**Requires:** Python 3.10+, macOS or Linux, and at least one host AI CLI (`gh`, `claude`, `codex`, `cursor-agent`, `junie`, or `opencode`).
+Adds `ghc`, `ghcs`, `ghce` shell aliases and syncs routing instructions to all connected host CLIs. Restart your shell after install.
 
-Restart your shell, then connect from Claude Code, Copilot CLI, Codex, Cursor, Junie, or OpenCode — Threnody registers as an MCP server automatically.
+Plugin-only install (skips shell aliases):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/timjensgrossinger/threnody/main/install.sh | bash -s -- --plugin-mode
+```
 
 **Provider terms:** Threnody is not affiliated with or endorsed by any AI provider. Credentials stay in provider-native stores; you configure auth in each host CLI. See [docs/LEGAL.md](docs/LEGAL.md) for operator responsibilities.
 
-Docs: [limitations](docs/RELEASE_LIMITATIONS.md) · [legal](docs/LEGAL.md) · [architecture](docs/ARCHITECTURE.md)
+Docs: [plugin install guide](docs/PLUGIN_INSTALL.md) · [limitations](docs/RELEASE_LIMITATIONS.md) · [legal](docs/LEGAL.md) · [architecture](docs/ARCHITECTURE.md)
 
 ---
 
@@ -307,6 +341,7 @@ Full reference: [docs/CLI.md](docs/CLI.md)
 
 | Doc | Contents |
 |---|---|
+| [Plugin Install](docs/PLUGIN_INSTALL.md) | uvx, plugin marketplace, and `--plugin-mode` setup |
 | [MCP Tools](docs/MCP_TOOLS.md) | All 41 MCP tool surfaces |
 | [CLI Reference](docs/CLI.md) | Shell aliases and operator commands |
 | [Architecture](docs/ARCHITECTURE.md) | Trust boundaries and local-first design |
