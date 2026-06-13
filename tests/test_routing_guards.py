@@ -934,7 +934,8 @@ def test_install_writes_claude_routing_hook() -> None:
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
         install_dir = home / ".local" / "lib" / "threnody"
         install_dir.mkdir(parents=True)
-        (install_dir / "config.yaml").write_text("routing_policy:\n  mode: default\n", encoding="utf-8")
+        # guarded mode enables PreToolUse hook enforcement (advisory default does not).
+        (install_dir / "config.yaml").write_text("routing_policy:\n  mode: guarded\n", encoding="utf-8")
 
         result = subprocess.run(
             ["bash", "install.sh"],
@@ -989,6 +990,8 @@ def test_install_keeps_claude_routing_hook_on_policy_parse_error() -> None:
         )
         assert result.returncode == 0, result.stderr
 
+        # A malformed routing_policy must fail closed: keep PreToolUse enforcement
+        # rather than silently dropping the guard on an unparseable policy.
         settings_path = home / ".claude" / "settings.json"
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         managed = [

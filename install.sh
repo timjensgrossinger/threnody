@@ -655,14 +655,47 @@ config_path = Path(sys.argv[2]).resolve()
 if not out_dir.is_absolute() or not config_path.is_absolute():
     raise SystemExit(f"paths not absolute: {out_dir}, {config_path}")
 out_dir.mkdir(parents=True, exist_ok=True)
+
+# Fail closed: an unparseable / malformed routing_policy must keep hook
+# enforcement enabled rather than silently degrading to advisory. The PyYAML
+# path raises on broken YAML; the limited fallback parser degrades silently, so
+# probe the raw routing_policy shape directly to catch both.
+policy_unresolved = False
 try:
     config = TGsConfig.from_yaml(config_path)
 except Exception as exc:
     print(
-        f"warning: invalid config at {config_path}; rendering default routing policy: {exc}",
+        f"warning: invalid config at {config_path}; keeping hook enforcement enabled: {exc}",
         file=sys.stderr,
     )
     config = TGsConfig()
+    policy_unresolved = True
+
+if not policy_unresolved:
+    try:
+        raw_text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        raw_text = ""
+    if raw_text.strip():
+        probe = None
+        try:
+            import yaml as _yaml
+            probe = _yaml.safe_load(raw_text)
+        except ImportError:
+            from shared.config import _load_basic_yaml_mapping
+            probe = _load_basic_yaml_mapping(raw_text)
+        except Exception:
+            policy_unresolved = True
+        if not policy_unresolved and isinstance(probe, dict):
+            routing_policy_raw = probe.get("routing_policy", {})
+            if routing_policy_raw is not None and not isinstance(routing_policy_raw, dict):
+                print(
+                    f"warning: malformed routing_policy in {config_path}; "
+                    "keeping hook enforcement enabled",
+                    file=sys.stderr,
+                )
+                policy_unresolved = True
+
 shells = {
     "claude-code": ("claude-code", False),
     "github-copilot-cli": ("github-copilot-cli", False),
@@ -675,8 +708,9 @@ for file_stem, (shell_id, verbatim) in shells.items():
     (out_dir / f"{file_stem}.md").write_text(body, encoding="utf-8")
 
 claude_profile = config.routing_policy.effective_profile("claude-code")
+hook_enabled = claude_profile.direct_edit_hooks or policy_unresolved
 (out_dir / "claude-code.hook").write_text(
-    "enabled\n" if claude_profile.direct_edit_hooks else "disabled\n",
+    "enabled\n" if hook_enabled else "disabled\n",
     encoding="utf-8",
 )
 PY

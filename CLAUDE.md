@@ -114,7 +114,7 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 | `linear` | `_execute_runtime_plan` (wave loop) | Default; all others fall back here on validation failure |
 | `dag` | `_execute_dag_runner` | Dependency-ordered wave execution via shared wave core |
 | `hierarchical` | `_execute_hierarchical_runner` | Parent–child subtask trees |
-| `star` | `_execute_star_runner` | Coordinator rounds with worker fanout |
+| `star` | `_execute_star_runner` | Coordinator rounds with worker fanout; `run_coordinator_consensus` fans out persona-diverse queens (subprocess path) |
 
 ### Supporting subsystems
 
@@ -155,6 +155,7 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 | `shared/agent_export.py` | Export approved learned agent definitions as provider-native skill files |
 | `shared/host_spawn.py` | Host-native spawn contract helpers — produces `host_spawn` / `host_spawn_waves` payloads, enforces `HostNativeRequired`; honors per-subtask `subagent_type` and `read_only` overrides |
 | `shared/review_fanout.py` | Per-file × dimension review fanout for `REVIEW:` tasks — complexity gating (trivial/moderate/complex), dimension selection, tier assignment, `build_review_subtasks()` |
+| `shared/consensus.py` | Multi-queen consensus decision logic shared by both execution paths — persona selection, quorum + structural tally, judge arbitration. Owns the *decision*; orchestrator/host own *execution* (spawning queens). Pure, dependency-light, independently tested |
 | `mcp_server.py` | MCP server (JSON-RPC/stdio) — lazy-init, ~41 public tools |
 | `shell/ghc.sh` | Multi-agent shell script backing the `ghc` / `ghcs` / `ghce` aliases |
 | `shell/threnody-watch` | Live monitoring daemon; run in a separate terminal alongside the MCP server |
@@ -229,6 +230,7 @@ Routing eval fixtures live in `tests/eval/` organised by tier (`low_tier/`, `med
 - Provider terms, policies, and enforcement may change at any time without notice
 - Host shells execute via `host_spawn` / `host_spawn_waves` (Agent/Task); when `host_spawn_waves` is present, spawn subagents — do not substitute direct edits on planned `target_files`. `execute_subtask` is utility-delegation only (opt-in); host→host subprocess delegation is blocked
 - Host-native heuristic planning (`shared/heuristic_plan.py`) fans out one agent per file for webapp/fullstack intent; tasks starting with `REVIEW:` route to `shared/review_fanout.py` for per-file × dimension review DAG. Mid-run `expand_host_plan` adds agents for discovered files. Learning ingest merges handoff snapshots in `shared/host_learning.py`
+- Host-native multi-queen consensus (when `swarm.consensus.enabled` + `host_native_enabled`, star/auto topology): `execute_swarm` appends a `wave_kind=consensus` wave of read-only persona-diverse review queens after the worker waves. The host spawns them, reports JSON decisions via `report_host_wave`; `ingest_host_wave` tallies quorum and, if unresolved, returns `consensus_followup` for a single lazy judge round. Host-native queens always run on the host model (never cross providers) — diversity comes from personas, not models. Subprocess path uses `run_coordinator_consensus` and may cross providers when `consensus_cross_provider_enabled`
 - Override router-only hosts via `providers.router_only_allow_execution`; see `docs/LEGAL.md`
 
 `routing_exceptions` is an exemption list, not a code-file allowlist. Add only extra non-code surfaces there; do not enumerate code languages or config formats.

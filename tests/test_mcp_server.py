@@ -1015,7 +1015,7 @@ def test_handle_plan_task_cache_hit_includes_models(monkeypatch) -> None:
             lambda: (cfg, db, None, None, None),
         )
         monkeypatch.setattr(mcp_server, "get_registry", lambda: StubRegistry())
-        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "github-copilot")
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: None)
 
         result = mcp_server.handle_plan_task({"task": "plan this"})
 
@@ -1037,7 +1037,7 @@ def test_handle_plan_task_preserves_explicit_route_metadata(monkeypatch) -> None
         db = Database(db_path=db_path)
         plan = SimpleNamespace(total_agents=1, waves=[[1]])
         planner = SimpleNamespace(
-            plan=lambda _task: plan,
+            plan=lambda _task, **_kwargs: plan,
             plan_to_dict=lambda _plan: {
                 "analysis": "fresh",
                 "subtasks": [{
@@ -1060,7 +1060,7 @@ def test_handle_plan_task_preserves_explicit_route_metadata(monkeypatch) -> None
             lambda: (cfg, db, None, planner, None),
         )
         monkeypatch.setattr(mcp_server, "get_registry", lambda: StubRegistry())
-        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "github-copilot")
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: None)
 
         result = mcp_server.handle_plan_task({"task": "plan this"})
 
@@ -1349,7 +1349,7 @@ def test_handle_fleet_plan_agents_use_plan_route_metadata(monkeypatch) -> None:
         db = Database(db_path=db_path)
         plan = SimpleNamespace(waves=[[1]], total_agents=1)
         planner = SimpleNamespace(
-            plan=lambda _task: plan,
+            plan=lambda _task, **_kwargs: plan,
             plan_to_dict=lambda _plan: {
                 "analysis": "fresh",
                 "subtasks": [{
@@ -1383,6 +1383,9 @@ def test_handle_fleet_plan_agents_use_plan_route_metadata(monkeypatch) -> None:
             "_ensure_init",
             lambda: (cfg, db, None, planner, orchestrator),
         )
+        # Non-host caller so explicit per-subtask route metadata is preserved
+        # (host callers receive host-native models instead).
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: None)
 
         result = mcp_server.handle_fleet_plan({"task": "plan this"})
 
@@ -2119,7 +2122,7 @@ def test_attach_models_to_subtasks_preserves_explicit_route_metadata(monkeypatch
             }
 
     monkeypatch.setattr(mcp_server, "get_registry", lambda: RecordingRegistry())
-    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "github-copilot")
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: None)
 
     result = mcp_server._attach_models_to_subtasks({
         "subtasks": [{
@@ -2162,7 +2165,7 @@ def test_attach_models_to_subtasks_reuses_selection_for_identical_inputs(monkeyp
 
     registry = RecordingRegistry()
     monkeypatch.setattr(mcp_server, "get_registry", lambda: registry)
-    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "github-copilot")
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: None)
 
     result = mcp_server._attach_models_to_subtasks({
         "subtasks": [
@@ -2193,7 +2196,7 @@ def test_attach_models_to_subtasks_backfills_placeholder_model_for_explicit_prov
             }
 
     monkeypatch.setattr(mcp_server, "get_registry", lambda: RecordingRegistry())
-    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "github-copilot")
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: None)
 
     result = mcp_server._attach_models_to_subtasks({
         "subtasks": [{
@@ -2230,7 +2233,7 @@ def test_attach_models_to_subtasks_filters_non_primitive_selection_fields(monkey
             }
 
     monkeypatch.setattr(mcp_server, "get_registry", lambda: RecordingRegistry())
-    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "github-copilot")
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: None)
 
     result = mcp_server._attach_models_to_subtasks({
         "subtasks": [{
@@ -2272,7 +2275,7 @@ def test_attach_models_to_subtasks_avoids_code_only_for_read_only_low_tier(monke
 
     registry = RecordingRegistry()
     monkeypatch.setattr(mcp_server, "get_registry", lambda: registry)
-    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "github-copilot")
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: None)
 
     mcp_server._attach_models_to_subtasks({
         "subtasks": [{
@@ -2284,7 +2287,7 @@ def test_attach_models_to_subtasks_avoids_code_only_for_read_only_low_tier(monke
     assert registry.calls == [{
         "tier": "low",
         "prefer_free": True,
-        "caller": "github-copilot",
+        "caller": None,
         "code_only": False,
     }]
 
@@ -2379,7 +2382,7 @@ def test_inspect_status_rejects_paths_outside_workspace(monkeypatch) -> None:
 
         assert inspection == {
             "error": "InvalidProjectPath",
-            "details": "project_path must resolve inside the active workspace",
+            "details": "project_id must resolve inside the workspace",
         }
 
 

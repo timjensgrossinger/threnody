@@ -120,6 +120,7 @@ from shared.host_spawn import (
     HOST_EXECUTION_CONTRACT,
     host_native_model_for_tier,
     COMPLIANCE_WARNING,
+    build_consensus_wave,
     build_host_native_required_response,
     build_host_spawn,
     build_host_spawn_waves,
@@ -134,6 +135,7 @@ from shared.host_learning import (
     ingest_host_wave,
     inspect_host_swarm,
     plan_run_id,
+    record_consensus_handoff,
     register_host_run_handoff,
 )
 from shared.host_plan_expand import expand_host_plan
@@ -3043,6 +3045,34 @@ def _execute_swarm_host_native_response(
     host_waves = plan_dict.get("host_spawn_waves")
     if not isinstance(host_waves, list):
         host_waves = []
+    # Append the host-native consensus wave (persona-diverse review queens) when
+    # enabled. The host spawns these read-only agents after the worker waves; the
+    # consensus decision is tallied in ingest_host_wave when they are reported.
+    consensus_eligible = str(
+        request_meta.get("topology") or plan.topology or "linear"
+    ).strip().lower() in {"star", "auto"}
+    if host_waves and consensus_eligible:
+        try:
+            registry = _get_registry_with_config()
+        except Exception:
+            registry = None
+        consensus_wave = build_consensus_wave(
+            config=config,
+            caller=caller,
+            task_text=task_text,
+            wave_index=len(host_waves) + 1,
+            registry=registry,
+        )
+        if consensus_wave is not None:
+            host_waves.append(consensus_wave)
+            plan_dict["host_spawn_waves"] = host_waves
+            record_consensus_handoff(
+                db,
+                swarm_id,
+                wave_index=int(consensus_wave.get("wave") or len(host_waves)),
+                personas=[str(p) for p in consensus_wave.get("personas") or []],
+                queen_tier=getattr(config, "consensus_queen_tier", "low"),
+            )
     try:
         db.persist_swarm_run(
             {
@@ -3100,7 +3130,11 @@ def _execute_swarm_host_native_response(
             "After each wave completes, call report_host_wave(swarm_id, wave, workspace_root, agents[]) "
             "with per-agent task_id, spawn_id, success, touched_files, and output_excerpt "
             "(see learning_report_contract); "
-            "on the final wave set terminal=true and outcome=accepted|revised|reworked|rejected."
+            "on the final wave set terminal=true and outcome=accepted|revised|reworked|rejected. "
+            "If a wave is tagged wave_kind=consensus, spawn each read-only queen and report their "
+            "JSON decisions as output_excerpt; if the response returns consensus_followup, spawn the "
+            "single judge agent it provides and call report_host_wave again with expects_wave and the "
+            "judge's JSON output."
         ),
     }
     if guard is not None:

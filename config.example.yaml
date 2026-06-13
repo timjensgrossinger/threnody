@@ -19,14 +19,22 @@ swarm:
   #   github-copilot: host_native
 
   # Multi-queen consensus (EXPERIMENTAL — off by default)
-  # Runs N low-tier queens in parallel for each coordinator round; a judge selects the winner.
-  # Token cost: ~2-3x a single coordinator round. Enable only on subprocess star topology.
+  # Runs N persona-diverse queens in parallel; they review independently and a judge
+  # arbitrates only when quorum is not reached. Token cost: ~2-3x a single round.
+  # Two paths share one decision engine (shared/consensus.py):
+  #   - subprocess star topology   → queens may cross providers (opt-in)
+  #   - host-native swarm wave      → host spawns read-only review queens on the host
+  #     model; diversity comes from personas, not providers
   # consensus:
   #   enabled: false
-  #   queens: 2                # parallel queens per round (clamped 2-3)
-  #   queen_tier: low          # tier for queen subtasks
-  #   judge_tier: low          # tier for the judge when queens disagree
-  #   max_consensus_rounds: 1  # rounds that use consensus (0 = all rounds)
+  #   queens: 2                  # parallel queens (clamped 2-3)
+  #   queen_tier: low            # tier for queen subtasks
+  #   judge_tier: low            # tier for the judge when queens disagree
+  #   max_consensus_rounds: 1    # rounds that use consensus (0 = all rounds)
+  #   host_native_enabled: false # append a consensus wave on star/auto host swarms
+  #   personas: []               # override built-in reviewer stances (empty → defaults)
+  #   quorum: 2                  # min agreeing queens (clamped 2..queens)
+  #   cross_provider_enabled: false  # subprocess path only; host-native never crosses
 
 budgets:
   default_hard_cap_tokens: 1000

@@ -11,9 +11,16 @@ from typing import Any, Mapping
 
 from .agents import check_draft_ready, derive_learning_quality, pattern_hash, structured_pattern_example
 from .config import TGsConfig
+from .consensus import (
+    build_judge_prompt,
+    consensus_tally,
+    parse_judge_decision,
+    persona_id_from_spawn_id,
+)
 from .context import is_within_repo, normalize_target_path
 from .db import Database
 from .eval import BackgroundEvaluator, WaveFileTracker, cold_path_adjust
+from .host_spawn import build_judge_spawn
 from .memory import memory_refresh_swarm_state_from_db
 from .outcomes import record_swarm_outcome
 from .router import TaskRouter
@@ -383,6 +390,233 @@ def register_host_run_handoff(
                 log.debug("host handoff stub failed for %s", task_id, exc_info=True)
 
 
+def record_consensus_handoff(
+    db: Database,
+    run_id: str,
+    *,
+    wave_index: int,
+    personas: list[str],
+    queen_tier: str,
+) -> None:
+    """Record host-native consensus-wave metadata so ingest can recognise it."""
+    meta = _ensure_host_run_meta(db, run_id)
+    meta["consensus_wave_index"] = int(wave_index)
+    meta["consensus_personas"] = [str(p) for p in personas if p]
+    meta["consensus_queen_tier"] = str(queen_tier or "low")
+    _persist_host_run_meta(db, run_id, meta)
+
+
+def _consensus_proposals_from_agents(
+    agents: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Parse each consensus-queen agent's reported output into a proposal dict."""
+    from .planner import _extract_json
+
+    proposals: list[dict[str, Any]] = []
+    for agent in agents:
+        if not isinstance(agent, Mapping):
+            continue
+        spawn_id = str(agent.get("spawn_id") or agent.get("id") or "")
+        persona = agent.get("persona") or persona_id_from_spawn_id(spawn_id)
+        raw = str(agent.get("output_excerpt") or "").strip()
+        decision: dict[str, Any] = {}
+        if raw:
+            try:
+                parsed = _extract_json(raw)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                decision = dict(parsed)
+        decision["persona"] = persona
+        proposals.append(decision)
+    return proposals
+
+
+def _consensus_block(tally, *, judge_used: bool, resolved: bool) -> dict[str, Any]:
+    winner = tally.winner or {}
+    return {
+        "resolved": resolved,
+        "queens": tally.queens,
+        "valid": tally.valid_count,
+        "personas": list(tally.personas),
+        "quorum": tally.quorum,
+        "agreement": tally.agreement,
+        "judge_used": judge_used,
+        "winner_persona": tally.winner_persona,
+        "verdict": winner.get("verdict"),
+        "dominant_verdict": tally.dominant_verdict,
+        "degraded": tally.degraded,
+    }
+
+
+def _process_consensus_report(
+    db: Database,
+    *,
+    run_id: str,
+    wave_index: int,
+    agents: list[Mapping[str, Any]],
+    meta: dict[str, Any],
+    config: TGsConfig | None,
+    terminal: bool,
+) -> dict[str, Any] | None:
+    """Handle a reported consensus or judge wave; mutate meta with the winner.
+
+    Returns a response fragment with a ``consensus`` block, or a
+    ``consensus_followup`` fragment requesting the host spawn the judge wave.
+    Returns ``None`` when this wave is not a consensus wave.
+    """
+    consensus_wave = meta.get("consensus_wave_index")
+    judge_wave = meta.get("consensus_judge_wave")
+
+    # --- Judge round: resolve the pending proposals with the judge's pick. ---
+    if judge_wave is not None and wave_index == int(judge_wave):
+        pending = meta.get("consensus_pending")
+        pending = list(pending) if isinstance(pending, list) else []
+        judge_raw = ""
+        for agent in agents:
+            if isinstance(agent, Mapping) and str(agent.get("output_excerpt") or "").strip():
+                judge_raw = str(agent.get("output_excerpt")).strip()
+                break
+        idx, judge_used = parse_judge_decision(judge_raw, pending)
+        winner = pending[idx] if 0 <= idx < len(pending) else (pending[0] if pending else {})
+        meta["consensus_winner_persona"] = winner.get("persona")
+        meta["consensus_resolved"] = True
+        meta["consensus_judge_used"] = judge_used
+        meta["consensus_verdict"] = winner.get("verdict")
+        meta.pop("consensus_pending", None)
+        _persist_host_run_meta(db, run_id, meta)
+        try:
+            db.log_swarm_event(
+                run_id,
+                "consensus_vote",
+                {
+                    "queens": len(pending),
+                    "valid": len(pending),
+                    "judge_used": judge_used,
+                    "selected_persona": winner.get("persona"),
+                    "wave": wave_index,
+                },
+            )
+        except Exception:
+            log.debug("consensus judge vote log failed for %s", run_id, exc_info=True)
+        return {
+            "consensus": {
+                "resolved": True,
+                "judge_used": judge_used,
+                "winner_persona": winner.get("persona"),
+                "verdict": winner.get("verdict"),
+                "personas": [str(p.get("persona")) for p in pending if p.get("persona")],
+            }
+        }
+
+    # --- Queen round: tally the persona proposals. ---
+    if consensus_wave is None or wave_index != int(consensus_wave):
+        return None
+
+    quorum = getattr(config, "consensus_quorum", 2) if config is not None else 2
+    judge_enabled = getattr(config, "consensus_judge_enabled", True) if config is not None else True
+    proposals = _consensus_proposals_from_agents(agents)
+    tally = consensus_tally(proposals, quorum=quorum, queens=len(proposals))
+
+    try:
+        db.log_swarm_event(run_id, "consensus_vote", tally.event_payload(round=wave_index))
+    except Exception:
+        log.debug("consensus vote log failed for %s", run_id, exc_info=True)
+
+    if tally.judge_needed and judge_enabled and not terminal:
+        meta["consensus_judge_wave"] = wave_index + 1
+        meta["consensus_pending"] = list(tally.valid)
+        _persist_host_run_meta(db, run_id, meta)
+        judge_prompt = build_judge_prompt(tally.valid)
+        caller = str(meta.get("caller") or "claude-code")
+        judge_spec = build_judge_spawn(
+            config=config,
+            caller=caller,
+            task_text=str(meta.get("task_hint") or ""),
+            judge_prompt=judge_prompt,
+            wave_index=wave_index,
+        ) if config is not None else None
+        if judge_spec is not None:
+            return {
+                "consensus_followup": {
+                    "reason": "no_quorum",
+                    "expects_wave": wave_index + 1,
+                    "host_spawn": judge_spec,
+                    "execution_note": (
+                        "No quorum among consensus queens. Spawn this single read-only "
+                        "judge agent, then call report_host_wave again with wave="
+                        f"{wave_index + 1} and the judge's JSON output as output_excerpt."
+                    ),
+                }
+            }
+
+    # Quorum / single / degraded / (judge needed but terminal or disabled) → resolve now.
+    judge_used = False
+    winner = tally.winner
+    if winner is None and tally.valid:
+        # judge needed but cannot run (terminal/disabled): deterministic fallback.
+        complete = [p for p in tally.valid if p.get("verdict") == "complete"]
+        winner = complete[0] if complete else tally.valid[0]
+    winner = winner or {}
+    meta["consensus_winner_persona"] = winner.get("persona") or tally.winner_persona
+    meta["consensus_resolved"] = True
+    meta["consensus_judge_used"] = judge_used
+    meta["consensus_verdict"] = winner.get("verdict")
+    _persist_host_run_meta(db, run_id, meta)
+    return {"consensus": _consensus_block(tally, judge_used=judge_used, resolved=True)}
+
+
+def record_consensus_learning(
+    db: Database,
+    run_id: str,
+    *,
+    outcome: str,
+    meta: Mapping[str, Any],
+    project_id: str | None,
+    router: TaskRouter | None,
+) -> None:
+    """Feed the consensus winner into the existing bandit/outcome learning infra.
+
+    Reuses the shadow-mode contextual bandit (``shared/bandit.py``): the winning
+    persona is rewarded by the terminal outcome under a dedicated ``:persona:``
+    arm namespace so it never pollutes the ``tier:provider`` routing arms.
+    Approval-gated on ``router.is_learning_enabled``. Best-effort.
+    """
+    winner_persona = meta.get("consensus_winner_persona")
+    if not winner_persona:
+        return
+    queen_tier = str(meta.get("consensus_queen_tier") or "low")
+    personas = [str(p) for p in (meta.get("consensus_personas") or []) if p]
+    success = outcome in {"accepted", "revised"}
+
+    try:
+        db.log_swarm_event(
+            run_id,
+            "consensus_outcome",
+            {
+                "winner_persona": winner_persona,
+                "personas": personas,
+                "judge_used": bool(meta.get("consensus_judge_used")),
+                "outcome": outcome,
+                "success": success,
+            },
+        )
+    except Exception:
+        log.debug("consensus_outcome log failed for %s", run_id, exc_info=True)
+
+    if router is None or not project_id or not router.is_learning_enabled(project_id):
+        return
+    try:
+        from .bandit import extract_task_features, get_bandit_policy
+
+        features = extract_task_features(str(meta.get("task_hint") or ""), project_id)
+        reward = 1.0 if success else 0.0
+        arm_id = f"{queen_tier}:persona:{winner_persona}"
+        get_bandit_policy(db).update(arm_id, features, reward)
+    except Exception:
+        log.debug("consensus bandit update failed for %s", run_id, exc_info=True)
+
+
 def record_host_agent_result(
     db: Database,
     *,
@@ -659,6 +893,20 @@ def ingest_host_wave(
     meta["assigned_files"] = assigned
     _persist_host_run_meta(db, run_id, meta)
 
+    consensus_fragment: dict[str, Any] | None = None
+    try:
+        consensus_fragment = _process_consensus_report(
+            db,
+            run_id=run_id,
+            wave_index=wave_index,
+            agents=list(agents),
+            meta=meta,
+            config=config,
+            terminal=terminal,
+        )
+    except Exception:
+        log.debug("consensus processing failed for %s", run_id, exc_info=True)
+
     db.log_swarm_event(
         run_id,
         "wave_progress",
@@ -707,6 +955,8 @@ def ingest_host_wave(
         }
     if wave_warnings:
         response["warnings"] = wave_warnings
+    if consensus_fragment:
+        response.update(consensus_fragment)
 
     expansion_files = discovered_files
     if expand_plan and not expansion_files:
@@ -728,7 +978,8 @@ def ingest_host_wave(
             response.setdefault("warnings", []).append(f"plan_expansion:{exc}")
             log.warning("plan expansion failed for %s", run_id, exc_info=True)
 
-    if terminal:
+    awaiting_judge = bool(consensus_fragment and "consensus_followup" in consensus_fragment)
+    if terminal and not awaiting_judge:
         if outcome is None:
             raise ValueError("outcome is required when terminal=true")
         response["finalize"] = finalize_host_swarm(
@@ -800,6 +1051,19 @@ def finalize_host_swarm(
         swarm_outcome_error = str(exc)
         finalize_warnings.append(f"swarm_outcome:{exc}")
         log.warning("record_swarm_outcome failed for %s", run_id, exc_info=True)
+
+    if meta.get("consensus_winner_persona"):
+        try:
+            record_consensus_learning(
+                db,
+                run_id,
+                outcome=normalized_outcome,
+                meta=meta,
+                project_id=project_id,
+                router=router,
+            )
+        except Exception:
+            log.debug("consensus learning failed for %s", run_id, exc_info=True)
 
     routing_learning_warning: str | None = None
     if router is not None and project_id and router.is_learning_enabled(project_id):
@@ -889,7 +1153,41 @@ def inspect_host_swarm(db: Database, run_id: str) -> dict[str, Any] | None:
     meta = _HOST_RUN_META.get(run_id) or _load_host_run_meta_from_db(db, run_id)
     if meta:
         payload["host_run_meta"] = dict(meta)
+        consensus = _consensus_inspect_section(db, meta)
+        if consensus:
+            payload["consensus"] = consensus
     return payload
+
+
+def _consensus_inspect_section(
+    db: Database,
+    meta: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Assemble the consensus view for inspect from meta + learned persona stats."""
+    if meta.get("consensus_wave_index") is None and not meta.get("consensus_personas"):
+        return None
+    section: dict[str, Any] = {
+        "enabled": True,
+        "personas": list(meta.get("consensus_personas") or []),
+        "wave_index": meta.get("consensus_wave_index"),
+        "resolved": bool(meta.get("consensus_resolved")),
+        "winner_persona": meta.get("consensus_winner_persona"),
+        "judge_used": bool(meta.get("consensus_judge_used")),
+        "verdict": meta.get("consensus_verdict"),
+    }
+    try:
+        from .bandit import get_bandit_policy
+
+        learned = [
+            arm
+            for arm in get_bandit_policy(db).arm_stats()
+            if ":persona:" in str(arm.get("arm_id", ""))
+        ]
+        if learned:
+            section["learned_persona_stats"] = learned
+    except Exception:
+        log.debug("consensus persona stats unavailable", exc_info=True)
+    return section
 
 
 def observe_host_style_edits(

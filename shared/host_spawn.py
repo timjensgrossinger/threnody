@@ -280,6 +280,90 @@ def build_host_spawn_waves(
     return host_waves
 
 
+def build_consensus_wave(
+    *,
+    config: TGsConfig,
+    caller: str | None,
+    task_text: str,
+    wave_index: int,
+    registry: Any | None = None,
+) -> dict[str, Any] | None:
+    """Build the host-native consensus wave appended after worker waves.
+
+    Returns ``None`` unless consensus and its host-native variant are enabled and
+    the caller is a host shell. Each queen is a *read-only* persona-diverse review
+    agent the host spawns via its ``Agent``/``Task`` tool — always on the host
+    model. Host-native queens never cross providers (that would require subprocess
+    delegation, which the host-native contract forbids); persona diversity is the
+    diversity source here.
+    """
+    if not _caller_is_host(caller):
+        return None
+    if not getattr(config, "consensus_enabled", False):
+        return None
+    if not getattr(config, "consensus_host_native_enabled", False):
+        return None
+
+    from .consensus import build_queen_prompt, consensus_review_instruction, select_personas
+
+    n_queens = getattr(config, "consensus_queens", 2)
+    personas = select_personas(n_queens, config)
+    if len(personas) < 2:
+        return None
+    queen_tier = getattr(config, "consensus_queen_tier", "low")
+    review_prompt = consensus_review_instruction(task_text)
+
+    agents: list[dict[str, Any]] = []
+    for persona in personas:
+        persona_id = persona.get("id") or "queen"
+        spec = build_host_spawn(
+            config=config,
+            caller=caller,
+            tier=queen_tier,
+            prompt=build_queen_prompt(review_prompt, persona),
+            wave_id=f"consensus-wave-{wave_index}",
+            spawn_id=f"queen-{persona_id}",
+            read_only=True,
+        ).to_dict()
+        spec["persona"] = persona_id
+        spec["wave_kind"] = "consensus"
+        spec["spawn_required"] = True
+        agents.append(spec)
+
+    return {
+        "wave": wave_index,
+        "wave_kind": "consensus",
+        "parallel": True,
+        "execution_contract": HOST_EXECUTION_CONTRACT,
+        "agents": agents,
+        "personas": [p.get("id") for p in personas],
+    }
+
+
+def build_judge_spawn(
+    *,
+    config: TGsConfig,
+    caller: str | None,
+    task_text: str,
+    judge_prompt: str,
+    wave_index: int,
+) -> dict[str, Any]:
+    """Build the single read-only judge spawn spec for the lazy arbitration round."""
+    judge_tier = getattr(config, "consensus_judge_tier", "low")
+    spec = build_host_spawn(
+        config=config,
+        caller=caller,
+        tier=judge_tier,
+        prompt=judge_prompt,
+        wave_id=f"consensus-judge-{wave_index}",
+        spawn_id="consensus-judge",
+        read_only=True,
+    ).to_dict()
+    spec["wave_kind"] = "consensus_judge"
+    spec["spawn_required"] = True
+    return spec
+
+
 def _normalize_provider_id(value: object) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None

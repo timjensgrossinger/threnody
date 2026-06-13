@@ -60,6 +60,13 @@ from .planner import (
     validate_single_coordinator_per_wave,
     validate_topology,
 )
+from .consensus import (
+    build_judge_prompt,
+    build_queen_prompt,
+    consensus_tally,
+    parse_judge_decision,
+    select_personas,
+)
 from .context import enrich_subtask, make_artifact_envelope, make_compact_summary, make_summary_for_wave
 from .db import Database, DEFAULT_PROJECT_FANOUT_CAP
 from .eval import (
@@ -4150,6 +4157,54 @@ class Orchestrator:
             return True
         return current_round is not None and current_round <= max_rounds
 
+    def _log_consensus_vote(
+        self,
+        execution_id: str | None,
+        tally: "ConsensusResult",
+        current_round: int | None,
+        *,
+        judge_used: bool,
+    ) -> None:
+        try:
+            payload = tally.event_payload(round=current_round)
+            payload["judge_used"] = judge_used
+            self._db.log_swarm_event(execution_id or "", "consensus_vote", payload)
+        except Exception:
+            log.debug("consensus_vote log failed", exc_info=True)
+
+    def _consensus_provider_assignments(self, tier: str, n: int) -> list[str | None]:
+        """Per-queen delegation provider ids when cross-provider consensus is opted in.
+
+        Strictly gated: requires BOTH ``consensus_cross_provider_enabled`` and
+        ``delegation_utilities_enabled``. Only open-source delegation utilities are
+        eligible (host/router providers are never returned). Returns all-``None``
+        when the gate is off (the default), so behaviour is unchanged.
+        """
+        none_list: list[str | None] = [None] * n
+        if not getattr(self._config, "consensus_cross_provider_enabled", False):
+            return none_list
+        if not getattr(self._config, "delegation_utilities_enabled", False):
+            return none_list
+        try:
+            from .discovery import get_registry
+
+            registry = get_registry()
+            candidates, _ = registry._ordered_execution_candidates(
+                tier=tier,
+                for_delegation=True,
+            )
+            provider_ids = [
+                getattr(c, "name", None)
+                for c in candidates
+                if getattr(c, "name", None)
+            ]
+        except Exception:
+            log.debug("consensus provider assignment failed", exc_info=True)
+            return none_list
+        if not provider_ids:
+            return none_list
+        return [provider_ids[i % len(provider_ids)] for i in range(n)]
+
     def run_coordinator_consensus(
         self,
         subtask: "Subtask",
@@ -4161,28 +4216,43 @@ class Orchestrator:
         current_wave: int | None = None,
         current_round: int | None = None,
     ) -> "dict[str, object]":
-        """Run N queens in parallel and select a winner via lightweight consensus.
+        """Run N persona-diverse queens in parallel and select a winner.
 
-        Falls back to a single run_coordinator_sync call when fewer than 2 proposals
-        are valid or when the judge fails — the returned dict is always a normal
-        coordinator decision so callers need no special handling.
+        Queens are distinct reviewer *stances* (correctness/risk/speed) rather than
+        identical re-runs; the decision (quorum + structural agreement, then a
+        grounded judge) is delegated to ``shared/consensus.py`` so this subprocess
+        path and the host-native consensus wave share one tested implementation.
+
+        Falls back to a single run_coordinator_sync call when no proposals are
+        valid — the returned dict is always a normal coordinator decision so
+        callers need no special handling.
         """
         import concurrent.futures
 
         n_queens = max(2, min(3, getattr(self._config, "consensus_queens", 2)))
         queen_tier = getattr(self._config, "consensus_queen_tier", "low")
         judge_tier = getattr(self._config, "consensus_judge_tier", "low")
+        quorum = getattr(self._config, "consensus_quorum", 2)
+        judge_enabled = getattr(self._config, "consensus_judge_enabled", True)
 
-        queen_subtask = replace(subtask, tier=queen_tier)
+        personas = select_personas(n_queens, self._config)
+        n_queens = len(personas)
+        provider_ids = self._consensus_provider_assignments(queen_tier, n_queens)
 
         def _run_queen(idx: int) -> "dict[str, object]":
-            q = replace(
-                queen_subtask,
+            persona = personas[idx]
+            persona_id = persona.get("id") or f"queen-{idx}"
+            queen_subtask = replace(
+                subtask,
+                tier=queen_tier,
                 id=subtask.id * 1000 + idx,
-                description=f"[queen-{idx}] " + queen_subtask.description,
+                description=build_queen_prompt(subtask.description, persona),
             )
+            provider_id = provider_ids[idx] if idx < len(provider_ids) else None
+            if provider_id:
+                queen_subtask = replace(queen_subtask, provider_id=provider_id)
             proposal = self.run_coordinator_sync(
-                q,
+                queen_subtask,
                 summary_context,
                 timeout=timeout,
                 execution_id=execution_id,
@@ -4190,12 +4260,14 @@ class Orchestrator:
                 current_wave=current_wave,
                 current_round=current_round,
             )
+            proposal["persona"] = persona_id
             try:
                 self._db.log_swarm_event(
                     execution_id or "",
                     "queen_proposal",
                     {
                         "queen_idx": idx,
+                        "persona": persona_id,
                         "verdict": proposal.get("verdict"),
                         "round": current_round,
                     },
@@ -4204,18 +4276,20 @@ class Orchestrator:
                 pass
             return proposal
 
+        # Collect in submission order so the judge's selected index is deterministic.
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_queens) as pool:
             futures = [pool.submit(_run_queen, i) for i in range(n_queens)]
-            proposals = []
-            for fut in concurrent.futures.as_completed(futures):
+            proposals: list[dict[str, object]] = []
+            for fut in futures:
                 try:
                     proposals.append(fut.result())
                 except Exception as exc:
                     log.debug("queen execution error: %s", exc, exc_info=True)
 
-        valid = [p for p in proposals if p.get("verdict") in {"complete", "another-pass"}]
+        tally = consensus_tally(proposals, quorum=quorum, queens=n_queens)
 
-        if not valid:
+        # Degraded: no valid proposals — single authoritative coordinator run.
+        if tally.degraded:
             result = self.run_coordinator_sync(
                 subtask,
                 summary_context,
@@ -4231,128 +4305,65 @@ class Orchestrator:
                 "selected": None,
                 "judge_used": False,
                 "degraded": True,
+                "personas": [p.get("id") for p in personas],
             }
-            try:
-                self._db.log_swarm_event(
-                    execution_id or "", "consensus_vote",
-                    {"queens": n_queens, "valid": 0, "degraded": True, "round": current_round},
-                )
-            except Exception:
-                pass
+            self._log_consensus_vote(execution_id, tally, current_round, judge_used=False)
             return result
 
-        if len(valid) == 1:
-            winner = valid[0]
+        # Resolved without a judge (single valid, full agreement, or quorum).
+        if not tally.judge_needed:
+            winner = dict(tally.winner or {})
             winner["consensus"] = {
                 "queens": n_queens,
-                "valid": 1,
-                "selected": 0,
+                "valid": tally.valid_count,
+                "selected": tally.winner_index if tally.winner_index is not None else 0,
                 "judge_used": False,
                 "degraded": False,
+                "quorum": tally.quorum,
+                "winner_persona": tally.winner_persona,
+                "personas": list(tally.personas),
             }
-            try:
-                self._db.log_swarm_event(
-                    execution_id or "", "consensus_vote",
-                    {"queens": n_queens, "valid": 1, "judge_used": False, "round": current_round},
-                )
-            except Exception:
-                pass
+            if tally.agreement:
+                winner["consensus"]["agreement"] = True
+            self._log_consensus_vote(execution_id, tally, current_round, judge_used=False)
             return winner
 
-        # Check agreement: same verdict + structurally identical amendment and next_work
-        def _key(p: "dict[str, object]") -> str:
-            import json as _json
-            return _json.dumps(
-                {
-                    "verdict": p.get("verdict"),
-                    "amendment": p.get("amendment"),
-                    "next_work": p.get("next_work"),
-                },
-                sort_keys=True,
+        # Disagreement → judge (unless disabled, then deterministic fallback).
+        valid = tally.valid
+        if judge_enabled:
+            judge_subtask = replace(
+                subtask,
+                tier=judge_tier,
+                id=subtask.id * 10000,
+                description=build_judge_prompt(valid),
             )
-
-        keys = [_key(p) for p in valid]
-        if len(set(keys)) == 1:
-            winner = valid[0]
-            winner["consensus"] = {
-                "queens": n_queens,
-                "valid": len(valid),
-                "selected": 0,
-                "judge_used": False,
-                "degraded": False,
-                "agreement": True,
-            }
             try:
-                self._db.log_swarm_event(
-                    execution_id or "", "consensus_vote",
-                    {"queens": n_queens, "valid": len(valid), "agreement": True, "round": current_round},
+                judge_result = self.execute_subtask(
+                    judge_subtask,
+                    timeout,
+                    execution_id=execution_id,
+                    plan_revision=plan_revision,
+                    current_wave=current_wave,
                 )
-            except Exception:
-                pass
-            return winner
+                selected_idx, judge_used = parse_judge_decision(
+                    judge_result.output.strip(), valid
+                )
+            except Exception as exc:
+                log.debug("consensus judge failed: %s", exc, exc_info=True)
+                selected_idx, judge_used = parse_judge_decision(None, valid)
+        else:
+            selected_idx, judge_used = parse_judge_decision(None, valid)
 
-        # Disagreement — ask a judge
-        import json as _json
-        proposals_text = _json.dumps(
-            [
-                {
-                    "index": i,
-                    "verdict": p.get("verdict"),
-                    "amendment": p.get("amendment"),
-                    "next_work": p.get("next_work"),
-                }
-                for i, p in enumerate(valid)
-            ],
-            indent=2,
-        )
-        judge_prompt = (
-            f"You are a judge selecting the best coordinator decision from {len(valid)} proposals.\n"
-            f"Proposals:\n{proposals_text}\n\n"
-            'Respond ONLY with JSON: {"selected": <index>, "reason": "..."}'
-        )
-        judge_subtask = replace(
-            subtask,
-            tier=judge_tier,
-            id=subtask.id * 10000,
-            description=judge_prompt,
-        )
-        selected_idx = 0
-        judge_used = True
-        try:
-            judge_result = self.execute_subtask(
-                judge_subtask,
-                timeout,
-                execution_id=execution_id,
-                plan_revision=plan_revision,
-                current_wave=current_wave,
-            )
-            judge_payload = _extract_json(judge_result.output.strip())
-            if isinstance(judge_payload, dict):
-                raw_idx = judge_payload.get("selected")
-                if isinstance(raw_idx, int) and 0 <= raw_idx < len(valid):
-                    selected_idx = raw_idx
-                else:
-                    # deterministic fallback: first "complete", else first valid
-                    complete = [i for i, p in enumerate(valid) if p.get("verdict") == "complete"]
-                    selected_idx = complete[0] if complete else 0
-                    judge_used = False
-            else:
-                complete = [i for i, p in enumerate(valid) if p.get("verdict") == "complete"]
-                selected_idx = complete[0] if complete else 0
-                judge_used = False
-        except Exception as exc:
-            log.debug("consensus judge failed: %s", exc, exc_info=True)
-            complete = [i for i, p in enumerate(valid) if p.get("verdict") == "complete"]
-            selected_idx = complete[0] if complete else 0
-            judge_used = False
-
-        winner = valid[selected_idx]
+        winner = dict(valid[selected_idx])
         winner["consensus"] = {
             "queens": n_queens,
             "valid": len(valid),
             "selected": selected_idx,
             "judge_used": judge_used,
             "degraded": False,
+            "quorum": False,
+            "winner_persona": winner.get("persona"),
+            "personas": list(tally.personas),
         }
         try:
             self._db.log_swarm_event(
@@ -4362,6 +4373,7 @@ class Orchestrator:
                     "valid": len(valid),
                     "selected": selected_idx,
                     "judge_used": judge_used,
+                    "selected_persona": winner.get("persona"),
                     "round": current_round,
                 },
             )

@@ -26,7 +26,8 @@ def test_claude_default_instructions_are_advisory() -> None:
     assert "Skills" in body
     assert "/threnody-routing" in body
     assert "/threnody-plan" in body
-    assert "PreToolUse" not in body
+    # advisory mode references PreToolUse only as an opt-in hint, never as active enforcement
+    assert "mode: guarded" in body
     assert "validate_routing_guard" not in body
     # slim block — verbose prose not present
     assert "meta-harness" not in body

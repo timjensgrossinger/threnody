@@ -132,7 +132,7 @@ Six repo-local skills under [`skills/`](skills/) guide MCP workflows from any co
 | **Swarm when needed** | `execute_swarm` defaults to `host_native`: wave plans hand off to the host; no subprocess fanout by default. |
 | **Utility delegation (opt-in)** | `execute_subtask(provider_id=…)` to OpenCode, Aider, or local endpoints only; host→host delegation is blocked. |
 | **Planning mode** | `threnody-plan` skill — plan-only vs plan-then-execute; routes to waves or swarms without extra coordinator rounds. |
-| **Spend discipline** | Host-native execution uses existing CLI entitlements; contract-first alignment instead of multi-queen consensus. |
+| **Spend discipline** | Host-native execution uses existing CLI entitlements; contract-first alignment by default, persona-diverse multi-queen consensus opt-in. |
 
 ---
 
@@ -223,7 +223,7 @@ execute_swarm           →  host_native default; delegate opt-in
 1. **`route_task` / `plan_task`** classify work and return `host_spawn` metadata plus `execution_hint.economics`.
 2. **Host-native first** — Agent/Task subagents and direct edits use your existing CLI entitlements; no Threnody subprocess loop for same-host work.
 3. **Utility delegation (opt-in)** — `execute_subtask(provider_id=…)` to OpenCode, Aider, or local loopback endpoints when `delegation_utilities_enabled: true`.
-4. **Contract-first alignment** — parallel waves + verify gates instead of multi-queen coordinator consensus (see [docs/COMPETITIVE.md](docs/COMPETITIVE.md)).
+4. **Contract-first by default, consensus opt-in** — parallel waves + verify gates out of the box; enable persona-diverse multi-queen consensus per swarm (`swarm.consensus`) when you want adversarial agreement (see [docs/COMPETITIVE.md](docs/COMPETITIVE.md)).
 5. **Measure locally** — `inspect_spend`, `threnody inspect spend`, and `threnody gain` aggregate delegated-subtask savings from `cost_telemetry`.
 6. **Guarded coordination (opt-in)** — set `routing_policy.mode: guarded` to require `route_task` before code edits; Claude Code can install a PreToolUse hook. See [docs/HOOKS.md](docs/HOOKS.md). Default is advisory for all shells.
 
@@ -239,7 +239,8 @@ Workflow guide: [docs/COST_SAVINGS.md](docs/COST_SAVINGS.md)
 | 🧠 | **Learning loop** | Pattern tracking → draft agents → approval queue → plan-time context injection for matching work |
 | 🐝 | **Swarm orchestration** | `execute_swarm` returns `host_spawn_waves` by default (`awaiting_host_execution`); heuristic intent fans out one agent per file; `expand_host_plan` for mid-run discovery |
 | 💾 | **Cross-session memory** | `memory_*` MCP tools backed by local SQLite — shared across all MCP hosts via `~/.local/lib/threnody/cache.db` |
-| 🔌 | **MCP-native** | ~43 tools over stdio JSON-RPC; works with any MCP-compatible host shell |
+| 🔌 | **MCP-native** | 40+ tools over stdio JSON-RPC; works with any MCP-compatible host shell |
+| 🗳️ | **Multi-queen consensus** | Opt-in persona-diverse review queens + lazy judge arbitration (`swarm.consensus`); host-native or subprocess star |
 | 🔀 | **Utility delegation** | Opt-in `execute_subtask` to OpenCode, Aider, local endpoints; host→host blocked |
 | 📋 | **Planning skills** | Six repo skills under `skills/` — start with `threnody-plan` for plan-only workflows |
 | 📈 | **Adaptive thresholds** | EMA-based threshold learning from `record_outcome` (pass `task_id` from `route_task`; enable per-project learning) |
@@ -342,7 +343,7 @@ Full reference: [docs/CLI.md](docs/CLI.md)
 | Doc | Contents |
 |---|---|
 | [Plugin Install](docs/PLUGIN_INSTALL.md) | uvx, plugin marketplace, and `--plugin-mode` setup |
-| [MCP Tools](docs/MCP_TOOLS.md) | All 41 MCP tool surfaces |
+| [MCP Tools](docs/MCP_TOOLS.md) | All 40+ MCP tool surfaces |
 | [CLI Reference](docs/CLI.md) | Shell aliases and operator commands |
 | [Architecture](docs/ARCHITECTURE.md) | Trust boundaries and local-first design |
 | [Configuration](config.example.yaml) | Safe starting config (copy to `~/.local/lib/threnody/config.yaml`) |

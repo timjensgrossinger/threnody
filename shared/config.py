@@ -1374,12 +1374,21 @@ class TGsConfig:
     skill_promotion_threshold: int = 10
     skill_auto_promote: bool = False
 
-    # Multi-queen consensus (experimental, subprocess star topology only)
+    # Multi-queen consensus (subprocess star topology + host-native consensus wave)
     consensus_enabled: bool = False
     consensus_queens: int = 2
     consensus_queen_tier: str = "low"
     consensus_judge_tier: str = "low"
     consensus_max_rounds: int = 0  # 0 = apply to all rounds
+    # Host-native consensus wave: host spawns persona-diverse queens via the Agent tool.
+    consensus_host_native_enabled: bool = False
+    consensus_personas: list[str] = field(default_factory=list)  # empty → built-in set
+    consensus_quorum: int = 2  # min agreeing queens; clamped to 2..consensus_queens
+    consensus_judge_enabled: bool = True
+    # Cross-provider queens for the SUBPROCESS path only, opt-in for open-source
+    # delegation utilities. Inert unless delegation_utilities_enabled is also true;
+    # host-native queens always run on the host model (never cross providers).
+    consensus_cross_provider_enabled: bool = False
 
     @property
     def swarm_max_agents(self) -> int:
@@ -2111,6 +2120,30 @@ class TGsConfig:
             cfg.consensus_max_rounds = max(0, int(consensus_raw.get("max_consensus_rounds", 0)))
         except (TypeError, ValueError):
             cfg.consensus_max_rounds = 0
+        cfg.consensus_host_native_enabled = (
+            consensus_raw.get("host_native_enabled", False) is True
+        )
+        raw_personas = consensus_raw.get("personas", [])
+        if isinstance(raw_personas, (list, tuple)):
+            cfg.consensus_personas = [
+                str(pid).strip().lower()
+                for pid in raw_personas
+                if isinstance(pid, str) and pid.strip()
+            ]
+        else:
+            cfg.consensus_personas = []
+        try:
+            cfg.consensus_quorum = max(
+                2, min(cfg.consensus_queens, int(consensus_raw.get("quorum", 2)))
+            )
+        except (TypeError, ValueError):
+            cfg.consensus_quorum = 2
+        cfg.consensus_judge_enabled = (
+            consensus_raw.get("judge_enabled", True) is not False
+        )
+        cfg.consensus_cross_provider_enabled = (
+            consensus_raw.get("cross_provider_enabled", False) is True
+        )
 
         raw_swarm_host_by_caller = swarm_raw.get("host_execution_mode_by_caller", {})
         if isinstance(raw_swarm_host_by_caller, Mapping):
