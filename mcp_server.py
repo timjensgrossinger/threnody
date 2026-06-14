@@ -1961,6 +1961,38 @@ def _planner_plan_for_caller(
         and effective_planner_host_execution_mode(config, caller) == "host_native"
     )
     if use_heuristic:
+        # Escape hatch: for genuinely complex tasks (coupled file group, many
+        # source files, or design keywords) the lexical heuristic produces poor
+        # plans. When enabled and a real LLM planner backend is reachable, escalate.
+        if getattr(config, "heuristic_complexity_llm_fallback", False):
+            try:
+                from shared.heuristic_plan import assess_task_complexity
+
+                assessment = assess_task_complexity(task)
+            except Exception:
+                log.debug("complexity assessment failed", exc_info=True)
+                assessment = {"complex": False}
+            if assessment.get("complex"):
+                try:
+                    plan = planner.plan(
+                        task,
+                        skip_cache=True,
+                        topology=topology,
+                        max_agents=max_agents,
+                    )
+                    plan.planner_mode = "heuristic_escalated"
+                    try:
+                        plan.analysis = (
+                            (plan.analysis or "")
+                            + " [escalated to LLM planner: high-complexity task]"
+                        ).strip()
+                    except Exception:
+                        pass
+                    return plan, False
+                except Exception:
+                    log.debug(
+                        "LLM planner escalation failed; using heuristic", exc_info=True
+                    )
         default_tier = "medium"
         if router is not None:
             try:

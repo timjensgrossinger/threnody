@@ -12,6 +12,7 @@ from .context import extract_references
 
 _FILE_EXT_GROUP = (
     r"py|ts|tsx|js|jsx|html|htm|css|scss|vue|svelte|go|rs|java|kt|rb|cs|yaml|yml|json|toml|md"
+    r"|lua|c|h|cpp|hpp|cc|sh|swift|ex|exs|ini|cfg|tf"
 )
 _NUMBERED_FILE = re.compile(
     r"\(\d+\)\s*([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.[A-Za-z][A-Za-z0-9]*)",
@@ -25,7 +26,34 @@ _CLAUSE_SPLIT = re.compile(
     rf"(?<=[,;])\s*(?=[A-Za-z0-9_.-]+\.(?:{_FILE_EXT_GROUP})\b)",
     re.IGNORECASE,
 )
-_INTEGRATION_STEMS = frozenset({"main", "cli", "app", "__init__", "index"})
+_INTEGRATION_STEMS = frozenset(
+    {"main", "cli", "app", "__init__", "index", "init", "setup", "mod", "lib", "entry", "bootstrap"}
+)
+
+# Source vs documentation/config extension classes (for complexity tiering).
+_SOURCE_EXTS = frozenset(
+    {
+        ".py", ".ts", ".tsx", ".js", ".jsx", ".lua", ".go", ".rs", ".c", ".h",
+        ".cpp", ".hpp", ".cc", ".java", ".kt", ".rb", ".cs", ".vue", ".svelte",
+        ".swift", ".ex", ".exs", ".sh",
+    }
+)
+_DOC_EXTS = frozenset({".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".txt"})
+
+# Task keywords that signal genuine design complexity (push tier toward high).
+_COMPLEXITY_KEYWORDS = frozenset(
+    {
+        "design", "architecture", "schema", "protocol", "interface", "refactor",
+        "concurrency", "async", "state machine", "parser", "compiler", "distributed",
+    }
+)
+
+# Keywords that, combined with a shared directory, indicate interdependent files.
+_COUPLING_KEYWORDS = frozenset(
+    {"schema", "contract", "shared", "protocol", "api", "event", "interface", "module"}
+)
+
+_TIER_ORDER = ("low", "medium", "high")
 
 _WORD_NUMBERS: dict[str, int] = {
     "one": 1,
@@ -290,14 +318,44 @@ def _description_hints_by_path(task: str, paths: list[str]) -> dict[str, str]:
         if key in hints:
             continue
         name = PurePosixPath(path).name
-        pattern = re.compile(
-            rf"{re.escape(name)}[^.;,\n]{{0,120}}",
-            re.IGNORECASE,
-        )
-        match = pattern.search(task)
-        if match:
-            hints[key] = match.group(0).strip(" ,;")
+        # The clause loop above keys hints by the matched token, which is usually
+        # the basename. Explicit paths are stored full ("lua/x/init.lua"), so first
+        # try to inherit the basename-keyed hint before falling back to extraction.
+        base_key = name.lower()
+        if base_key in hints:
+            hints[key] = hints[base_key]
+            continue
+        window = _clause_window(task, name)
+        hints[key] = window if len(window) >= 12 else f"Implement {path}"
     return hints
+
+
+def _clause_window(task: str, name: str) -> str:
+    """Extract the descriptive clause for *name* without cutting at the first comma.
+
+    Captures text from the filename up to the next file token (so each file gets
+    its own clause), allowing commas/periods that sit inside balanced parentheses.
+    """
+    idx = task.lower().find(name.lower())
+    if idx == -1:
+        return ""
+    tail = task[idx:]
+    # End the window at the next distinct file token, or a hard newline break.
+    end = len(tail)
+    for match in _BARE_FILENAME.finditer(tail):
+        if match.start() >= len(name):  # skip the filename we started on
+            end = match.start()
+            break
+    newline = tail.find("\n\n")
+    if newline != -1:
+        end = min(end, newline)
+    window = tail[:end].strip(" ,;:-\t")
+    # Drop a dangling unbalanced opening paren left by the cut.
+    if window.count("(") > window.count(")"):
+        cut = window.rfind("(")
+        if cut != -1:
+            window = window[:cut].strip(" ,;:-\t")
+    return window
 
 
 def _tier_for_subtask(*, file_count: int, default_tier: str) -> str:
@@ -308,12 +366,206 @@ def _tier_for_subtask(*, file_count: int, default_tier: str) -> str:
     return "low"
 
 
+def _complexity_tier(*, paths: list[str], task_lower: str, coupled: bool, default_tier: str) -> str:
+    """Tier from file-type, design keywords, and coupling. default_tier is a floor."""
+    exts = {PurePosixPath(_normalize_path(p)).suffix.lower() for p in paths}
+    if exts & _SOURCE_EXTS:
+        base = "medium"
+    elif exts and exts <= _DOC_EXTS:
+        base = "low"
+    else:
+        base = "low"
+    idx = _TIER_ORDER.index(base)
+    if any(kw in task_lower for kw in _COMPLEXITY_KEYWORDS):
+        idx = max(idx, _TIER_ORDER.index("high"))
+    if coupled:
+        idx = min(idx + 1, len(_TIER_ORDER) - 1)
+    if default_tier in _TIER_ORDER:
+        idx = max(idx, _TIER_ORDER.index(default_tier))
+    return _TIER_ORDER[min(idx, len(_TIER_ORDER) - 1)]
+
+
+def _entry_parent(path: str) -> str:
+    parent = str(PurePosixPath(_normalize_path(path)).parent)
+    return "" if parent in ("", ".") else parent
+
+
+def _coupled_group_indices(entries: list[tuple[str, str]], task_lower: str) -> list[int]:
+    """1-based indices of entries that form a coupled group.
+
+    Coupling requires BOTH a coupling keyword in the task text AND >=2 entries
+    sharing the same non-empty parent directory. Top-level files (no directory)
+    never couple, so simple multi-file tasks are unaffected.
+    """
+    if not any(kw in task_lower for kw in _COUPLING_KEYWORDS):
+        return []
+    by_dir: dict[str, list[int]] = {}
+    for index, (path, _hint) in enumerate(entries, start=1):
+        parent = _entry_parent(path)
+        if not parent:
+            continue
+        by_dir.setdefault(parent, []).append(index)
+    coupled = {i for ids in by_dir.values() if len(ids) >= 2 for i in ids}
+    return sorted(coupled)
+
+
+def assess_task_complexity(task: str) -> dict[str, object]:
+    """Cheap signal of whether a task warrants the real LLM planner over heuristics."""
+    if not isinstance(task, str) or not task.strip():
+        return {"complex": False, "coupled": False, "source_count": 0, "design_keyword": False}
+    task_lower = task.lower()
+    try:
+        entries = extract_task_file_entries(task, intent_templates=False)
+    except Exception:
+        entries = []
+    coupled = len(_coupled_group_indices(entries, task_lower)) >= 2
+    source_count = sum(
+        1 for path, _ in entries if PurePosixPath(_normalize_path(path)).suffix.lower() in _SOURCE_EXTS
+    )
+    design_keyword = any(kw in task_lower for kw in _COMPLEXITY_KEYWORDS)
+    return {
+        "complex": bool(coupled or source_count >= 4 or design_keyword),
+        "coupled": coupled,
+        "source_count": source_count,
+        "design_keyword": design_keyword,
+    }
+
+
+def _coupled_subtasks(
+    entries: list[tuple[str, str]],
+    coupled_ids: list[int],
+    *,
+    default_tier: str,
+    topology: str | None,
+    task_lower: str,
+    strategy: str,
+) -> dict[str, object]:
+    """Build a plan for a detected coupled group.
+
+    "single"   -> one higher-tier subtask owning all coupled files (no extra wave).
+    "contract" -> wave 1 defines a shared interface file; the rest depend on it.
+    Non-coupled entries (if any) are appended as independent subtasks.
+    """
+    coupled_set = set(coupled_ids)
+    members = [entries[i - 1] for i in coupled_ids]
+    others = [(i, entries[i - 1]) for i in range(1, len(entries) + 1) if i not in coupled_set]
+    member_paths = [p for p, _ in members]
+    tier = _complexity_tier(
+        paths=member_paths, task_lower=task_lower, coupled=True, default_tier=default_tier
+    )
+
+    # Pick the interface/primary file: an integration file if present, else the first.
+    primary_idx = 0
+    for j, (path, _hint) in enumerate(members):
+        if _is_integration_file(path):
+            primary_idx = j
+            break
+    primary_path = member_paths[primary_idx]
+
+    subtasks: list[dict[str, object]] = []
+    if strategy == "contract":
+        interface_hint = members[primary_idx][1] or f"Define the shared interface in {primary_path}"
+        subtasks.append(
+            {
+                "id": 1,
+                "description": f"Define the shared interface first — {interface_hint}",
+                "tier": tier,
+                "target_file": primary_path,
+                "single_file_insertion": False,
+                "depends_on": [],
+            }
+        )
+        next_id = 2
+        for j, (path, hint) in enumerate(members):
+            if j == primary_idx:
+                continue
+            subtasks.append(
+                {
+                    "id": next_id,
+                    "description": (hint or f"Implement {path}")
+                    + f" (depends on the interface in {primary_path})",
+                    "tier": tier,
+                    "target_file": path,
+                    "single_file_insertion": False,
+                    "depends_on": [1],
+                }
+            )
+            next_id += 1
+    else:  # "single"
+        parts = []
+        for path, hint in members:
+            parts.append(hint if hint else path)
+        merged = "; ".join(parts)
+        subtasks.append(
+            {
+                "id": 1,
+                "description": (
+                    "Implement the coupled module as one coherent unit "
+                    f"(shared interface across {len(members)} files): {merged}"
+                ),
+                "tier": tier,
+                "target_file": primary_path,
+                "target_files": member_paths,
+                "single_file_insertion": False,
+                "depends_on": [],
+            }
+        )
+        next_id = 2
+
+    # Append any non-coupled entries as independent subtasks.
+    for _orig_idx, (path, hint) in others:
+        subtasks.append(
+            {
+                "id": next_id,
+                "description": hint or f"Create or update {path} as described in the task.",
+                "tier": _tier_for_subtask(file_count=len(entries), default_tier=default_tier),
+                "target_file": path,
+                "single_file_insertion": False,
+                "depends_on": [],
+            }
+        )
+        next_id += 1
+
+    has_deps = any(st.get("depends_on") for st in subtasks)
+    normalized_topology = str(topology or "").strip().lower()
+    if normalized_topology in {"star", "hierarchical", "dag", "linear"}:
+        plan_topology = normalized_topology
+    else:
+        plan_topology = "dag" if has_deps else "linear"
+    return {
+        "analysis": (
+            f"Host-native heuristic plan: detected a coupled file group "
+            f"({len(members)} files); strategy={strategy}. No external planner LLM was called."
+        ),
+        "subtasks": subtasks,
+        "strategy": "dag" if has_deps else ("parallel" if len(subtasks) > 1 else "sequential"),
+        "topology": plan_topology,
+    }
+
+
 def _subtasks_from_entries(
     entries: list[tuple[str, str]],
     *,
     default_tier: str,
     topology: str | None,
+    task: str = "",
+    coupled_strategy: str = "single",
 ) -> dict[str, object]:
+    # Detect a coupled file group first; if present, plan it coherently instead
+    # of fanning out independent low-tier agents that cannot integrate.
+    task_lower = task.lower() if isinstance(task, str) else ""
+    coupled_ids = _coupled_group_indices(entries, task_lower)
+    if len(coupled_ids) >= 2:
+        strategy = coupled_strategy if coupled_strategy in {"single", "contract"} else "single"
+        return _coupled_subtasks(
+            entries,
+            coupled_ids,
+            default_tier=default_tier,
+            topology=topology,
+            task_lower=task_lower,
+            strategy=strategy,
+        )
+
     integration_ids: list[int] = []
     foundation_ids: list[int] = []
     subtasks: list[dict[str, object]] = []
@@ -366,6 +618,7 @@ def build_heuristic_plan_payload(
     max_agents: int | None = None,
     topology: str | None = None,
     intent_templates: bool = True,
+    coupled_strategy: str = "single",
 ) -> dict[str, object]:
     """Build planner JSON compatible with ``Planner._build_plan`` without an LLM."""
     # Review fanout: REVIEW: sentinel → per-file × dimension DAG plan
@@ -437,6 +690,8 @@ def build_heuristic_plan_payload(
         entries,
         default_tier=default_tier,
         topology=topology,
+        task=task if isinstance(task, str) else "",
+        coupled_strategy=coupled_strategy,
     )
 
 

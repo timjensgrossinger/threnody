@@ -1298,14 +1298,17 @@ class Planner:
 
         started_at = time.monotonic()
         intent_templates = True
+        coupled_strategy = "single"
         if self._config is not None:
             intent_templates = bool(self._config.heuristic_intent_templates)
+            coupled_strategy = getattr(self._config, "heuristic_coupled_strategy", "single")
         parsed = build_heuristic_plan_payload(
             task,
             default_tier=default_tier,
             max_agents=max_agents,
             topology=topology,
             intent_templates=intent_templates,
+            coupled_strategy=coupled_strategy,
         )
         plan = self._build_plan(parsed, task)
         plan.planner_mode = "heuristic"

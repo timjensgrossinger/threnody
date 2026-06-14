@@ -6,7 +6,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from shared.heuristic_plan import build_heuristic_plan_payload, extract_task_file_entries
+from shared.heuristic_plan import (
+    assess_task_complexity,
+    build_heuristic_plan_payload,
+    extract_task_file_entries,
+)
 
 
 CALCULATOR_TASK = (
@@ -111,3 +115,60 @@ def test_intent_templates_disabled_keeps_single_subtask() -> None:
         intent_templates=False,
     )
     assert len(payload["subtasks"]) == 1
+
+
+# --- coupled-group + description + complexity fixes -------------------------
+
+COUPLED_TASK = (
+    "Build a plugin with a shared event schema across "
+    "lua/app/init.lua (setup and config), "
+    "lua/app/panel.lua (render the collapsible panel), "
+    "lua/app/sources/hooks.lua (RPC receiver and installer), and "
+    "lua/app/sources/jsonl.lua (session watcher and parser)."
+)
+
+
+def test_description_hint_not_truncated_at_first_comma() -> None:
+    # Full paths must inherit the basename-keyed clause, not a punctuation-truncated
+    # fragment like "init.lua (setup".
+    task = "Update lua/app/init.lua (setup, config, and teardown logic) carefully."
+    entries = extract_task_file_entries(task)
+    assert entries, "expected init.lua to be extracted"
+    _path, hint = entries[0]
+    assert "config" in hint and "teardown" in hint
+    assert hint != "lua/app/init.lua (setup"
+
+
+def test_coupled_group_single_strategy_collapses_to_one_subtask() -> None:
+    payload = build_heuristic_plan_payload(
+        COUPLED_TASK, default_tier="medium", coupled_strategy="single"
+    )
+    subtasks = payload["subtasks"]
+    assert len(subtasks) == 1
+    # Coupled source group escalates above the flat "low".
+    assert subtasks[0]["tier"] in {"medium", "high"}
+    assert len(subtasks[0].get("target_files", [])) == 4
+
+
+def test_coupled_group_contract_strategy_builds_dag() -> None:
+    payload = build_heuristic_plan_payload(
+        COUPLED_TASK, default_tier="medium", coupled_strategy="contract"
+    )
+    subtasks = payload["subtasks"]
+    assert len(subtasks) >= 2
+    assert payload["strategy"] == "dag"
+    assert subtasks[0]["depends_on"] == []
+    assert all(st["depends_on"] == [1] for st in subtasks[1:])
+
+
+def test_init_lua_recognized_as_integration_stem() -> None:
+    # init.* is now an integration file; with a foundation file present it gains deps.
+    task = "Wire app/init.lua and app/helper.lua together via a shared module interface."
+    payload = build_heuristic_plan_payload(task, default_tier="medium", coupled_strategy="contract")
+    # Coupled (shared dir app/ + 'shared'/'module'/'interface' keyword) → contract DAG.
+    assert payload["strategy"] == "dag"
+
+
+def test_assess_task_complexity_flags_coupled_and_spares_simple() -> None:
+    assert assess_task_complexity(COUPLED_TASK)["complex"] is True
+    assert assess_task_complexity("Create greet.py in sandbox/demo")["complex"] is False

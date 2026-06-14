@@ -1323,6 +1323,14 @@ class TGsConfig:
     planner_host_execution_mode: str = "host_native"
     planner_host_execution_mode_by_caller: dict[str, str] = field(default_factory=dict)
     heuristic_intent_templates: bool = True
+    # How the heuristic planner handles a detected coupled file group:
+    #   "single"   -> collapse into one higher-tier subtask (default; no extra wave)
+    #   "contract" -> 2-wave DAG: define a shared interface file first, rest depend on it
+    heuristic_coupled_strategy: str = "single"
+    # When the heuristic planner sees a high-complexity task (coupled group, >=4
+    # source files, or design keywords), escalate to the real LLM planner instead
+    # of producing a lexical plan. Degrades gracefully to heuristic on any error.
+    heuristic_complexity_llm_fallback: bool = True
 
     # Janitor-style verify gate (plan 04).
     verify_gate: VerifyGateConfig = field(default_factory=VerifyGateConfig)
@@ -2173,6 +2181,15 @@ class TGsConfig:
         raw_intent_templates = orchestrator_raw.get("heuristic_intent_templates", True)
         if isinstance(raw_intent_templates, bool):
             cfg.heuristic_intent_templates = raw_intent_templates
+        raw_coupled_strategy = orchestrator_raw.get("heuristic_coupled_strategy", "single")
+        if isinstance(raw_coupled_strategy, str) and raw_coupled_strategy.strip().lower() in {
+            "single",
+            "contract",
+        }:
+            cfg.heuristic_coupled_strategy = raw_coupled_strategy.strip().lower()
+        raw_llm_fallback = orchestrator_raw.get("heuristic_complexity_llm_fallback", True)
+        if isinstance(raw_llm_fallback, bool):
+            cfg.heuristic_complexity_llm_fallback = raw_llm_fallback
 
         if isinstance(providers_section, dict):
             # Optional: per-provider usage-window thresholds
@@ -2479,6 +2496,8 @@ class TGsConfig:
                     sorted(self.planner_host_execution_mode_by_caller.items())
                 ),
                 "heuristic_intent_templates": self.heuristic_intent_templates,
+                "heuristic_coupled_strategy": self.heuristic_coupled_strategy,
+                "heuristic_complexity_llm_fallback": self.heuristic_complexity_llm_fallback,
             },
             "parallelism": {
                 "enabled": self.parallelism.enabled,
