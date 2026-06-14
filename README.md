@@ -10,7 +10,7 @@
   <a href="https://github.com/timjensgrossinger/threnody/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/timjensgrossinger/threnody/ci.yml?branch=main" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%20%E2%80%93%203.13-blue" alt="Python">
   <img src="https://img.shields.io/badge/MCP-stdio-green" alt="MCP">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.2.0--alpha.1-orange" alt="Release"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.3.0--alpha.1-orange" alt="Release"></a>
 </p>
 
 <p align="center">
@@ -364,7 +364,7 @@ Full reference: [docs/CLI.md](docs/CLI.md)
 
 ## Beta status
 
-Public alpha **v0.2.0-alpha.1** — MCP tool schemas may change between releases; pin a git tag for stability. See [CHANGELOG.md](CHANGELOG.md).
+Public alpha **v0.3.0-alpha.1** — MCP tool schemas may change between releases; pin a git tag for stability. See [CHANGELOG.md](CHANGELOG.md).
 
 - macOS and Linux; `zsh` and `bash`
 - Windows not supported by the installer

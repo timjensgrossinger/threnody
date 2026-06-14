@@ -7,6 +7,40 @@ Versioning for public releases.
 
 ## [Unreleased]
 
+## [0.3.0-alpha.1] - 2026-06-14
+
+Host-native swarm safety hardening and tier-aware Dynamic Workflow emission.
+
+### Added
+
+- **Dynamic Workflow emission** (claude-code, opt-in) — render an `ExecutionPlan`
+  into a Claude Code Workflow JS script with tier-aware per-`agent()` model
+  routing; approval-gated learning and pre-tuned permanent export to
+  `.claude/workflows/<slug>.js`. New `report_workflow_result` MCP tool,
+  consensus-in-workflow path, and `/threnody-workflow` skill.
+- **Plan safety gate** (`sanitize_plan_for_host`) — runs before both
+  `host_spawn_waves` and workflow emission: strips `target_file`s that escape
+  the workspace root, drops fragment/empty prompts, prunes waves and
+  `depends_on`, and collapses to a single coherent agent when nothing safe
+  survives. Read-only review targets are exempt. Emits a `sanitization` report.
+
+### Fixed
+
+- **Heuristic planner misfire** — reject absolute/home/system-root/fragment
+  paths at extraction so spurious prose slices (home dir, plan file) never
+  become write targets; the single-subtask fallback fires instead.
+- **`execute_swarm` `workspace_root`** — the arg now threads through into the
+  handoff, routing guard, and file hints instead of always defaulting to the
+  active MCP workspace root.
+- `build_host_spawn_waves` warns instead of silently skipping empty prompts.
+
+### Changed
+
+- `Subtask.edit_mode` documented as `execute_subtask` utility-delegation only;
+  host-native swarm agents edit via their own native tools.
+- Test suite consolidation (fork → replay, phase15 → planner, topology-explain
+  → execute-swarm).
+
 ## [0.2.0-alpha.1] - 2026-06-11
 
 Second public alpha — host-native swarm orchestration, richer learning ingest, and
@@ -152,7 +186,8 @@ hardening (older internal tags such as `v3.2.0-alpha.1` remain in git history).
 
 - Last internal milestone before the public release hardening cycle.
 
-[Unreleased]: https://github.com/timjensgrossinger/threnody/compare/v0.2.0-alpha.1...HEAD
+[Unreleased]: https://github.com/timjensgrossinger/threnody/compare/v0.3.0-alpha.1...HEAD
+[0.3.0-alpha.1]: https://github.com/timjensgrossinger/threnody/compare/v0.2.0-alpha.1...v0.3.0-alpha.1
 [0.2.0-alpha.1]: https://github.com/timjensgrossinger/threnody/releases/tag/v0.2.0-alpha.1
 [0.1.0-alpha.1]: https://github.com/timjensgrossinger/threnody/releases/tag/v0.1.0-alpha.1
 [1.0.0-beta.1]: https://github.com/timjensgrossinger/threnody/commit/4fbf8629301a7a557e9cc16ace00e9e85f9495a8
