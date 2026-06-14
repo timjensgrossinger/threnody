@@ -1015,3 +1015,126 @@ def test_config_tier_timeouts_defaults_when_missing():
     os.unlink(f.name)
 
     assert cfg.tier_timeouts == {"low": 60, "medium": 120, "high": 180}
+
+
+# ---------------------------------------------------------------------------
+# DB concurrency test (from test_phase15_concurrency.py)
+# Inline stubs replace helpers_phase15 dependency.
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace as _SimpleNamespace  # noqa: E402
+
+
+class _DummyProvider:
+    def resolve_model(self, tier: str) -> str:
+        return f"dummy-{tier}"
+
+    def execute(self, subtask, model: str, timeout: int = 120) -> str | None:
+        return f"{model}:{getattr(subtask, 'id', 'x')}"
+
+    def available_tiers(self) -> list[str]:
+        return ["low", "medium", "high"]
+
+
+class _DummyPlanner:
+    def __init__(self) -> None:
+        self._backend = _SimpleNamespace(call=lambda *args, **kwargs: None)
+
+    def plan(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+def _run_stubbed_execute_wave(temp_db_path, max_workers: int = 2, *, urgency: float = 0.5, topology: str = "linear"):
+    """Run a small wave using a stub orchestrator and return (db, telemetry_rows)."""
+    from shared.db import Database
+    from shared.orchestrator import Orchestrator, AgentResult
+    from shared.config import TGsConfig
+
+    class _StubOrchestrator(Orchestrator):
+        def __init__(self, config: TGsConfig, db: Database) -> None:
+            super().__init__(config, _DummyProvider(), _DummyPlanner(), db=db)
+
+        def execute_subtask(
+            self,
+            subtask,
+            timeout: int = 120,
+            score: float | None = None,
+            *,
+            execution_id: str | None = None,
+            plan_revision: int = 1,
+            current_wave: int | None = None,
+        ) -> AgentResult:
+            assert self._db is not None
+            self._db.log_agent_result(
+                session_id=execution_id or "wave-test",
+                task_hash=f"task-{getattr(subtask, 'id', 'x')}",
+                agent_id=getattr(subtask, 'id', 'x'),
+                tier=getattr(subtask, 'tier', 'low'),
+                model="dummy-low",
+                urgency_score=getattr(subtask, 'urgency', None),
+                selected_topology=getattr(subtask, 'topology', None),
+                artifact_publish_count=1,
+            )
+            return AgentResult(
+                subtask_id=getattr(subtask, 'id', None),
+                tier=getattr(subtask, 'tier', 'low'),
+                model="dummy-low",
+                output=f"completed {getattr(subtask, 'id', None)}",
+                token_count=1,
+            )
+
+    db = Database(temp_db_path)
+    try:
+        config = TGsConfig()
+        config.parallelism.enabled = True
+        config.parallelism.max_workers = max_workers
+        orchestrator = _StubOrchestrator(config, db)
+
+        subtasks = [
+            _SimpleNamespace(id=i, description=f"s{i}", tier="low", urgency=urgency, topology=topology)
+            for i in (1, 2, 3)
+        ]
+        orchestrator.execute_wave(0, subtasks)
+        with db.conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM telemetry WHERE session_id = ?", ("wave-test",)
+            ).fetchall()
+        return db, rows
+    finally:
+        db.close()
+
+
+def test_concurrent_artifact_visibility_and_counts(tmp_path) -> None:
+    """Spawn multiple threads that each write telemetry via the stubbed orchestrator
+    and assert that telemetry rows reflect only committed writes and counts are consistent.
+    """
+    db_path = tmp_path / "phase15_concurrency.db"
+
+    results = []
+    errors = []
+
+    def worker(idx):
+        try:
+            db, rows = _run_stubbed_execute_wave(db_path, max_workers=1, urgency=0.2 + idx * 0.1, topology="linear")
+            try:
+                with db.conn() as conn:
+                    cnt = conn.execute(
+                        "SELECT COUNT(*) FROM telemetry WHERE session_id = ?",
+                        ("wave-test",),
+                    ).fetchone()[0]
+                results.append(cnt)
+            finally:
+                db.close()
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert any(r >= 0 for r in results)
+    assert any(r >= 3 for r in results)

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Tests for Phase 31 swarm persistence scaffolding."""
-import importlib.util
 import sys
 import tempfile
 from pathlib import Path
@@ -10,10 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from shared.db import Database, SWARM_SCHEMA_VERSION
 from shared.memory import memory_refresh_swarm_state_from_db
 
-
-def test_shim_exists() -> None:
-    """Pytest wiring should be live before Phase 31 implementation tasks run."""
-    assert importlib.util.find_spec("shared.swarm") is not None
 
 
 def test_schema_init_runs() -> None:

@@ -2,17 +2,24 @@
 from __future__ import annotations
 
 import logging
+import re
 
 log = logging.getLogger(__name__)
 
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any, Mapping
 
 from .config import TGsConfig, normalize_caller_id, normalize_routing_policy_shell_id
+from .context import is_within_repo, normalize_target_path
 from .discovery import HOST_PROVIDER_NAMES, ROUTER_ONLY_PROVIDERS
 
 HOST_SPAWN_ERROR = "HostNativeRequired"
 HOST_EXECUTION_CONTRACT = "spawn_subagents"
+# Opt-in alternative to spawn_subagents: emit a Claude Code Dynamic Workflow JS
+# script the host launches via the Workflow tool. claude-code only. See
+# shared/workflow_emit.py. Requires Claude Code v2.1.154+ (operator opt-in implies it).
+WORKFLOW_EXECUTION_CONTRACT = "emit_workflow"
 COMPLIANCE_WARNING = (
     "router_only_allow_execution bypasses host-native execution and may violate "
     "provider OAuth policy — see docs/LEGAL.md"
@@ -126,6 +133,41 @@ def host_native_model_for_tier(
     return model if isinstance(model, str) and model.strip() else None
 
 
+def workflow_emit_enabled(config: TGsConfig, caller: str | None) -> bool:
+    """True when the caller is claude-code and the operator opted into workflow emission.
+
+    Gated on ``routing_policy.shells.claude-code.workflow_emit``. Other host shells
+    have no Workflow-tool equivalent, so emission is claude-code only.
+    """
+    if normalize_caller_id(caller) != "claude-code":
+        return False
+    if config is None:
+        return False
+    try:
+        profile = config.routing_policy.effective_profile("claude-code")
+    except Exception:
+        log.debug("workflow_emit_enabled: profile lookup failed", exc_info=True)
+        return False
+    return bool(getattr(profile, "workflow_emit", False))
+
+
+def consensus_in_workflow_enabled(config: TGsConfig, caller: str | None) -> bool:
+    """True when the operator opted into rendering consensus INTO the workflow script.
+
+    Requires ``workflow_emit`` (the consensus phase lives in the emitted script) and is
+    claude-code only. When false, the swarm path runs consensus queens as separate host
+    agents (hybrid default).
+    """
+    if not workflow_emit_enabled(config, caller):
+        return False
+    try:
+        profile = config.routing_policy.effective_profile("claude-code")
+    except Exception:
+        log.debug("consensus_in_workflow_enabled: profile lookup failed", exc_info=True)
+        return False
+    return bool(getattr(profile, "consensus_in_workflow", False))
+
+
 def subagent_type_for_tier(tier: str) -> str:
     if tier in {"low", "medium", "high"}:
         return f"threnody-{tier}"
@@ -207,6 +249,152 @@ def enrich_host_spawn_waves(
     return enriched
 
 
+_BARE_FILE_TOKEN = re.compile(r"[\w.-]+\.[A-Za-z][A-Za-z0-9]{0,4}")
+
+
+def _is_fragment_prompt(text: str, target_basename: str | None = None) -> bool:
+    """True when *text* is an incoherent fragment, not an executable prompt.
+
+    Guards against truncated prose slices (e.g. ``"someuser/"``) that the
+    lexical heuristic can produce from task text. Keyed on path/identifier shape,
+    not length — a terse-but-real description ("auth module") is not a fragment.
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    if target_basename and t.strip("/").lower() == target_basename.strip("/").lower():
+        return True
+    # Whitespace-free path slice or bare filename token => fragment.
+    if not any(ws in t for ws in (" ", "\t", "\n")):
+        if "/" in t or "\\" in t:
+            return True
+        if _BARE_FILE_TOKEN.fullmatch(t):
+            return True
+        if len(t) < 3:
+            return True
+    return False
+
+
+def _target_within_workspace(target: str, root: str) -> bool:
+    try:
+        resolved = normalize_target_path(target, root)
+    except ValueError:
+        return False
+    return is_within_repo(resolved, root)
+
+
+def sanitize_plan_for_host(
+    plan_dict: dict[str, Any],
+    *,
+    workspace_root: str | None,
+    task: str | None,
+    default_tier: str = "medium",
+) -> dict[str, Any]:
+    """Drop unsafe/incoherent subtasks before host-wave or workflow emission.
+
+    Mutates *plan_dict* in place and returns a sanitization report. Subtask
+    ``target_file`` values that escape *workspace_root* (out-of-root, traversal,
+    sensitive dirs) are stripped; subtasks whose prompt is a fragment/empty are
+    dropped. ``waves`` and ``depends_on`` are repaired to match. If nothing
+    survives, the plan collapses to a single coherent agent over the full task.
+    """
+    report: dict[str, Any] = {
+        "dropped_targets": [],
+        "dropped_subtasks": [],
+        "collapsed_to_single": False,
+        "reasons": [],
+    }
+    subtasks = plan_dict.get("subtasks")
+    if not isinstance(subtasks, list):
+        return report
+
+    root = str(workspace_root).strip() if workspace_root else ""
+
+    surviving: list[dict[str, Any]] = []
+    dropped_ids: set[Any] = set()
+    for raw in subtasks:
+        if not isinstance(raw, dict):
+            continue
+        st = dict(raw)
+        sid = st.get("id")
+        target = st.get("target_file")
+        target_basename: str | None = None
+        if isinstance(target, str) and target.strip():
+            target_basename = PurePosixPath(target.strip().replace("\\", "/")).name
+            # read_only subtasks (e.g. review fanout) never write — a target
+            # outside the workspace is safe, so skip containment stripping.
+            read_only = bool(st.get("read_only"))
+            if root and not read_only and not _target_within_workspace(target.strip(), root):
+                report.setdefault("dropped_targets", []).append(
+                    {"id": sid, "target_file": target}
+                )
+                report.setdefault("reasons", []).append(
+                    f"subtask {sid}: target '{target}' outside workspace root"
+                )
+                st.pop("target_file", None)
+                target = None
+        desc = str(st.get("description") or "")
+        # Only treat the (stripped) target basename as a fragment signal once the
+        # target itself has been removed — a coherent prompt for a valid file is fine.
+        if _is_fragment_prompt(desc, None if target else target_basename):
+            report.setdefault("dropped_subtasks", []).append(
+                {"id": sid, "description": desc[:80]}
+            )
+            report.setdefault("reasons", []).append(
+                f"subtask {sid}: fragment/empty prompt"
+            )
+            if sid is not None:
+                dropped_ids.add(sid)
+            continue
+        surviving.append(st)
+
+    if dropped_ids:
+        for st in surviving:
+            deps = st.get("depends_on")
+            if isinstance(deps, list):
+                st["depends_on"] = [d for d in deps if d not in dropped_ids]
+
+    surviving_ids = {st.get("id") for st in surviving}
+    waves = plan_dict.get("waves")
+    if isinstance(waves, list):
+        new_waves: list[list[Any]] = []
+        for wave in waves:
+            if not isinstance(wave, list):
+                continue
+            kept = [sid for sid in wave if sid in surviving_ids]
+            if kept:
+                new_waves.append(kept)
+        plan_dict["waves"] = new_waves
+    plan_dict["subtasks"] = surviving
+
+    if not surviving:
+        report["collapsed_to_single"] = True
+        report.setdefault("reasons", []).append(
+            "all subtasks unsafe/incoherent; collapsed to single full-task agent"
+        )
+        tier = default_tier if default_tier in {"low", "medium", "high"} else "medium"
+        full = (str(task).strip() if task else "") or "Complete the requested task."
+        plan_dict["subtasks"] = [
+            {"id": 1, "description": full, "tier": tier, "depends_on": []}
+        ]
+        plan_dict["waves"] = [[1]]
+        plan_dict["topology"] = "linear"
+        plan_dict["strategy"] = "sequential"
+
+    plan_dict["sanitization"] = report
+    dropped_targets = report.get("dropped_targets", [])
+    dropped_subtasks = report.get("dropped_subtasks", [])
+    collapsed = report.get("collapsed_to_single", False)
+    if dropped_targets or dropped_subtasks or collapsed:
+        log.info(
+            "host plan sanitized: %d target(s) dropped, %d subtask(s) dropped, collapsed=%s",
+            len(dropped_targets),
+            len(dropped_subtasks),
+            collapsed,
+        )
+    return report
+
+
 def build_host_spawn_waves(
     plan_dict: Mapping[str, Any],
     *,
@@ -237,6 +425,11 @@ def build_host_spawn_waves(
             tier = str(subtask.get("tier") or "medium")
             prompt = str(subtask.get("description") or "").strip()
             if not prompt:
+                log.warning(
+                    "host_spawn_waves: skipping subtask %r with empty prompt "
+                    "(should have been handled by sanitize_plan_for_host)",
+                    sid,
+                )
                 continue
             if _caller_is_host(caller):
                 model = host_native_model_for_tier(

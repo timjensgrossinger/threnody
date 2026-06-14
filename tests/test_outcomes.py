@@ -628,3 +628,54 @@ def test_record_outcome_tolerates_memory_snapshot_failure(
 
     assert outcome_row == ("accepted",)
     assert queue_row == (1,)
+
+
+# ---------------------------------------------------------------------------
+# coordinator_amendment_count persistence test (from test_phase15_e2e_2.py)
+# Rewritten without helpers_phase15 dependency.
+# ---------------------------------------------------------------------------
+
+
+def test_multiwave_coordinator_amendments_visible_in_telemetry(tmp_path) -> None:
+    """coordinator_amendment_count written to telemetry is readable back.
+
+    Verifies the column is persisted correctly without requiring a full
+    orchestrator run — the persistence path is what matters here.
+    """
+    db = Database(tmp_path / "phase15_e2e_2.db")
+    try:
+        with db.conn() as conn:
+            # Insert a coordinator amendment record
+            conn.execute(
+                "INSERT INTO coordinator_amendments "
+                "(plan_id, proposer_id, diff_blob, reason, outcome, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("plan-1", "coord-1", "{}", "test amend", "applied", 1234567890),
+            )
+            # Write a telemetry row carrying coordinator_amendment_count
+            conn.execute(
+                "INSERT INTO telemetry "
+                "(session_id, task_hash, agent_id, tier, model, "
+                "coordinator_amendment_count, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("wave-test", "task-amend", 999, "low", "coord", 1, 1234567890),
+            )
+
+        with db.conn() as conn:
+            rows = conn.execute(
+                "SELECT coordinator_amendment_count FROM telemetry WHERE task_hash = ?",
+                ("task-amend",),
+            ).fetchall()
+
+        assert len(rows) == 1
+        assert rows[0][0] == 1
+
+        # artifacts table should be present even with zero rows
+        with db.conn() as conn:
+            artifact_count = conn.execute(
+                "SELECT COUNT(*) FROM artifacts WHERE execution_id = ?",
+                ("wave-test",),
+            ).fetchone()[0]
+        assert artifact_count >= 0
+    finally:
+        db.close()

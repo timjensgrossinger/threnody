@@ -16,6 +16,7 @@ from shared.host_spawn import (
     enrich_host_spawn_waves,
     effective_swarm_host_execution_mode,
     host_tool_for_caller,
+    sanitize_plan_for_host,
     would_self_delegate,
 )
 
@@ -115,3 +116,118 @@ def test_enrich_host_spawn_waves_forces_host_task_contract() -> None:
     for agent in waves[0]["agents"]:
         assert agent["method"] == "host_task"
         assert agent["spawn_required"] is True
+
+
+# ---- sanitize_plan_for_host: workspace-containment + fragment safety gate ----
+
+
+def test_sanitize_strips_out_of_root_target(tmp_path) -> None:
+    root = str(tmp_path)
+    plan = {
+        "subtasks": [
+            {
+                "id": 1,
+                "description": "Update the home file as described in the task.",
+                "tier": "medium",
+                "target_file": "/Users/someuser/secret.py",
+            }
+        ],
+        "waves": [[1]],
+    }
+    report = sanitize_plan_for_host(plan, workspace_root=root, task="do work")
+    # Target escapes root -> stripped, but coherent prompt keeps the subtask.
+    assert plan["subtasks"][0].get("target_file") is None
+    assert any(d["id"] == 1 for d in report["dropped_targets"])
+    assert plan["waves"] == [[1]]
+
+
+def test_sanitize_drops_fragment_prompt_subtask(tmp_path) -> None:
+    plan = {
+        "subtasks": [
+            {"id": 1, "description": "someuser/", "tier": "low",
+             "target_file": "/Users/someuser"},
+            {"id": 2, "description": "Implement the parser module fully.",
+             "tier": "medium", "target_file": "src/parser.py"},
+        ],
+        "waves": [[1, 2]],
+    }
+    sanitize_plan_for_host(plan, workspace_root=str(tmp_path), task="build parser")
+    ids = [st["id"] for st in plan["subtasks"]]
+    assert ids == [2]
+    assert plan["waves"] == [[2]]
+
+
+def test_sanitize_collapses_to_single_agent_when_all_unsafe(tmp_path) -> None:
+    plan = {
+        "subtasks": [
+            {"id": 1, "description": "someuser/", "tier": "low",
+             "target_file": "/Users/someuser"},
+            {"id": 2, "description": "plans/", "tier": "low",
+             "target_file": "/Users/someuser/.claude/plans/x.md"},
+        ],
+        "waves": [[1, 2]],
+        "topology": "dag",
+    }
+    task = "Refactor the tightly-coupled coordinator and queen modules together."
+    report = sanitize_plan_for_host(plan, workspace_root=str(tmp_path), task=task)
+    assert report["collapsed_to_single"] is True
+    assert len(plan["subtasks"]) == 1
+    assert plan["subtasks"][0]["description"] == task
+    assert plan["waves"] == [[1]]
+    assert plan["topology"] == "linear"
+
+
+def test_sanitize_leaves_clean_fanout_untouched(tmp_path) -> None:
+    plan = {
+        "subtasks": [
+            {"id": 1, "description": "Build module a fully.", "tier": "low",
+             "target_file": "a.py"},
+            {"id": 2, "description": "Build module b fully.", "tier": "low",
+             "target_file": "b.py"},
+            {"id": 3, "description": "Build module c fully.", "tier": "low",
+             "target_file": "c.py"},
+        ],
+        "waves": [[1, 2, 3]],
+    }
+    report = sanitize_plan_for_host(plan, workspace_root=str(tmp_path), task="build")
+    assert report["collapsed_to_single"] is False
+    assert not report["dropped_targets"]
+    assert not report["dropped_subtasks"]
+    assert [st["target_file"] for st in plan["subtasks"]] == ["a.py", "b.py", "c.py"]
+    assert plan["waves"] == [[1, 2, 3]]
+
+
+def test_sanitize_keeps_read_only_external_target(tmp_path) -> None:
+    # Read-only review subtasks may legitimately target absolute, out-of-root files.
+    plan = {
+        "subtasks": [
+            {
+                "id": 1,
+                "description": "Security review of the auth module.",
+                "tier": "high",
+                "read_only": True,
+                "target_file": "/Users/someuser/repo/auth.py",
+            }
+        ],
+        "waves": [[1]],
+    }
+    report = sanitize_plan_for_host(plan, workspace_root=str(tmp_path), task="review")
+    assert plan["subtasks"][0]["target_file"] == "/Users/someuser/repo/auth.py"
+    assert not report["dropped_targets"]
+
+
+def test_sanitize_prunes_dropped_id_from_depends_on(tmp_path) -> None:
+    plan = {
+        "subtasks": [
+            {"id": 1, "description": "x/", "tier": "low",
+             "target_file": "/etc/passwd"},
+            {"id": 2, "description": "Wire the integration layer together.",
+             "tier": "medium", "target_file": "main.py", "depends_on": [1]},
+        ],
+        "waves": [[1], [2]],
+    }
+    sanitize_plan_for_host(plan, workspace_root=str(tmp_path), task="integrate")
+    survivors = {st["id"]: st for st in plan["subtasks"]}
+    assert set(survivors) == {2}
+    assert survivors[2]["depends_on"] == []
+    assert plan["waves"] == [[2]]

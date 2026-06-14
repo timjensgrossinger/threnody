@@ -3377,3 +3377,158 @@ def test_handle_route_task_includes_host_spawn_for_claude_host(monkeypatch) -> N
     assert result["execution_hint"]["mode"] == "host_native"
     assert result["host_spawn"]["tool"] == "Agent"
     assert result["host_spawn"]["tier"] == "medium"
+
+
+# ---------------------------------------------------------------------------
+# Approval / agent queue aliases (moved from test_approval_aliases.py)
+# ---------------------------------------------------------------------------
+
+
+def test_agent_queue_tools_are_discoverable() -> None:
+    tool_names = {tool["name"] for tool in mcp_server.TOOLS}
+
+    assert "agent_queue_list" in tool_names
+    assert "agent_queue_approve" in tool_names
+    assert "agent_queue_reject" in tool_names
+    assert "agent_queue_merge" in tool_names
+    assert "approval_queue_list" in tool_names
+    assert "approval_queue_approve" in tool_names
+    assert "approval_queue_reject" in tool_names
+    assert "approval_queue_merge" in tool_names
+
+
+def test_agent_queue_handlers_share_compatibility_mappings() -> None:
+    assert mcp_server.HANDLERS["agent_queue_list"] is mcp_server.HANDLERS["approval_queue_list"]
+    assert mcp_server.HANDLERS["agent_queue_approve"] is mcp_server.HANDLERS["approval_queue_approve"]
+    assert mcp_server.HANDLERS["agent_queue_reject"] is mcp_server.HANDLERS["approval_queue_reject"]
+    assert mcp_server.HANDLERS["agent_queue_merge"] is mcp_server.HANDLERS["approval_queue_merge"]
+
+
+# ---------------------------------------------------------------------------
+# Effort override (moved from test_effort.py)
+# ---------------------------------------------------------------------------
+
+
+class _StubGitHubRegistry:
+    """Registry that selects GitHub Copilot (unsupported explicit effort)."""
+
+    def select_provider_for_tier(self, tier: str, **_kwargs):
+        is_free = tier == "low"
+        return {
+            "provider": "GitHub Copilot",
+            "provider_id": "github-copilot",
+            "model": "gpt-5-mini" if tier == "low" else "gpt-5.4",
+            "tier": tier,
+            "is_free": is_free,
+            "billing_tier": "free" if is_free else "subscription",
+            "provider_cost_hint": "free" if is_free else "included in subscription/quota",
+            "cost_rank": 0 if is_free else 2,
+            "billing_source": "user_override" if is_free else "provider_default",
+            "excluded_providers": [],
+        }
+
+    def execute_cheapest(self, **_kwargs):
+        return {
+            "result": "ok",
+            "provider": "GitHub Copilot",
+            "provider_id": "github-copilot",
+            "model": "gpt-5-mini",
+            "tier": "low",
+            "is_free": True,
+            "billing_tier": "free",
+            "provider_cost_hint": "free",
+            "cost_rank": 0,
+            "billing_source": "user_override",
+            "fallback_used": False,
+        }
+
+
+class _StubCodexRegistry:
+    """Registry that selects Codex (supports explicit effort)."""
+
+    def select_provider_for_tier(self, tier: str, **_kwargs):
+        return {
+            "provider": "Codex",
+            "provider_id": "codex",
+            "model": "codex-mini" if tier == "low" else "codex-large",
+            "tier": tier,
+            "is_free": False,
+            "billing_tier": "subscription",
+            "provider_cost_hint": "included in subscription/quota",
+            "cost_rank": 2,
+            "billing_source": "provider_default",
+            "excluded_providers": [],
+        }
+
+    def execute_cheapest(self, **kwargs):
+        return {
+            "result": "ok",
+            "provider": "Codex",
+            "provider_id": "codex",
+            "model": kwargs.get("model", "codex-mini"),
+            "tier": kwargs.get("tier", "low"),
+            "is_free": False,
+            "billing_tier": "subscription",
+            "provider_cost_hint": "included in subscription/quota",
+            "cost_rank": 2,
+            "billing_source": "provider_default",
+            "fallback_used": False,
+            "effort": kwargs.get("effort"),
+            "effort_source": "explicit" if kwargs.get("effort") else None,
+        }
+
+
+def test_execute_subtask_rejects_explicit_effort_for_unsupported_provider(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "effort.db"
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
+        db = Database(db_path=db_path)
+
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, None, None, None))
+        monkeypatch.setattr(mcp_server, "get_registry", lambda: _StubGitHubRegistry())
+
+        result = mcp_server.handle_execute_subtask({
+            "prompt": "Hello",
+            "effort": "high",
+        })
+
+        assert result.get("error") == "UnsupportedEffortOverride"
+        assert "cannot be honored" in result.get("details", "").lower()
+
+
+def test_execute_subtask_annotates_config_default_effort_for_unsupported_provider(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "effort.db"
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
+        cfg.provider_effort_defaults = {"github-copilot": {"low": "careful"}}
+        db = Database(db_path=db_path)
+
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, None, None, None))
+        monkeypatch.setattr(mcp_server, "get_registry", lambda: _StubGitHubRegistry())
+
+        result = mcp_server.handle_execute_subtask({
+            "prompt": "Hello",
+        })
+
+        assert result.get("provider") == "GitHub Copilot"
+        assert result.get("effort") == "careful"
+        assert result.get("effort_source") == "config_default"
+
+
+def test_execute_subtask_allows_explicit_effort_for_supported_provider(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "effort.db"
+        cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
+        db = Database(db_path=db_path)
+
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, None, None, None))
+        monkeypatch.setattr(mcp_server, "get_registry", lambda: _StubCodexRegistry())
+
+        result = mcp_server.handle_execute_subtask({
+            "prompt": "Hello",
+            "effort": "high",
+        })
+
+        assert result.get("provider") == "Codex"
+        assert result.get("effort") == "high"
+        assert result.get("effort_source") == "explicit"

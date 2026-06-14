@@ -85,6 +85,8 @@ Docs: [plugin install guide](docs/PLUGIN_INSTALL.md) · [limitations](docs/RELEA
 
 `execute_subtask` is **utility delegation only** (opt-in): OpenCode, Aider, and local loopback endpoints — never to other host CLIs. Same-host work returns `HostNativeRequired` with an actionable spawn payload. Claude Code is a **router-only host** by default.
 
+On Claude Code, an opt-in mode (`routing_policy.shells.claude-code.workflow_emit`) emits **tier-aware [Dynamic Workflow](https://code.claude.com/docs/en/workflows) scripts** for fan-out plans: each `agent()` routes to its Threnody tier model, where a vanilla workflow would run every agent on the session model. Recurring orchestration shapes can be approved and saved as permanent `/workflow` commands.
+
 Search terms that describe the same project: **MCP orchestrator**, **meta-harness**, **multi-agent coding**, **swarm coordination**, **self-learning agents**, **Copilot / Claude / Codex orchestration**.
 
 ---
@@ -118,6 +120,7 @@ Six repo-local skills under [`skills/`](skills/) guide MCP workflows from any co
 | [threnody-routing](skills/threnody-routing/SKILL.md) | `route_task`, routing guard, host-native vs utility delegation |
 | [threnody-task](skills/threnody-task/SKILL.md) | `plan_task`, `decompose_task`, `fleet_plan`, `host_spawn_waves` |
 | [threnody-swarm](skills/threnody-swarm/SKILL.md) | `execute_swarm`, topology, budget preview, resume |
+| [threnody-workflow](skills/threnody-workflow/SKILL.md) | Consensus swarm via tier-aware Dynamic Workflows; save pre-tuned, zero-config `/workflow` commands (claude-code) |
 | [threnody-fullstack](skills/threnody-fullstack/SKILL.md) | Contract-first parallel frontend + backend + API |
 | [threnody-subtasks](skills/threnody-subtasks/SKILL.md) | Monitor opt-in utility `execute_subtask` runs |
 

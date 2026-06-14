@@ -88,6 +88,25 @@ def _render_claude_pointer_block(
         "",
     ])
 
+    if getattr(profile, "workflow_emit", False):
+        lines.extend([
+            "### Dynamic Workflow emission (opt-in)",
+            "",
+            "When a fan-out plan response includes `workflow_emit: true`, prefer launching its "
+            "`workflow_script` via the **Workflow** tool (Claude Code v2.1.154+) instead of "
+            "spawning `host_spawn_waves`. The script is tier-aware — each `agent()` routes to its "
+            "Threnody tier model, where Workflow's default would otherwise run every agent on the "
+            "session model — and runs in the background, keeping intermediate results out of context.",
+            "After it returns, call `report_workflow_result(workflow_name, agents[])` with the "
+            "returned `agents` array so Threnody records learning telemetry. If the Workflow tool is "
+            "unavailable, fall back to `host_spawn_waves`.",
+            "Use the **`/threnody-workflow`** skill to run a consensus swarm over this path and save a "
+            "pre-tuned, documented, zero-config `/<slug>` command for coworkers. Multi-queen consensus is "
+            "hybrid by default (queens as host agents); set `consensus_in_workflow: true` to render queens "
+            "inside the workflow.",
+            "",
+        ])
+
     if not profile.route_task_mandatory:
         lines.extend([
             "### Guarded mode",
@@ -102,7 +121,7 @@ def _render_claude_pointer_block(
         "",
         "Full routing contracts, execution patterns, and host-native details are in the installed Threnody skills:",
         "`/threnody-routing` · `/threnody-plan` · `/threnody-task` · "
-        "`/threnody-subtasks` · `/threnody-swarm` · `/threnody-fullstack`",
+        "`/threnody-subtasks` · `/threnody-swarm` · `/threnody-workflow` · `/threnody-fullstack`",
         "",
         "Run `/threnody-routing` first if you are unfamiliar with Threnody.",
     ])

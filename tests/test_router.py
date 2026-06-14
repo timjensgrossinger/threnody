@@ -11,11 +11,16 @@ import pytest
 # Ensure shared/ is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import json
+import re
+
 import shared.adaptive as adaptive_module
 import shared.router as router_module
 from shared.config import TGsConfig
 from shared.db import Database
 from shared.router import TaskRouter, RoutingDecision
+from shared.routing_report import build_routing_report, render_routing_accuracy_markdown
+from shared.routing_hook import parse_hook_payload, validate_routing_guard
 
 
 def _make_router() -> TaskRouter:
@@ -148,6 +153,136 @@ def test_project_sample_min_gate() -> None:
     assert hasattr(router_module, "ACTIVATION_MIN_SAMPLES")
     assert router_module.ACTIVATION_MIN_SAMPLES == 5
     assert adaptive_module.PROJECT_SAMPLE_MIN == 3
+
+
+# --- urgency ---
+
+
+def test_classify_includes_urgency_fields():
+    """D-07/D-08: RoutingDecision must expose urgency fields without breaking existing fields."""
+    cfg = TGsConfig()
+    r = TaskRouter(cfg)
+    decision = r.classify("just a small change")
+
+    # existing fields still present
+    assert hasattr(decision, "score")
+    assert hasattr(decision, "reason")
+
+    # new urgency explainability surface
+    assert hasattr(decision, "urgency_score")
+    assert isinstance(decision.urgency_score, float)
+    assert hasattr(decision, "matched_urgency_signals")
+    assert isinstance(decision.matched_urgency_signals, list)
+    # default should be 0.0 for non-urgent prompts
+    assert decision.urgency_score == 0.0
+
+
+def test_soft_implied_urgency_detected():
+    """D-01/D-02: Softer implied urgency like "by EOD" and "ASAP" raises urgency_score."""
+    cfg = TGsConfig()
+    r = TaskRouter(cfg)
+    prompt = "Please finish this by EOD — we need it ASAP."
+    decision = r.classify(prompt)
+
+    assert decision.urgency_score > 0.0
+    # matched signals should mention at least eod or asap
+    matched = " ".join(decision.matched_urgency_signals).lower()
+    assert re.search(r"eod|asap|by eod", matched)
+
+
+def test_excluded_phrases_do_not_raise_urgency():
+    """D-03: Phrases like 'quick question', 'review', 'refactor' do not trigger urgency."""
+    cfg = TGsConfig()
+    r = TaskRouter(cfg)
+    prompt = "Quick question: could you review this refactor?"
+    decision = r.classify(prompt)
+
+    assert decision.urgency_score == 0.0
+    assert decision.matched_urgency_signals == []
+
+
+# --- routing report ---
+
+
+def test_build_routing_report_in_test_mode(monkeypatch) -> None:
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
+    report = build_routing_report(filter_categories=["low"])
+    assert "summary" in report
+    assert "config_hash" in report
+    assert report["summary"]["fixture_count"] >= 1
+    markdown = render_routing_accuracy_markdown(report)
+    assert "Routing accuracy" in markdown
+    assert "Executed accuracy" in markdown
+
+
+# --- routing hook ---
+
+
+def test_parse_hook_payload_extracts_edit_target() -> None:
+    payload = {
+        "tool_name": "Edit",
+        "cwd": "/tmp/project",
+        "tool_input": {"file_path": "src/main.py"},
+    }
+    fields = parse_hook_payload(payload)
+    assert fields["tool_name"] == "Edit"
+    assert fields["cwd"] == "/tmp/project"
+    assert fields["target_file"] == "src/main.py"
+    assert fields["caller"] == "claude-code"
+
+
+def test_validate_routing_guard_blocks_without_guard(monkeypatch, tmp_path) -> None:
+    import mcp_server
+    from shared.config import TGsConfig
+    from shared.db import Database
+
+    db_path = tmp_path / "hook.db"
+    cfg = TGsConfig(db_path=db_path)
+    db = Database(db_path=db_path)
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (cfg, db, None, None, None),
+    )
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+    result = validate_routing_guard(
+        caller="claude-code",
+        cwd=str(tmp_path),
+        target_file="foo.py",
+        tool_name="Edit",
+    )
+    assert result["valid"] is False
+    assert "route_task" in str(result.get("reason", "")).lower()
+
+
+def test_routing_hook_cli_blocks_without_guard(monkeypatch, tmp_path, capsys) -> None:
+    import mcp_server
+    from shared.config import TGsConfig
+    from shared.db import Database
+
+    import shared.routing_hook as routing_hook
+
+    db_path = tmp_path / "hook-cli.db"
+    cfg = TGsConfig(db_path=db_path)
+    db = Database(db_path=db_path)
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (cfg, db, None, None, None),
+    )
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+    payload = json.dumps({
+        "tool_name": "Write",
+        "cwd": str(tmp_path),
+        "tool_input": {"file_path": "bar.py"},
+    })
+    exit_code = routing_hook.main(["validate", "--json", payload])
+    captured = capsys.readouterr()
+    body = json.loads(captured.out)
+    assert exit_code == 2
+    assert body["valid"] is False
 
 
 if __name__ == "__main__":

@@ -618,5 +618,182 @@ def test_db_pattern_readers_treat_string_zero_rework_as_false(agent_learning_db:
     assert mature_pattern["rework_detected"] is False
 
 
+# --- lane detection edge cases ---
+
+
+def test_detect_lane_edge_case_empty_string():
+    result = _detect_lane("")
+    assert result == "shared", f"Empty string should default to shared, got '{result}'"
+
+
+def test_detect_lane_edge_case_whitespace_only():
+    result = _detect_lane("   ")
+    assert result == "shared", f"Whitespace-only should default to shared, got '{result}'"
+
+
+def test_detect_lane_case_insensitive_our():
+    result = _detect_lane("Our module needs refactoring")
+    assert result == "project", f"'Our' (capitalized) should trigger project lane, got '{result}'"
+
+
+def test_detect_lane_edge_case_none_input():
+    result = _detect_lane(None)  # type: ignore
+    assert result == "shared", f"None input should safely default to shared, got '{result}'"
+
+
+def test_detect_lane_edge_case_non_string_input():
+    result = _detect_lane(123)  # type: ignore
+    assert result == "shared", f"Non-string input should safely default to shared, got '{result}'"
+
+
+def test_draft_gate_project_lane_lower_bar():
+    """Project lane requires recurrence >= 5 and eval >= 0.70 (lower bar than shared)."""
+    import tempfile
+    import time
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = Path(f.name)
+
+    try:
+        db = Database(db_path=db_path)
+        pattern_hash_val = "test_proj_pattern_001"
+        with db.conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO subtask_patterns
+                (pattern_hash, pattern_desc, occurrence_count, rework_detected, eval_quality, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (pattern_hash_val, "Write tests for our asyncio worker pool", 5, 0, 0.70, time.time()),
+            )
+            conn.commit()
+
+        result = check_draft_ready(db, "test-project", pattern_hash_val)
+        assert result is True, f"Expected True (meets project lane bar), got {result}"
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+        try:
+            db_path.unlink(missing_ok=True)
+            (db_path.parent / f"{db_path.name}-wal").unlink(missing_ok=True)
+            (db_path.parent / f"{db_path.name}-shm").unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def test_draft_gate_shared_lane_higher_bar_not_met():
+    """Shared lane requires recurrence >= 10 and eval >= 0.85; 8/0.80 should be rejected."""
+    import tempfile
+    import time
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = Path(f.name)
+
+    try:
+        db = Database(db_path=db_path)
+        pattern_hash_val = "test_shared_pattern_001"
+        with db.conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO subtask_patterns
+                (pattern_hash, pattern_desc, occurrence_count, rework_detected, eval_quality, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (pattern_hash_val, "Test writer for async patterns", 8, 0, 0.80, time.time()),
+            )
+            conn.commit()
+
+        result = check_draft_ready(db, "test-project", pattern_hash_val)
+        assert result is False, f"Expected False (does not meet shared lane bar), got {result}"
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+        try:
+            db_path.unlink(missing_ok=True)
+            (db_path.parent / f"{db_path.name}-wal").unlink(missing_ok=True)
+            (db_path.parent / f"{db_path.name}-shm").unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def test_draft_gate_shared_lane_higher_bar_met():
+    """Shared lane passes when recurrence >= 10 and eval >= 0.85."""
+    import tempfile
+    import time
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = Path(f.name)
+
+    try:
+        db = Database(db_path=db_path)
+        pattern_hash_val = "test_shared_pattern_002"
+        with db.conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO subtask_patterns
+                (pattern_hash, pattern_desc, occurrence_count, rework_detected, eval_quality, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (pattern_hash_val, "Test writer for async patterns", 10, 0, 0.85, time.time()),
+            )
+            conn.commit()
+
+        result = check_draft_ready(db, "test-project", pattern_hash_val)
+        assert result is True, f"Expected True (meets shared lane bar), got {result}"
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+        try:
+            db_path.unlink(missing_ok=True)
+            (db_path.parent / f"{db_path.name}-wal").unlink(missing_ok=True)
+            (db_path.parent / f"{db_path.name}-shm").unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def test_evaluate_pattern_readiness_project_lane_ready_metadata():
+    state = evaluate_pattern_readiness(
+        {
+            "pattern_hash": "proj-ready-001",
+            "pattern_desc": "Write tests for our asyncio worker pool",
+            "occurrence_count": 5,
+            "rework_detected": False,
+            "eval_quality": 0.70,
+        },
+        "test-project",
+    )
+    assert state["ready"] is True, f"Expected ready=True, got {state}"
+    assert state["lane"] == "project", f"Expected project lane, got {state['lane']}"
+    assert state["recurrence_threshold"] == 5, f"Expected project recurrence threshold, got {state['recurrence_threshold']}"
+
+
+def test_evaluate_pattern_readiness_shared_lane_reports_blocker():
+    state = evaluate_pattern_readiness(
+        {
+            "pattern_hash": "shared-blocked-001",
+            "pattern_desc": "Write tests for async patterns",
+            "occurrence_count": 8,
+            "rework_detected": False,
+            "eval_quality": 0.80,
+        },
+        "test-project",
+    )
+    assert state["ready"] is False, f"Expected ready=False, got {state}"
+    assert state["lane"] == "shared", f"Expected shared lane, got {state['lane']}"
+    assert state["reason"] == "recurrence_below_threshold", f"Unexpected blocker: {state['reason']}"
+
+
+def test_mcp_server_import_smoke():
+    import mcp_server
+
+    assert callable(mcp_server.handle_learning_pattern_health), "mcp_server should import successfully"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

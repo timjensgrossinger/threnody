@@ -2,12 +2,14 @@
 """
 Tests for shared/orchestrator.py parallel wave execution.
 """
+import hashlib
+import json
 import sys
 import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -15,7 +17,7 @@ import pytest
 
 from shared.config import PLANNER_ALLOW_TOPOLOGY_FALLBACK, TGsConfig
 from shared.db import Database
-from shared.orchestrator import AgentResult, Orchestrator, Provider, seed_resume_from_checkpoint
+from shared.orchestrator import AgentResult, CircuitBreakerError, Orchestrator, Provider, fan_out_task, seed_resume_from_checkpoint
 from shared.planner import CLIBackend, ExecutionPlan, Planner, PlannerParseError, Subtask
 
 
@@ -997,3 +999,764 @@ def test_result_metadata_provider_name_reflects_actual_provider_used(tmp_path: P
         assert results[0].provider_name == "ProviderB"
     finally:
         db.close()
+
+
+# --- coordinator sync ---
+
+class RecordingProvider(Provider):
+    def __init__(self, outputs: dict[int, str]) -> None:
+        self.outputs = outputs
+        self.calls: list[int] = []
+        self.descriptions: dict[int, str] = {}
+
+    def resolve_model(self, tier: str) -> str:
+        return f"dummy-{tier}"
+
+    def execute(self, subtask: Subtask, model: str, timeout: int = 120) -> str | None:
+        self.calls.append(subtask.id)
+        self.descriptions[subtask.id] = subtask.description
+        return self.outputs[subtask.id]
+
+    def available_tiers(self) -> list[str]:
+        return ["low", "medium", "high"]
+
+
+def _build_coordinator_plan() -> ExecutionPlan:
+    subtasks = [
+        Subtask(id=1, description="produce artifact", tier="low", model="low", produces=["summary"]),
+        Subtask(
+            id=2,
+            description="coordinate next wave",
+            tier="low",
+            model="low",
+            depends_on=[1],
+            is_coordinator=True,
+        ),
+        Subtask(id=3, description="worker after coordinator", tier="low", model="low", depends_on=[1]),
+    ]
+    return ExecutionPlan(
+        analysis="coordinator",
+        subtasks=subtasks,
+        waves=[[1], [2, 3]],
+        total_agents=3,
+        strategy="dag",
+    )
+
+
+def test_coordinator_runs_before_next_wave() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "coordinator.db")
+        try:
+            provider = RecordingProvider({
+                1: "artifact payload",
+                2: json.dumps({"verdict": "complete"}),
+                3: "worker output",
+            })
+            config = TGsConfig()
+            config.parallelism.enabled = True
+            orchestrator = Orchestrator(config, provider, DummyPlanner(), db=db)
+
+            results = orchestrator.execute_plan(
+                _build_coordinator_plan(),
+                execution_id="exec-13",
+                plan_revision=1,
+            )
+
+            assert provider.calls == [1, 2, 3]
+            assert set(results) == {1, 2, 3}
+        finally:
+            db.close()
+
+
+def test_coordinator_receives_summary_only_artifacts() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "coordinator-summary.db")
+        try:
+            payload = "raw-start " + ("x" * 5000) + " ENDMARK"
+            provider = RecordingProvider({
+                1: payload,
+                2: json.dumps({"verdict": "complete"}),
+                3: "worker output",
+            })
+            config = TGsConfig()
+            orchestrator = Orchestrator(config, provider, DummyPlanner(), db=db)
+
+            orchestrator.execute_plan(
+                _build_coordinator_plan(),
+                execution_id="exec-13",
+                plan_revision=1,
+            )
+
+            coordinator_description = provider.descriptions[2]
+            assert "COORDINATOR RESPONSE CONTRACT" in coordinator_description
+            assert '"verdict":"complete|another-pass|fallback"' in coordinator_description
+            assert "--- ARTIFACT HANDOFF ---" in coordinator_description
+            assert "Reference: artifact:" in coordinator_description
+            assert "ENDMARK" not in coordinator_description
+        finally:
+            db.close()
+
+
+def test_coordinator_another_pass_ignores_artifact_backed_amendment() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "coordinator-amendment.db")
+        try:
+            provider = RecordingProvider({
+                1: "artifact payload",
+                2: json.dumps(
+                    {
+                        "verdict": "another-pass",
+                        "amendment": {
+                            "subtask_updates": [
+                                {"id": 3, "description": "worker after coordinator revised"},
+                            ]
+                        },
+                    }
+                ),
+                3: "worker output",
+            })
+            config = TGsConfig()
+            orchestrator = Orchestrator(config, provider, DummyPlanner(), db=db)
+
+            orchestrator.execute_plan(
+                _build_coordinator_plan(),
+                execution_id="exec-13",
+                plan_revision=1,
+            )
+
+            assert provider.calls == [1, 2, 3]
+            assert provider.descriptions[3] == "worker after coordinator"
+        finally:
+            db.close()
+
+
+# --- fanout cap enforcement ---
+
+class FanoutStubOrchestrator(Orchestrator):
+    def __init__(self, config: TGsConfig, db: Database):
+        super().__init__(config, DummyProvider(), DummyPlanner(), db=db)
+
+    def execute_subtask(
+        self,
+        subtask: Subtask,
+        timeout: int = 120,
+        score: float | None = None,
+        *,
+        execution_id: str | None = None,
+        plan_revision: int = 1,
+        current_wave: int | None = None,
+    ) -> AgentResult:
+        assert self._db is not None
+        self._db.log_agent_result(
+            session_id="fanout-test",
+            task_hash=f"task-{subtask.id}",
+            agent_id=subtask.id,
+            tier=subtask.tier,
+            model="dummy-low",
+        )
+        return AgentResult(
+            subtask_id=subtask.id,
+            tier=subtask.tier,
+            model="dummy-low",
+            output=f"completed {subtask.id}",
+            token_count=2,
+        )
+
+
+def _task_id_for_description(desc: str) -> str:
+    return hashlib.sha256(desc.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def test_orchestrator_rejects_fanout_above_budget() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "reject.db")
+        try:
+            config = TGsConfig()
+            config.parallelism.enabled = True
+            config.parallelism.max_workers = 10
+            orchestrator = FanoutStubOrchestrator(config, db)
+
+            domains = [
+                {"name": "A", "confidence": 0.95, "tier": "low"},
+                {"name": "B", "confidence": 0.9, "tier": "low"},
+                {"name": "C", "confidence": 0.9, "tier": "low"},
+            ]
+            task_desc = "urgent: please run cross-domain analysis asap"
+            task = {
+                "opt_in_fanout": True,
+                "domains": domains,
+                "description": task_desc,
+                "budget_limit": 50,
+                "urgency_score": 0.9,
+                "matched_urgency_signals": ["asap"],
+            }
+
+            result = fan_out_task(task, max_routers=3, per_router_budget=100, orchestrator=orchestrator, db=db)
+
+            assert result.get("fallback") == "single_route"
+            assert result.get("reason") == "caps_exceeded"
+
+            task_id = _task_id_for_description(task_desc)
+            with db.conn() as conn:
+                row = conn.execute(
+                    "SELECT budget_accounting FROM fanout_telemetry WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                assert row is not None, "Expected a fanout_telemetry row"
+                payload = json.loads(row[0])
+                assert "urgency" in payload, payload
+                urgency = payload["urgency"]
+                assert urgency.get("final_action") in ("fallback_to_linear", "rejected")
+                assert urgency.get("requested_router_count") == 3
+                assert urgency.get("urgency_score") == 0.9
+        finally:
+            db.close()
+
+
+def test_orchestrator_allows_safe_urgency_fanout() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "allow.db")
+        try:
+            config = TGsConfig()
+            config.parallelism.enabled = True
+            config.parallelism.max_workers = 4
+            orchestrator = FanoutStubOrchestrator(config, db)
+
+            domains = [
+                {"name": "A", "confidence": 0.95, "tier": "low"},
+                {"name": "B", "confidence": 0.9, "tier": "low"},
+            ]
+            task_desc = "please prioritize this soon"
+            task = {
+                "opt_in_fanout": True,
+                "domains": domains,
+                "description": task_desc,
+                "budget_limit": 100,
+                "urgency_score": 0.7,
+                "matched_urgency_signals": ["soon"],
+            }
+
+            result = fan_out_task(task, max_routers=3, per_router_budget=10, orchestrator=orchestrator, db=db)
+
+            assert result.get("result") is not None or result.get("per_domain")
+            assert len(result.get("per_domain", [])) == 2
+
+            task_id = _task_id_for_description(task_desc)
+            with db.conn() as conn:
+                row = conn.execute(
+                    "SELECT budget_accounting FROM fanout_telemetry WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                assert row is not None, "Expected a fanout_telemetry row"
+                payload = json.loads(row[0])
+                assert "urgency" in payload
+                urgency = payload["urgency"]
+                assert urgency.get("final_action") == "allowed"
+                assert urgency.get("urgency_score") == 0.7
+        finally:
+            db.close()
+
+
+# --- synthesis map-reduce ---
+
+class RecordingBackend(CLIBackend):
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def call(self, prompt: str, model: str | None = None, timeout: int = 120) -> str | None:
+        self.calls.append(prompt)
+        if "AGENT OUTPUTS (partial):" in prompt:
+            if "Agent #1" in prompt:
+                return "chunk-1: completed auth module"
+            if "Agent #2" in prompt:
+                return "chunk-2: completed billing module"
+            if "Agent #3" in prompt:
+                return "chunk-3: completed docs module"
+            return "chunk-summary"
+        if "CHUNK SUMMARIES:" in prompt:
+            return (
+                "- Auth module done\n"
+                "- Billing module done\n"
+                "- Docs module done\n"
+                "- No conflicts detected"
+            )
+        return "single-pass summary"
+
+
+class SynthesisDummyProvider:
+    def resolve_model(self, tier: str) -> str:
+        return f"dummy-{tier}"
+
+    def execute(self, subtask, model: str, timeout: int = 120) -> str | None:
+        return None
+
+    def available_tiers(self) -> list[str]:
+        return ["low", "medium", "high"]
+
+    def provider_info(self) -> dict:
+        return {"primary": "dummy-provider"}
+
+
+def _build_synthesis_config(**overrides) -> TGsConfig:
+    config = TGsConfig()
+    config.parallelism.max_workers = 4
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_synthesis_auto_single_pass_for_small_outputs() -> None:
+    backend = RecordingBackend()
+    orchestrator = Orchestrator(_build_synthesis_config(synthesis_map_reduce="auto"), SynthesisDummyProvider(), DummyPlanner())
+    results = {1: "small output", 2: "another small output"}
+
+    summary = orchestrator.synthesise("integrate modules", results, backend_call=backend.call)
+
+    assert summary == "single-pass summary"
+    assert len(backend.calls) == 1
+    assert "AGENT OUTPUTS:" in backend.calls[0]
+
+
+def test_synthesis_off_always_single_pass() -> None:
+    backend = RecordingBackend()
+    orchestrator = Orchestrator(
+        _build_synthesis_config(synthesis_map_reduce="off", synthesis_chunk_chars=100),
+        SynthesisDummyProvider(),
+        DummyPlanner(),
+    )
+    results = {index: "x" * 5000 for index in range(1, 4)}
+
+    summary = orchestrator.synthesise("large task", results, backend_call=backend.call)
+
+    assert summary == "single-pass summary"
+    assert len(backend.calls) == 1
+
+
+def test_synthesis_auto_map_reduce_for_large_outputs() -> None:
+    backend = RecordingBackend()
+    orchestrator = Orchestrator(
+        _build_synthesis_config(synthesis_map_reduce="auto", synthesis_chunk_chars=12000),
+        SynthesisDummyProvider(),
+        DummyPlanner(),
+    )
+    results = {
+        1: "alpha " * 3000,
+        2: "beta " * 3000,
+        3: "gamma " * 3000,
+    }
+
+    summary = orchestrator.synthesise("ship feature", results, backend_call=backend.call)
+
+    assert summary is not None
+    assert "Auth module done" in summary
+    partial_calls = [prompt for prompt in backend.calls if "AGENT OUTPUTS (partial):" in prompt]
+    reduce_calls = [prompt for prompt in backend.calls if "CHUNK SUMMARIES:" in prompt]
+    assert len(partial_calls) >= 2
+    assert len(reduce_calls) == 1
+    assert any("Agent #1" in prompt for prompt in partial_calls)
+    assert any("Agent #2" in prompt for prompt in partial_calls)
+    assert any("Agent #3" in prompt for prompt in partial_calls)
+
+
+def test_synthesis_always_map_reduce_even_for_small_outputs() -> None:
+    backend = RecordingBackend()
+    orchestrator = Orchestrator(
+        _build_synthesis_config(synthesis_map_reduce="always", synthesis_chunk_chars=12000),
+        SynthesisDummyProvider(),
+        DummyPlanner(),
+    )
+    results = {1: "small", 2: "also small"}
+
+    summary = orchestrator.synthesise("tiny task", results, backend_call=backend.call)
+
+    assert summary is not None
+    partial_calls = [prompt for prompt in backend.calls if "AGENT OUTPUTS (partial):" in prompt]
+    reduce_calls = [prompt for prompt in backend.calls if "CHUNK SUMMARIES:" in prompt]
+    assert len(partial_calls) == 1
+    assert len(reduce_calls) == 1
+
+
+# --- budget soft warning ---
+
+class BudgetProvider(Provider):
+    def __init__(self) -> None:
+        self.calls = 0
+        self._outputs = [
+            "a" * 180,  # 45 tokens
+            "b" * 160,  # 40 tokens -> soft warning at 85/100
+            "c" * 100,  # 25 tokens -> circuit breaker at 110/100
+            "d" * 200,
+        ]
+
+    def resolve_model(self, tier: str) -> str:
+        return f"budget-{tier}"
+
+    def execute(self, subtask: Subtask, model: str, timeout: int = 120) -> str | None:
+        output = self._outputs[self.calls]
+        self.calls += 1
+        return output
+
+    def available_tiers(self) -> list[str]:
+        return ["low", "medium", "high"]
+
+
+class BudgetPlanner:
+    def plan(self, task: str, skip_cache: bool = False) -> ExecutionPlan:
+        return ExecutionPlan(
+            analysis="budget-test",
+            subtasks=[
+                Subtask(id=1, description="one", tier="low", model="budget-low"),
+                Subtask(id=2, description="two", tier="low", model="budget-low"),
+                Subtask(id=3, description="three", tier="low", model="budget-low"),
+                Subtask(id=4, description="four", tier="low", model="budget-low"),
+            ],
+            waves=[[1, 2, 3, 4]],
+            total_agents=4,
+            strategy="sequential",
+        )
+
+
+def test_budget_warning(caplog) -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "budget.db")
+        config = TGsConfig()
+        config.parallelism.enabled = False
+        config.budgets.default_hard_cap_tokens = 100
+        config.budgets.default_soft_warning_pct = 0.7
+
+        provider = BudgetProvider()
+        orchestrator = Orchestrator(config, provider, BudgetPlanner(), db=db)
+
+        with pytest.raises(CircuitBreakerError):
+            orchestrator.run("budget warning test")
+
+        assert provider.calls == 3
+        assert "soft token budget warning" in caplog.text
+        assert "token circuit breaker" in caplog.text
+
+        with db.conn() as conn:
+            reason_rows = conn.execute(
+                "SELECT reason FROM telemetry WHERE reason IS NOT NULL ORDER BY id",
+            ).fetchall()
+
+        assert [row[0] for row in reason_rows] == [
+            "subtask_result",
+            "subtask_result",
+            "soft_warning",
+            "subtask_result",
+            "circuit_breaker",
+        ]
+
+        db.close()
+
+
+# --- spillover unique regressions ---
+
+class AnchoringOrchestrator(Orchestrator):
+    def __init__(self, config: TGsConfig, db: Database) -> None:
+        super().__init__(config, DummyProvider(), None, db=db)
+
+    def execute_subtask(self, subtask: Subtask, timeout: int = 120, provider_override: "Provider | None" = None, **kwargs) -> object:
+        class R:
+            def __init__(self, subtask_id, provider_name):
+                self.subtask_id = subtask_id
+                self.tier = subtask.tier
+                self.model = subtask.model
+                self.output = ""
+                self.token_count = 1
+                self.provider_name = provider_name
+                self.used_fallback = False
+                self.used_speculation = False
+                self.escalated = False
+                self.success = True
+
+        provider_name = provider_override.provider_info().get("primary") if provider_override else "none"
+        return R(subtask.id, provider_name)
+
+
+def test_missing_explicit_primary_fails_clearly(tmp_path: Path) -> None:
+    db = Database(tmp_path / "spill-no-primary.db")
+    try:
+        config = TGsConfig()
+        orchestrator = AnchoringOrchestrator(config, db)
+
+        with patch.object(orchestrator, "_provider_registry") as mock_registry:
+            orchestrator._providers_map = {"b": MagicMock(provider_info=MagicMock(return_value={"primary": "b"}))}
+
+            def fake_plan(tier, count, anchor_provider_id=None, **kwargs):
+                raise RuntimeError(
+                    f"Explicitly routed provider '{anchor_provider_id}' is not routeable/available for tier '{tier}'"
+                )
+
+            mock_registry.plan_spillover_allocation.side_effect = fake_plan
+
+            subtasks = [
+                Subtask(id=1, description="s1", tier="low", model="m", provider_id="a"),
+                Subtask(id=2, description="s2", tier="low", model="m", provider_id="a"),
+                Subtask(id=3, description="s3", tier="low", model="m", provider_id="b"),
+                Subtask(id=4, description="s4", tier="low", model="m", provider_id="b"),
+            ]
+            with pytest.raises(RuntimeError):
+                orchestrator.execute_wave(0, subtasks)
+    finally:
+        db.close()
+
+
+def test_missing_runtime_provider_mapping_fails_clearly(tmp_path: Path) -> None:
+    db = Database(tmp_path / "spill-missing-map.db")
+    try:
+        config = TGsConfig()
+        orchestrator = AnchoringOrchestrator(config, db)
+
+        with patch.object(orchestrator, "_provider_registry") as mock_registry:
+            orchestrator._providers_map = {
+                "a": MagicMock(provider_info=MagicMock(return_value={"primary": "a"}))
+            }
+
+            def fake_plan(tier, count, anchor_provider_id=None, **kwargs):
+                return {
+                    "primary": {"provider_id": "missing-provider"},
+                    "assignments": [{"provider_id": "missing-provider", "slots": count}],
+                    "remaining": 0,
+                }
+
+            mock_registry.plan_spillover_allocation.side_effect = fake_plan
+
+            with pytest.raises(RuntimeError, match="missing-provider"):
+                orchestrator.execute_wave(0, [Subtask(id=1, description="s1", tier="low", model="m")])
+    finally:
+        db.close()
+
+
+def test_runtime_provider_mapping_uses_normalized_assignment_ids(tmp_path: Path) -> None:
+    db = Database(tmp_path / "spill-normalize.db")
+    try:
+        config = TGsConfig()
+        orchestrator = AnchoringOrchestrator(config, db)
+
+        with patch.object(orchestrator, "_provider_registry") as mock_registry:
+            orchestrator._providers_map = {
+                "github-copilot": MagicMock(
+                    provider_info=MagicMock(return_value={"primary": "github-copilot"})
+                )
+            }
+
+            def fake_plan(tier, count, anchor_provider_id=None, **kwargs):
+                return {
+                    "primary": {"provider_id": "GitHub_Copilot"},
+                    "assignments": [{"provider_id": "GitHub_Copilot", "slots": count}],
+                    "remaining": 0,
+                }
+
+            mock_registry.plan_spillover_allocation.side_effect = fake_plan
+
+            results = orchestrator.execute_wave(
+                0,
+                [Subtask(id=1, description="s1", tier="low", model="m")],
+            )
+
+            assert results[0].provider_name == "github-copilot"
+    finally:
+        db.close()
+
+
+def test_string_zero_remaining_does_not_raise(tmp_path: Path) -> None:
+    db = Database(tmp_path / "spill-str-zero.db")
+    try:
+        config = TGsConfig()
+        orchestrator = AnchoringOrchestrator(config, db)
+
+        with patch.object(orchestrator, "_provider_registry") as mock_registry:
+            orchestrator._providers_map = {
+                "a": MagicMock(provider_info=MagicMock(return_value={"primary": "a"}))
+            }
+
+            def fake_plan(tier, count, anchor_provider_id=None, **kwargs):
+                return {
+                    "primary": {"provider_id": "a"},
+                    "assignments": [{"provider_id": "a", "slots": count}],
+                    "remaining": "0",
+                }
+
+            mock_registry.plan_spillover_allocation.side_effect = fake_plan
+
+            results = orchestrator.execute_wave(
+                0,
+                [Subtask(id=1, description="s1", tier="low", model="m")],
+            )
+
+            assert results[0].provider_name == "a"
+    finally:
+        db.close()
+
+
+def test_invalid_assignment_shape_fails_clearly(tmp_path: Path) -> None:
+    db = Database(tmp_path / "spill-invalid-shape.db")
+    try:
+        config = TGsConfig()
+        orchestrator = AnchoringOrchestrator(config, db)
+
+        with patch.object(orchestrator, "_provider_registry") as mock_registry:
+            orchestrator._providers_map = {
+                "a": MagicMock(provider_info=MagicMock(return_value={"primary": "a"}))
+            }
+
+            def fake_plan(tier, count, anchor_provider_id=None, **kwargs):
+                return {
+                    "primary": {"provider_id": "a"},
+                    "assignments": ["not-a-mapping"],
+                    "remaining": 0,
+                }
+
+            mock_registry.plan_spillover_allocation.side_effect = fake_plan
+
+            with pytest.raises(RuntimeError, match="invalid assignment"):
+                orchestrator.execute_wave(
+                    0,
+                    [Subtask(id=1, description="s1", tier="low", model="m")],
+                )
+    finally:
+        db.close()
+
+
+# --- hierarchical artifacts ---
+
+def test_parent_scoped_selection() -> None:
+    """Parent-scoped lookup should honor direct-parent scope, active revision, and stable ties."""
+    import shared.db as _shared_db
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = _shared_db.Database(Path(tmpdir) / "hier.db")
+        try:
+            db.save_artifact(
+                execution_id="exec-1",
+                plan_revision=1,
+                wave=1,
+                subtask_id="parent-old",
+                artifact_type="summary",
+                full_payload="stale payload",
+                compact_summary="stale summary",
+                parent_execution_id="parent-1",
+            )
+            db.save_artifact(
+                execution_id="exec-1",
+                plan_revision=2,
+                wave=1,
+                subtask_id="parent-direct",
+                artifact_type="summary",
+                full_payload="older payload",
+                compact_summary="older summary",
+                parent_execution_id="parent-1",
+            )
+            latest_ref = db.save_artifact(
+                execution_id="exec-1",
+                plan_revision=2,
+                wave=2,
+                subtask_id="parent-direct",
+                artifact_type="summary",
+                full_payload="latest payload",
+                compact_summary="latest summary",
+                parent_execution_id="parent-1",
+            )
+            db.save_artifact(
+                execution_id="exec-1",
+                plan_revision=2,
+                wave=3,
+                subtask_id="parent-other",
+                artifact_type="summary",
+                full_payload="other parent payload",
+                compact_summary="other parent summary",
+                parent_execution_id="parent-2",
+            )
+            selected = db.get_parent_scoped_artifacts(
+                "exec-1",
+                2,
+                "parent-1",
+                ["summary"],
+            )
+            assert selected == [
+                {
+                    "artifact_type": "summary",
+                    "summary_text": "latest summary",
+                    "length_chars": len("latest summary"),
+                    "artifact_ref": latest_ref,
+                    "producer_subtask_id": "parent-direct",
+                    "parent_execution_id": "parent-1",
+                }
+            ]
+
+            with patch("shared.db.time.time", return_value=1_700_000_000):
+                first_ref = db.save_artifact(
+                    execution_id="exec-2",
+                    plan_revision=2,
+                    wave=2,
+                    subtask_id="parent-a",
+                    artifact_type="summary",
+                    full_payload="tie payload a",
+                    compact_summary="tie summary a",
+                    parent_execution_id="parent-tie",
+                )
+                second_ref = db.save_artifact(
+                    execution_id="exec-2",
+                    plan_revision=2,
+                    wave=2,
+                    subtask_id="parent-b",
+                    artifact_type="summary",
+                    full_payload="tie payload b",
+                    compact_summary="tie summary b",
+                    parent_execution_id="parent-tie",
+                )
+
+            first = db.get_parent_scoped_artifacts("exec-2", 2, "parent-tie", ["summary"])
+            second = db.get_parent_scoped_artifacts("exec-2", 2, "parent-tie", ["summary"])
+            assert first == second
+            expected_ref = min(first_ref, second_ref)
+            expected_subtask = "parent-a" if expected_ref == first_ref else "parent-b"
+            assert first[0]["artifact_ref"] == expected_ref
+            assert first[0]["producer_subtask_id"] == expected_subtask
+        finally:
+            db.close()
+
+
+def test_missing_parent_degrades_subtree() -> None:
+    """Missing direct-parent artifacts should persist one degradation event and stay sticky."""
+    import shared.config as _shared_config
+    import shared.orchestrator as _shared_orchestrator
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Database(Path(tmpdir) / "hier-degrade.db")
+        orchestrator = _shared_orchestrator.Orchestrator(
+            _shared_config.TGsConfig(),
+            DummyProvider(),
+            DummyPlanner(),
+            db=db,
+        )
+        try:
+            first = orchestrator.bind_parent_artifacts(
+                "exec-1",
+                "child-1",
+                "parent-1",
+                ["summary"],
+                db=db,
+            )
+            assert first == {"degraded": True, "artifact_refs": []}
+            events = db.query_degradation_events("exec-1")
+            assert events == [
+                {
+                    "parent_subtask_id": "parent-1",
+                    "missing_artifact_type": "summary",
+                    "affected_child_subtask_id": "child-1",
+                    "reason": "missing_parent_artifacts",
+                    "created_at": events[0]["created_at"],
+                }
+            ]
+
+            second = orchestrator.bind_parent_artifacts(
+                "exec-1",
+                "child-1",
+                "parent-1",
+                ["summary"],
+                db=db,
+            )
+            assert second == {"degraded": True, "artifact_refs": []}
+            assert len(db.query_degradation_events("exec-1")) == 1
+        finally:
+            db.close()

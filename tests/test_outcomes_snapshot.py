@@ -336,7 +336,7 @@ def test_compute_snapshot_window_boundaries(tmp_path) -> None:
 def test_compute_snapshot_error_handling(tmp_path) -> None:
     """Test that errors are logged but the function returns gracefully."""
     db = Database(tmp_path / "test.db")
-    
+
     # Create a deliberately broken db connection scenario
     # by calling with a db that will fail on query execution
     # We'll just verify the function doesn't raise an exception
@@ -347,3 +347,110 @@ def test_compute_snapshot_error_handling(tmp_path) -> None:
     except Exception as e:
         # The function should not raise
         pytest.fail(f"compute_learning_outcome_snapshot raised an exception: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Full-pipeline integration test (from test_outcomes_integration.py)
+# ---------------------------------------------------------------------------
+
+from shared.memory import MemoryNotFoundError  # noqa: E402
+
+
+def test_integration_outcome_recording_to_snapshot_computation() -> None:
+    """
+    Full pipeline test: insert telemetry, record outcomes, compute snapshot, query memory.
+
+    Scenario: 40 tasks routed (telemetry), 35 with recorded outcomes.
+    Expected coverage: 87.5% (35/40)
+    Expected distribution: 30 accepted, 2 revised, 1 rejected, 2 reworked
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "integration-test.db"
+        db = Database(db_path=db_path)
+
+        now = time.time()
+        cutoff = now - 3600  # 1 hour window
+
+        # Step 1: Insert 40 telemetry records (simulating 40 routed tasks)
+        with db.conn() as conn:
+            for i in range(40):
+                ts = cutoff + 100 + i * 60  # Spread across window
+                conn.execute(
+                    """
+                    INSERT INTO telemetry (ts, tier, model, provider_name)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (ts, "low", "gpt-5-mini", "test-provider"),
+                )
+
+            # Step 2: Record 35 outcomes (various types) for 35 of the 40 tasks
+            outcomes_spec = [
+                ("task-0", "accepted"),
+                ("task-1", "accepted"),
+                ("task-2", "accepted"),
+                ("task-3", "accepted"),
+                ("task-4", "accepted"),
+                ("task-5", "revised"),
+                ("task-6", "revised"),
+                ("task-7", "rejected"),
+                ("task-8", "reworked"),
+                ("task-9", "reworked"),
+            ]
+
+            for task_id, outcome in outcomes_spec:
+                conn.execute(
+                    """
+                    INSERT INTO routing_outcomes (
+                        task_id, current_outcome, recorded_at, tier, model,
+                        provider_name, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (task_id, outcome, cutoff + 150, "low", "gpt-5-mini", "test-provider", cutoff + 150),
+                )
+
+            # Record 25 more accepted outcomes (to get 30 total accepted)
+            for i in range(10, 35):
+                conn.execute(
+                    """
+                    INSERT INTO routing_outcomes (
+                        task_id, current_outcome, recorded_at, tier, model,
+                        provider_name, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (f"task-{i}", "accepted", cutoff + 150 + i * 10, "low", "gpt-5-mini", "test-provider", cutoff + 150 + i * 10),
+                )
+
+        # Step 3: Compute snapshot (simulates warm-path executor background task)
+        compute_learning_outcome_snapshot(db)
+
+        # Step 4: Query via memory
+        try:
+            result = memory_get("global", "learning_stats", db=db)
+            snapshot = result.get("value", {})
+        except MemoryNotFoundError:
+            pytest.fail("Snapshot should be stored in memory after computation")
+
+        # Step 5: Verify response structure and exact values
+        assert snapshot, "Snapshot should not be empty"
+
+        assert snapshot["coverage_percentage"] == 87.5
+        assert snapshot["total_tasks_in_window"] == 40
+        assert snapshot["tasks_with_feedback"] == 35
+
+        dist = snapshot["outcome_distribution"]
+        assert "low:gpt-5-mini" in dist
+
+        tier_model_dist = dist["low:gpt-5-mini"]
+        assert tier_model_dist["accepted"] == 30
+        assert tier_model_dist["revised"] == 2
+        assert tier_model_dist["rejected"] == 1
+        assert tier_model_dist["reworked"] == 2
+
+        assert "window_start_time" in snapshot
+        assert "window_end_time" in snapshot
+        assert "computed_at" in snapshot
+        assert snapshot["window_end_time"] - snapshot["window_start_time"] >= 3599

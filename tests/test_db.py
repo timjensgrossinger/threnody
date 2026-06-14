@@ -523,6 +523,181 @@ def test_memory_validation_and_corrupted_value() -> None:
 
 
 
+# ---------------------------------------------------------------------------
+# Coordinator audit persistence (from test_coordinator_audit_persistence.py)
+# ---------------------------------------------------------------------------
+
+import json
+
+
+def test_accepted_amendment_persists_revision_and_audit() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".db") as db_file:
+        db = Database(Path(db_file.name))
+        revision_id = db.insert_plan_revision(
+            plan_id="13-03",
+            revision_number=2,
+            diff_blob={"updated_subtasks": ["13-03-02"]},
+            proposer_id="coordinator-1",
+            reason="tighten future validation",
+        )
+        audit_id = db.insert_coordinator_audit(revision_id, outcome="accepted")
+
+        with db.conn() as conn:
+            revision = conn.execute(
+                """
+                SELECT plan_id, revision_number, diff_blob, proposer_id, reason
+                FROM plan_revisions
+                WHERE id = ?
+                """,
+                (revision_id,),
+            ).fetchone()
+            audit = conn.execute(
+                """
+                SELECT plan_id, revision_id, proposer_id, diff_blob, reason, outcome, rejection_reason
+                FROM coordinator_amendments
+                WHERE id = ?
+                """,
+                (audit_id,),
+            ).fetchone()
+
+        assert revision is not None
+        assert revision[0] == "13-03"
+        assert revision[1] == 2
+        assert json.loads(revision[2]) == {"updated_subtasks": ["13-03-02"]}
+        assert revision[3] == "coordinator-1"
+        assert revision[4] == "tighten future validation"
+
+        assert audit is not None
+        assert audit[0] == "13-03"
+        assert audit[1] == revision_id
+        assert audit[2] == "coordinator-1"
+        assert json.loads(audit[3]) == {"updated_subtasks": ["13-03-02"]}
+        assert audit[4] == "tighten future validation"
+        assert audit[5] == "accepted"
+        assert audit[6] is None
+
+        db.close()
+
+
+def test_rejected_amendment_persists_audit_error() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".db") as db_file:
+        db = Database(Path(db_file.name))
+        audit_id = db.insert_coordinator_audit_rejection(
+            plan_id="13-03",
+            proposer_id="coordinator-2",
+            reason="attempted duplicate coordinator in wave 2",
+            diff_blob={"wave": 2, "coordinator_ids": [4, 5]},
+        )
+
+        with db.conn() as conn:
+            audit = conn.execute(
+                """
+                SELECT plan_id, revision_id, proposer_id, diff_blob, reason, outcome, rejection_reason
+                FROM coordinator_amendments
+                WHERE id = ?
+                """,
+                (audit_id,),
+            ).fetchone()
+
+        assert audit is not None
+        assert audit[0] == "13-03"
+        assert audit[1] is None
+        assert audit[2] == "coordinator-2"
+        assert json.loads(audit[3]) == {"wave": 2, "coordinator_ids": [4, 5]}
+        assert audit[4] == "attempted duplicate coordinator in wave 2"
+        assert audit[5] == "rejected"
+        assert audit[6] == "attempted duplicate coordinator in wave 2"
+
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# File permission hardening (from test_db_permissions.py)
+# ---------------------------------------------------------------------------
+
+
+def test_database_restricts_permissions_to_owner(tmp_path: Path) -> None:
+    db_path = tmp_path / "private-router.db"
+    db = Database(db_path=db_path)
+    try:
+        assert db_path.parent.stat().st_mode & 0o777 == 0o700
+        conn = db._connect()
+        conn.execute("CREATE TABLE IF NOT EXISTS perms_probe (id INTEGER PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+
+        for candidate in (
+            db_path,
+            Path(f"{db_path}-wal"),
+            Path(f"{db_path}-shm"),
+        ):
+            if candidate.exists():
+                assert candidate.stat().st_mode & 0o777 == 0o600
+    finally:
+        db.close()
+
+
+def test_database_restricts_custom_owned_parent_directory(tmp_path: Path) -> None:
+    custom_parent = tmp_path / "custom-db-dir"
+    custom_parent.mkdir(mode=0o755)
+    db_path = custom_parent / "router.db"
+    db = Database(db_path=db_path)
+    try:
+        assert custom_parent.stat().st_mode & 0o777 == 0o700
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Artifact visibility scoping (from test_db_concurrency.py — unique test)
+# ---------------------------------------------------------------------------
+
+import shared.db as _shared_db
+
+
+def test_artifact_visibility_scoping() -> None:
+    """Artifacts should be visible across DB instances and scoped by revision and wave."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "artifacts.db"
+        first = _shared_db.Database(db_path)
+        second = _shared_db.Database(db_path)
+        try:
+            first_ref = first.save_artifact(
+                execution_id="exec-1",
+                plan_revision=1,
+                wave=1,
+                subtask_id="12-01",
+                artifact_type="summary",
+                full_payload="payload-one",
+                compact_summary="summary-one",
+            )
+            second_ref = first.save_artifact(
+                execution_id="exec-1",
+                plan_revision=2,
+                wave=2,
+                subtask_id="12-01",
+                artifact_type="summary",
+                full_payload="payload-two",
+                compact_summary="summary-two",
+            )
+
+            visible = second.query_artifacts("exec-1", 1, wave=1, artifact_types=["summary"])
+            assert len(visible) == 1
+            assert visible[0]["stable_ref"] == first_ref
+            assert visible[0]["compact_summary"]["artifact_ref"] == first_ref
+
+            hidden = second.query_artifacts("exec-1", 1, wave=2, artifact_types=["summary"])
+            assert hidden == []
+
+            other_revision = second.query_artifacts("exec-1", 2, wave=2, artifact_types=["summary"])
+            assert len(other_revision) == 1
+            assert other_revision[0]["stable_ref"] == second_ref
+            assert first._get_full_payload(second_ref) == "payload-two"
+        finally:
+            first.close()
+            second.close()
+
+
 if __name__ == "__main__":
     tests = [
         test_cache_put_and_get,

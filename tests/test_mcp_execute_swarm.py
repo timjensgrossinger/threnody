@@ -2,13 +2,16 @@
 """Tests for the Phase 36 execute_swarm MCP surface."""
 from __future__ import annotations
 
+import json
 import time
+import tempfile
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mcp_server
+from mcp_server import prepare_swarm_execution_request
 from shared.config import TGsConfig
 from shared.db import Database
 
@@ -294,3 +297,164 @@ def test_execute_swarm_host_native_skips_runtime_handoff(monkeypatch, tmp_path: 
     assert guard.get("mode") == "routed_plan"
     file_hints = guard.get("file_hints") or []
     assert any("auth.py" in str(hint) for hint in file_hints)
+
+
+def test_execute_swarm_honors_workspace_root_arg(monkeypatch, tmp_path: Path) -> None:
+    """workspace_root arg must flow into the handoff, routing_guard, and file_hints."""
+    db = _stub_init(monkeypatch, tmp_path)
+    mcp_server._execute_swarm_rate_limit.clear()
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+    class FakePlan:
+        total_agents = 1
+        topology = "linear"
+
+    class FakePlanner:
+        def plan(self, _t: str, **_k) -> FakePlan:
+            return FakePlan()
+
+        def plan_heuristic(self, _t: str, **_k) -> FakePlan:
+            return FakePlan()
+
+        def plan_to_dict(self, _p: FakePlan) -> dict[str, object]:
+            return {
+                "subtasks": [
+                    {
+                        "id": "st-1",
+                        "description": "build the calculator ops module",
+                        "tier": "low",
+                        "depends_on": [],
+                        "target_file": "ops.py",
+                    }
+                ],
+                "waves": [["st-1"]],
+                "topology": "linear",
+            }
+
+    monkeypatch.setattr(
+        mcp_server, "_spawn_execute_swarm_runtime_handoff", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (TGsConfig(db_path=tmp_path / "ws.db"), db, None, FakePlanner(), None),
+    )
+
+    ws = str(tmp_path / "external-proj")
+    result = mcp_server.handle_execute_swarm(
+        {"task": "build calculator ops", "max_agents": 1, "workspace_root": ws}
+    )
+    payload = result["result"]
+    assert payload["workspace_root"] == ws
+    assert payload["learning_report_contract"]["workspace_root"] == ws
+    guard = payload.get("routing_guard") or {}
+    assert guard.get("cwd") == ws
+    # file_hints resolve the relative target under the supplied workspace root.
+    assert any(ws in str(hint) for hint in (guard.get("file_hints") or []))
+
+
+# ---------------------------------------------------------------------------
+# Topology rationale (moved from test_mcp_server_topology_explain.py)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_swarm_auto_topology_exposes_rationale(monkeypatch, tmp_path: Path) -> None:
+    _stub_init(monkeypatch, tmp_path)
+    mcp_server._execute_swarm_rate_limit.clear()
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "topology-explain")
+
+    result = mcp_server.handle_execute_swarm(
+        {
+            "task": "Incident blocked today, parallelize immediately.",
+            "max_agents": 8,
+            "urgency_hint": "ASAP outage today",
+        }
+    )
+
+    assert result["started"] is True
+    payload = result["result"]
+    assert payload["swarm_id"].startswith("swarm-")
+    assert payload["selected_topology"] == "star"
+    assert payload["topology_rationale"] == "urgency_high"
+    assert payload["requested_vs_effective_agent_count"] == {
+        "requested": 8,
+        "effective": 8,
+    }
+    assert payload["effective_values"]["topology"] == "star"
+
+
+# ---------------------------------------------------------------------------
+# Swarm cap enforcement (moved from test_swarm_config.py)
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_request_propagates_workspace_root() -> None:
+    """workspace_root arg must reach request_meta (not silently default to active root)."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as handle:
+        db = Database(Path(handle.name))
+        config = TGsConfig.defaults()
+
+        prepared = prepare_swarm_execution_request(
+            {"task": "build x", "workspace_root": "/tmp/swarm-demo"},
+            config=config,
+            db=db,
+            swarm_id="swarm-ws-test",
+        )
+        assert prepared["workspace_root"] == "/tmp/swarm-demo"
+
+        # Absent/blank arg normalizes to None so the caller falls back to active root.
+        prepared_none = prepare_swarm_execution_request(
+            {"task": "build x", "workspace_root": "  "},
+            config=config,
+            db=db,
+            swarm_id="swarm-ws-none",
+        )
+        assert prepared_none["workspace_root"] is None
+
+
+def test_max_agents_default_and_clamp() -> None:
+    """Over-cap swarm requests should clamp to the hard cap and persist telemetry."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as handle:
+        db = Database(Path(handle.name))
+        config = TGsConfig.defaults()
+
+        prepared = prepare_swarm_execution_request(
+            {"max_agents": 20},
+            config=config,
+            db=db,
+            swarm_id="swarm-cap-test",
+        )
+
+        assert config.swarm_max_agents == 12
+        assert prepared["requested_agents"] == 20
+        assert prepared["effective_agents"] == 12
+        assert prepared["clamped"] is True
+        assert prepared["requested_vs_effective_agent_count"] == {
+            "requested": 20,
+            "effective": 12,
+        }
+
+        with db.conn() as conn:
+            run_row = conn.execute(
+                """
+                SELECT requested_agents, effective_agents
+                FROM swarm_runs
+                WHERE swarm_id = ?
+                """,
+                ("swarm-cap-test",),
+            ).fetchone()
+            event_row = conn.execute(
+                """
+                SELECT payload
+                FROM swarm_events
+                WHERE swarm_id = ? AND event_type = ?
+                """,
+                ("swarm-cap-test", "cap_event"),
+            ).fetchone()
+
+        assert run_row == (20, 12)
+        assert event_row is not None
+        payload = json.loads(event_row[0])
+        assert payload["requested"] == 20
+        assert payload["effective"] == 12
+        db.close()

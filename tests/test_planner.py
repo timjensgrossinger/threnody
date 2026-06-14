@@ -649,6 +649,324 @@ def test_evaluate_fanout_logs_telemetry_when_db_provided() -> None:
         db.close()
 
 
+# ---------------------------------------------------------------------------
+# From test_planner_auto_topology.py
+# ---------------------------------------------------------------------------
+
+from shared.planner import make_auto_topology_decision
+
+
+def test_auto_select_star() -> None:
+    config = TGsConfig.defaults()
+
+    topology, rationale = make_auto_topology_decision(
+        {"task_chars": 160, "subtask_count": 8},
+        0.75,
+        8,
+        config=config,
+        db=None,
+    )
+
+    assert topology == "star"
+    assert rationale == "urgency_high"
+
+
+def test_auto_select_hierarchical() -> None:
+    config = TGsConfig.defaults()
+
+    topology, rationale = make_auto_topology_decision(
+        {
+            "subtasks": [
+                {"id": "architect"},
+                {"id": "implementer", "parent_id": "architect"},
+            ]
+        },
+        0.10,
+        4,
+        config=config,
+        db=None,
+    )
+
+    assert topology == "hierarchical"
+    assert rationale == "hierarchy_detected"
+
+
+def test_auto_select_dag() -> None:
+    config = TGsConfig.defaults()
+
+    topology, rationale = make_auto_topology_decision(
+        {"task_chars": 80, "subtask_count": 2},
+        0.0,
+        2,
+        config=config,
+        db=None,
+    )
+
+    assert topology == "dag"
+    assert rationale == "balanced_default"
+
+
+# ---------------------------------------------------------------------------
+# From test_planner_fanout_urgency.py
+# ---------------------------------------------------------------------------
+
+
+def _make_urgency_plan(num_subtasks=3, estimated_tokens=10000, strategy="parallel"):
+    subtasks = [
+        Subtask(id=i + 1, description=f"task {i+1}", tier="low", depends_on=[])
+        for i in range(num_subtasks)
+    ]
+    plan = ExecutionPlan(
+        analysis="test",
+        subtasks=subtasks,
+        waves=[list(range(1, num_subtasks + 1))],
+        total_agents=num_subtasks,
+        strategy=strategy,
+        topology="linear",
+        token_budget=None,
+        planner_tokens=None,
+        estimated_agent_tokens=estimated_tokens,
+    )
+    return plan
+
+
+def test_urgency_lowers_threshold():
+    """High urgency should conservatively lower router_count compared to default."""
+    config = FanOutConfig(opt_in_fanout=True, max_routers=3)
+    plan = _make_urgency_plan(num_subtasks=3, estimated_tokens=10_000)
+
+    base = evaluate_fanout(plan, config)
+    urgent = evaluate_fanout(plan, config, urgency_score=0.8)
+
+    assert base.enabled is True
+    assert urgent.enabled is True
+    assert urgent.router_count < base.router_count
+
+
+def test_urgency_prefers_star():
+    """For a fan-out-friendly plan, high urgency should prefer star topology."""
+    config = FanOutConfig(opt_in_fanout=True, max_routers=4)
+    plan = _make_urgency_plan(num_subtasks=4, estimated_tokens=20_000, strategy="parallel")
+
+    dec = evaluate_fanout(plan, config, urgency_score=0.9)
+
+    assert dec.enabled is True
+    assert dec.router_count <= config.max_routers
+    assert dec.topology_hint == "star" or (dec.topology_bias_reason and "star" in dec.topology_bias_reason)
+
+
+# ---------------------------------------------------------------------------
+# From test_telemetry_columns.py
+# ---------------------------------------------------------------------------
+
+import time
+import tempfile
+
+
+def test_fanout_columns_written():
+    with tempfile.NamedTemporaryFile(suffix=".db") as tf:
+        db = Database(Path(tf.name))
+
+        subtasks = [
+            Subtask(id=1, description="one", tier="low"),
+            Subtask(id=2, description="two", tier="low"),
+        ]
+        waves = build_waves(subtasks)
+        plan = ExecutionPlan(
+            analysis="test",
+            subtasks=subtasks,
+            waves=waves,
+            total_agents=2,
+            strategy="parallel",
+            estimated_agent_tokens=100,
+        )
+
+        config = FanOutConfig(opt_in_fanout=True, max_routers=2, budget_limit=1000)
+
+        decision = evaluate_fanout(plan, config=config, db=db, urgency_score=0.7)
+        assert decision.enabled
+
+        with db.conn() as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(telemetry)").fetchall()}
+            assert "urgency_score" in cols
+            assert "selected_topology" in cols
+            assert "fanout_final_action" in cols
+
+            row = conn.execute(
+                "SELECT urgency_score, selected_topology, fanout_final_action FROM telemetry ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            assert row is not None
+            urgency_score_val, selected_topology, fanout_final_action = row
+            assert urgency_score_val is not None
+            assert selected_topology == "star" or selected_topology is None
+            assert fanout_final_action is not None
+
+
+def test_telemetry_backward_compatibility():
+    with tempfile.NamedTemporaryFile(suffix=".db") as tf:
+        db = Database(db_path=Path(tf.name))
+        with db.conn() as conn:
+            conn.execute(
+                "INSERT INTO telemetry (session_id, task_hash, agent_id, tier, model, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                ("legacy", "oldhash", 1, "low", "legacy-model", time.time()),
+            )
+
+            row = conn.execute(
+                "SELECT session_id, urgency_score FROM telemetry WHERE session_id = ?", ("legacy",)
+            ).fetchone()
+            assert row is not None
+            assert row[0] == "legacy"
+            assert row[1] is None
+
+
+# ---------------------------------------------------------------------------
+# From test_telemetry_tokens.py
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+class _MockPlannerBackendTokens(CLIBackend):
+    def __init__(self, response: str, actual_tokens: int) -> None:
+        self._response = response
+        self.last_actual_tokens = actual_tokens
+
+    def call(self, prompt: str, model: str | None = None, timeout: int = 120) -> str | None:
+        return self._response
+
+
+def test_estimated_and_actual_tokens_persist(tmp_path: Path) -> None:
+    """Planner telemetry persists estimated/actual tokens and timing to an isolated DB."""
+    from shared.planner import PLAN_START, PLAN_END
+
+    db_path = tmp_path / "telemetry.db"
+    db = Database(db_path=db_path)
+    backend = _MockPlannerBackendTokens(
+        "<PLAN_JSON>\n"
+        + _json.dumps({
+            "analysis": "test",
+            "subtasks": [{"id": 1, "description": "do thing", "tier": "low", "depends_on": []}],
+            "strategy": "parallel",
+        })
+        + "\n</PLAN_JSON>",
+        actual_tokens=42,
+    )
+    planner = Planner(TGsConfig(db_path=db_path), backend, db)
+
+    planner.plan("plan with telemetry", skip_cache=True)
+
+    with db.conn() as conn:
+        row = conn.execute(
+            "SELECT estimated_tokens, actual_tokens, timing_ms, rework_count "
+            "FROM telemetry ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] and row[0] > 0
+    assert row[1] == 42
+    assert row[2] is not None and row[2] >= 0
+    assert row[3] == 0
+
+
+# ---------------------------------------------------------------------------
+# From test_phase15_e2e_1.py (helpers_phase15 inlined)
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace as _SimpleNamespace
+
+
+class _DummyProviderPhase15:
+    def resolve_model(self, tier: str) -> str:
+        return f"dummy-{tier}"
+
+    def execute(self, subtask, model: str, timeout: int = 120) -> str | None:
+        return f"{model}:{getattr(subtask, 'id', 'x')}"
+
+    def available_tiers(self) -> list[str]:
+        return ["low", "medium", "high"]
+
+
+class _DummyPlannerPhase15:
+    def __init__(self) -> None:
+        self._backend = _SimpleNamespace(call=lambda *args, **kwargs: None)
+
+    def plan(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+def _run_stubbed_execute_wave(temp_db_path, max_workers: int = 2, *, urgency: float = 0.5, topology: str = "linear"):
+    from shared.orchestrator import Orchestrator, AgentResult
+    from shared.config import TGsConfig as _TGsConfig
+
+    class _StubOrchestrator(Orchestrator):
+        def __init__(self, config, db) -> None:
+            super().__init__(config, _DummyProviderPhase15(), _DummyPlannerPhase15(), db=db)
+
+        def execute_subtask(
+            self,
+            subtask,
+            timeout: int = 120,
+            score: float | None = None,
+            *,
+            execution_id: str | None = None,
+            plan_revision: int = 1,
+            current_wave: int | None = None,
+        ) -> AgentResult:
+            assert self._db is not None
+            self._db.log_agent_result(
+                session_id=execution_id or "wave-test",
+                task_hash=f"task-{getattr(subtask, 'id', 'x')}",
+                agent_id=getattr(subtask, 'id', 'x'),
+                tier=getattr(subtask, 'tier', 'low'),
+                model="dummy-low",
+                urgency_score=getattr(subtask, 'urgency', None),
+                selected_topology=getattr(subtask, 'topology', None),
+                artifact_publish_count=1,
+            )
+            return AgentResult(
+                subtask_id=getattr(subtask, 'id', None),
+                tier=getattr(subtask, 'tier', 'low'),
+                model="dummy-low",
+                output=f"completed {getattr(subtask, 'id', None)}",
+                token_count=1,
+            )
+
+    db = Database(temp_db_path)
+    config = _TGsConfig()
+    config.parallelism.enabled = True
+    config.parallelism.max_workers = max_workers
+    orchestrator = _StubOrchestrator(config, db)
+    subtasks = [
+        _SimpleNamespace(id=i, description=f"s{i}", tier="low", urgency=urgency, topology=topology)
+        for i in (1, 2, 3)
+    ]
+    orchestrator.execute_wave(0, subtasks)
+    with db.conn() as conn:
+        rows = conn.execute("SELECT * FROM telemetry WHERE session_id = ?", ("wave-test",)).fetchall()
+    return db, rows
+
+
+def test_multiwave_artifact_and_urgency_path(tmp_path):
+    """Representative multi-wave scenario asserting telemetry explainability fields
+    and artifact publish counts are written per-agent.
+    """
+    db_path = tmp_path / "phase15_e2e_1.db"
+    db, _rows = _run_stubbed_execute_wave(db_path, urgency=0.7, topology="star")
+    try:
+        with db.conn() as conn:
+            rows = conn.execute(
+                "SELECT urgency_score, selected_topology, artifact_publish_count FROM telemetry WHERE session_id = ?",
+                ("wave-test",),
+            ).fetchall()
+        assert len(rows) == 3
+        for urgency_score, selected_topology, publish_count in rows:
+            assert abs(urgency_score - 0.7) < 1e-6
+            assert selected_topology == "star"
+            assert publish_count == 1
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     tests = [
         test_build_waves_simple,

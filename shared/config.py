@@ -510,6 +510,13 @@ class ShellRoutingProfile:
     low_tier_execute_subtask: bool = False
     agent_transparency_required: bool = False
     direct_edit_hooks: bool = False
+    # Opt-in: emit a Claude Code Dynamic Workflow JS script (tier-aware per-agent
+    # model routing) instead of host_spawn_waves for fan-out plans. claude-code only.
+    workflow_emit: bool = False
+    # Opt-in (requires workflow_emit): render the multi-queen consensus phase INTO the
+    # workflow script instead of running queens as separate host agents (hybrid default).
+    # claude-code only.
+    consensus_in_workflow: bool = False
     tier_model_mapping: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROUTING_TIER_MODELS))
 
     def to_dict(self) -> dict[str, Any]:
@@ -518,6 +525,8 @@ class ShellRoutingProfile:
             "low_tier_execute_subtask": self.low_tier_execute_subtask,
             "agent_transparency_required": self.agent_transparency_required,
             "direct_edit_hooks": self.direct_edit_hooks,
+            "workflow_emit": self.workflow_emit,
+            "consensus_in_workflow": self.consensus_in_workflow,
             "tier_model_mapping": dict(sorted(self.tier_model_mapping.items())),
         }
 
@@ -548,6 +557,8 @@ class RoutingPolicyConfig:
             low_tier_execute_subtask=override.low_tier_execute_subtask,
             agent_transparency_required=override.agent_transparency_required,
             direct_edit_hooks=direct_edit_hooks,
+            workflow_emit=override.workflow_emit,
+            consensus_in_workflow=override.consensus_in_workflow,
             tier_model_mapping=merged_models,
         )
 
@@ -957,6 +968,16 @@ def _parse_shell_routing_profile(
             field_name=f"routing_policy.shells.{canonical}.agent_transparency_required",
         ),
         direct_edit_hooks=direct_edit_hooks,
+        workflow_emit=_coerce_config_bool(
+            raw_profile.get("workflow_emit"),
+            default=base.workflow_emit,
+            field_name=f"routing_policy.shells.{canonical}.workflow_emit",
+        ),
+        consensus_in_workflow=_coerce_config_bool(
+            raw_profile.get("consensus_in_workflow"),
+            default=base.consensus_in_workflow,
+            field_name=f"routing_policy.shells.{canonical}.consensus_in_workflow",
+        ),
         tier_model_mapping=_parse_tier_model_mapping(
             raw_profile.get("tier_model_mapping"),
             field_name=f"routing_policy.shells.{canonical}.tier_model_mapping",

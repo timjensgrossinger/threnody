@@ -172,3 +172,23 @@ def test_init_lua_recognized_as_integration_stem() -> None:
 def test_assess_task_complexity_flags_coupled_and_spares_simple() -> None:
     assert assess_task_complexity(COUPLED_TASK)["complex"] is True
     assert assess_task_complexity("Create greet.py in sandbox/demo")["complex"] is False
+
+
+def test_extract_rejects_absolute_and_home_paths() -> None:
+    # Absolute home-dir path + plan-file path in prose must NOT become targets.
+    task = (
+        "Refactor the coordinator described in /Users/someuser/secret.py "
+        "and the plan at /Users/someuser/.claude/plans/foo.md"
+    )
+    entries = extract_task_file_entries(task, intent_templates=False)
+    paths = [path for path, _ in entries]
+    assert not any(p.startswith("/") for p in paths)
+
+
+def test_all_absolute_paths_collapse_to_single_subtask() -> None:
+    # When the only "files" are out-of-root absolutes, fall back to one agent.
+    task = "Edit /Users/someuser/a.py and /Users/someuser/b.py together."
+    payload = build_heuristic_plan_payload(task, default_tier="medium", intent_templates=False)
+    assert len(payload["subtasks"]) == 1
+    assert payload["subtasks"][0]["description"] == task.strip()
+    assert payload["topology"] == "linear"

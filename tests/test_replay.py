@@ -246,3 +246,58 @@ def test_diff_two_empty_runs(db, engine):
     result = engine.diff(sid_a, sid_b)
     assert result["identical"] is True
     assert result["total_rounds"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Fork lineage (from test_fork.py)
+# ---------------------------------------------------------------------------
+
+def test_fork_sets_parent_swarm_id(db, engine):
+    parent_id = _make_swarm(db)
+    _add_checkpoint(db, parent_id, 0)
+    result = engine.fork(parent_id, dry_run=False)
+    fork_id = result["fork_run_id"]
+    fork_info = engine.show_run(fork_id)
+    assert fork_info["parent_swarm_id"] == parent_id
+
+
+def test_fork_parent_remains_intact(db, engine):
+    parent_id = _make_swarm(db)
+    _add_checkpoint(db, parent_id, 0)
+    _add_checkpoint(db, parent_id, 1, verdict="complete")
+    engine.fork(parent_id, dry_run=False)
+    parent_info = engine.show_run(parent_id)
+    assert parent_info["status"] == "completed"
+    assert len(parent_info["checkpoints"]) == 2
+
+
+def test_fork_returns_unique_run_id_each_time(db, engine):
+    parent_id = _make_swarm(db)
+    _add_checkpoint(db, parent_id, 0)
+    r1 = engine.fork(parent_id, dry_run=False)
+    r2 = engine.fork(parent_id, dry_run=False)
+    assert r1["fork_run_id"] != r2["fork_run_id"]
+
+
+def test_fork_inherits_from_checkpoint(db, engine):
+    parent_id = _make_swarm(db)
+    cp0 = _add_checkpoint(db, parent_id, 0, verdict="continue")
+    _add_checkpoint(db, parent_id, 1, verdict="complete")
+    result = engine.fork(parent_id, from_checkpoint_id=cp0, dry_run=True)
+    assert result["plan"]["from_checkpoint_id"] == cp0
+    assert result["plan"]["from_round_index"] == 0
+
+
+def test_multi_gen_fork_chain(db, engine):
+    grandparent_id = _make_swarm(db)
+    _add_checkpoint(db, grandparent_id, 0)
+    parent_result = engine.fork(grandparent_id, dry_run=False)
+    parent_id = parent_result["fork_run_id"]
+    _add_checkpoint(db, parent_id, 0)
+    child_result = engine.fork(parent_id, dry_run=False)
+    child_id = child_result["fork_run_id"]
+
+    child_info = engine.show_run(child_id)
+    parent_info = engine.show_run(parent_id)
+    assert child_info["parent_swarm_id"] == parent_id
+    assert parent_info["parent_swarm_id"] == grandparent_id

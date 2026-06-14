@@ -526,3 +526,114 @@ def test_ingest_style_observe_on_rewrite(db: Database, tmp_path: Path) -> None:
             config=TGsConfig(),
         )
         assert observe.called
+
+
+# ---------------------------------------------------------------------------
+# host_plan_expand tests (from test_host_plan_expand.py)
+# ---------------------------------------------------------------------------
+
+from shared.host_plan_expand import expand_host_plan  # noqa: E402
+
+
+def test_expand_host_plan_adds_parallel_wave(tmp_path: Path) -> None:
+    database = Database(tmp_path / "host-plan-expand-1.db")
+    database._init_schema(database._get_connection())
+    try:
+        run_id = "swarm-expand-1"
+        register_host_run_handoff(
+            database,
+            run_id=run_id,
+            host_spawn_waves=[
+                {
+                    "wave": 1,
+                    "agents": [
+                        {
+                            "id": "1",
+                            "tier": "low",
+                            "model": "test",
+                            "prompt": "scaffold contract",
+                            "target_files": ["openapi.yaml"],
+                        },
+                    ],
+                }
+            ],
+            planned_subtasks=1,
+            workspace_root="/tmp/project",
+            topology="dag",
+            task_hint="build todo app",
+        )
+        database.persist_swarm_run(
+            {
+                "swarm_id": run_id,
+                "status": "running",
+                "requested_agents": 1,
+                "effective_agents": 1,
+                "resume_status": "running",
+            }
+        )
+        result = expand_host_plan(
+            database,
+            run_id=run_id,
+            discovered_files=["app.py", "templates/index.html", "static/js/app.js"],
+            workspace_root="/tmp/project",
+            config=TGsConfig(),
+            caller="cursor",
+        )
+        assert result["expanded"] is True
+        waves = result.get("host_spawn_waves")
+        assert isinstance(waves, list) and len(waves) >= 1
+        agent_count = sum(
+            len(w.get("agents", []))
+            for w in waves
+            if isinstance(w, dict) and isinstance(w.get("agents"), list)
+        )
+        assert agent_count == 3
+        snapshots = database.get_handoff_agent_snapshots(run_id)
+        assert len(snapshots) == 4
+    finally:
+        database.close()
+
+
+def test_expand_host_plan_skips_already_assigned_files(tmp_path: Path) -> None:
+    database = Database(tmp_path / "host-plan-expand-2.db")
+    database._init_schema(database._get_connection())
+    try:
+        run_id = "swarm-expand-2"
+        register_host_run_handoff(
+            database,
+            run_id=run_id,
+            host_spawn_waves=[
+                {
+                    "wave": 1,
+                    "agents": [
+                        {
+                            "id": "1",
+                            "tier": "low",
+                            "model": "test",
+                            "prompt": "create app.py",
+                            "target_files": ["app.py"],
+                        },
+                    ],
+                }
+            ],
+            planned_subtasks=1,
+            workspace_root="/tmp/project",
+        )
+        database.persist_swarm_run(
+            {
+                "swarm_id": run_id,
+                "status": "running",
+                "resume_status": "running",
+            }
+        )
+        result = expand_host_plan(
+            database,
+            run_id=run_id,
+            discovered_files=["app.py", "style.css"],
+            workspace_root="/tmp/project",
+            config=TGsConfig(),
+        )
+        assert result["expanded"] is True
+        assert result.get("new_files") == ["style.css"]
+    finally:
+        database.close()

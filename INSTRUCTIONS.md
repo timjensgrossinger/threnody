@@ -12,6 +12,8 @@
 
 Same-host `execute_subtask` returns `HostNativeRequired`.
 
+**Dynamic Workflow emission (opt-in, claude-code only).** With `routing_policy.shells.claude-code.workflow_emit` set, fan-out plans also return `workflow_emit: true` and a `workflow_script` (contract `emit_workflow`). Prefer launching it via the **Workflow** tool (Claude Code v2.1.154+) over `host_spawn_waves`: each `agent()` routes to its Threnody tier model (vanilla Workflow runs every agent on the session model), and it runs in the background. After it returns, call `report_workflow_result(workflow_name, agents[])` so Threnody records telemetry and learns recurring shapes for export as permanent `/workflow` commands. Fall back to `host_spawn_waves` if the Workflow tool is unavailable.
+
 # Threnody — Custom Instructions
 
 Threnody generates AI-shell-specific instruction blocks during installation.

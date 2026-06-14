@@ -776,3 +776,24 @@ if __name__ == "__main__":
 
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(1 if failed else 0)
+
+
+# ---------------------------------------------------------------------------
+# Swarm config validation (moved from test_swarm_config.py)
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_swarm_max_agents_config_falls_back_to_default() -> None:
+    """Malformed swarm.max_agents config should fall back to the default hard cap."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        config_path.write_text(
+            "parallelism:\n"
+            "  enabled: true\n"
+            "  max_workers: 9\n"
+            "swarm:\n"
+            "  max_agents: nope\n",
+            encoding="utf-8",
+        )
+        config = TGsConfig.from_yaml(config_path)
+        assert config.swarm_max_agents == 12

@@ -126,3 +126,152 @@ def test_local_contradiction_parse_error() -> None:
             },
             "fallback task",
         )
+
+
+# ---------------------------------------------------------------------------
+# From test_planner_coordinator_validation.py
+# ---------------------------------------------------------------------------
+
+from shared.planner import ExecutionPlan, Subtask
+
+
+def _planner_coord() -> Planner:
+    tempdir = tempfile.TemporaryDirectory()
+    db_path = Path(tempdir.name) / "planner.db"
+    planner = Planner(
+        TGsConfig(db_path=db_path),
+        DummyBackend(),
+        Database(db_path=db_path),
+    )
+    planner._phase13_tempdir = tempdir
+    return planner
+
+
+def test_single_coordinator_validation() -> None:
+    planner = _planner_coord()
+
+    plan = planner._build_plan(
+        {
+            "analysis": "coordinator validation",
+            "subtasks": [
+                {
+                    "id": 1,
+                    "description": "inspect prior artifacts",
+                    "tier": "low",
+                    "depends_on": [],
+                    "is_coordinator": True,
+                },
+                {
+                    "id": 2,
+                    "description": "run worker task",
+                    "tier": "low",
+                    "depends_on": [1],
+                },
+            ],
+            "strategy": "dag",
+        },
+        "fallback task",
+    )
+
+    assert plan.subtasks[0].is_coordinator is True
+
+
+def test_duplicate_coordinators_in_wave_rejected() -> None:
+    planner = _planner_coord()
+
+    with pytest.raises(PlannerParseError, match="D-01/D-02"):
+        planner._build_plan(
+            {
+                "analysis": "coordinator validation",
+                "subtasks": [
+                    {
+                        "id": 1,
+                        "description": "first coordinator",
+                        "tier": "low",
+                        "depends_on": [],
+                        "is_coordinator": True,
+                    },
+                    {
+                        "id": 2,
+                        "description": "second coordinator",
+                        "tier": "low",
+                        "depends_on": [],
+                        "is_coordinator": True,
+                    },
+                ],
+                "strategy": "parallel",
+            },
+            "fallback task",
+        )
+
+
+# ---------------------------------------------------------------------------
+# From test_planner_stable_ids.py
+# ---------------------------------------------------------------------------
+
+
+def _planner_stable() -> Planner:
+    tempdir = tempfile.TemporaryDirectory()
+    db_path = Path(tempdir.name) / "planner.db"
+    planner = Planner(
+        TGsConfig(db_path=db_path),
+        DummyBackend(),
+        Database(db_path=db_path),
+    )
+    planner._phase32_tempdir = tempdir
+    return planner
+
+
+def test_stable_ids_deterministic() -> None:
+    planner = _planner_stable()
+    parsed = {
+        "phase_number": "32",
+        "plan_number": "1",
+        "analysis": "stable ids",
+        "subtasks": [
+            {"id": 1, "description": "define schema", "tier": "low", "model": "low"},
+            {
+                "id": 2,
+                "description": "serialize fields",
+                "tier": "medium",
+                "model": "medium",
+                "depends_on": [1],
+            },
+        ],
+        "strategy": "dag",
+    }
+
+    first = planner._build_plan(parsed, "phase 32")
+    second = planner._build_plan(parsed, "phase 32")
+
+    assert [st.stable_id for st in first.subtasks] == [
+        "phase32-plan01-task01",
+        "phase32-plan01-task02",
+    ]
+    assert [st.stable_id for st in first.subtasks] == [
+        st.stable_id for st in second.subtasks
+    ]
+
+
+def test_plan_to_dict_includes_topology_and_max_rounds() -> None:
+    plan = ExecutionPlan(
+        analysis="serialize",
+        subtasks=[
+            Subtask(
+                id=1,
+                stable_id="phase32-plan01-task01",
+                description="define schema",
+                tier="low",
+                model="low",
+            )
+        ],
+        waves=[[1]],
+        total_agents=1,
+        strategy="parallel",
+    )
+
+    serialized = Planner.plan_to_dict(plan)
+
+    assert serialized["topology"] == "dag"
+    assert serialized["max_rounds"] == 3
+    assert serialized["subtasks"][0]["stable_id"] == "phase32-plan01-task01"

@@ -20,6 +20,9 @@ from shared.agents import (
     MAX_DEFINITION_LENGTH, build_learned_agent_runtime_context,
     derive_learning_quality, evaluate_pattern_readiness,
     structured_pattern_example,
+    find_similar_agents, merge_agent_definitions,
+    _similarity_score, _extract_specialist_aspects,
+    generate_agent_draft,
 )
 from shared.config import TGsConfig
 from shared.context import enrich_subtask
@@ -870,6 +873,204 @@ def test_test_approval_queue_rate_limit():
             db.close()
 
 
+# --- dedup / similarity ---
+
+
+def test_find_similar_agents_high_threshold():
+    """similar A and B returned, C not returned"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        db = Database(db_path)
+
+        db.agent_definition_insert(
+            project_id=None,
+            lane="shared",
+            pattern_hash="hash_a",
+            pattern_desc="Test writer for async code",
+            description="Test writer for async code",
+            agent_id="agent_a",
+            status="approved",
+        )
+        db.agent_definition_insert(
+            project_id=None,
+            lane="shared",
+            pattern_hash="hash_b",
+            pattern_desc="Test writer for async error handling",
+            description="Test writer for async error handling",
+            agent_id="agent_b",
+            status="approved",
+        )
+        db.agent_definition_insert(
+            project_id=None,
+            lane="shared",
+            pattern_hash="hash_c",
+            pattern_desc="Documentation generator",
+            description="Documentation generator",
+            agent_id="agent_c",
+            status="approved",
+        )
+
+        result = find_similar_agents(
+            "Test writer for async code",
+            lane="shared",
+            db=db,
+            project_id=None,
+        )
+
+        assert len(result) >= 1, f"Expected >= 1 result, got {len(result)}: {result}"
+        agent_ids = [r["agent_id"] for r in result]
+        assert "agent_a" in agent_ids, f"Expected agent_a in results, got {agent_ids}"
+        assert "agent_c" not in agent_ids, f"Expected agent_c NOT in results, got {agent_ids}"
+
+
+def test_conservative_merge_keeps_specialization():
+    """merge preserves both aspects"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        db = Database(db_path)
+
+        db.agent_definition_insert(
+            project_id=None,
+            lane="shared",
+            pattern_hash="hash_a",
+            pattern_desc="Test writer for async code patterns",
+            description="Test writer for async code patterns",
+            agent_id="agent_a",
+            status="approved",
+        )
+        db.agent_definition_insert(
+            project_id=None,
+            lane="shared",
+            pattern_hash="hash_b",
+            pattern_desc="Test writer for exception handling",
+            description="Test writer for exception handling",
+            agent_id="agent_b",
+            status="pending",
+        )
+
+        result = merge_agent_definitions("agent_a", "agent_b", db)
+        assert result is True, f"Expected merge to succeed, got {result}"
+
+        canonical = db.agent_definition_get("agent_a")
+        assert canonical is not None, "Canonical agent not found after merge"
+        assert "async" in canonical["description"].lower(), \
+            f"Async specialization not preserved: {canonical['description']}"
+        assert "exception" in canonical["description"].lower(), \
+            f"Exception handling specialization not preserved: {canonical['description']}"
+        assert canonical["status"] == "approved", \
+            f"Expected canonical status 'approved', got '{canonical['status']}'"
+
+        merge_from = db.agent_definition_get("agent_b")
+        assert merge_from is not None, "Merge-from agent not found after merge"
+        assert merge_from["status"] == "merged_into", \
+            f"Expected merge_from status 'merged_into', got '{merge_from['status']}'"
+
+        description = canonical["description"].lower()
+        assert "also handles" in description or "exception" in description, \
+            f"Specializations appear to be flattened: {canonical['description']}"
+
+        db.close()
+
+
+def test_low_similarity_does_not_suggest_merge():
+    """returns empty list when similarity is below threshold"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        db = Database(db_path)
+
+        db.agent_definition_insert(
+            project_id=None,
+            lane="shared",
+            pattern_hash="hash_a",
+            pattern_desc="Test writer for async patterns",
+            description="Test writer for async patterns",
+            agent_id="agent_a",
+            status="approved",
+        )
+
+        result = find_similar_agents(
+            "Documentation generator",
+            lane="shared",
+            db=db,
+            project_id=None,
+        )
+
+        assert len(result) == 0, f"Expected no results for low similarity, got {len(result)}"
+        db.close()
+
+
+def test_similarity_score_computation():
+    """_similarity_score() computes Jaccard similarity correctly"""
+    # Identical text
+    score = _similarity_score("test writer", "test writer")
+    assert score == 1.0, f"Expected 1.0 for identical text, got {score}"
+
+    # 2-token intersection out of 4-token union → Jaccard ~0.5
+    score = _similarity_score("test writer async", "test writer exception")
+    assert 0.4 < score <= 0.6, f"Expected 0.4 < score <= 0.6 for 2/4 overlap, got {score}"
+
+    # No overlap
+    score = _similarity_score("test", "documentation")
+    assert score == 0.0 or score < 0.2, f"Expected ~0 for no overlap, got {score}"
+
+    # High overlap — 3 common out of 5 union → Jaccard ~0.6
+    score = _similarity_score("test writer async code", "test writer async patterns")
+    assert 0.5 < score < 0.8, f"Expected 0.5 < score < 0.8 for high overlap, got {score}"
+
+
+def test_extract_specialist_aspects():
+    """_extract_specialist_aspects() extracts keywords correctly"""
+    # Single aspect
+    aspects = _extract_specialist_aspects("Test writer for async patterns")
+    assert "async patterns" in aspects or "async" in aspects[0].lower(), \
+        f"Expected 'async patterns' or 'async' in {aspects}"
+
+    # Multiple aspects
+    aspects = _extract_specialist_aspects("Test writer for async patterns and exception handling")
+    assert len(aspects) >= 2, f"Expected >= 2 aspects, got {len(aspects)}"
+    assert any("async" in a.lower() for a in aspects), f"Expected 'async' in {aspects}"
+    assert any("exception" in a.lower() for a in aspects), f"Expected 'exception' in {aspects}"
+
+    # No "for" pattern — generic description yields no aspects
+    aspects = _extract_specialist_aspects("Generic test writer")
+    assert len(aspects) == 0, f"Expected no aspects for generic pattern, got {aspects}"
+
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Cost lane agent drafting (from test_cost_lane_agents.py)
+# ---------------------------------------------------------------------------
+
+def test_cost_lane_readiness_for_low_tier_pattern() -> None:
+    pattern = {
+        "pattern_desc": "Write tests for async helper",
+        "occurrence_count": 6,
+        "tier": "low",
+        "rework_detected": False,
+        "eval_quality": 0.82,
+    }
+    readiness = evaluate_pattern_readiness(pattern, "demo-project")
+    assert readiness["lane"] == "cost_lane"
+    assert readiness["ready"] is True
+
+
+def test_generate_agent_draft_cost_lane_metadata(tmp_path) -> None:
+    db = Database(tmp_path / "cost-lane.db")
+    candidate = {
+        "pattern_hash": "abc123",
+        "description": "Refactor small utility with low-tier routing",
+        "tier": "low",
+        "occurrence_count": 7,
+        "rework_detected": False,
+        "eval_quality": 0.9,
+    }
+    draft = generate_agent_draft("demo-project", candidate, db=db)
+    assert draft["lane"] == "cost_lane"
+    assert draft["cost_lane"] is True
+    assert draft["preferred_tier"] == "low"
+    assert draft["prefer_free"] is True
+    assert draft["model"] == "haiku"

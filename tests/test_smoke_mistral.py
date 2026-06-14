@@ -72,9 +72,10 @@ def test_detect_mistral_binary_missing(provider, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_detect_mistral_api_key(mock_mistral_cli, provider, monkeypatch):
+def test_detect_mistral_api_key(mock_mistral_cli, provider, monkeypatch, tmp_path):
     """MISTRAL_API_KEY present → routeable."""
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key-abc")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     result = _detect_mistral(provider)
     assert result.routeable
     assert result.reason == DetectReason.READY

@@ -95,7 +95,7 @@ class Subtask:
     target_file: str | None = None
     workspace_root: str | None = None
     single_file_insertion: bool = False
-    edit_mode: str = "write"   # write | rewrite | blocks | patch
+    edit_mode: str = "write"   # write | rewrite | blocks | patch — execute_subtask (subprocess utility delegation) ONLY; unused by the host-native swarm path, where host agents own their edit strategy via native Edit/Write tools
     op_class: str = "side_effecting"  # replayable | side_effecting | approval_required
     session_id: str | None = None  # plan 10: reuse persistent worker session
     convergence_target: ConvergenceTarget | None = None  # plan 14: quality convergence loop

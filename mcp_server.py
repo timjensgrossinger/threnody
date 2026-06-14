@@ -96,6 +96,7 @@ from shared.swarm import (
     list_resume_checkpoints,
 )
 from shared.agents import (
+    approval_queue_enqueue,
     approval_queue_list as list_approval_queue_items,
     approval_queue_approve as approve_queue_item,
     approval_queue_reject as reject_queue_item,
@@ -104,6 +105,11 @@ from shared.agents import (
     activate_agent_locally,
     evaluate_pattern_readiness,
     register_agent_to_capable_clis,
+)
+from shared.workflow_export import (
+    DEFAULT_WORKFLOW_PROMOTE_THRESHOLD,
+    build_workflow_draft,
+    workflow_shape_fingerprint,
 )
 from copilot.providers import CopilotProvider
 from shared.resilience import RetryPolicy as _RetryPolicy
@@ -118,17 +124,27 @@ from shared.discovery import (
 from shared.config import normalize_caller_id, normalize_routing_policy_shell_id
 from shared.host_spawn import (
     HOST_EXECUTION_CONTRACT,
+    WORKFLOW_EXECUTION_CONTRACT,
     host_native_model_for_tier,
     COMPLIANCE_WARNING,
     build_consensus_wave,
     build_host_native_required_response,
     build_host_spawn,
     build_host_spawn_waves,
+    sanitize_plan_for_host,
     effective_planner_host_execution_mode,
     effective_swarm_host_execution_mode,
     validate_execute_subtask_delegation,
+    workflow_emit_enabled,
+    consensus_in_workflow_enabled,
     would_self_delegate,
     _caller_is_host,
+)
+from shared.workflow_emit import render_workflow_script, workflow_slug
+from shared.consensus import (
+    build_judge_prompt as consensus_build_judge_prompt,
+    consensus_tally,
+    select_personas as consensus_select_personas,
 )
 from shared.host_learning import (
     build_learning_report_contract,
@@ -136,6 +152,8 @@ from shared.host_learning import (
     inspect_host_swarm,
     plan_run_id,
     record_consensus_handoff,
+    record_consensus_learning,
+    record_host_agent_result,
     register_host_run_handoff,
 )
 from shared.host_plan_expand import expand_host_plan
@@ -1389,6 +1407,61 @@ TOOLS = [
                 },
             },
             "required": ["wave", "agents"],
+        },
+    },
+    {
+        "name": "report_workflow_result",
+        "description": (
+            "Report the result of a Threnody-emitted Dynamic Workflow run (workflow_emit). "
+            "Pass the workflow_name from the handoff and the agents[] array the workflow "
+            "returned (each entry: id/label, tier, model, result{summary,findings,success}). "
+            "Threnody records per-agent learning telemetry and, once the orchestration shape "
+            "recurs across successful runs, enqueues it as an approval-gated draft you can "
+            "approve to save as a permanent /workflow command."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workflow_name": {"type": "string", "description": "workflow_name from the handoff"},
+                "run_id": {"type": "string", "description": "Optional run/plan id for telemetry grouping"},
+                "workspace_root": {"type": "string"},
+                "agents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "label": {"type": "string"},
+                            "tier": {"type": "string"},
+                            "model": {"type": "string"},
+                            "result": {
+                                "type": "object",
+                                "properties": {
+                                    "summary": {"type": "string"},
+                                    "findings": {"type": "array", "items": {"type": "string"}},
+                                    "success": {"type": "boolean"},
+                                },
+                            },
+                        },
+                    },
+                },
+                "consensus": {
+                    "type": "array",
+                    "description": (
+                        "Consensus-in-workflow only: the queen verdicts the workflow returned "
+                        "(each {persona, result:{verdict, amendment, next_work, synthesis}}). "
+                        "Threnody tallies quorum; may return consensus_followup for a judge round."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "persona": {"type": "string"},
+                            "result": {"type": "object"},
+                        },
+                    },
+                },
+            },
+            "required": ["workflow_name", "agents"],
         },
     },
     {
@@ -2919,6 +2992,106 @@ def _register_host_handoff_if_ready(
     payload["host_run_id"] = run_id
 
 
+def _maybe_attach_workflow_script(
+    payload: dict[str, object],
+    waves: list,
+    *,
+    config: TGsConfig,
+    caller: str | None,
+    task: str | None,
+    registry: object | None = None,
+) -> None:
+    """Attach a Claude Code Dynamic Workflow script when the operator opted in.
+
+    Additive: ``host_spawn_waves`` remains the default/fallback. When emission is
+    enabled (claude-code + ``routing_policy.shells.claude-code.workflow_emit``) and
+    the plan is fan-out shaped (>= 2 agents), render a tier-aware Workflow JS script
+    so the host can launch it via the Workflow tool instead of spawning each wave.
+    The deterministic JS owns the loop; intermediate results stay out of the host
+    context; each agent() routes to its tier model.
+    """
+    if not workflow_emit_enabled(config, caller):
+        return
+    total_agents = sum(
+        len(w.get("agents") or []) for w in waves if isinstance(w, dict)
+    )
+    if total_agents < 2:
+        return  # single-agent plans gain nothing from workflow orchestration
+    include_consensus = consensus_in_workflow_enabled(config, caller)
+    try:
+        script = render_workflow_script(
+            payload,
+            config=config,
+            caller=caller,
+            registry=registry,
+            task_text=task if isinstance(task, str) else None,
+            include_consensus=include_consensus,
+        )
+    except Exception:
+        log.warning("workflow emit: render failed; falling back to host_spawn_waves", exc_info=True)
+        return
+    slug = workflow_slug(task if isinstance(task, str) else None)
+    payload["workflow_emit"] = True
+    payload["workflow_execution_contract"] = WORKFLOW_EXECUTION_CONTRACT
+    payload["workflow_name"] = slug
+    payload["workflow_script"] = script
+    if include_consensus:
+        payload["consensus_in_workflow"] = True
+    # Baked tier→model map (uniform per tier) so export can re-tune from learning.
+    tier_models: dict[str, str] = {}
+    for st in payload.get("subtasks", []):
+        if not isinstance(st, dict):
+            continue
+        st_tier = str(st.get("tier") or "medium")
+        if st_tier not in tier_models:
+            resolved = host_native_model_for_tier(config, caller, st_tier, registry=registry)
+            if resolved:
+                tier_models[st_tier] = resolved
+    persona_ids: list[str] = []
+    if include_consensus:
+        try:
+            persona_ids = [
+                str(p.get("id"))
+                for p in consensus_select_personas(getattr(config, "consensus_queens", 2), config)
+            ]
+        except Exception:
+            persona_ids = []
+    payload["workflow_execution_note"] = (
+        "PREFERRED: launch this workflow_script via the Workflow tool (claude-code, "
+        "v2.1.154+). It runs in the background, keeps intermediate results out of your "
+        "context, and routes each agent() to its Threnody tier model. After it returns, "
+        "call report_workflow_result(workflow_name, agents[]) with the returned agents "
+        "array so Threnody records telemetry. FALLBACK: if the Workflow tool is "
+        "unavailable, spawn host_spawn_waves the normal way."
+    )
+    # Persist a minimal shape snapshot + script so report_workflow_result can learn
+    # the recurring orchestration shape and (after approval) export it as a permanent
+    # /workflow command. Global scope keeps this single-user-local and project-agnostic.
+    try:
+        fp = workflow_shape_fingerprint(payload)
+        snapshot = {
+            "script": script,
+            "fingerprint": fp,
+            "topology": payload.get("topology"),
+            "waves": payload.get("waves"),
+            "subtasks": [
+                {
+                    "id": st.get("id"),
+                    "tier": st.get("tier"),
+                    "subagent_type": st.get("subagent_type"),
+                    "read_only": bool(st.get("read_only", False)),
+                }
+                for st in payload.get("subtasks", [])
+                if isinstance(st, dict)
+            ],
+            "tier_models": tier_models,
+            "personas": persona_ids,
+        }
+        memory_set("global", f"workflow_emit:{slug}", snapshot)
+    except Exception:
+        log.debug("workflow emit: snapshot persistence failed", exc_info=True)
+
+
 def _attach_host_spawn_metadata(
     payload: dict[str, object],
     *,
@@ -2936,6 +3109,19 @@ def _attach_host_spawn_metadata(
     if normalize_caller_id(caller) not in HOST_PROVIDER_NAMES:
         return
     if isinstance(payload.get("subtasks"), list) and isinstance(payload.get("waves"), list):
+        # Safety gate: drop out-of-workspace targets and fragment prompts before
+        # they reach host_spawn_waves OR the Dynamic Workflow script (both consume
+        # this payload). Collapses to a single coherent agent if nothing survives.
+        resolved_root = workspace_root or str(_active_workspace_root())
+        try:
+            sanitize_plan_for_host(
+                payload,
+                workspace_root=resolved_root,
+                task=task,
+                default_tier=tier if isinstance(tier, str) and tier else "medium",
+            )
+        except Exception:
+            log.debug("host plan sanitize failed", exc_info=True)
         try:
             registry = _get_registry_with_config()
         except Exception:
@@ -2949,6 +3135,14 @@ def _attach_host_spawn_metadata(
         if waves:
             payload["host_spawn_waves"] = waves
             payload["host_execution_contract"] = HOST_EXECUTION_CONTRACT
+            _maybe_attach_workflow_script(
+                payload,
+                waves,
+                config=config,
+                caller=caller,
+                task=task,
+                registry=registry,
+            )
         _register_host_handoff_if_ready(
             payload,
             db=db,
@@ -3083,28 +3277,57 @@ def _execute_swarm_host_native_response(
     consensus_eligible = str(
         request_meta.get("topology") or plan.topology or "linear"
     ).strip().lower() in {"star", "auto"}
+    emit_on = bool(plan_dict.get("workflow_emit"))
+    consensus_in_wf = bool(plan_dict.get("consensus_in_workflow"))
     if host_waves and consensus_eligible:
         try:
             registry = _get_registry_with_config()
         except Exception:
             registry = None
-        consensus_wave = build_consensus_wave(
-            config=config,
-            caller=caller,
-            task_text=task_text,
-            wave_index=len(host_waves) + 1,
-            registry=registry,
-        )
-        if consensus_wave is not None:
-            host_waves.append(consensus_wave)
-            plan_dict["host_spawn_waves"] = host_waves
-            record_consensus_handoff(
-                db,
-                swarm_id,
-                wave_index=int(consensus_wave.get("wave") or len(host_waves)),
-                personas=[str(p) for p in consensus_wave.get("personas") or []],
-                queen_tier=getattr(config, "consensus_queen_tier", "low"),
+        if emit_on and consensus_in_wf:
+            # Opt-in: consensus queens are already rendered INTO workflow_script. No
+            # separate host wave; the tally happens in report_workflow_result. Record
+            # the handoff for tracking only.
+            try:
+                personas = [
+                    str(p.get("id"))
+                    for p in consensus_select_personas(getattr(config, "consensus_queens", 2), config)
+                ]
+                record_consensus_handoff(
+                    db,
+                    swarm_id,
+                    wave_index=len(host_waves) + 1,
+                    personas=personas,
+                    queen_tier=getattr(config, "consensus_queen_tier", "low"),
+                )
+            except Exception:
+                log.debug("consensus_in_workflow handoff record failed", exc_info=True)
+        else:
+            consensus_wave = build_consensus_wave(
+                config=config,
+                caller=caller,
+                task_text=task_text,
+                wave_index=len(host_waves) + 1,
+                registry=registry,
             )
+            if consensus_wave is not None:
+                if emit_on:
+                    # Hybrid default: workers run via workflow_script; consensus queens
+                    # run as a SEPARATE host wave the skill spawns after the workflow.
+                    # Keep workflow keys; expose the queen wave on its own key so workers
+                    # are not double-run via host_spawn_waves.
+                    plan_dict["consensus_wave"] = consensus_wave
+                else:
+                    # No workflow emit: legacy path — append queens to host_spawn_waves.
+                    host_waves.append(consensus_wave)
+                    plan_dict["host_spawn_waves"] = host_waves
+                record_consensus_handoff(
+                    db,
+                    swarm_id,
+                    wave_index=int(consensus_wave.get("wave") or len(host_waves) + 1),
+                    personas=[str(p) for p in consensus_wave.get("personas") or []],
+                    queen_tier=getattr(config, "consensus_queen_tier", "low"),
+                )
     try:
         db.persist_swarm_run(
             {
@@ -3173,6 +3396,20 @@ def _execute_swarm_host_native_response(
         swarm_result["routing_guard"] = guard
     if plan_dict.get("host_execution_contract"):
         swarm_result["host_execution_contract"] = plan_dict["host_execution_contract"]
+    # Surface workflow-emit keys (claude-code opt-in) so the /threnody-workflow skill
+    # can launch the tier-aware script. consensus_wave is the hybrid queen wave the
+    # skill spawns separately; absent when consensus is rendered into the workflow.
+    for key in (
+        "workflow_emit",
+        "workflow_execution_contract",
+        "workflow_name",
+        "workflow_script",
+        "workflow_execution_note",
+        "consensus_in_workflow",
+        "consensus_wave",
+    ):
+        if plan_dict.get(key) is not None:
+            swarm_result[key] = plan_dict[key]
     if used_heuristic:
         swarm_result["planner_host_execution_mode"] = "host_native"
     return {
@@ -4293,8 +4530,13 @@ def prepare_swarm_execution_request(
             db=None,
         )
         effective_topology = selected_topology
+    raw_ws = args.get("workspace_root")
+    normalized_ws = (
+        raw_ws.strip() if isinstance(raw_ws, str) and raw_ws.strip() else None
+    )
     return {
         "swarm_id": resolved_swarm_id,
+        "workspace_root": normalized_ws,
         "requested_agents": allocation.requested_agents,
         "effective_agents": allocation.effective_agents,
         "hard_cap": allocation.hard_cap,
@@ -5832,6 +6074,194 @@ def handle_report_host_wave(args: dict) -> dict:
             "error": type(exc).__name__,
             "details": str(exc),
         }
+
+
+def handle_report_workflow_result(args: dict) -> dict:
+    """Ingest a Dynamic Workflow run's per-agent results and learn its shape.
+
+    Telemetry bridge for the workflow_emit path: workflow intermediate results live
+    in script variables (not host context), so the host returns the ``agents`` array
+    and Threnody records each into pattern tracking via ``record_host_agent_result``.
+    When the orchestration shape recurs across successful runs, the script is enqueued
+    as an approval-gated draft for export to a permanent ``/workflow`` command.
+    """
+    config, db, router, planner, orchestrator = _ensure_init()
+    workflow_name = args.get("workflow_name")
+    if not isinstance(workflow_name, str) or not workflow_name.strip():
+        return {"error": "workflow_name is required"}
+    workflow_name = workflow_name.strip()
+    agents_raw = args.get("agents")
+    if not isinstance(agents_raw, list) or not agents_raw:
+        return {"error": "agents must be a non-empty list"}
+    run_id = str(args.get("run_id") or workflow_name)
+    workspace_root = args.get("workspace_root")
+    project_id = (
+        workspace_root.strip()
+        if isinstance(workspace_root, str) and workspace_root.strip()
+        else "default-project"
+    )
+
+    ingested = 0
+    all_success = True
+    for entry in agents_raw:
+        if not isinstance(entry, dict):
+            continue
+        res = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+        success = bool(res.get("success", True))
+        all_success = all_success and success
+        excerpt = str(res.get("summary") or "")
+        findings = res.get("findings")
+        if isinstance(findings, list) and findings:
+            excerpt = (excerpt + "\n" + "\n".join(str(f) for f in findings)).strip()
+        spec = {
+            "spawn_id": str(entry.get("id") or entry.get("label") or ""),
+            "description": str(entry.get("label") or entry.get("id") or "workflow agent"),
+            "tier": str(entry.get("tier") or "medium"),
+            "model": str(entry.get("model") or "host-native"),
+        }
+        try:
+            record_host_agent_result(
+                db,
+                run_id=run_id,
+                agent_spec=spec,
+                result={"success": success, "output_excerpt": excerpt},
+                project_id=project_id,
+            )
+            ingested += 1
+        except Exception:
+            log.debug("workflow telemetry ingest failed for %s", spec["spawn_id"], exc_info=True)
+
+    result: dict[str, object] = {
+        "workflow_name": workflow_name,
+        "agents_ingested": ingested,
+        "all_success": all_success,
+    }
+
+    # Consensus-in-workflow (opt-in): the workflow returns a `consensus` array of
+    # persona queen verdicts. The DECISION is tallied here (shared/consensus.py),
+    # never in JS. If quorum fails, return a lazy judge follow-up the skill spawns.
+    consensus_raw = args.get("consensus")
+    if isinstance(consensus_raw, list) and consensus_raw:
+        proposals: list[dict] = []
+        for q in consensus_raw:
+            if not isinstance(q, dict):
+                continue
+            qres = q.get("result") if isinstance(q.get("result"), dict) else q
+            proposals.append(
+                {
+                    "persona": q.get("persona"),
+                    "verdict": qres.get("verdict"),
+                    "amendment": qres.get("amendment"),
+                    "next_work": qres.get("next_work"),
+                    "synthesis": qres.get("synthesis"),
+                }
+            )
+        try:
+            tally = consensus_tally(
+                proposals,
+                quorum=int(getattr(config, "consensus_quorum", 2) or 2),
+                queens=len(proposals),
+            )
+        except Exception:
+            log.debug("consensus tally failed", exc_info=True)
+            tally = None
+        if tally is not None and tally.judge_needed:
+            result["consensus_followup"] = {
+                "judge_needed": True,
+                "judge_prompt": consensus_build_judge_prompt(tally.valid),
+                "note": (
+                    "Quorum failed. Spawn ONE read-only judge Agent with judge_prompt; it "
+                    "returns {\"selected\": <index>, ...}. Re-call report_workflow_result with "
+                    "consensus set to just the selected queen's proposal so it resolves."
+                ),
+            }
+        elif tally is not None:
+            winner = tally.winner or {}
+            result["consensus"] = {
+                "resolved": True,
+                "winner_persona": tally.winner_persona,
+                "verdict": winner.get("verdict"),
+                "quorum": tally.quorum,
+                "agreement": tally.agreement,
+                "personas": list(tally.personas),
+            }
+            try:
+                record_consensus_learning(
+                    db,
+                    run_id,
+                    outcome="accepted" if all_success else "reworked",
+                    meta={
+                        "consensus_winner_persona": tally.winner_persona,
+                        "consensus_queen_tier": getattr(config, "consensus_queen_tier", "low"),
+                        "consensus_personas": list(tally.personas),
+                        "task_hint": workflow_name,
+                    },
+                    project_id=project_id,
+                    router=router,
+                )
+            except Exception:
+                log.debug("consensus learning record failed", exc_info=True)
+
+    # Recurrence-gated learning: only count successful runs toward promotion.
+    snapshot: dict | None = None
+    try:
+        env = memory_get("global", f"workflow_emit:{workflow_name}")
+        value = env.get("value") if isinstance(env, dict) else None
+        snapshot = value if isinstance(value, dict) else None
+    except Exception:
+        snapshot = None
+
+    if snapshot and snapshot.get("script") and all_success:
+        fp = str(snapshot.get("fingerprint") or "")
+        count_key = f"workflow_shape:{fp}"
+        prev_count = 0
+        try:
+            prev_env = memory_get("global", count_key)
+            prev_val = prev_env.get("value") if isinstance(prev_env, dict) else None
+            if isinstance(prev_val, dict):
+                prev_count = int(prev_val.get("count") or 0)
+        except Exception:
+            prev_count = 0
+        count = prev_count + 1
+        try:
+            memory_set("global", count_key, {"count": count, "name": workflow_name})
+        except Exception:
+            log.debug("workflow shape counter persist failed", exc_info=True)
+        result["shape_runs"] = count
+        threshold = DEFAULT_WORKFLOW_PROMOTE_THRESHOLD
+        if count >= threshold:
+            try:
+                draft = build_workflow_draft(
+                    name=workflow_name,
+                    script=str(snapshot["script"]),
+                    fingerprint=fp,
+                    plan_dict={
+                        "topology": snapshot.get("topology"),
+                        "waves": snapshot.get("waves") or [],
+                        "analysis": "",
+                    },
+                    run_count=count,
+                    tier_models=snapshot.get("tier_models") if isinstance(snapshot.get("tier_models"), dict) else None,
+                    personas=snapshot.get("personas") if isinstance(snapshot.get("personas"), list) else None,
+                )
+                enq = approval_queue_enqueue(project_id, draft, db=db)
+                result["workflow_draft"] = {
+                    "enqueued": True,
+                    "queue_id": enq.get("id"),
+                    "status": enq.get("status"),
+                    "note": "Approve via approval_queue_approve, then export with workflow_export.",
+                }
+            except ValueError as exc:
+                result["workflow_draft"] = {"enqueued": False, "reason": str(exc)}
+            except Exception as exc:
+                log.warning("workflow draft enqueue failed", exc_info=True)
+                result["workflow_draft"] = {"enqueued": False, "reason": type(exc).__name__}
+        else:
+            result["workflow_draft"] = {
+                "enqueued": False,
+                "reason": f"shape seen {count}/{threshold} successful runs",
+            }
+    return result
 
 
 def handle_expand_host_plan(args: dict) -> dict:
@@ -10461,6 +10891,7 @@ HANDLERS = {
     "execute_subtask": handle_execute_subtask,
     "execute_swarm": handle_execute_swarm,
     "report_host_wave": handle_report_host_wave,
+    "report_workflow_result": handle_report_workflow_result,
     "report_host_swarm_complete": handle_report_host_swarm_complete,
     "expand_host_plan": handle_expand_host_plan,
     "inspect_swarm": handle_inspect_swarm,

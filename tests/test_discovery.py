@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from shared.adapters import ProviderAdapter, ProviderCapability
+from shared.config import TGsConfig, SpilloverConfig
 from shared.discovery import (
     CLIProvider,
     BUILTIN_PROVIDERS,
@@ -2471,3 +2472,46 @@ def test_unknown_model_falls_to_keyword_heuristic():
     # Keyword heuristic covers it
     tiered = _tier_models_by_cost(["llama3-haiku"])
     assert "llama3-haiku" in tiered.get("low", [])
+
+
+# ---------------------------------------------------------------------------
+# Spillover config + selection metadata (from test_spillover.py)
+# ---------------------------------------------------------------------------
+
+def test_spillover_defaults(monkeypatch):
+    """Defaults enable spillover and unspecified provider capacity is None."""
+    cfg = TGsConfig.defaults()
+    assert isinstance(cfg.spillover, SpilloverConfig)
+    assert cfg.spillover.enabled is True
+    assert cfg.spillover.get_provider_capacity("anything") is None
+
+    # Ensure registry in test mode exposes adapter metadata with concurrency key
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
+    registry = ProviderRegistry()
+    adapters = registry.list_adapters()
+    assert adapters, "Expected at least one test adapter in test mode"
+    adapter = adapters[0]
+    # concurrency field should be present (None when unspecified)
+    assert "concurrency" in adapter.metadata
+    assert adapter.metadata["concurrency"] is None
+
+
+def test_selection_metadata_includes_concurrency(monkeypatch):
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
+    overrides = {
+        "providers": {
+            "spillover": {
+                "enabled": True,
+                "per_provider_concurrency": {
+                    "test-provider": 7
+                }
+            }
+        }
+    }
+    registry = ProviderRegistry(config_overrides=overrides)
+    sel = registry.select_provider_for_tier("low")
+    assert sel is not None
+    # concurrency must be present on selection metadata
+    assert "concurrency" in sel
+    # For test-provider the configured value should be surfaced
+    assert sel["concurrency"] == 7

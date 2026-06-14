@@ -139,6 +139,38 @@ def _stem(path: str) -> str:
     return PurePosixPath(_normalize_path(path)).stem.lower()
 
 
+_ABS_OR_HOME = re.compile(r"^(?:[A-Za-z]:[\\/]|/|~)")
+# First-segment roots that are never a legit repo-relative path. extract_references
+# emits a leading-slash-stripped duplicate of absolute paths (e.g. an absolute
+# /Users/.../a.py also surfaces as "Users/.../a.py"); reject those too.
+_SYSTEM_ROOT_SEGMENTS = frozenset(
+    {"users", "home", "root", "etc", "var", "tmp", "private",
+     "library", "system", "opt", "usr", "bin", "sbin"}
+)
+
+
+def _is_safe_relative_path(path: str) -> bool:
+    """Host-native targets must be repo-relative file paths.
+
+    Rejects absolute/home-anchored paths (the source of home-dir and plan-file
+    capture), system-root-anchored relatives, parent traversal, and
+    fragment-shaped tokens with no real extension. Spurious prose slices are
+    dropped so the empty-entries single-subtask fallback can fire.
+    """
+    p = (path or "").strip()
+    if not p or p.endswith("/"):
+        return False
+    if _ABS_OR_HOME.match(p):
+        return False
+    parts = PurePosixPath(p).parts
+    if ".." in parts:
+        return False
+    if parts and parts[0].lower() in _SYSTEM_ROOT_SEGMENTS:
+        return False
+    suffix = PurePosixPath(p).suffix
+    return len(suffix) >= 2  # require a real ".ext"
+
+
 def _is_integration_file(path: str) -> bool:
     name = _basename(path)
     stem = _stem(path)
@@ -147,8 +179,15 @@ def _is_integration_file(path: str) -> bool:
     return name in {"index.ts", "index.tsx", "index.js", "index.jsx", "index.html"}
 
 
-def _extract_explicit_file_entries(task: str) -> list[tuple[str, str]]:
-    """Extract file paths explicitly mentioned in task text (no intent inference)."""
+def _extract_explicit_file_entries(
+    task: str, *, allow_external: bool = False
+) -> list[tuple[str, str]]:
+    """Extract file paths explicitly mentioned in task text (no intent inference).
+
+    *allow_external* keeps absolute/out-of-root paths — used by the read-only
+    review fanout, which legitimately targets arbitrary files. Write fanout
+    leaves it False so spurious home/plan-file slices are dropped.
+    """
     if not isinstance(task, str) or not task.strip():
         return []
 
@@ -157,6 +196,8 @@ def _extract_explicit_file_entries(task: str) -> list[tuple[str, str]]:
 
     def _add(path: str, hint: str = "") -> None:
         normalized = _normalize_path(path)
+        if not allow_external and not _is_safe_relative_path(normalized):
+            return
         key = normalized.lower()
         if key in seen:
             return
@@ -277,9 +318,14 @@ def extract_task_file_entries(
     task: str,
     *,
     intent_templates: bool = True,
+    allow_external: bool = False,
 ) -> list[tuple[str, str]]:
-    """Return ordered (path, description_hint) pairs from explicit paths and intent."""
-    explicit = _extract_explicit_file_entries(task)
+    """Return ordered (path, description_hint) pairs from explicit paths and intent.
+
+    *allow_external* is forwarded to the explicit extractor; the read-only review
+    fanout sets it True to keep absolute review targets.
+    """
+    explicit = _extract_explicit_file_entries(task, allow_external=allow_external)
     if len(explicit) >= 2:
         return explicit
     if len(explicit) == 1:
@@ -624,7 +670,10 @@ def build_heuristic_plan_payload(
     # Review fanout: REVIEW: sentinel → per-file × dimension DAG plan
     from .review_fanout import is_review_intent, build_review_subtasks
     if isinstance(task, str) and is_review_intent(task):
-        entries = extract_task_file_entries(task, intent_templates=False)
+        # Review fanout is read-only — allow absolute/out-of-root review targets.
+        entries = extract_task_file_entries(
+            task, intent_templates=False, allow_external=True
+        )
         return build_review_subtasks(entries, task, max_agents=max_agents)  # type: ignore[return-value]
 
     task_lower = task.lower() if isinstance(task, str) else ""
