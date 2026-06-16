@@ -90,3 +90,67 @@ def test_main_tolerates_garbage(capsys: pytest.CaptureFixture) -> None:
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["captured"] is False
+
+
+def test_parse_codex_apply_patch_payload() -> None:
+    fields = learning_hook.parse_hook_payload({
+        "tool_name": "apply_patch",
+        "cwd": "/tmp/p",
+        "tool_input": {"command": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-x\n+y\n*** End Patch"},
+        "tool_response": "ok",
+    })
+    assert fields["target_files"] == ["src/app.py"]
+    assert fields["success"] is True
+
+
+def test_parse_cursor_after_file_edit_payload() -> None:
+    fields = learning_hook.parse_hook_payload({
+        "hook_event_name": "afterFileEdit",
+        "file_path": "/tmp/p/style.css",
+        "edits": [{"oldString": "a", "newString": "b"}],
+        "workspace_roots": ["/tmp/p"],
+    })
+    assert fields["target_files"] == ["/tmp/p/style.css"]
+    assert fields["tool_name"] == "afterFileEdit"
+
+
+def test_parse_copilot_payload() -> None:
+    fields = learning_hook.parse_hook_payload({
+        "toolName": "edit",
+        "cwd": "/tmp/p",
+        "toolArgs": {"path": "/tmp/p/main.go"},
+        "toolResult": {"resultType": "success", "textResultForLlm": "done"},
+    })
+    assert fields["target_files"] == ["/tmp/p/main.go"]
+    assert fields["success"] is True
+
+
+def test_parse_copilot_failure_resulttype() -> None:
+    fields = learning_hook.parse_hook_payload({
+        "toolName": "edit",
+        "toolArgs": {"file_path": "/tmp/p/x.go"},
+        "toolResult": {"resultType": "error"},
+    })
+    assert fields["success"] is False
+
+
+def test_main_captures_codex_apply_patch(capsys: pytest.CaptureFixture) -> None:
+    run_log.set_active_run("swarm-codex")
+    payload = json.dumps({
+        "tool_name": "apply_patch",
+        "tool_input": {"command": "*** Add File: a.py\n+print(1)\n"},
+        "tool_response": "ok",
+    })
+    assert learning_hook.main(["capture", "--json", payload]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["captured"] is True
+    assert run_log.read_run_log("swarm-codex")[0]["touched_files"] == ["a.py"]
+
+
+def test_main_captures_cursor_event(capsys: pytest.CaptureFixture) -> None:
+    run_log.set_active_run("swarm-cursor")
+    payload = json.dumps({"hook_event_name": "afterFileEdit", "file_path": "/tmp/p/x.ts"})
+    assert learning_hook.main(["capture", "--json", payload]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["captured"] is True
+    assert run_log.read_run_log("swarm-cursor")[0]["touched_files"] == ["/tmp/p/x.ts"]

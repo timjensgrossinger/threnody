@@ -148,15 +148,15 @@ def _auto_output_excerpt(
 def effective_learning_capture(config: TGsConfig | None, caller: str | None) -> str:
     """Resolve the capture mode for *caller*.
 
-    ``hook`` capture only works where install.sh actually registered a PostToolUse
-    learning hook (``ROUTING_POLICY_HOOK_CAPABLE_SHELLS``). Every other host CLI
-    (Copilot, Codex, Cursor, Junie, OpenCode, …) falls back to ``model`` capture:
-    the host passes per-agent results in the single terminal report. Same fidelity,
-    one call, no per-wave round-trip — so no CLI loses learning when it lacks a
-    wired hook.
+    ``hook`` capture only works where install.sh actually registered a learning
+    hook (``LEARNING_HOOK_CAPABLE_SHELLS`` — claude-code, codex, cursor,
+    github-copilot-cli). Other host CLIs (Junie, OpenCode, …) fall back to
+    ``model`` capture: the host passes per-agent results in the single terminal
+    report. Same fidelity, one call, no per-wave round-trip — so no CLI loses
+    learning when it lacks a wired hook.
     """
     from .config import (
-        ROUTING_POLICY_HOOK_CAPABLE_SHELLS,
+        LEARNING_HOOK_CAPABLE_SHELLS,
         normalize_routing_policy_shell_id,
     )
 
@@ -164,7 +164,7 @@ def effective_learning_capture(config: TGsConfig | None, caller: str | None) -> 
     if cap != "hook":
         return cap
     shell_id = normalize_routing_policy_shell_id(caller)
-    if shell_id in ROUTING_POLICY_HOOK_CAPABLE_SHELLS:
+    if shell_id in LEARNING_HOOK_CAPABLE_SHELLS:
         return "hook"
     return "model"
 

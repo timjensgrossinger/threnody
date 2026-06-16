@@ -1098,6 +1098,141 @@ PY
     fi
 fi
 
+# --- Learning-capture hooks for the other host CLIs (Codex / Cursor / Copilot) ---
+# Same standalone bridge (shell/threnody-learning-hook.sh, stdin JSON → run log),
+# registered in each CLI's own format + event name. Gated on the same
+# host_native.learning_capture=hook + report_mode=batch config.
+LEARN_HOOK_SCRIPT="$INSTALL_DIR/shell/threnody-learning-hook.sh"
+[[ -f "$LEARN_HOOK_SCRIPT" ]] && chmod +x "$LEARN_HOOK_SCRIPT"
+MULTI_LEARN_ACTION="remove"
+if python3 - "$INSTALL_DIR" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+try:
+    from shared.config import TGsConfig, CONFIG_YAML
+    cfg = TGsConfig.from_yaml(CONFIG_YAML) if Path(CONFIG_YAML).exists() else TGsConfig()
+    ok = (getattr(cfg.host_native, "learning_capture", "hook") == "hook"
+          and getattr(cfg.host_native, "report_mode", "batch") == "batch")
+    raise SystemExit(0 if ok else 1)
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(0)
+PY
+then
+    MULTI_LEARN_ACTION="install"
+fi
+
+# Codex: ~/.codex/hooks.json, event PostToolUse, matcher Edit|Write (Claude-shaped).
+if [[ "$HAS_CODEX" -eq 1 ]]; then
+    if python3 - "$HOME/.codex/hooks.json" "$MULTI_LEARN_ACTION" "$LEARN_HOOK_SCRIPT" "PostToolUse" "Edit|Write" <<'PY'
+from pathlib import Path
+import json, sys
+_home = Path.home().resolve()
+path = Path(sys.argv[1]).resolve()
+if not str(path).startswith(str(_home)):
+    raise SystemExit(f"path outside home: {path}")
+action, hook_script, event, matcher = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+path.parent.mkdir(parents=True, exist_ok=True)
+cfg = {}
+if path.exists():
+    raw = path.read_text(encoding="utf-8").strip()
+    cfg = json.loads(raw) if raw else {}
+if not isinstance(cfg, dict):
+    raise SystemExit("expected JSON object")
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}; cfg["hooks"] = hooks
+groups = hooks.get(event) if isinstance(hooks.get(event), list) else []
+def managed(g):
+    hs = g.get("hooks") if isinstance(g, dict) else None
+    return isinstance(hs, list) and any(
+        isinstance(h, dict) and "threnody-learning-hook" in str(h.get("command") or "") for h in hs)
+groups = [g for g in groups if not managed(g)]
+if action == "install":
+    groups.append({"matcher": matcher,
+                   "hooks": [{"type": "command", "command": hook_script}]})
+hooks[event] = groups
+if not hooks.get(event):
+    hooks.pop(event, None)
+if not hooks:
+    cfg.pop("hooks", None)
+path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+PY
+    then
+        [[ "$MULTI_LEARN_ACTION" == "install" ]] \
+            && info "Installed Codex PostToolUse learning hook in ~/.codex/hooks.json" \
+            || info "Removed managed Codex learning hook from ~/.codex/hooks.json"
+    else
+        warn "Could not update ~/.codex/hooks.json learning hook"
+    fi
+fi
+
+# Cursor: ~/.cursor/hooks.json, event afterFileEdit, bare {command} entries.
+if [[ "$HAS_CURSOR" -eq 1 ]]; then
+    if python3 - "$HOME/.cursor/hooks.json" "$MULTI_LEARN_ACTION" "$LEARN_HOOK_SCRIPT" <<'PY'
+from pathlib import Path
+import json, sys
+_home = Path.home().resolve()
+path = Path(sys.argv[1]).resolve()
+if not str(path).startswith(str(_home)):
+    raise SystemExit(f"path outside home: {path}")
+action, hook_script = sys.argv[2], sys.argv[3]
+path.parent.mkdir(parents=True, exist_ok=True)
+cfg = {}
+if path.exists():
+    raw = path.read_text(encoding="utf-8").strip()
+    cfg = json.loads(raw) if raw else {}
+if not isinstance(cfg, dict):
+    raise SystemExit("expected JSON object")
+cfg.setdefault("version", 1)
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}; cfg["hooks"] = hooks
+entries = hooks.get("afterFileEdit") if isinstance(hooks.get("afterFileEdit"), list) else []
+entries = [e for e in entries
+           if not (isinstance(e, dict) and "threnody-learning-hook" in str(e.get("command") or ""))]
+if action == "install":
+    entries.append({"command": hook_script})
+hooks["afterFileEdit"] = entries
+if not hooks.get("afterFileEdit"):
+    hooks.pop("afterFileEdit", None)
+path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+PY
+    then
+        [[ "$MULTI_LEARN_ACTION" == "install" ]] \
+            && info "Installed Cursor afterFileEdit learning hook in ~/.cursor/hooks.json" \
+            || info "Removed managed Cursor learning hook from ~/.cursor/hooks.json"
+    else
+        warn "Could not update ~/.cursor/hooks.json learning hook"
+    fi
+fi
+
+# Copilot: dedicated file ~/.copilot/hooks/threnody-learning.json, event postToolUse.
+if [[ "$HAS_GH" -eq 1 ]]; then
+    COPILOT_HOOK_FILE="$HOME/.copilot/hooks/threnody-learning.json"
+    if [[ "$MULTI_LEARN_ACTION" == "install" ]]; then
+        mkdir -p "$HOME/.copilot/hooks"
+        python3 - "$COPILOT_HOOK_FILE" "$LEARN_HOOK_SCRIPT" <<'PY'
+from pathlib import Path
+import json, sys
+_home = Path.home().resolve()
+path = Path(sys.argv[1]).resolve()
+if not str(path).startswith(str(_home)):
+    raise SystemExit(f"path outside home: {path}")
+path.write_text(json.dumps({
+    "version": 1,
+    "hooks": {"postToolUse": [{"type": "command", "command": sys.argv[2]}]},
+}, indent=2) + "\n", encoding="utf-8")
+PY
+        info "Installed Copilot postToolUse learning hook in $COPILOT_HOOK_FILE"
+    else
+        rm -f "$COPILOT_HOOK_FILE" 2>/dev/null \
+            && info "Removed managed Copilot learning hook" || true
+    fi
+fi
+
 # --- GitHub Copilot instructions ---
 COPILOT_INSTRUCTIONS_MD="$HOME/.copilot/copilot-instructions.md"
 LEGACY_COPILOT_INSTRUCTIONS_MD="$HOME/.github/copilot-instructions.md"

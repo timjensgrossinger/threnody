@@ -818,18 +818,19 @@ def test_effective_capture_falls_back_to_model_for_non_claude() -> None:
     cfg = TGsConfig()
     cfg.host_native = HostNativeConfig(report_mode="batch", learning_capture="hook")
 
-    # Claude has a wired PostToolUse hook → hook capture.
-    assert effective_learning_capture(cfg, "claude-code") == "hook"
-    # Other CLIs have no wired hook → model capture (no learning loss).
-    for caller in ("github-copilot", "copilot", "codex", "cursor", "junie", "opencode"):
+    # Shells with a wired learning hook → hook capture.
+    for caller in ("claude-code", "github-copilot", "copilot", "codex", "cursor"):
+        assert effective_learning_capture(cfg, caller) == "hook", caller
+    # CLIs without a wired hook → model capture (no learning loss).
+    for caller in ("junie", "opencode"):
         assert effective_learning_capture(cfg, caller) == "model", caller
 
     # Contract advertises the resolved per-caller mode.
     c_claude = build_learning_report_contract("/tmp/p", run_id="swarm-x", config=cfg, caller="claude-code")
-    c_codex = build_learning_report_contract("/tmp/p", run_id="swarm-x", config=cfg, caller="codex")
+    c_junie = build_learning_report_contract("/tmp/p", run_id="swarm-x", config=cfg, caller="junie")
     assert c_claude["learning_capture"] == "hook"
-    assert c_codex["learning_capture"] == "model"
-    assert c_claude["report_mode"] == c_codex["report_mode"] == "batch"
+    assert c_junie["learning_capture"] == "model"
+    assert c_claude["report_mode"] == c_junie["report_mode"] == "batch"
 
 
 def test_effective_capture_respects_explicit_model_and_off() -> None:

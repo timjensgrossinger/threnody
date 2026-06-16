@@ -291,6 +291,13 @@ ROUTING_POLICY_SHELL_ALIASES = {
     "opencode": "opencode",
 }
 ROUTING_POLICY_HOOK_CAPABLE_SHELLS = frozenset({"claude-code"})
+# Shells where install.sh registers a PostToolUse-style learning-capture hook.
+# These get `learning_capture=hook` (zero model tokens); other shells fall back
+# to `model` capture. Separate from the routing-guard set above — wiring a
+# learning hook must NOT imply routing-guard PreToolUse enforcement.
+LEARNING_HOOK_CAPABLE_SHELLS = frozenset(
+    {"claude-code", "codex", "cursor", "github-copilot-cli"}
+)
 ROUTING_POLICY_SHELL_BOOTSTRAP_IDS = {
     "claude-code": "claude-code",
     "github-copilot-cli": "github-copilot",
