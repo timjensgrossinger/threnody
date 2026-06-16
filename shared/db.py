@@ -322,6 +322,29 @@ class Database:
              CREATE INDEX IF NOT EXISTS idx_swarm_events_swarm_type
                  ON swarm_events (swarm_id, event_type, ts);
 
+             -- Operator receipts: compact audit/export artifacts for routed runs.
+             CREATE TABLE IF NOT EXISTS run_receipts (
+                 run_id TEXT PRIMARY KEY,
+                 source_tool TEXT NOT NULL,
+                 task_hash TEXT NOT NULL DEFAULT '',
+                 receipt_json TEXT NOT NULL,
+                 markdown TEXT NOT NULL DEFAULT '',
+                 created_ts REAL NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_run_receipts_created
+                 ON run_receipts (created_ts DESC);
+
+             -- Replayable host-native workflow blueprints.
+             CREATE TABLE IF NOT EXISTS workflow_blueprints (
+                 name TEXT PRIMARY KEY,
+                 source_run_id TEXT NOT NULL,
+                 blueprint_json TEXT NOT NULL,
+                 created_ts REAL NOT NULL,
+                 last_run_ts REAL
+             );
+             CREATE INDEX IF NOT EXISTS idx_workflow_blueprints_created
+                 ON workflow_blueprints (created_ts DESC);
+
              -- Phase 36 budget-preview admission tokens for execute_swarm.
              CREATE TABLE IF NOT EXISTS preview_tokens (
                  token_hmac TEXT PRIMARY KEY,
@@ -5636,6 +5659,135 @@ class Database:
                 "subtask_count": int(row[5] or 0),
             })
         return result
+
+    def record_run_receipt(
+        self,
+        *,
+        run_id: str,
+        source_tool: str,
+        task_hash: str,
+        receipt: Mapping[str, object],
+        markdown: str = "",
+    ) -> None:
+        """Persist one operator run receipt."""
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            raise ValueError("run_id is required")
+        receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+        created_ts = float(receipt.get("created_ts") or time.time())
+        with self.conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO run_receipts (
+                    run_id, source_tool, task_hash, receipt_json, markdown, created_ts
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    source_tool = excluded.source_tool,
+                    task_hash = excluded.task_hash,
+                    receipt_json = excluded.receipt_json,
+                    markdown = excluded.markdown,
+                    created_ts = excluded.created_ts
+                """,
+                (
+                    normalized_run_id,
+                    str(source_tool or ""),
+                    str(task_hash or ""),
+                    receipt_json,
+                    str(markdown or ""),
+                    created_ts,
+                ),
+            )
+
+    def get_run_receipt(self, run_id: str) -> dict[str, object] | None:
+        """Return a persisted operator receipt."""
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            raise ValueError("run_id is required")
+        with self.conn() as conn:
+            row = conn.execute(
+                """
+                SELECT run_id, source_tool, task_hash, receipt_json, markdown, created_ts
+                FROM run_receipts
+                WHERE run_id = ?
+                """,
+                (normalized_run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            receipt = json.loads(row[3])
+        except json.JSONDecodeError:
+            receipt = {}
+        return {
+            "run_id": row[0],
+            "source_tool": row[1],
+            "task_hash": row[2],
+            "receipt": receipt,
+            "markdown": row[4],
+            "created_ts": float(row[5]),
+        }
+
+    def record_workflow_blueprint(
+        self,
+        name: str,
+        *,
+        run_id: str,
+        blueprint: Mapping[str, object],
+    ) -> None:
+        """Persist a replayable workflow blueprint."""
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            raise ValueError("name is required")
+        created_ts = float(blueprint.get("created_ts") or time.time())
+        payload = json.dumps(blueprint, sort_keys=True, separators=(",", ":"))
+        with self.conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO workflow_blueprints (
+                    name, source_run_id, blueprint_json, created_ts, last_run_ts
+                )
+                VALUES (?, ?, ?, ?, NULL)
+                ON CONFLICT(name) DO UPDATE SET
+                    source_run_id = excluded.source_run_id,
+                    blueprint_json = excluded.blueprint_json,
+                    created_ts = excluded.created_ts
+                """,
+                (normalized_name, str(run_id or ""), payload, created_ts),
+            )
+
+    def get_workflow_blueprint(self, name: str) -> dict[str, object] | None:
+        """Return a persisted workflow blueprint by name."""
+        normalized_name = str(name or "").strip()
+        if not normalized_name:
+            raise ValueError("name is required")
+        with self.conn() as conn:
+            row = conn.execute(
+                """
+                SELECT name, source_run_id, blueprint_json, created_ts, last_run_ts
+                FROM workflow_blueprints
+                WHERE name = ?
+                """,
+                (normalized_name,),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    "UPDATE workflow_blueprints SET last_run_ts = ? WHERE name = ?",
+                    (time.time(), normalized_name),
+                )
+        if row is None:
+            return None
+        try:
+            blueprint = json.loads(row[2])
+        except json.JSONDecodeError:
+            blueprint = {}
+        return {
+            "name": row[0],
+            "source_run_id": row[1],
+            "blueprint": blueprint,
+            "created_ts": float(row[3]),
+            "last_run_ts": float(row[4]) if row[4] is not None else None,
+        }
 
     def close(self) -> None:
         """Close all database connections

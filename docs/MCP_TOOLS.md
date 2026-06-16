@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Threnody exposes **43 public MCP tools** over JSON-RPC/stdio. Tests enforce that every published schema has a callable handler.
+Threnody exposes **53 public MCP tools** over JSON-RPC/stdio. Tests enforce that every published schema has a callable handler.
 
 Tools are grouped by role: **coordination** (plan and route), **delegation** (optional subprocess to utility backends only), **learning**, **memory**, and **operator** surfaces.
 
@@ -16,6 +16,10 @@ Plan, classify, and orchestrate work. Prefer host-native execution using
 | `decompose_task(task)` | Alias for `plan_task`; preferred entry point for multi-concern tasks |
 | `fleet_plan(task)` | Like decompose but returns fleet waves with embedded `host_spawn` per agent |
 | `execute_swarm(task, topology?, max_agents?)` | Plan swarm; default `host_native` returns `host_spawn_waves` without subprocess fanout |
+| `list_task_packs()` | List curated planning presets such as `security-review`, `test-gap`, and `release-check` |
+| `plan_task_pack(pack, task)` | Build a host-native plan with a curated task-pack preset |
+| `workflow_blueprint_export(run_id)` | Save a successful host-native run receipt as a replayable workflow blueprint |
+| `workflow_blueprint_run(name, inputs?)` | Replay saved host-native waves without a fresh planner call |
 | `validate_routing_guard(...)` | Check whether a host edit/write is allowed by the active routing policy |
 | `apply_preview(preview_token, approve)` | Approve/deny file writes outside workspace |
 
@@ -39,7 +43,7 @@ via the host Agent/Task tool.
 | Parameter | Notes |
 |-----------|-------|
 | `topology` | `auto`, `dag`, `hierarchical`, or `star` |
-| `max_agents` | Cap fanout (see `swarm.max_agents` in config) |
+| `max_agents` | Requested fanout; `swarm.max_agents: -1` means no built-in size cap, while `parallelism.max_workers` can still limit concurrent host wave execution |
 | `budget_limit` | Triggers `preview_token` confirmation when estimate exceeds limit |
 
 **Delegate mode** (`swarm.host_execution_mode: delegate`): background orchestrator
@@ -120,7 +124,8 @@ Approval workflow: `agent_queue_list`, `agent_queue_approve`, `agent_queue_rejec
 
 | Tool | Description |
 |---|---|
-| `inspect_spend(since?)` | Aggregated spend/savings from delegated subtasks; includes `usage_state` when windows configured |
+| `inspect_spend(since?)` | Aggregated spend/savings from delegated subtasks and run receipts; includes `usage_state` when windows configured |
+| `inspect_run_receipt(run_id, format?)` | Export an operator receipt as JSON, Markdown, or local HTML run card |
 | `check_providers()` | List detected CLIs, models, router-only vs delegation flags |
 | `inspect_status(project_id)` | Project readiness, limits, fanout state |
 | `approval_queue_list(project_id)` | Pending approval queue |

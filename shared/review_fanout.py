@@ -13,6 +13,7 @@ from typing import NamedTuple
 log = logging.getLogger(__name__)
 
 _REVIEW_SENTINEL = "REVIEW:"
+_FAST_REVIEW_SENTINEL = "FAST_REVIEW:"
 
 _LOC_TRIVIAL = 50
 _LOC_COMPLEX = 200
@@ -120,7 +121,15 @@ def is_review_intent(task: str) -> bool:
     """True when the task carries the REVIEW: sentinel injected by the skill."""
     if not isinstance(task, str):
         return False
-    return task.strip().upper().startswith(_REVIEW_SENTINEL)
+    normalized = task.strip().upper()
+    return normalized.startswith(_REVIEW_SENTINEL) or normalized.startswith(_FAST_REVIEW_SENTINEL)
+
+
+def is_fast_review_intent(task: str) -> bool:
+    """True for the fast one-agent-per-file review override."""
+    if not isinstance(task, str):
+        return False
+    return task.strip().upper().startswith(_FAST_REVIEW_SENTINEL)
 
 
 def _read_file_safe(path: str) -> str | None:
@@ -227,6 +236,9 @@ def build_review_subtasks(
             "topology": "linear",
         }
 
+    if is_fast_review_intent(task):
+        return build_fast_review_subtasks(entries, task, max_agents=max_agents)
+
     # Compute per-file (dims, band, risk)
     file_dims: list[tuple[str, list[_Dim], Complexity, bool]] = []
     for path, _ in entries:
@@ -302,4 +314,75 @@ def build_review_subtasks(
         "subtasks": subtasks,
         "strategy": "dag",
         "topology": "dag",
+    }
+
+
+def build_fast_review_subtasks(
+    entries: list[tuple[str, str]],
+    task: str,
+    *,
+    max_agents: int | None = None,
+) -> dict:
+    """Build one read-only review agent per file plus synthesis.
+
+    This override trades depth for throughput: one agent owns logic, security,
+    edge, type, and performance review for a single file. It is intended for
+    broad review sweeps where per-file parallelism matters more than per-dimension
+    depth.
+    """
+    file_entries = list(entries)
+    dropped = 0
+    if max_agents is not None and max_agents > 0:
+        review_cap = max(1, max_agents - 1)
+        if len(file_entries) > review_cap:
+            dropped = len(file_entries) - review_cap
+            file_entries = file_entries[:review_cap]
+
+    subtasks: list[dict] = []
+    review_ids: list[int] = []
+    for idx, (path, _hint) in enumerate(file_entries, start=1):
+        band, has_risk = estimate_complexity(path)
+        tier = "high" if has_risk or band == "complex" else "medium"
+        subtasks.append({
+            "id": idx,
+            "description": (
+                f"Fast full-file review of {path}: check logic, security, edge/null cases, "
+                "type safety, and performance. Report only concrete findings as: "
+                "⚠️ [SEVERITY] category — file:line — description [(CWE-XXX)]. "
+                "Output nothing if no issues found."
+            ),
+            "tier": tier,
+            "target_file": path,
+            "subagent_type": "review-fast-file",
+            "read_only": True,
+            "depends_on": [],
+            "single_file_insertion": False,
+        })
+        review_ids.append(idx)
+
+    synth_id = len(file_entries) + 1
+    reviewed_files = [path for path, _ in file_entries]
+    subtasks.append({
+        "id": synth_id,
+        "description": (
+            _SYNTHESIS_PROMPT
+            + f"\n\nFast review mode: one review agent per file. Files reviewed: {', '.join(reviewed_files)}"
+        ),
+        "tier": "high",
+        "depends_on": review_ids,
+        "subagent_type": "",
+        "read_only": True,
+    })
+
+    return {
+        "analysis": (
+            f"Fast review fanout: {len(file_entries)} file agent(s) + 1 synthesis. "
+            f"Dropped {dropped} file(s) due to max_agents cap. "
+            "Host-native DAG. No external planner LLM was called."
+        ),
+        "subtasks": subtasks,
+        "strategy": "dag",
+        "topology": "dag",
+        "review_mode": "fast_file",
+        "dropped_file_count": dropped,
     }

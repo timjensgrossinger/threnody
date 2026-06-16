@@ -236,6 +236,7 @@ Threnody MCP workflows (CLI-agnostic — use from any connected host):
 | [threnody-routing](skills/threnody-routing/SKILL.md) | `route_task`, routing guard, host-native vs utility delegation |
 | [threnody-task](skills/threnody-task/SKILL.md) | `plan_task`, `decompose_task`, `fleet_plan`, `host_spawn_waves` |
 | [threnody-swarm](skills/threnody-swarm/SKILL.md) | `execute_swarm`, topology, budget preview, resume |
+| [threnody-fast-review](skills/threnody-fast-review/SKILL.md) | Fast broad review swarm — one read-only agent per file plus synthesis |
 | [threnody-fullstack](skills/threnody-fullstack/SKILL.md) | Parallel frontend + backend + API (contract-first DAG) |
 | [threnody-subtasks](skills/threnody-subtasks/SKILL.md) | `list_subtasks` for utility `execute_subtask` monitoring |
 

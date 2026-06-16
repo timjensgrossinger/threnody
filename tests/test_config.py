@@ -836,7 +836,7 @@ if __name__ == "__main__":
 
 
 def test_invalid_swarm_max_agents_config_falls_back_to_default() -> None:
-    """Malformed swarm.max_agents config should fall back to the default hard cap."""
+    """Malformed swarm.max_agents config should fall back to unlimited."""
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = Path(tmpdir) / "config.yaml"
         config_path.write_text(
@@ -848,4 +848,4 @@ def test_invalid_swarm_max_agents_config_falls_back_to_default() -> None:
             encoding="utf-8",
         )
         config = TGsConfig.from_yaml(config_path)
-        assert config.swarm_max_agents == 12
+        assert config.swarm_max_agents == -1

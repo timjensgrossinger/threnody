@@ -35,7 +35,9 @@ host_native:
   runs_keep: 20                  # per-run log dirs to retain (rotation, like cache.backup_keep)
 
 swarm:
-  max_agents: 12
+  # -1 means no built-in swarm size cap. Use parallelism.max_workers below when
+  # you want a concurrency/backpressure limit while still allowing broad plans.
+  max_agents: -1
   # host_native (default for MCP host shells): plan in Threnody, execute waves via host Agent/Task
   # delegate: legacy subprocess orchestrator fanout (higher billing/policy surface)
   host_execution_mode: host_native

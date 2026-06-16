@@ -324,17 +324,19 @@ def clamp_swarm_agent_count(
         parallelism_cap_raw = int(config.parallelism.max_workers)
     except (TypeError, ValueError) as exc:
         raise ValueError("parallelism.max_workers must be an integer") from exc
-    configured_cap = config.swarm_max_agents
-    # UNLIMITED_PARALLELISM (-1) means no wave-level cap; fall back to swarm cap only.
+    configured_cap_raw = config.swarm_max_agents
+    configured_cap = normalize_parallelism_limit(configured_cap_raw)
+    # UNLIMITED_PARALLELISM (-1) means no wave-level cap.
     if parallelism_cap_raw < 0:
-        parallelism_cap = configured_cap
+        parallelism_cap = None
     elif parallelism_cap_raw == 0:
         raise ValueError("parallelism.max_workers must be at least 1 or UNLIMITED_PARALLELISM")
     else:
         parallelism_cap = parallelism_cap_raw
-    hard_cap = max(1, min(configured_cap, parallelism_cap))
+
+    caps = [cap for cap in (configured_cap, parallelism_cap) if cap is not None]
     if requested_agents is None:
-        requested = hard_cap
+        requested = max(1, min(caps)) if caps else 1
     else:
         try:
             requested = int(requested_agents)
@@ -342,6 +344,7 @@ def clamp_swarm_agent_count(
             raise ValueError("requested_agents must be an integer") from exc
         if requested < 1:
             raise ValueError("requested_agents must be at least 1")
+    hard_cap = max(1, min(caps)) if caps else requested
     effective = min(requested, hard_cap)
     clamped = requested != effective
 
@@ -354,8 +357,8 @@ def clamp_swarm_agent_count(
                 "effective_agents": effective,
                 "progress_counters": {
                     "cap_source": source,
-                    "configured_cap": configured_cap,
-                    "parallelism_cap": parallelism_cap,
+                    "configured_cap": configured_cap_raw,
+                    "parallelism_cap": parallelism_cap if parallelism_cap is not None else UNLIMITED_PARALLELISM,
                 },
                 "round": 0,
                 "resumable": False,
@@ -370,8 +373,8 @@ def clamp_swarm_agent_count(
                     "requested": requested,
                     "effective": effective,
                     "hard_cap": hard_cap,
-                    "configured_cap": configured_cap,
-                    "parallelism_cap": parallelism_cap,
+                    "configured_cap": configured_cap_raw,
+                    "parallelism_cap": parallelism_cap if parallelism_cap is not None else UNLIMITED_PARALLELISM,
                     "source": source,
                 },
             )

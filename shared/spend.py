@@ -195,6 +195,43 @@ def build_spend_snapshot(
     totals.update(_free_subtask_stats(db, since_ts))
     routing = _routing_telemetry_summary(db, since_ts)
     usage_state = build_usage_state(db, config)
+    try:
+        with db.conn() as conn:
+            receipt_rows = conn.execute(
+                """
+                SELECT run_id, source_tool, receipt_json, created_ts
+                FROM run_receipts
+                WHERE created_ts >= ?
+                ORDER BY created_ts DESC
+                LIMIT 25
+                """,
+                (since_ts,),
+            ).fetchall()
+    except Exception:
+        log.debug("run receipt summary failed", exc_info=True)
+        receipt_rows = []
+    receipts: list[dict[str, Any]] = []
+    receipt_savings = 0.0
+    for run_id, source_tool, receipt_json, created_ts in receipt_rows:
+        try:
+            import json
+
+            receipt = json.loads(receipt_json)
+        except Exception:
+            receipt = {}
+        cost_receipt = receipt.get("cost_receipt") if isinstance(receipt, dict) else {}
+        savings = cost_receipt.get("savings") if isinstance(cost_receipt, dict) else {}
+        selected = cost_receipt.get("selected") if isinstance(cost_receipt, dict) else {}
+        savings_usd = float(savings.get("estimated_usd") or 0.0) if isinstance(savings, dict) else 0.0
+        receipt_savings += savings_usd
+        receipts.append({
+            "run_id": run_id,
+            "source_tool": source_tool,
+            "created_ts": float(created_ts),
+            "selected_tier": selected.get("tier") if isinstance(selected, dict) else None,
+            "selected_model": selected.get("model") if isinstance(selected, dict) else None,
+            "estimated_savings_usd": round(savings_usd, 6),
+        })
     return {
         "window": window_label,
         "since_ts": since_ts,
@@ -202,6 +239,11 @@ def build_spend_snapshot(
         "by_tier": by_tier,
         "by_provider": by_provider,
         "routing_telemetry": routing,
+        "receipts": {
+            "count": len(receipts),
+            "estimated_savings_usd": round(receipt_savings, 6),
+            "recent": receipts,
+        },
         "usage_windows": _serialize_usage_windows(config),
         "usage_state": usage_state,
         "disclaimer": (

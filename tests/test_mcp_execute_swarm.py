@@ -417,6 +417,7 @@ def test_max_agents_default_and_clamp() -> None:
     with tempfile.NamedTemporaryFile(suffix=".db") as handle:
         db = Database(Path(handle.name))
         config = TGsConfig.defaults()
+        config.parallelism.swarm_max_agents = 12
 
         prepared = prepare_swarm_execution_request(
             {"max_agents": 20},
@@ -457,4 +458,24 @@ def test_max_agents_default_and_clamp() -> None:
         payload = json.loads(event_row[0])
         assert payload["requested"] == 20
         assert payload["effective"] == 12
+        db.close()
+
+
+def test_default_swarm_max_agents_unlimited() -> None:
+    """Default host-native swarms do not clamp explicit fanout by size."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as handle:
+        db = Database(Path(handle.name))
+        config = TGsConfig.defaults()
+
+        prepared = prepare_swarm_execution_request(
+            {"task": "FAST_REVIEW: " + " ".join(f"src/f{i}.py" for i in range(35)), "max_agents": 36},
+            config=config,
+            db=db,
+            swarm_id="swarm-unlimited-test",
+        )
+
+        assert config.swarm_max_agents == -1
+        assert prepared["requested_agents"] == 36
+        assert prepared["effective_agents"] == 36
+        assert prepared["clamped"] is False
         db.close()

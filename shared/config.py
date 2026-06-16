@@ -384,7 +384,7 @@ class ParallelismConfig:
     """
     enabled: bool = True
     max_workers: int = UNLIMITED_PARALLELISM
-    swarm_max_agents: int = 12
+    swarm_max_agents: int = UNLIMITED_PARALLELISM
     speculation_workers: int = 1
     warm_path_workers: int = 2
 
@@ -1479,14 +1479,17 @@ class TGsConfig:
 
     @property
     def swarm_max_agents(self) -> int:
-        """Return the effective swarm agent hard cap for this config."""
+        """Return the effective swarm agent hard cap, or -1 for unlimited."""
+        raw = self.parallelism.swarm_max_agents
+        if raw == UNLIMITED_PARALLELISM:
+            return UNLIMITED_PARALLELISM
         return max(
             1,
             _coerce_config_int(
-                self.parallelism.swarm_max_agents,
-                default=12,
+                raw,
+                default=UNLIMITED_PARALLELISM,
                 field_name="parallelism.swarm_max_agents",
-                minimum=1,
+                minimum=UNLIMITED_PARALLELISM,
             ),
         )
 
@@ -1543,10 +1546,10 @@ class TGsConfig:
                     UNLIMITED_PARALLELISM,
                 ),
                 swarm_max_agents=_coerce_config_int(
-                    swarm_raw.get("max_agents", 12),
-                    default=12,
+                    swarm_raw.get("max_agents", UNLIMITED_PARALLELISM),
+                    default=UNLIMITED_PARALLELISM,
                     field_name="swarm.max_agents",
-                    minimum=1,
+                    minimum=UNLIMITED_PARALLELISM,
                 ),
                 speculation_workers=_coerce_config_int(
                     parallelism_raw.get("speculation_workers", 1),

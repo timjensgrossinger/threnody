@@ -459,7 +459,8 @@ def _coerce_auto_topology_complexity(
     elif isinstance(raw_task_chars, float):
         task_chars = max(0, int(raw_task_chars))
 
-    max_agents = max(1, int(config.swarm_max_agents))
+    configured_max_agents = int(config.swarm_max_agents)
+    max_agents = max(1, configured_max_agents) if configured_max_agents > 0 else max(1, router_count, 12)
     _inv_agents = pow(max_agents, -1) if max_agents != 0 else 0.0
     router_component = min(max(router_count, 0) * _inv_agents, 1.0)
     _inv_chars = pow(4_000.0, -1)

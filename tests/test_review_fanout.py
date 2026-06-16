@@ -13,6 +13,7 @@ from shared.review_fanout import (
     build_review_subtasks,
     dimensions_for,
     estimate_complexity,
+    is_fast_review_intent,
     is_review_intent,
     tier_for,
 )
@@ -47,6 +48,10 @@ class TestIsReviewIntent:
     def test_non_string(self):
         assert is_review_intent(None) is False  # type: ignore[arg-type]
         assert is_review_intent(42) is False  # type: ignore[arg-type]
+
+    def test_fast_review_sentinel_is_review_intent(self):
+        assert is_review_intent("FAST_REVIEW: src/a.py src/b.py") is True
+        assert is_fast_review_intent("FAST_REVIEW: src/a.py") is True
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +293,39 @@ class TestBuildReviewSubtasks:
         review = [s for s in result["subtasks"] if not s.get("depends_on")]
         synthesis = [s for s in result["subtasks"] if s.get("depends_on")]
         assert len(synthesis) == 1
-        assert len(review) == 4  # 2 files × 2 dims (trivial)
+
+    def test_fast_review_one_agent_per_file_plus_synthesis(self, tmp_path: Path):
+        files = []
+        for name in ("a.py", "b.py", "c.py"):
+            f = tmp_path / name
+            f.write_text("x = 1\n", encoding="utf-8")
+            files.append(f)
+        result = build_review_subtasks(
+            [(str(f), "") for f in files],
+            "FAST_REVIEW: " + " ".join(str(f) for f in files),
+            max_agents=4,
+        )
+        review = [s for s in result["subtasks"] if not s.get("depends_on")]
+        synthesis = [s for s in result["subtasks"] if s.get("depends_on")]
+        assert result["review_mode"] == "fast_file"
+        assert len(review) == 3
+        assert len(synthesis) == 1
+        assert all(s["subagent_type"] == "review-fast-file" for s in review)
+
+    def test_fast_review_respects_max_agents_cap(self, tmp_path: Path):
+        files = []
+        for i in range(5):
+            f = tmp_path / f"f{i}.py"
+            f.write_text("x = 1\n", encoding="utf-8")
+            files.append(f)
+        result = build_review_subtasks(
+            [(str(f), "") for f in files],
+            "FAST_REVIEW: " + " ".join(str(f) for f in files),
+            max_agents=3,
+        )
+        review = [s for s in result["subtasks"] if not s.get("depends_on")]
+        assert len(review) == 2
+        assert result["dropped_file_count"] == 3
 
 
 # ---------------------------------------------------------------------------

@@ -90,6 +90,13 @@ from shared.memory import (
 from shared import outcomes as shared_outcomes
 from shared.status import build_status_snapshot
 from shared.spend import build_spend_snapshot, build_usage_state
+from shared.agent_optimizer import choose_agent_count
+from shared.receipts import build_cost_receipt, load_run_receipt, record_run_receipt
+from shared.task_packs import list_task_packs, plan_task_pack
+from shared.workflow_blueprints import (
+    export_blueprint_from_receipt,
+    run_workflow_blueprint,
+)
 from shared.swarm import (
     build_wave_progress_payload,
     get_coordinator_round_checkpoint_by_index,
@@ -1652,7 +1659,7 @@ TOOLS = [
         "name": "inspect_spend",
         "description": (
             "Return aggregated spend and savings telemetry from delegated subtasks "
-            "(est_cost_usd vs counterfactual) for a time window."
+            "(est_cost_usd vs counterfactual) and persisted cost receipts for a time window."
         ),
         "inputSchema": {
             "type": "object",
@@ -1662,6 +1669,63 @@ TOOLS = [
                     "description": "Time window (7d, 30d, 24h, all). Default: 7d",
                 },
             },
+        },
+    },
+    {
+        "name": "inspect_run_receipt",
+        "description": (
+            "Return an operator run receipt by run_id/swarm_id, as JSON, Markdown, or local HTML."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "swarm_id": {"type": "string"},
+                "format": {"type": "string", "enum": ["json", "markdown", "html"]},
+            },
+        },
+    },
+    {
+        "name": "list_task_packs",
+        "description": "List curated task packs for cheap repeatable planning.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "plan_task_pack",
+        "description": "Plan a task using a curated task-pack preset.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pack": {"type": "string"},
+                "task": {"type": "string"},
+                "cwd": {"type": "string"},
+                "max_agents": {"type": "integer", "minimum": 1},
+            },
+            "required": ["pack", "task"],
+        },
+    },
+    {
+        "name": "workflow_blueprint_export",
+        "description": "Export a successful host-native run receipt into a replayable workflow blueprint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "swarm_id": {"type": "string"},
+                "name": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "workflow_blueprint_run",
+        "description": "Replay a saved workflow blueprint with optional string replacements; no planner call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "inputs": {"type": "object"},
+            },
+            "required": ["name"],
         },
     },
     {
@@ -2153,6 +2217,43 @@ def _persist_host_plan_run(
         log.debug("host plan run persist failed for %s", run_id, exc_info=True)
 
 
+def _attach_and_persist_plan_receipt(
+    db: Database,
+    *,
+    result: dict[str, object],
+    run_id: str | None,
+    source_tool: str,
+    task: str,
+    workspace_root: str | None,
+) -> None:
+    subtasks = result.get("subtasks")
+    first_subtask = subtasks[0] if isinstance(subtasks, list) and subtasks and isinstance(subtasks[0], dict) else {}
+    receipt = build_cost_receipt(
+        source_tool=source_tool,
+        task=task,
+        tier=str(first_subtask.get("tier") or "medium"),
+        model=str(first_subtask.get("model") or result.get("model") or ""),
+        provider=str(first_subtask.get("provider") or result.get("provider") or ""),
+        payload=result,
+        rationale="Host-native plan handoff avoids same-host subprocess fanout and extra coordinator rounds.",
+        skipped_calls=["same-host subprocess delegation"],
+    )
+    result["cost_receipt"] = receipt
+    if run_id:
+        try:
+            record_run_receipt(
+                db,
+                run_id=run_id,
+                source_tool=source_tool,
+                task=task,
+                payload=result,
+                cost_receipt=receipt,
+                workspace_root=workspace_root,
+            )
+        except Exception:
+            log.debug("%s receipt persist failed for %s", source_tool, run_id, exc_info=True)
+
+
 def handle_plan_task(args: dict) -> dict:
     global _config, _db, _router, _planner, _orchestrator
     # Respect injected planner/config/db during tests; this handler does not use router/orchestrator.
@@ -2198,6 +2299,14 @@ def handle_plan_task(args: dict) -> dict:
                     payload=result,
                     workspace_root=workspace_root,
                 )
+            _attach_and_persist_plan_receipt(
+                db,
+                result=result,
+                run_id=host_run_id or str(result.get("task_id") or ""),
+                source_tool="plan_task",
+                task=task,
+                workspace_root=workspace_root,
+            )
             return result
         except (json.JSONDecodeError, TypeError):
             pass
@@ -2275,8 +2384,17 @@ def handle_plan_task(args: dict) -> dict:
             payload=result,
             workspace_root=workspace_root,
         )
+    _attach_and_persist_plan_receipt(
+        db,
+        result=result,
+        run_id=host_run_id,
+        source_tool="plan_task",
+        task=task,
+        workspace_root=workspace_root,
+    )
     cacheable_result = dict(result)
     cacheable_result.pop("routing_guard", None)
+    cacheable_result.pop("cost_receipt", None)
     db.cache_put(task, json.dumps(cacheable_result), "planner")
     return result
 
@@ -3457,6 +3575,30 @@ def _execute_swarm_host_native_response(
             swarm_result[key] = plan_dict[key]
     if used_heuristic:
         swarm_result["planner_host_execution_mode"] = "host_native"
+    cost_receipt = build_cost_receipt(
+        source_tool="execute_swarm",
+        task=task_text,
+        tier="medium",
+        model="host-native",
+        provider=normalize_caller_id(caller) or "host",
+        payload=swarm_result,
+        estimated_cost_usd=float(estimated_cost),
+        rationale="Host-native swarm handoff plans once and executes in the host without subprocess fanout.",
+        skipped_calls=["delegate coordinator process", "same-host subprocess delegation"],
+    )
+    swarm_result["cost_receipt"] = cost_receipt
+    try:
+        record_run_receipt(
+            db,
+            run_id=swarm_id,
+            source_tool="execute_swarm",
+            task=task_text,
+            payload=swarm_result,
+            cost_receipt=cost_receipt,
+            workspace_root=resolved_workspace,
+        )
+    except Exception:
+        log.debug("execute_swarm receipt persist failed for %s", swarm_id, exc_info=True)
     return {
         "result": swarm_result,
         "started": False,
@@ -4481,6 +4623,40 @@ def handle_route_task(args: dict) -> dict:
         tier=decision.tier,
         execution_hint=execution_hint,
     )
+    economics = execution_hint.get("economics") if isinstance(execution_hint, dict) else None
+    estimated_cost = (
+        economics.get("estimated_cost_usd")
+        if isinstance(economics, Mapping)
+        else None
+    )
+    cost_receipt = build_cost_receipt(
+        source_tool="route_task",
+        task=task,
+        tier=decision.tier,
+        model=str(result.get("model") or model),
+        provider=str(result.get("provider") or ""),
+        payload=result,
+        estimated_cost_usd=estimated_cost if isinstance(estimated_cost, (int, float)) else None,
+        rationale=(
+            str(economics.get("cheapest_path_rationale"))
+            if isinstance(economics, Mapping) and economics.get("cheapest_path_rationale")
+            else None
+        ),
+        skipped_calls=["planner call"],
+    )
+    result["cost_receipt"] = cost_receipt
+    try:
+        record_run_receipt(
+            db,
+            run_id=task_id,
+            source_tool="route_task",
+            task=task,
+            payload=result,
+            cost_receipt=cost_receipt,
+            workspace_root=project_path,
+        )
+    except Exception:
+        log.debug("route_task receipt persist failed for %s", task_id, exc_info=True)
     shared_outcomes.persist_route_telemetry(
         db,
         task_id=task_id,
@@ -4538,9 +4714,21 @@ def prepare_swarm_execution_request(
     swarm_id: str | None = None,
 ) -> dict[str, object]:
     """Normalize a future execute_swarm request without changing current MCP surfaces."""
+    explicit_max_agents = args.get("max_agents") is not None
+    task_text_for_optimizer = _stringify_execute_swarm_task(args.get("task"))
+    optimizer = choose_agent_count(
+        task_text_for_optimizer,
+        requested=args.get("max_agents") if explicit_max_agents else None,
+        hard_cap=config.swarm_max_agents,
+    )
+    default_agents = (
+        int(optimizer.get("recommended_agents") or config.swarm_max_agents)
+        if not explicit_max_agents
+        else config.swarm_max_agents
+    )
     requested_agents = _parse_requested_swarm_agents(
         args.get("max_agents"),
-        config.swarm_max_agents,
+        default_agents,
     )
     resolved_swarm_id = swarm_id or str(args.get("swarm_id") or f"swarm-{uuid.uuid4().hex}")
     allocation = clamp_swarm_agent_count(
@@ -4590,6 +4778,7 @@ def prepare_swarm_execution_request(
             "requested": allocation.requested_agents,
             "effective": allocation.effective_agents,
         },
+        "agent_count_optimizer": optimizer,
         "topology": effective_topology,
         "selected_topology": selected_topology,
         "topology_rationale": topology_rationale,
@@ -8572,6 +8761,112 @@ def handle_inspect_spend(args: dict) -> dict:
     return inspect_spend(str(args.get("since") or "7d"))
 
 
+def handle_inspect_run_receipt(args: dict) -> dict:
+    _, db, *_ = _ensure_init()
+    run_id = args.get("run_id") or args.get("swarm_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        return {"error": "run_id or swarm_id is required"}
+    fmt = str(args.get("format") or "json").strip().lower()
+    if fmt not in {"json", "markdown", "html"}:
+        return {"error": "format must be one of: json, markdown, html"}
+    try:
+        return load_run_receipt(db, run_id.strip(), format=fmt)
+    except KeyError:
+        return {"error": "RunReceiptNotFound", "run_id": run_id.strip()}
+
+
+def handle_list_task_packs(_args: dict) -> dict:
+    return {"task_packs": list_task_packs()}
+
+
+def handle_plan_task_pack(args: dict) -> dict:
+    config, db, router, planner, orchestrator = _ensure_init()
+    caller = _resolve_caller()
+    pack = args.get("pack")
+    task = args.get("task")
+    if not isinstance(pack, str) or not pack.strip():
+        return {"error": "pack is required"}
+    if not isinstance(task, str) or not task.strip():
+        return {"error": "task is required"}
+    max_agents = None
+    if args.get("max_agents") is not None:
+        try:
+            max_agents = int(args.get("max_agents"))
+        except (TypeError, ValueError):
+            return {"error": "max_agents must be an integer"}
+    try:
+        result = _attach_models_to_subtasks(plan_task_pack(pack, task, max_agents=max_agents))
+    except ValueError as exc:
+        return {"error": str(exc)}
+    host_run_id = plan_run_id(f"{pack}:{task}") if normalize_caller_id(caller) in HOST_PROVIDER_NAMES else None
+    workspace_root = args.get("cwd") if isinstance(args.get("cwd"), str) else None
+    _attach_host_spawn_metadata(
+        result,
+        config=config,
+        caller=caller,
+        task=task,
+        db=db,
+        run_id=host_run_id,
+        workspace_root=workspace_root,
+    )
+    _attach_and_persist_plan_receipt(
+        db,
+        result=result,
+        run_id=host_run_id,
+        source_tool="plan_task_pack",
+        task=task,
+        workspace_root=workspace_root,
+    )
+    if host_run_id:
+        _persist_host_plan_run(
+            db,
+            run_id=host_run_id,
+            task=task,
+            payload=result,
+            workspace_root=workspace_root,
+        )
+    return result
+
+
+def handle_workflow_blueprint_export(args: dict) -> dict:
+    _, db, *_ = _ensure_init()
+    run_id = args.get("run_id") or args.get("swarm_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        return {"error": "run_id or swarm_id is required"}
+    name = args.get("name")
+    try:
+        blueprint = export_blueprint_from_receipt(
+            db,
+            run_id=run_id.strip(),
+            name=name if isinstance(name, str) and name.strip() else None,
+        )
+    except KeyError:
+        return {"error": "RunReceiptNotFound", "run_id": run_id.strip()}
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return {"exported": True, "blueprint": blueprint}
+
+
+def handle_workflow_blueprint_run(args: dict) -> dict:
+    _, db, *_ = _ensure_init()
+    name = args.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return {"error": "name is required"}
+    inputs = args.get("inputs")
+    if inputs is not None and not isinstance(inputs, Mapping):
+        return {"error": "inputs must be an object when provided"}
+    try:
+        return run_workflow_blueprint(
+            db,
+            name=name,
+            inputs=inputs if isinstance(inputs, Mapping) else None,
+        )
+    except KeyError:
+        return {"error": "WorkflowBlueprintNotFound", "name": name.strip()}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
 def inspect_status(project_id: str = "") -> dict:
     _config, db, *_ = _ensure_init()
     try:
@@ -11044,6 +11339,11 @@ HANDLERS = {
     "resume_swarm_inspect": handle_resume_swarm_inspect,
     "resume_swarm_confirm": handle_resume_swarm_confirm,
     "inspect_spend": handle_inspect_spend,
+    "inspect_run_receipt": handle_inspect_run_receipt,
+    "list_task_packs": handle_list_task_packs,
+    "plan_task_pack": handle_plan_task_pack,
+    "workflow_blueprint_export": handle_workflow_blueprint_export,
+    "workflow_blueprint_run": handle_workflow_blueprint_run,
     "inspect_status": handle_inspect_status,
     "agent_queue_list": handle_approval_queue_list,
     "approval_queue_list": handle_approval_queue_list,

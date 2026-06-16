@@ -97,6 +97,11 @@ def cmd_gain(args) -> int:
             f"savings=${float(totals.get('savings_usd') or 0):.6f}  "
             f"free={totals.get('free_subtask_pct', 0)}%"
         )
+        receipts = snapshot.get("receipts") if isinstance(snapshot.get("receipts"), dict) else {}
+        print(
+            f"  receipts={receipts.get('count', 0)}  "
+            f"receipt_savings=${float(receipts.get('estimated_savings_usd') or 0):.6f}"
+        )
         print(f"  {snapshot.get('disclaimer', '')}")
         return 0
 
