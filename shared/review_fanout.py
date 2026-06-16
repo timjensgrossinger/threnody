@@ -124,10 +124,13 @@ def is_review_intent(task: str) -> bool:
 
 
 def _read_file_safe(path: str) -> str | None:
-    try:
-        return Path(path).read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return None
+    # Delegate to the shared mtime+size-keyed cache so the bytes read here for
+    # complexity estimation are reused by per-cell context enrichment instead
+    # of being re-read from disk. max_bytes=None preserves the prior uncapped
+    # read, so banding for large files is unchanged.
+    from .context import read_source_cached
+
+    return read_source_cached(Path(path), max_bytes=None)
 
 
 def _count_loc(content: str) -> int:

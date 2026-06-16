@@ -15,11 +15,14 @@ from shared.context import (
     extract_references,
     find_function_boundaries,
     read_file_context,
+    read_source_cached,
+    clear_source_cache,
     build_context_block,
     enrich_subtask,
     normalize_target_path,
     is_within_repo,
 )
+import shared.context as context_module
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +573,58 @@ class TestTargetPathHelpers(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+class TestSourceCache(unittest.TestCase):
+    """Wave-scoped file-content cache: dedup reads, never serve stale."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        clear_source_cache()
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+        clear_source_cache()
+
+    def test_read_file_context_identical_pre_post_cache(self):
+        p = Path(self.td) / "mod.py"
+        p.write_text("def foo():\n    return 1\n", encoding="utf-8")
+        ref = FileReference(path="mod.py")
+        clear_source_cache()
+        first = read_file_context(ref, project_root=self.td)
+        second = read_file_context(ref, project_root=self.td)  # served from cache
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+
+    def test_unchanged_file_read_from_disk_once(self):
+        p = Path(self.td) / "a.py"
+        p.write_text("x = 1\n", encoding="utf-8")
+        clear_source_cache()
+        # Prime the cache, then spy: a second read must NOT touch disk.
+        self.assertEqual(read_source_cached(p), "x = 1\n")
+        with patch.object(Path, "read_text", side_effect=AssertionError("disk re-read")) as spy:
+            self.assertEqual(read_source_cached(p), "x = 1\n")
+            spy.assert_not_called()
+
+    def test_mtime_change_invalidates_no_staleness(self):
+        p = Path(self.td) / "b.py"
+        p.write_text("v = 1\n", encoding="utf-8")
+        clear_source_cache()
+        self.assertEqual(read_source_cached(p), "v = 1\n")
+        # Rewrite with new content + force a distinct mtime_ns.
+        p.write_text("v = 2\n", encoding="utf-8")
+        st = p.stat()
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        self.assertEqual(read_source_cached(p), "v = 2\n")  # fresh, never stale
+
+    def test_byte_cap_gate(self):
+        from shared.config import CONTEXT_MAX_FILE_BYTES
+        p = Path(self.td) / "big.py"
+        p.write_text("a" * (CONTEXT_MAX_FILE_BYTES + 10), encoding="utf-8")
+        clear_source_cache()
+        # Capped read rejects oversize; uncapped read returns content.
+        self.assertIsNone(read_source_cached(p, max_bytes=CONTEXT_MAX_FILE_BYTES))
+        self.assertIsNotNone(read_source_cached(p, max_bytes=None))
+
 
 def run_tests(name: str):
     loader = unittest.TestLoader()

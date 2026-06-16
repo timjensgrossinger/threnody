@@ -103,17 +103,29 @@ def test_export_rejects_missing_script() -> None:
 
 def _stub_handler_env(monkeypatch, *, snapshot, shape_counter):
     """Patch mcp_server collaborators so the handler runs without a real DB."""
+    import types
     import mcp_server
 
-    monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (None, object(), None, None, None))
+    # Fake db exposing the batched flush the handler now calls once per run.
+    fake_db = types.SimpleNamespace(flush_host_wave_records=lambda **kwargs: [])
+    monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (None, fake_db, None, None, None))
 
     ingested: list[dict] = []
 
-    def fake_record(db, *, run_id, agent_spec, result, project_id=None):
+    def fake_build(db, *, run_id, agent_spec, result, project_id=None):
         ingested.append({"spec": agent_spec, "result": result})
-        return {"task_id": agent_spec["spawn_id"]}
+        return {
+            "task_id": agent_spec["spawn_id"],
+            "pattern_hash": "h-" + str(agent_spec.get("spawn_id")),
+            "eval_quality": 1.0,
+            "touched_files": [],
+            "resolved_project": project_id or "p",
+            "pattern_payload": {},
+            "telemetry_payload": {},
+        }
 
-    monkeypatch.setattr(mcp_server, "record_host_agent_result", fake_record)
+    monkeypatch.setattr(mcp_server, "build_host_agent_record", fake_build)
+    monkeypatch.setattr(mcp_server, "check_draft_ready", lambda *a, **k: False)
 
     def fake_memory_get(scope, key, *a, **k):
         if key.startswith("workflow_emit:"):

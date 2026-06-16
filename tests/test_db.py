@@ -698,6 +698,78 @@ def test_artifact_visibility_scoping() -> None:
             second.close()
 
 
+def _count(db, table: str) -> int:
+    with db.conn() as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def test_flush_host_wave_records_single_transaction_all_tables() -> None:
+    """flush_host_wave_records writes patterns, telemetry, and routing guards."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        db = Database(Path(f.name))
+        counts = db.flush_host_wave_records(
+            patterns=[
+                {"pattern_hash": "h1", "pattern_desc": "task one", "tier": "low"},
+                {"pattern_hash": "h2", "pattern_desc": "task two", "tier": "medium"},
+            ],
+            telemetry=[
+                {"session_id": "run", "task_hash": "t1", "agent_id": 1, "tier": "low", "model": "haiku"},
+                {"session_id": "run", "task_hash": "t2", "agent_id": 2, "tier": "medium", "model": "sonnet"},
+            ],
+            routing_guards=[
+                {"caller": "claude-code", "cwd": "/tmp/x", "task_id": "t1", "file_written": "a.py"},
+            ],
+        )
+        assert counts == [1, 1]
+        assert _count(db, "subtask_patterns") == 2
+        assert _count(db, "telemetry") == 2
+        assert _count(db, "routing_guard_executions") == 1
+
+
+def test_flush_accumulates_repeated_pattern_hash() -> None:
+    """Repeated hashes in one flush accumulate occurrence_count (sees in-txn writes)."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        db = Database(Path(f.name))
+        counts = db.flush_host_wave_records(
+            patterns=[
+                {"pattern_hash": "dup", "pattern_desc": "same", "tier": "low"},
+                {"pattern_hash": "dup", "pattern_desc": "same", "tier": "low"},
+                {"pattern_hash": "dup", "pattern_desc": "same", "tier": "low"},
+            ],
+        )
+        assert counts == [1, 2, 3]
+        with db.conn() as conn:
+            row = conn.execute(
+                "SELECT occurrence_count FROM subtask_patterns WHERE pattern_hash = ?", ("dup",)
+            ).fetchone()
+        assert row[0] == 3
+
+
+def test_apply_pattern_row_parity_with_track_pattern() -> None:
+    """Batched _apply_pattern_row yields the same occurrence_count as track_pattern."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as fa, \
+         tempfile.NamedTemporaryFile(suffix=".db") as fb:
+        single = Database(Path(fa.name))
+        batched = Database(Path(fb.name))
+        for _ in range(3):
+            single.track_pattern(pattern_hash="p", pattern_desc="d", tier="low")
+        batched.flush_host_wave_records(
+            patterns=[{"pattern_hash": "p", "pattern_desc": "d", "tier": "low"}] * 3,
+        )
+        with single.conn() as ca, batched.conn() as cb:
+            a = ca.execute("SELECT occurrence_count FROM subtask_patterns WHERE pattern_hash='p'").fetchone()[0]
+            b = cb.execute("SELECT occurrence_count FROM subtask_patterns WHERE pattern_hash='p'").fetchone()[0]
+        assert a == b == 3
+
+
+def test_flush_empty_is_noop() -> None:
+    """Empty buffers write nothing and return no counts."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        db = Database(Path(f.name))
+        assert db.flush_host_wave_records() == []
+        assert _count(db, "telemetry") == 0
+
+
 if __name__ == "__main__":
     tests = [
         test_cache_put_and_get,

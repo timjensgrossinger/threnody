@@ -138,6 +138,66 @@ def test_ingest_host_wave_tracks_patterns_and_finalizes(db: Database) -> None:
     assert summary.get("status") in {"completed", "running", "awaiting_host_execution"}
 
 
+def test_ingest_host_wave_batches_multi_agent_writes(db: Database) -> None:
+    """A multi-agent wave writes one telemetry + routing-guard row per agent/file
+    via the single batched flush — same totals as the per-agent path would."""
+    run_id = "swarm-batch"
+    n = 6
+    agent_specs = [
+        {"id": str(i), "tier": "low", "model": "m", "prompt": f"create file_{i}.py"}
+        for i in range(1, n + 1)
+    ]
+    register_host_run_handoff(
+        db,
+        run_id=run_id,
+        host_spawn_waves=[{"wave": 1, "agents": agent_specs}],
+        planned_subtasks=n,
+        workspace_root="/tmp/project",
+    )
+    db.persist_swarm_run(
+        {"swarm_id": run_id, "status": "running", "requested_agents": n,
+         "effective_agents": n, "resume_status": "running"}
+    )
+    result = ingest_host_wave(
+        db,
+        run_id=run_id,
+        wave_index=1,
+        agents=[
+            {
+                "spawn_id": str(i),
+                "task_id": host_task_id(run_id, str(i)),
+                "success": True,
+                "touched_files": [f"file_{i}.py"],
+                "output_excerpt": f"created file_{i}.py",
+            }
+            for i in range(1, n + 1)
+        ],
+        workspace_root="/tmp/project",
+        terminal=False,
+        config=TGsConfig(),
+    )
+    assert result["agents_recorded"] == n
+    with db.conn() as conn:
+        # Only count completion rows; register_host_run_handoff writes a
+        # separate per-agent host_handoff_stub row at handoff time.
+        tel = conn.execute(
+            "SELECT COUNT(*) FROM telemetry WHERE session_id = ? AND reason = ?",
+            (run_id, "host_agent_complete"),
+        ).fetchone()[0]
+        # The 6 prompts normalize to one pattern; the batched flush must
+        # accumulate occurrence_count across all agents (sees in-txn writes).
+        occ = conn.execute(
+            "SELECT COALESCE(SUM(occurrence_count), 0) FROM subtask_patterns"
+        ).fetchone()[0]
+        guards = conn.execute(
+            "SELECT COUNT(*) FROM routing_guard_executions WHERE task_id LIKE ?",
+            (f"%{run_id}%",),
+        ).fetchone()[0]
+    assert tel == n          # one telemetry row per agent
+    assert occ == n          # occurrence_count accumulated across the batch
+    assert guards == n       # one guard row per touched file
+
+
 def test_ingest_enriches_pattern_from_handoff_snapshot(db: Database) -> None:
     run_id = "swarm-test-snapshot"
     waves = [

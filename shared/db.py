@@ -3822,83 +3822,155 @@ class Database:
         various counts). The additions are additive and optional to preserve
         backward compatibility with older rows and readers per D-01, D-02, D-03.
         """
+        columns, values = self._telemetry_columns_values(
+            session_id=session_id,
+            task_hash=task_hash,
+            agent_id=agent_id,
+            tier=tier,
+            model=model,
+            success=success,
+            rework=rework,
+            tokens_used=tokens_used,
+            escalated=escalated,
+            provider_name=provider_name,
+            used_fallback=used_fallback,
+            used_speculation=used_speculation,
+            provenance_trace_id=provenance_trace_id,
+            provenance_depth=provenance_depth,
+            provenance_caller_id=provenance_caller_id,
+            provider_opt_out_reason=provider_opt_out_reason,
+            estimated_tokens=estimated_tokens,
+            actual_tokens=actual_tokens,
+            timing_ms=timing_ms,
+            rework_count=rework_count,
+            parse_diagnostics=parse_diagnostics,
+            reason=reason,
+            version=version,
+            urgency_score=urgency_score,
+            selected_topology=selected_topology,
+            fanout_final_action=fanout_final_action,
+            artifact_publish_count=artifact_publish_count,
+            artifact_consume_count=artifact_consume_count,
+            coordinator_round_count=coordinator_round_count,
+            coordinator_amendment_count=coordinator_amendment_count,
+            complexity_score=complexity_score,
+        )
         with self.conn() as conn:
-            # Build a stable ordered list of columns and corresponding values.
-            # Using a dynamically generated placeholder string avoids mismatches
-            # between the SQL and Python tuple length that caused earlier
-            # OperationalError in some environments.
-            columns = [
-                "session_id",
-                "task_hash",
-                "agent_id",
-                "tier",
-                "model",
-                "provider_name",
-                "success",
-                "rework",
-                "tokens_used",
-                "escalated",
-                "used_fallback",
-                "used_speculation",
-                "provenance_trace_id",
-                "provenance_depth",
-                "provenance_caller_id",
-                "provider_opt_out_reason",
-                "estimated_tokens",
-                "actual_tokens",
-                "timing_ms",
-                "rework_count",
-                "parse_diagnostics",
-                "reason",
-                "version",
-                "urgency_score",
-                "selected_topology",
-                "fanout_final_action",
-                "artifact_publish_count",
-                "artifact_consume_count",
-                "coordinator_round_count",
-                "coordinator_amendment_count",
-                "complexity_score",
-                "ts",
-            ]
-            values = [
-                session_id,
-                task_hash,
-                agent_id,
-                tier,
-                model,
-                provider_name,
-                int(success),
-                int(rework),
-                tokens_used,
-                int(escalated),
-                int(used_fallback),
-                int(used_speculation),
-                provenance_trace_id,
-                provenance_depth,
-                provenance_caller_id,
-                provider_opt_out_reason,
-                estimated_tokens,
-                actual_tokens,
-                timing_ms,
-                rework_count,
-                parse_diagnostics,
-                reason,
-                version,
-                urgency_score,
-                selected_topology,
-                fanout_final_action,
-                int(artifact_publish_count),
-                int(artifact_consume_count),
-                int(coordinator_round_count),
-                int(coordinator_amendment_count),
-                complexity_score,
-                time.time(),
-            ]
             placeholders = ", ".join(["?"] * len(values))
             sql = f"INSERT INTO telemetry ({', '.join(columns)}) VALUES ({placeholders})"
             cursor = conn.execute(sql, tuple(values))
             return int(cursor.lastrowid or 0)
+
+    @staticmethod
+    def _telemetry_columns_values(
+        *,
+        session_id: str,
+        task_hash: str,
+        agent_id: int,
+        tier: str,
+        model: str,
+        success: bool = True,
+        rework: bool = False,
+        tokens_used: int = 0,
+        escalated: bool = False,
+        provider_name: str | None = None,
+        used_fallback: bool = False,
+        used_speculation: bool = False,
+        provenance_trace_id: str | None = None,
+        provenance_depth: int | None = 0,
+        provenance_caller_id: str | None = None,
+        provider_opt_out_reason: str | None = None,
+        estimated_tokens: int | None = None,
+        actual_tokens: int | None = None,
+        timing_ms: int | None = None,
+        rework_count: int = 0,
+        parse_diagnostics: str | None = None,
+        reason: str | None = None,
+        version: str = "copilot",
+        urgency_score: float | None = None,
+        selected_topology: str | None = None,
+        fanout_final_action: str | None = None,
+        artifact_publish_count: int = 0,
+        artifact_consume_count: int = 0,
+        coordinator_round_count: int = 0,
+        coordinator_amendment_count: int = 0,
+        complexity_score: float | None = None,
+    ) -> tuple[list[str], list[object]]:
+        """Build the ordered (columns, values) for one telemetry INSERT.
+
+        Shared by :meth:`log_agent_result` (single insert) and
+        :meth:`flush_host_wave_records` (batched ``executemany``) so both
+        produce byte-identical rows. ``ts`` is stamped here per row.
+        """
+        columns = [
+            "session_id",
+            "task_hash",
+            "agent_id",
+            "tier",
+            "model",
+            "provider_name",
+            "success",
+            "rework",
+            "tokens_used",
+            "escalated",
+            "used_fallback",
+            "used_speculation",
+            "provenance_trace_id",
+            "provenance_depth",
+            "provenance_caller_id",
+            "provider_opt_out_reason",
+            "estimated_tokens",
+            "actual_tokens",
+            "timing_ms",
+            "rework_count",
+            "parse_diagnostics",
+            "reason",
+            "version",
+            "urgency_score",
+            "selected_topology",
+            "fanout_final_action",
+            "artifact_publish_count",
+            "artifact_consume_count",
+            "coordinator_round_count",
+            "coordinator_amendment_count",
+            "complexity_score",
+            "ts",
+        ]
+        values = [
+            session_id,
+            task_hash,
+            agent_id,
+            tier,
+            model,
+            provider_name,
+            int(success),
+            int(rework),
+            tokens_used,
+            int(escalated),
+            int(used_fallback),
+            int(used_speculation),
+            provenance_trace_id,
+            provenance_depth,
+            provenance_caller_id,
+            provider_opt_out_reason,
+            estimated_tokens,
+            actual_tokens,
+            timing_ms,
+            rework_count,
+            parse_diagnostics,
+            reason,
+            version,
+            urgency_score,
+            selected_topology,
+            fanout_final_action,
+            int(artifact_publish_count),
+            int(artifact_consume_count),
+            int(coordinator_round_count),
+            int(coordinator_amendment_count),
+            complexity_score,
+            time.time(),
+        ]
+        return columns, values
 
     def write_telemetry_row(
         self,
@@ -4166,6 +4238,37 @@ class Database:
         rework_detected: bool | None = None,
     ) -> int:
         """Increment occurrence count for a subtask pattern. Returns new count."""
+        with self.conn() as conn:
+            return self._apply_pattern_row(
+                conn,
+                pattern_hash=pattern_hash,
+                pattern_desc=pattern_desc,
+                tier=tier,
+                example=example,
+                quality_score=quality_score,
+                rework_detected=rework_detected,
+            )
+
+    def _apply_pattern_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        pattern_hash: str,
+        pattern_desc: str,
+        tier: str,
+        example: str | dict = "",
+        quality_score: float | None = None,
+        rework_detected: bool | None = None,
+    ) -> int:
+        """Increment one subtask-pattern row on an already-open *conn*.
+
+        Does NOT commit — the caller owns the transaction. Used by
+        :meth:`track_pattern` (single, auto-committed) and
+        :meth:`flush_host_wave_records` (batched, one transaction for the
+        whole wave). Because all batched calls share one connection, each
+        SELECT sees prior uncommitted writes, so occurrence counts accumulate
+        exactly as they would across N separate commits.
+        """
         def _bounded_examples(raw_value: object, new_example: str | dict) -> str:
             try:
                 existing = json.loads(raw_value) if raw_value else []
@@ -4205,43 +4308,42 @@ class Database:
             if math.isfinite(candidate_quality):
                 bounded_quality = max(0.0, min(1.0, candidate_quality))
 
-        with self.conn() as conn:
-            row = conn.execute(
-                "SELECT occurrence_count, examples, eval_quality, rework_detected FROM subtask_patterns "
-                "WHERE pattern_hash = ?",
-                (pattern_hash,),
-            ).fetchone()
-            if row is None:
-                examples = _bounded_examples(None, example)
-                initial_quality = bounded_quality if bounded_quality is not None else 0.0
-                initial_rework = 1 if rework_detected else 0
-                conn.execute(
-                    "INSERT INTO subtask_patterns "
-                    "(pattern_hash, pattern_desc, occurrence_count, tier, last_seen, examples, rework_detected, eval_quality) "
-                    "VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
-                    (pattern_hash, pattern_desc, tier, time.time(), examples, initial_rework, initial_quality),
-                )
-                return 1
-            count = row[0] + 1
-            examples = _bounded_examples(row[1], example)
-            prior_quality = float(row[2]) if row[2] is not None else 0.0
-            if bounded_quality is None:
-                next_quality = prior_quality
-            else:
-                if count != 0:
-                    next_quality = ((prior_quality * row[0]) + bounded_quality) / count
-                else:
-                    next_quality = prior_quality
-            prior_rework = _coerce_db_bool(row[3])
-            next_rework = prior_rework if rework_detected is None else (prior_rework or bool(rework_detected))
+        row = conn.execute(
+            "SELECT occurrence_count, examples, eval_quality, rework_detected FROM subtask_patterns "
+            "WHERE pattern_hash = ?",
+            (pattern_hash,),
+        ).fetchone()
+        if row is None:
+            examples = _bounded_examples(None, example)
+            initial_quality = bounded_quality if bounded_quality is not None else 0.0
+            initial_rework = 1 if rework_detected else 0
             conn.execute(
-                "UPDATE subtask_patterns "
-                "SET occurrence_count = ?, tier = ?, last_seen = ?, examples = ?, "
-                "rework_detected = ?, eval_quality = ? "
-                "WHERE pattern_hash = ?",
-                (count, tier, time.time(), examples, 1 if next_rework else 0, next_quality, pattern_hash),
+                "INSERT INTO subtask_patterns "
+                "(pattern_hash, pattern_desc, occurrence_count, tier, last_seen, examples, rework_detected, eval_quality) "
+                "VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+                (pattern_hash, pattern_desc, tier, time.time(), examples, initial_rework, initial_quality),
             )
-            return count
+            return 1
+        count = row[0] + 1
+        examples = _bounded_examples(row[1], example)
+        prior_quality = float(row[2]) if row[2] is not None else 0.0
+        if bounded_quality is None:
+            next_quality = prior_quality
+        else:
+            if count != 0:
+                next_quality = ((prior_quality * row[0]) + bounded_quality) / count
+            else:
+                next_quality = prior_quality
+        prior_rework = _coerce_db_bool(row[3])
+        next_rework = prior_rework if rework_detected is None else (prior_rework or bool(rework_detected))
+        conn.execute(
+            "UPDATE subtask_patterns "
+            "SET occurrence_count = ?, tier = ?, last_seen = ?, examples = ?, "
+            "rework_detected = ?, eval_quality = ? "
+            "WHERE pattern_hash = ?",
+            (count, tier, time.time(), examples, 1 if next_rework else 0, next_quality, pattern_hash),
+        )
+        return count
 
     def update_pattern_quality(
         self,
@@ -4910,6 +5012,74 @@ class Database:
                 "INSERT INTO routing_guard_executions (caller, cwd, task_id, file_written, executed_ts) VALUES (?, ?, ?, ?, ?)",
                 (caller_norm, cwd_norm, task_id, file_written, executed_ts),
             )
+
+    def flush_host_wave_records(
+        self,
+        *,
+        patterns: list[dict] | None = None,
+        telemetry: list[dict] | None = None,
+        routing_guards: list[dict] | None = None,
+    ) -> list[int]:
+        """Persist a whole host wave's learning rows in ONE transaction.
+
+        Coalesces what would otherwise be ``3 × N`` separate auto-committed
+        writes (``track_pattern`` + ``log_agent_result`` +
+        ``routing_guard_record_execution`` per agent) into a single commit at
+        wave end. Produces byte-identical rows to the per-call path:
+        ``_apply_pattern_row`` and ``_telemetry_columns_values`` are the same
+        primitives used by ``track_pattern`` / ``log_agent_result``.
+
+        - ``patterns``: each dict is kwargs for :meth:`_apply_pattern_row`
+          (``pattern_hash``, ``pattern_desc``, ``tier``, ``example``,
+          ``quality_score``, ``rework_detected``). Returned counts preserve
+          input order; pattern SELECTs see prior in-transaction writes so
+          repeated hashes accumulate exactly as separate commits would.
+        - ``telemetry``: each dict is kwargs for
+          :meth:`_telemetry_columns_values`.
+        - ``routing_guards``: each dict carries ``caller``, ``cwd``,
+          ``task_id`` (optional), ``file_written`` (optional).
+
+        Durability note: these three tables fall under the WAL
+        ``synchronous=NORMAL`` "loss-on-crash acceptable" contract, so widening
+        the crash-loss window from per-agent to per-wave is safe.
+        """
+        patterns = patterns or []
+        telemetry = telemetry or []
+        routing_guards = routing_guards or []
+        pattern_counts: list[int] = []
+        with self.conn() as conn:
+            for p in patterns:
+                pattern_counts.append(self._apply_pattern_row(conn, **p))
+
+            if telemetry:
+                columns: list[str] | None = None
+                rows: list[tuple] = []
+                for t in telemetry:
+                    cols, vals = self._telemetry_columns_values(**t)
+                    if columns is None:
+                        columns = cols
+                    rows.append(tuple(vals))
+                assert columns is not None
+                placeholders = ", ".join(["?"] * len(columns))
+                sql = f"INSERT INTO telemetry ({', '.join(columns)}) VALUES ({placeholders})"
+                conn.executemany(sql, rows)
+
+            if routing_guards:
+                guard_rows = [
+                    (
+                        str(g.get("caller") or "").strip().lower() or "mcp",
+                        self._normalize_routing_guard_cwd(g.get("cwd")),
+                        g.get("task_id", "") or "",
+                        g.get("file_written"),
+                        time.time(),
+                    )
+                    for g in routing_guards
+                ]
+                conn.executemany(
+                    "INSERT INTO routing_guard_executions (caller, cwd, task_id, file_written, executed_ts) VALUES (?, ?, ?, ?, ?)",
+                    guard_rows,
+                )
+        return pattern_counts
 
     def routing_guard_has_executions(
         self,

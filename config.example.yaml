@@ -9,6 +9,15 @@ parallelism:
   speculation_workers: 1   # concurrent higher-tier speculation lanes (cap 8)
   warm_path_workers: 2     # parallel rework eval batch size (cap 8)
 
+# Persistent MCP daemon loops. Longer intervals = fewer idle wakeups (less
+# background CPU). Set *_enabled: false to skip spawning the thread entirely.
+# Legacy resilience.health_probe_interval_s is honored as a fallback default.
+background:
+  health_probe_enabled: true
+  health_probe_interval_s: 60    # probe quarantined providers (min 5)
+  warm_path_enabled: true
+  warm_path_interval_s: 120      # drain learning_queue plus warm-path backlog (min 5)
+
 swarm:
   max_agents: 12
   # host_native (default for MCP host shells): plan in Threnody, execute waves via host Agent/Task

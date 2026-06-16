@@ -103,6 +103,7 @@ from shared.agents import (
     approval_queue_merge as merge_queue_item,
     DEFAULT_PENDING_APPROVAL_LIMIT,
     activate_agent_locally,
+    check_draft_ready,
     evaluate_pattern_readiness,
     register_agent_to_capable_clis,
 )
@@ -147,6 +148,7 @@ from shared.consensus import (
     select_personas as consensus_select_personas,
 )
 from shared.host_learning import (
+    build_host_agent_record,
     build_learning_report_contract,
     ingest_host_wave,
     inspect_host_swarm,
@@ -483,13 +485,23 @@ def _ensure_bg_loop() -> None:
 
 
 def _run_health_probe_loop() -> None:
-    """Daemon: every 30 s probe QUARANTINED providers whose cooldown has elapsed."""
+    """Daemon: periodically probe QUARANTINED providers whose cooldown has elapsed.
+
+    Cadence is read from ``config.background.health_probe_interval_s`` on each
+    iteration so a reloaded config takes effect without a restart; falls back
+    to 60 s before ``_config`` is initialised.
+    """
     from shared.health import record_probe_result as _record_probe_result
     from shared.resilience import AuthProbe as _AuthProbe
 
     while True:
         try:
-            time.sleep(30)
+            interval = (
+                getattr(_config.background, "health_probe_interval_s", 60.0)
+                if _config is not None
+                else 60.0
+            )
+            time.sleep(interval)
             if _db is None:
                 continue
             rows = _db.iter_provider_health()
@@ -519,10 +531,19 @@ def _run_health_probe_loop() -> None:
 
 
 def _run_warm_path_loop() -> None:
-    """Daemon: periodically process learning_queue and warm-path eval backlog."""
+    """Daemon: periodically process learning_queue and warm-path eval backlog.
+
+    Cadence is read from ``config.background.warm_path_interval_s`` on each
+    iteration; falls back to 120 s before ``_config`` is initialised.
+    """
     while True:
         try:
-            time.sleep(45)
+            interval = (
+                getattr(_config.background, "warm_path_interval_s", 120.0)
+                if _config is not None
+                else 120.0
+            )
+            time.sleep(interval)
             if _db is None:
                 continue
             run_warm_path_background_tasks(_db)
@@ -653,7 +674,10 @@ def _ensure_init() -> tuple[TGsConfig, Database, TaskRouter, Planner, Orchestrat
             _model_catalog = model_catalog
 
             global _shutdown_registered, _health_probe_thread, _warm_path_thread
-            if _health_probe_thread is None or not _health_probe_thread.is_alive():
+            _bg = config.background
+            if _bg.health_probe_enabled and (
+                _health_probe_thread is None or not _health_probe_thread.is_alive()
+            ):
                 _health_probe_thread = threading.Thread(
                     target=_run_health_probe_loop,
                     name="tgs-health-probe",
@@ -661,7 +685,9 @@ def _ensure_init() -> tuple[TGsConfig, Database, TaskRouter, Planner, Orchestrat
                 )
                 _health_probe_thread.start()
                 log.debug("health probe loop started")
-            if _warm_path_thread is None or not _warm_path_thread.is_alive():
+            if _bg.warm_path_enabled and (
+                _warm_path_thread is None or not _warm_path_thread.is_alive()
+            ):
                 _warm_path_thread = threading.Thread(
                     target=_run_warm_path_loop,
                     name="tgs-warm-path",
@@ -6103,6 +6129,11 @@ def handle_report_workflow_result(args: dict) -> dict:
 
     ingested = 0
     all_success = True
+    # Buffer per-agent learning writes and flush once for the whole workflow
+    # run (one transaction instead of 3×N auto-commits).
+    pattern_buffer: list[dict] = []
+    telemetry_buffer: list[dict] = []
+    draft_projects_by_hash: dict[str, str] = {}
     for entry in agents_raw:
         if not isinstance(entry, dict):
             continue
@@ -6120,16 +6151,30 @@ def handle_report_workflow_result(args: dict) -> dict:
             "model": str(entry.get("model") or "host-native"),
         }
         try:
-            record_host_agent_result(
+            rec = build_host_agent_record(
                 db,
                 run_id=run_id,
                 agent_spec=spec,
                 result={"success": success, "output_excerpt": excerpt},
                 project_id=project_id,
             )
+            pattern_buffer.append(rec["pattern_payload"])
+            telemetry_buffer.append(rec["telemetry_payload"])
+            draft_projects_by_hash.setdefault(rec["pattern_hash"], rec["resolved_project"])
             ingested += 1
         except Exception:
             log.debug("workflow telemetry ingest failed for %s", spec["spawn_id"], exc_info=True)
+
+    if pattern_buffer or telemetry_buffer:
+        try:
+            db.flush_host_wave_records(patterns=pattern_buffer, telemetry=telemetry_buffer)
+        except Exception:
+            log.warning("workflow learning flush failed for %s", workflow_name, exc_info=True)
+    for _ph, _proj in draft_projects_by_hash.items():
+        try:
+            check_draft_ready(db, _proj, _ph)
+        except Exception:
+            log.debug("workflow draft-readiness check failed for %s", _ph, exc_info=True)
 
     result: dict[str, object] = {
         "workflow_name": workflow_name,

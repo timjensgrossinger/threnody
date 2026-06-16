@@ -20,6 +20,8 @@ import dataclasses
 import hashlib
 import logging
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,6 +39,55 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 ARTIFACT_INJECTION_SIZE_BUDGET = 1000
+
+# --- Wave-scoped source cache ------------------------------------------------
+# During a fan-out wave many subtasks reference the same source file; without a
+# cache each enrichment re-reads it from disk (e.g. a review wave of N×dims
+# cells on one file = N×dims reads). Keying on (st_mtime_ns, st_size) means any
+# mid-wave write changes the key → a fresh read, so stale content is never
+# served past a modification. Bounded LRU keeps RAM in check; a lock keeps the
+# cache correct under the orchestrator's ThreadPoolExecutor waves.
+_FILE_CACHE: "OrderedDict[str, tuple[int, int, str]]" = OrderedDict()
+_FILE_CACHE_MAX = 256
+_FILE_CACHE_LOCK = threading.Lock()
+
+
+def read_source_cached(path: Path, *, max_bytes: int | None = CONTEXT_MAX_FILE_BYTES) -> str | None:
+    """Return the full text of *path*, served from an mtime+size-keyed cache.
+
+    Returns ``None`` if the file is unreadable or (when *max_bytes* is set)
+    exceeds the byte cap. Pass ``max_bytes=None`` to bypass the cap (the cached
+    bytes are identical either way — only the cap gate differs).
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if max_bytes is not None and st.st_size > max_bytes:
+        return None
+    key = str(path)
+    sig0, sig1 = st.st_mtime_ns, st.st_size
+    with _FILE_CACHE_LOCK:
+        hit = _FILE_CACHE.get(key)
+        if hit is not None and hit[0] == sig0 and hit[1] == sig1:
+            _FILE_CACHE.move_to_end(key)
+            return hit[2]
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeDecodeError):
+        return None
+    with _FILE_CACHE_LOCK:
+        _FILE_CACHE[key] = (sig0, sig1, text)
+        _FILE_CACHE.move_to_end(key)
+        while len(_FILE_CACHE) > _FILE_CACHE_MAX:
+            _FILE_CACHE.popitem(last=False)
+    return text
+
+
+def clear_source_cache() -> None:
+    """Drop all cached file contents (optional wave-boundary reset)."""
+    with _FILE_CACHE_LOCK:
+        _FILE_CACHE.clear()
 SOURCE_BLOCK_HEADER = "\n--- RELEVANT SOURCE CODE ---\n"
 SOURCE_BLOCK_FOOTER = "\n--- END SOURCE CODE ---\n"
 ARTIFACT_BLOCK_HEADER = "\n--- ARTIFACT HANDOFF ---\n"
@@ -432,13 +483,9 @@ def read_file_context(
         log.debug("context: could not resolve %r (root=%s)", ref.path, project_root)
         return None
 
-    try:
-        if path.stat().st_size > CONTEXT_MAX_FILE_BYTES:
-            log.debug("context: skipping %s — exceeds %d byte cap", path, CONTEXT_MAX_FILE_BYTES)
-            return None
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except (FileNotFoundError, PermissionError, UnicodeDecodeError) as exc:
-        log.debug("context: cannot read %s: %s", path, exc)
+    raw = read_source_cached(path, max_bytes=CONTEXT_MAX_FILE_BYTES)
+    if raw is None:
+        log.debug("context: cannot read %s (unreadable or exceeds %d byte cap)", path, CONTEXT_MAX_FILE_BYTES)
         return None
 
     all_lines = raw.splitlines()

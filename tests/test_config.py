@@ -15,6 +15,7 @@ from shared.config import (
     DEFAULT_ROUTING_EXCEPTION_FILETYPES,
     DEFAULT_ROUTING_EXCEPTION_PATHS,
     DEFAULT_PLANNER_MODEL,
+    BackgroundConfig,
     TGsConfig,
     ThresholdConfig,
     LOW_TIER_FLOOR,
@@ -140,6 +141,57 @@ def test_effort_defaults_round_trip() -> None:
         assert cfg.get_default_effort("codex", "medium") == "medium"
         assert cfg.get_default_effort("junie", "low") is None
         assert cfg.to_legacy_dict()["providers"]["effort_defaults"]["claude-code"]["high"] == "max"
+
+
+def test_background_config_defaults() -> None:
+    """BackgroundConfig defaults: both loops enabled at the lower cadence."""
+    cfg = TGsConfig.defaults()
+    assert isinstance(cfg.background, BackgroundConfig)
+    assert cfg.background.health_probe_enabled is True
+    assert cfg.background.health_probe_interval_s == 60.0
+    assert cfg.background.warm_path_enabled is True
+    assert cfg.background.warm_path_interval_s == 120.0
+    legacy = cfg.to_legacy_dict()["background"]
+    assert legacy["health_probe_interval_s"] == 60.0
+    assert legacy["warm_path_interval_s"] == 120.0
+
+
+def test_background_config_parses_overrides() -> None:
+    """Explicit background block parses, with a 5 s floor on intervals."""
+    with tempfile.TemporaryDirectory() as td:
+        config_path = Path(td) / "config.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "background:",
+                    "  health_probe_enabled: false",
+                    "  health_probe_interval_s: 300",
+                    "  warm_path_enabled: true",
+                    "  warm_path_interval_s: 1",  # below floor → clamped to 5
+                ]
+            ),
+            encoding="utf-8",
+        )
+        cfg = TGsConfig.from_yaml(config_path)
+        assert cfg.background.health_probe_enabled is False
+        assert cfg.background.health_probe_interval_s == 300.0
+        assert cfg.background.warm_path_enabled is True
+        assert cfg.background.warm_path_interval_s == 5.0  # floored
+
+
+def test_background_config_honors_legacy_health_interval() -> None:
+    """resilience.health_probe_interval_s is the fallback default for the new knob."""
+    with tempfile.TemporaryDirectory() as td:
+        config_path = Path(td) / "config.yaml"
+        config_path.write_text(
+            "resilience:\n  health_probe_interval_s: 90\n",
+            encoding="utf-8",
+        )
+        cfg = TGsConfig.from_yaml(config_path)
+        # No background block → legacy resilience value seeds the health interval.
+        assert cfg.background.health_probe_interval_s == 90.0
+        # warm-path has no legacy alias → its own default.
+        assert cfg.background.warm_path_interval_s == 120.0
 
 
 def test_routing_policy_legacy_defaults_are_advisory_for_all_shells() -> None:

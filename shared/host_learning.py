@@ -617,7 +617,7 @@ def record_consensus_learning(
         log.debug("consensus bandit update failed for %s", run_id, exc_info=True)
 
 
-def record_host_agent_result(
+def build_host_agent_record(
     db: Database,
     *,
     run_id: str,
@@ -625,7 +625,13 @@ def record_host_agent_result(
     result: Mapping[str, Any],
     project_id: str | None = None,
 ) -> dict[str, Any]:
-    """Record one host agent completion into pattern tracking and telemetry."""
+    """Pure compute for one host agent completion — performs no DB writes.
+
+    Derives the task id, pattern hash, eval quality, touched files, and the
+    ready-to-write ``pattern_payload`` / ``telemetry_payload`` kwargs. Used by
+    :func:`record_host_agent_result` (single, immediate writes) and by the
+    buffered :func:`ingest_host_wave` loop (one batched flush per wave).
+    """
     spawn_id = str(agent_spec.get("spawn_id") or agent_spec.get("id") or "")
     task_id = str(agent_spec.get("task_id") or host_task_id(run_id, spawn_id))
     description = str(
@@ -672,36 +678,65 @@ def record_host_agent_result(
     ph = pattern_hash(description)
     resolved_project = project_id or _HOST_RUN_META.get(run_id, {}).get("project_id") or "default-project"
 
+    return {
+        "task_id": task_id,
+        "pattern_hash": ph,
+        "eval_quality": eval_quality,
+        "touched_files": touched_files,
+        "resolved_project": resolved_project,
+        "pattern_payload": {
+            "pattern_hash": ph,
+            "pattern_desc": description,
+            "tier": tier,
+            "example": example,
+            "quality_score": eval_quality,
+            "rework_detected": rework_hint,
+        },
+        "telemetry_payload": {
+            "session_id": run_id,
+            "task_hash": task_id,
+            "agent_id": int(spawn_id) if spawn_id.isdigit() else 0,
+            "tier": tier,
+            "model": model,
+            "success": success,
+            "rework": rework_hint,
+            "provider_name": "host-native",
+            "reason": "host_agent_complete",
+            "version": "host_native",
+            "timing_ms": int(result.get("duration_ms") or 0) if result.get("duration_ms") else None,
+        },
+    }
+
+
+def record_host_agent_result(
+    db: Database,
+    *,
+    run_id: str,
+    agent_spec: Mapping[str, Any],
+    result: Mapping[str, Any],
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Record one host agent completion into pattern tracking and telemetry."""
+    rec = build_host_agent_record(
+        db,
+        run_id=run_id,
+        agent_spec=agent_spec,
+        result=result,
+        project_id=project_id,
+    )
+    task_id = rec["task_id"]
+
     pattern_warning: str | None = None
     try:
-        db.track_pattern(
-            pattern_hash=ph,
-            pattern_desc=description,
-            tier=tier,
-            example=example,
-            quality_score=eval_quality,
-            rework_detected=rework_hint,
-        )
-        check_draft_ready(db, resolved_project, ph)
+        db.track_pattern(**rec["pattern_payload"])
+        check_draft_ready(db, rec["resolved_project"], rec["pattern_hash"])
     except Exception as exc:
         pattern_warning = f"pattern_tracking:{exc}"
         log.warning("host pattern tracking failed for %s", task_id, exc_info=True)
 
     telemetry_warning: str | None = None
     try:
-        db.log_agent_result(
-            session_id=run_id,
-            task_hash=task_id,
-            agent_id=int(spawn_id) if spawn_id.isdigit() else 0,
-            tier=tier,
-            model=model,
-            success=success,
-            rework=rework_hint,
-            provider_name="host-native",
-            reason="host_agent_complete",
-            version="host_native",
-            timing_ms=int(result.get("duration_ms") or 0) if result.get("duration_ms") else None,
-        )
+        db.log_agent_result(**rec["telemetry_payload"])
     except Exception as exc:
         telemetry_warning = f"telemetry:{exc}"
         log.debug("host agent telemetry update failed for %s", task_id, exc_info=True)
@@ -711,9 +746,9 @@ def record_host_agent_result(
 
     result_payload: dict[str, Any] = {
         "task_id": task_id,
-        "pattern_hash": ph,
-        "eval_quality": eval_quality,
-        "touched_files": touched_files,
+        "pattern_hash": rec["pattern_hash"],
+        "eval_quality": rec["eval_quality"],
+        "touched_files": rec["touched_files"],
     }
     warnings = [w for w in (pattern_warning, telemetry_warning) if w]
     if warnings:
@@ -768,6 +803,14 @@ def ingest_host_wave(
     auto_excerpt_count = 0
     files_read = 0
 
+    # Per-agent DB writes are buffered and flushed once per wave (one
+    # transaction instead of 3×N auto-commits). See db.flush_host_wave_records.
+    pattern_buffer: list[dict[str, Any]] = []
+    telemetry_buffer: list[dict[str, Any]] = []
+    routing_guard_buffer: list[dict[str, Any]] = []
+    draft_projects_by_hash: dict[str, str] = {}
+    processed_agents = 0
+
     for agent_index, agent in enumerate(agents):
         if not isinstance(agent, Mapping):
             continue
@@ -806,34 +849,37 @@ def ingest_host_wave(
             "rework_detected": enriched.get("rework_detected", False),
             "duration_ms": enriched.get("duration_ms"),
         }
-        recorded = record_host_agent_result(
+        rec = build_host_agent_record(
             db,
             run_id=run_id,
             agent_spec=spec,
             result=result_payload,
             project_id=project_id,
         )
+        # Buffer the per-agent writes; they are flushed once after the loop.
+        pattern_buffer.append(rec["pattern_payload"])
+        telemetry_buffer.append(rec["telemetry_payload"])
+        draft_projects_by_hash.setdefault(rec["pattern_hash"], rec["resolved_project"])
+        processed_agents += 1
+        recorded = {
+            "task_id": rec["task_id"],
+            "pattern_hash": rec["pattern_hash"],
+            "eval_quality": rec["eval_quality"],
+            "touched_files": rec["touched_files"],
+        }
         agent_results.append(recorded)
-        for warning in recorded.get("warnings") or []:
-            if isinstance(warning, str):
-                wave_warnings.append(warning)
         task_id = str(spec.get("task_id") or "")
         for path in recorded.get("touched_files") or []:
             if not isinstance(path, str) or not path.strip():
                 continue
-            try:
-                db.routing_guard_record_execution(
-                    caller=handoff_caller,
-                    cwd=handoff_cwd,
-                    task_id=task_id,
-                    file_written=path.strip(),
-                )
-            except Exception:
-                log.debug(
-                    "routing_guard_record_execution failed for %s",
-                    path,
-                    exc_info=True,
-                )
+            routing_guard_buffer.append(
+                {
+                    "caller": handoff_caller,
+                    "cwd": handoff_cwd,
+                    "task_id": task_id,
+                    "file_written": path.strip(),
+                }
+            )
         for path in recorded.get("touched_files") or []:
             if not isinstance(path, str) or not path.strip():
                 continue
@@ -847,6 +893,29 @@ def ingest_host_wave(
                 files_read += 1
             except OSError:
                 log.debug("could not read %s for rework tracking", resolved, exc_info=True)
+
+    # Flush all buffered per-agent writes for this wave in one transaction,
+    # then run draft-readiness once per unique pattern hash (kept strictly
+    # after the flush — check_draft_ready opens its own connection and reads
+    # the now-committed counts).
+    if pattern_buffer or telemetry_buffer or routing_guard_buffer:
+        try:
+            db.flush_host_wave_records(
+                patterns=pattern_buffer,
+                telemetry=telemetry_buffer,
+                routing_guards=routing_guard_buffer,
+            )
+        except Exception as exc:
+            wave_warnings.append(f"wave_flush:{exc}")
+            log.warning("host wave flush failed for run %s wave %d", run_id, wave_index, exc_info=True)
+    for ph, proj in draft_projects_by_hash.items():
+        try:
+            check_draft_ready(db, proj, ph)
+        except Exception as exc:
+            wave_warnings.append(f"pattern_tracking:{exc}")
+            log.warning("host draft-readiness check failed for %s", ph, exc_info=True)
+    if processed_agents:
+        meta["reported_agents"] = int(meta.get("reported_agents") or 0) + processed_agents
 
     if wave_index > 1:
         prev_files = tracker.wave_files.get(wave_index - 1, set())

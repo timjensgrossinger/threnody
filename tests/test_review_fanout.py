@@ -97,6 +97,19 @@ class TestEstimateComplexity:
         band, risk = estimate_complexity(str(f))
         assert band == "complex"
 
+    def test_oversize_file_still_bands_complex(self, tmp_path: Path):
+        # File exceeds CONTEXT_MAX_FILE_BYTES: complexity estimation must still
+        # read it fully (uncapped cache delegation). A capped read would return
+        # None → "moderate", so this guards the max_bytes=None fallback.
+        from shared.config import CONTEXT_MAX_FILE_BYTES
+        f = tmp_path / "huge.md"
+        line = "x" * 10_000
+        n_lines = (CONTEXT_MAX_FILE_BYTES // len(line)) + 250  # > cap and > _LOC_COMPLEX
+        f.write_text("\n".join(line for _ in range(n_lines)), encoding="utf-8")
+        assert f.stat().st_size > CONTEXT_MAX_FILE_BYTES
+        band, risk = estimate_complexity(str(f))
+        assert band == "complex"
+
     def test_risk_signal_sql(self, tmp_path: Path):
         f = tmp_path / "query.md"
         f.write_text("do sql injection here\n" + "\n".join("x" for _ in range(5)), encoding="utf-8")

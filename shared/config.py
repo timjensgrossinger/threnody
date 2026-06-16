@@ -382,6 +382,21 @@ class ParallelismConfig:
     warm_path_workers: int = 2
 
 
+@dataclass
+class BackgroundConfig:
+    """Cadence + enable flags for the persistent MCP daemon loops.
+
+    Both loops run forever once started, waking on a fixed interval and
+    querying the DB each cycle. Longer intervals mean fewer idle wakeups
+    (less background CPU); disabling skips spawning the thread entirely.
+    Defaults preserve the prior always-on behaviour at a lower cadence.
+    """
+    health_probe_enabled: bool = True
+    health_probe_interval_s: float = 60.0   # was hardcoded 30
+    warm_path_enabled: bool = True
+    warm_path_interval_s: float = 120.0     # was hardcoded 45
+
+
 def normalize_parallelism_limit(
     value: Any,
     *,
@@ -1239,6 +1254,7 @@ class TGsConfig:
     planner_model: str = DEFAULT_PLANNER_MODEL
     planner_timeout: int = DEFAULT_PLANNER_TIMEOUT
     parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
+    background: BackgroundConfig = field(default_factory=BackgroundConfig)
     budgets: BudgetConfig = field(default_factory=BudgetConfig)
 
     # Cache
@@ -2304,6 +2320,29 @@ class TGsConfig:
                 health_probe_interval_s=float(res_raw.get("health_probe_interval_s", 30.0)),
             )
 
+        # Background daemon cadence (health-probe + warm-path loops).
+        # Legacy resilience.health_probe_interval_s is honored as a fallback
+        # default so existing configs keep working.
+        bg_raw = raw.get("background", {})
+        if isinstance(bg_raw, Mapping):
+            _legacy_health_interval = (
+                float(res_raw.get("health_probe_interval_s", 60.0))
+                if isinstance(res_raw, Mapping)
+                else 60.0
+            )
+            cfg.background = BackgroundConfig(
+                health_probe_enabled=bool(bg_raw.get("health_probe_enabled", True)),
+                health_probe_interval_s=max(
+                    5.0,
+                    float(bg_raw.get("health_probe_interval_s", _legacy_health_interval)),
+                ),
+                warm_path_enabled=bool(bg_raw.get("warm_path_enabled", True)),
+                warm_path_interval_s=max(
+                    5.0,
+                    float(bg_raw.get("warm_path_interval_s", 120.0)),
+                ),
+            )
+
         # Surgical edit settings
         surgical_raw = raw.get("surgical_edits", {})
         if isinstance(surgical_raw, dict):
@@ -2526,6 +2565,12 @@ class TGsConfig:
                 "swarm_max_agents": self.parallelism.swarm_max_agents,
                 "speculation_workers": self.parallelism.speculation_workers,
                 "warm_path_workers": self.parallelism.warm_path_workers,
+            },
+            "background": {
+                "health_probe_enabled": self.background.health_probe_enabled,
+                "health_probe_interval_s": self.background.health_probe_interval_s,
+                "warm_path_enabled": self.background.warm_path_enabled,
+                "warm_path_interval_s": self.background.warm_path_interval_s,
             },
             "swarm": {
                 "max_agents": self.swarm_max_agents,
