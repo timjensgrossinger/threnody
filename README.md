@@ -2,7 +2,7 @@
 <h3 align="center">Local-first MCP meta-harness — host executes, Threnody coordinates swarms, memory, and learning</h3>
 
 <p align="center"><sub>
-  MCP coordination · self-learning agents · swarm orchestration · cross-session memory · optional delegation
+  MCP coordination · self-learning agents · swarm orchestration · tier-aware Dynamic Workflows · cross-session memory · optional delegation
 </sub></p>
 
 <p align="center">
@@ -10,12 +10,13 @@
   <a href="https://github.com/timjensgrossinger/threnody/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/timjensgrossinger/threnody/ci.yml?branch=main" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%20%E2%80%93%203.13-blue" alt="Python">
   <img src="https://img.shields.io/badge/MCP-stdio-green" alt="MCP">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.3.0--alpha.1-orange" alt="Release"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.3.0--alpha.2-orange" alt="Release"></a>
 </p>
 
 <p align="center">
   <strong>Plan in Threnody.</strong> Route, decompose, and swarm via MCP.<br>
   <strong>Execute in the host.</strong> Agent/Task subagents from <code>host_spawn</code> / <code>host_spawn_waves</code>.<br>
+  <strong>Run as Dynamic Workflows (opt-in, Claude Code).</strong> Tier-aware <code>agent()</code> routing, saved as permanent <code>/workflow</code> commands.<br>
   <strong>Utility delegation (opt-in).</strong> <code>execute_subtask</code> to OpenCode, Aider, or local endpoints — never host→host.
 </p>
 
@@ -32,7 +33,7 @@ claude plugin marketplace add timjensgrossinger/threnody
 claude plugin install threnody@threnody
 ```
 
-Bundles the MCP server and six routing skills. No shell restart needed.
+Bundles the MCP server and eight routing skills. No shell restart needed.
 
 ### MCP registry via `uvx`
 
@@ -112,7 +113,7 @@ Threnody documents operator responsibilities; it does not provide legal certific
 
 ## Project skills
 
-Six repo-local skills under [`skills/`](skills/) guide MCP workflows from any connected host (Cursor, Copilot, Claude Code, Codex, etc.). Host shells discover them via repo symlinks (`.cursor/skills`, `.claude/skills`) and the skill index in [copilot-instructions.md](copilot-instructions.md).
+Eight repo-local skills under [`skills/`](skills/) guide MCP workflows from any connected host (Cursor, Copilot, Claude Code, Codex, etc.). Host shells discover them via repo symlinks (`.cursor/skills`, `.claude/skills`) and the skill index in [copilot-instructions.md](copilot-instructions.md).
 
 | Skill | Use when |
 |---|---|
@@ -120,6 +121,7 @@ Six repo-local skills under [`skills/`](skills/) guide MCP workflows from any co
 | [threnody-routing](skills/threnody-routing/SKILL.md) | `route_task`, routing guard, host-native vs utility delegation |
 | [threnody-task](skills/threnody-task/SKILL.md) | `plan_task`, `decompose_task`, `fleet_plan`, `host_spawn_waves` |
 | [threnody-swarm](skills/threnody-swarm/SKILL.md) | `execute_swarm`, topology, budget preview, resume |
+| [threnody-swarm-review](skills/threnody-swarm-review/SKILL.md) | Complexity-gated review swarm — one agent per file × dimension, ranked report (read-only) |
 | [threnody-workflow](skills/threnody-workflow/SKILL.md) | Consensus swarm via tier-aware Dynamic Workflows; save pre-tuned, zero-config `/workflow` commands (claude-code) |
 | [threnody-fullstack](skills/threnody-fullstack/SKILL.md) | Contract-first parallel frontend + backend + API |
 | [threnody-subtasks](skills/threnody-subtasks/SKILL.md) | Monitor opt-in utility `execute_subtask` runs |
@@ -241,11 +243,12 @@ Workflow guide: [docs/COST_SAVINGS.md](docs/COST_SAVINGS.md)
 | 🎯 | **Tier routing** | Heuristic complexity scoring + `host_spawn` / `execution_hint` for host-native work |
 | 🧠 | **Learning loop** | Pattern tracking → draft agents → approval queue → plan-time context injection for matching work |
 | 🐝 | **Swarm orchestration** | `execute_swarm` returns `host_spawn_waves` by default (`awaiting_host_execution`); heuristic intent fans out one agent per file; `expand_host_plan` for mid-run discovery |
+| ⚡ | **Dynamic Workflows** | Opt-in (claude-code): fan-out plans emit a tier-aware [Workflow](https://code.claude.com/docs/en/workflows) script — each `agent()` routes to its Threnody tier model; recurring shapes export to permanent `/workflow` commands (`report_workflow_result`, `routing_policy.shells.claude-code.workflow_emit`) |
 | 💾 | **Cross-session memory** | `memory_*` MCP tools backed by local SQLite — shared across all MCP hosts via `~/.local/lib/threnody/cache.db` |
 | 🔌 | **MCP-native** | 40+ tools over stdio JSON-RPC; works with any MCP-compatible host shell |
 | 🗳️ | **Multi-queen consensus** | Opt-in persona-diverse review queens + lazy judge arbitration (`swarm.consensus`); host-native or subprocess star |
 | 🔀 | **Utility delegation** | Opt-in `execute_subtask` to OpenCode, Aider, local endpoints; host→host blocked |
-| 📋 | **Planning skills** | Six repo skills under `skills/` — start with `threnody-plan` for plan-only workflows |
+| 📋 | **Planning skills** | Eight repo skills under `skills/` — start with `threnody-plan` for plan-only workflows |
 | 📈 | **Adaptive thresholds** | EMA-based threshold learning from `record_outcome` (pass `task_id` from `route_task`; enable per-project learning) |
 | 🛡️ | **Write safety** | Path validation, outside-workspace grant model + audit trail |
 | 🔒 | **Guarded routing** | Optional coordination gate + Claude PreToolUse hooks (`routing_policy.mode: guarded`; advisory is default) |

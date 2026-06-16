@@ -5,7 +5,7 @@
   "pypi_package": "threnody-mcp",
   "version": "0.3.0-alpha.2",
   "pypi_version": "0.3.0a2",
-  "description": "Local-first MCP meta-harness: routes, plans, and swarms multi-agent coding work while the host shell executes via Agent/Task subagents.",
+  "description": "Local-first MCP meta-harness: routes, plans, and swarms multi-agent coding work — emitting tier-aware Dynamic Workflows on Claude Code — while the host shell executes via Agent/Task subagents.",
   "homepage": "https://github.com/timjensgrossinger/threnody",
   "repository": {
     "url": "https://github.com/timjensgrossinger/threnody",
