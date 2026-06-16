@@ -245,8 +245,19 @@ def enrich_host_spawn_waves(
                 next_agent["spawn_required"] = True
                 next_agents.append(next_agent)
             next_wave["agents"] = next_agents
+            next_wave.update(_batch_spawn_metadata(next_agents))
         enriched.append(next_wave)
     return enriched
+
+
+def _batch_spawn_metadata(agents: list[Any]) -> dict[str, Any]:
+    """Machine-readable same-wave launch metadata for host-native handoffs."""
+    return {
+        "parallel_start_required": True,
+        "spawn_batch": [
+            dict(agent) if isinstance(agent, dict) else agent for agent in agents
+        ],
+    }
 
 
 _BARE_FILE_TOKEN = re.compile(r"[\w.-]+\.[A-Za-z][A-Za-z0-9]{0,4}")
@@ -523,7 +534,7 @@ def build_consensus_wave(
         spec["spawn_required"] = True
         agents.append(spec)
 
-    return {
+    wave = {
         "wave": wave_index,
         "wave_kind": "consensus",
         "parallel": True,
@@ -531,6 +542,8 @@ def build_consensus_wave(
         "agents": agents,
         "personas": [p.get("id") for p in personas],
     }
+    wave.update(_batch_spawn_metadata(agents))
+    return wave
 
 
 def build_judge_spawn(
@@ -801,4 +814,3 @@ def validate_execute_subtask_delegation(
         "details": f"Provider '{normalized}' is not installed or not routable for delegation.",
         "provider_id": normalized,
     }
-

@@ -23,6 +23,17 @@ plan-only qualifiers
 
 Host-native plans auto-fan out to **one agent per file** when intent implies a webapp/fullstack stack (`heuristic_intent_templates`). Use `expand_host_plan` after scaffold waves if more files appear.
 
+## Fast-start contract
+
+Any plan path that emits agents must return a spawnable `host_spawn_waves`
+handoff quickly: target **under 5 seconds** to handoff and **under 30 seconds**
+to first host spawn. Keep optional LLM refinement, consensus, detailed receipts,
+and learning aggregation off the first-spawn path.
+
+When executing a returned plan, spawn **all agents in the same wave as one
+batch** before waiting at the wave barrier. Never serialize agents inside a
+single wave.
+
 ## Workflow
 
 ### 1. Classify
@@ -77,6 +88,8 @@ Include `consumes` / `produces` / `depends_on` when the plan exposes them.
 
 - Show a **brief** wave summary (can be shorter than full table).
 - Immediately spawn `host_spawn_waves` via `threnody-task` or `threnody-swarm` — the orchestrator does **not** implement subtasks with direct edits.
+- For every wave, start every same-wave agent first, then wait for that wave's
+  results before advancing to dependent waves.
 - **Reporting:** in `batch` mode (default, see `learning_report_contract.report_mode`) report once at terminal via `report_host_swarm_complete` — no per-worker-wave round-trip. In `inline` mode call `report_host_wave` after each wave. Use `inspect_swarm` to confirm status transitions.
 
 ## Full-stack prompt boilerplate

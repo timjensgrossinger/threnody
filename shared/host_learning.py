@@ -454,6 +454,11 @@ def register_host_run_handoff(
                 global_worker_index += 1
             except Exception:
                 log.debug("host handoff stub failed for %s", task_id, exc_info=True)
+        if wave.get("spawn_batch") is not None:
+            wave["spawn_batch"] = [
+                dict(agent) if isinstance(agent, dict) else agent
+                for agent in agents
+            ]
 
 
 def record_consensus_handoff(

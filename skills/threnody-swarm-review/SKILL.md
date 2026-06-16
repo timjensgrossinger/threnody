@@ -21,9 +21,23 @@ Complexity gating prevents token blowout:
 | complex | > 200 | logic, edge, types, security, performance |
 
 Security is always added when the file contains risk signals (SQL, exec, auth, tokens, etc.).
-Tier → model: trivial → low (haiku), moderate → medium (sonnet), security+complex → high (opus).
+Tier → model: trivial → low, moderate/standard review → medium. Use high tier
+only for explicit deep review or clear high-risk surfaces such as auth, crypto,
+payments, secrets, remote code execution, or a targeted threat-model/security
+request. Default synthesis is medium; escalate synthesis to high only when the
+review scope or findings justify it.
 
 ---
+
+## Fast-start contract
+
+Review swarm paths must return `host_spawn_waves` quickly: target **under 5
+seconds** to handoff and **under 30 seconds** to first review-agent spawn. Cheap
+review tiers are the default; high tier is reserved for risk/deep review.
+
+Do not block first spawn on optional refinement, consensus, learning
+aggregation, or deep planner calls. Run deterministic lint/context collection
+only when cheap, then start the first review wave.
 
 ## Workflow
 
@@ -78,14 +92,15 @@ Files listed after `REVIEW:` are extracted automatically.
 ### 4. Execute host_spawn_waves
 
 On `awaiting_host_execution: true` + `host_spawn_waves`:
-- **All agents in a wave → one parallel message** (never sequential)
+- **All agents in a wave → one parallel batch/message before waiting** (never sequential)
 - Pass each agent its `prompt`, `model`, and `subagent_type` from the handoff
 - Do **not** `Write`/`Edit` any `target_files` — review is read-only
 - **Reporting** (see `learning_report_contract.report_mode`): in `batch` mode (default) do **not** call `report_host_wave` per wave — hold each agent's `output_excerpt` in your own context for the synthesis wave, and report once at terminal. In `inline` mode call `report_host_wave` after each wave.
 
 ### 5. Synthesis wave
 
-The final wave contains a single synthesis subtask (`tier: high`). Inject:
+The final wave contains a single synthesis subtask (`tier: medium` by default;
+`high` only for risk/deep review). Inject:
 - Linter output from step 1
 - All `output_excerpt` summaries from prior waves
 
@@ -124,6 +139,7 @@ Output the full ranked findings report to the user.
 
 - Call `execute_subtask` for same-host review agents
 - Run all waves in sequence via a single agent — fan out each wave in parallel
+- Start one same-wave review agent and wait before starting the next
 - Spawn review agents for generated files, lock files, or binary assets
 - Skip the synthesis wave — it dedupes + ranks all dimension findings
 

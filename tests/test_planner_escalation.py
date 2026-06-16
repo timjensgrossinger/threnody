@@ -81,31 +81,45 @@ def _harness(monkeypatch, tmp, cfg, backend):
     monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "cursor")
 
 
-def test_complex_task_escalates_to_llm_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_complex_task_escalates_to_llm_planner_when_refinement_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     with TemporaryDirectory() as td:
         backend = PlanBackend()
-        _harness(monkeypatch, td, TGsConfig(), backend)
-        result = mcp_server.handle_plan_task({"task": COMPLEX_TASK})
+        cfg = TGsConfig(heuristic_complexity_llm_fallback=True)
+        cfg.host_fast_start.llm_refinement = True
+        _harness(monkeypatch, td, cfg, backend)
+        result = mcp_server.handle_plan_task({"task": COMPLEX_TASK + " refinement-enabled"})
         assert backend.calls, "LLM planner backend should have been invoked"
         assert result.get("planner_mode") == "heuristic_escalated"
 
 
-def test_complex_task_falls_back_when_backend_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_complex_task_falls_back_when_refinement_backend_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     with TemporaryDirectory() as td:
         backend = RecordingBackend()
-        _harness(monkeypatch, td, TGsConfig(), backend)
-        result = mcp_server.handle_plan_task({"task": COMPLEX_TASK})
+        cfg = TGsConfig(heuristic_complexity_llm_fallback=True)
+        cfg.host_fast_start.llm_refinement = True
+        _harness(monkeypatch, td, cfg, backend)
+        result = mcp_server.handle_plan_task({"task": COMPLEX_TASK + " backend-unavailable"})
         assert backend.calls, "escalation should be attempted"
         # Backend returned nothing → graceful fall back to heuristic.
         assert result.get("planner_mode") == "heuristic"
         assert result.get("subtasks")
 
 
+def test_fast_start_blocks_configured_pre_spawn_escalation(monkeypatch: pytest.MonkeyPatch) -> None:
+    with TemporaryDirectory() as td:
+        backend = RecordingBackend()
+        cfg = TGsConfig(heuristic_complexity_llm_fallback=True)
+        _harness(monkeypatch, td, cfg, backend)
+        result = mcp_server.handle_plan_task({"task": COMPLEX_TASK + " fast-start-block"})
+        assert backend.calls == [], "fast-start default must not call the LLM planner before handoff"
+        assert result.get("planner_mode") == "heuristic"
+
+
 def test_simple_task_stays_heuristic_no_escalation(monkeypatch: pytest.MonkeyPatch) -> None:
     with TemporaryDirectory() as td:
         backend = RecordingBackend()
         _harness(monkeypatch, td, TGsConfig(), backend)
-        result = mcp_server.handle_plan_task({"task": SIMPLE_TASK})
+        result = mcp_server.handle_plan_task({"task": SIMPLE_TASK + " simple-no-escalation"})
         assert backend.calls == [], "simple task must not call the LLM planner"
         assert result.get("planner_mode") == "heuristic"
 
@@ -115,6 +129,6 @@ def test_escalation_disabled_by_config(monkeypatch: pytest.MonkeyPatch) -> None:
         backend = RecordingBackend()
         cfg = TGsConfig(heuristic_complexity_llm_fallback=False)
         _harness(monkeypatch, td, cfg, backend)
-        result = mcp_server.handle_plan_task({"task": COMPLEX_TASK})
+        result = mcp_server.handle_plan_task({"task": COMPLEX_TASK + " disabled"})
         assert backend.calls == [], "escalation disabled → no LLM call"
         assert result.get("planner_mode") == "heuristic"

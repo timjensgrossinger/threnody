@@ -20,6 +20,18 @@ defaults to **`host_native`**:
 
 This path is **unaffected** by utility-only delegation rules.
 
+## Fast-start contract
+
+Agent-emitting swarm paths must return `host_spawn_waves` quickly: target
+**under 5 seconds** to a spawnable handoff and **under 30 seconds** to first host
+spawn. Use the fast host-native handoff first; optional refinement, consensus,
+learning aggregation, and detailed receipts happen after the first worker wave
+starts or at terminal reporting.
+
+Within each wave, spawn every agent as the same batch before waiting on the wave
+barrier. A host loop that starts one same-wave agent, waits, then starts the
+next is a fast-start regression.
+
 ## Workflow
 
 0. If not already planned, follow **`threnody-plan`** (plan-only swarm preview stops before spawn).
@@ -41,7 +53,7 @@ This path is **unaffected** by utility-only delegation rules.
 
 ## Must (when awaiting_host_execution)
 
-- Spawn **one** host `Task`/`Agent` per entry in `host_spawn_waves[].agents` — all agents in a wave in **one parallel message**.
+- Spawn **one** host `Task`/`Agent` per entry in `host_spawn_waves[].agents` — all agents in a wave in **one parallel batch/message before waiting**.
 - Pass each agent its `prompt`, `target_files`, `model`, and `subagent_type` from the handoff.
 - Do **not** use `Write`/`Edit` yourself on any `target_files` from the plan.
 - Do not follow `route_task`'s `direct_edit` hint while a handoff is active (`execution_hint.active_handoff` or pending `host_spawn_waves`).
@@ -49,7 +61,11 @@ This path is **unaffected** by utility-only delegation rules.
 
 ## Consensus waves
 
-A wave with `wave_kind: "consensus"` is **always** reported via `report_host_wave` even in batch mode — a failed quorum spawns a judge mid-run, so the decision can't wait for terminal. Follow any returned `consensus_followup` (spawn the judge, report its verdict), then proceed to the terminal call.
+Consensus is optional post-worker coordination, not pre-spawn gating. A wave
+with `wave_kind: "consensus"` is **always** reported via `report_host_wave` even
+in batch mode — a failed quorum spawns a judge mid-run, so the decision can't
+wait for terminal. Follow any returned `consensus_followup` (spawn the judge,
+report its verdict), then proceed to the terminal call.
 
 ## Terminal report example
 

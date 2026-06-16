@@ -438,6 +438,15 @@ class HostNativeConfig:
     runs_keep: int = 20
 
 
+@dataclass
+class HostFastStartConfig:
+    """Controls the host-native pre-spawn critical path."""
+
+    enabled: bool = True
+    max_handoff_ms: int = 30_000
+    llm_refinement: bool = False
+
+
 def normalize_parallelism_limit(
     value: Any,
     *,
@@ -1297,6 +1306,7 @@ class TGsConfig:
     parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
     host_native: HostNativeConfig = field(default_factory=HostNativeConfig)
+    host_fast_start: HostFastStartConfig = field(default_factory=HostFastStartConfig)
     budgets: BudgetConfig = field(default_factory=BudgetConfig)
 
     # Cache
@@ -1409,7 +1419,7 @@ class TGsConfig:
     # When the heuristic planner sees a high-complexity task (coupled group, >=4
     # source files, or design keywords), escalate to the real LLM planner instead
     # of producing a lexical plan. Degrades gracefully to heuristic on any error.
-    heuristic_complexity_llm_fallback: bool = True
+    heuristic_complexity_llm_fallback: bool = False
 
     # Janitor-style verify gate (plan 04).
     verify_gate: VerifyGateConfig = field(default_factory=VerifyGateConfig)
@@ -2245,6 +2255,26 @@ class TGsConfig:
                 and str(mode).strip().lower() in {"host_native", "delegate"}
             }
 
+        raw_fast_start = orchestrator_raw.get("host_fast_start", {})
+        if isinstance(raw_fast_start, Mapping):
+            cfg.host_fast_start.enabled = _coerce_config_bool(
+                raw_fast_start.get("enabled"),
+                default=cfg.host_fast_start.enabled,
+                field_name="orchestrator.host_fast_start.enabled",
+            )
+            cfg.host_fast_start.max_handoff_ms = _coerce_config_int(
+                raw_fast_start.get("max_handoff_ms"),
+                default=cfg.host_fast_start.max_handoff_ms,
+                field_name="orchestrator.host_fast_start.max_handoff_ms",
+                minimum=1_000,
+                maximum=600_000,
+            )
+            cfg.host_fast_start.llm_refinement = _coerce_config_bool(
+                raw_fast_start.get("llm_refinement"),
+                default=cfg.host_fast_start.llm_refinement,
+                field_name="orchestrator.host_fast_start.llm_refinement",
+            )
+
         raw_planner_host_mode = orchestrator_raw.get("planner_host_execution_mode", "host_native")
         if isinstance(raw_planner_host_mode, str) and raw_planner_host_mode.strip().lower() in {
             "host_native",
@@ -2269,7 +2299,7 @@ class TGsConfig:
             "contract",
         }:
             cfg.heuristic_coupled_strategy = raw_coupled_strategy.strip().lower()
-        raw_llm_fallback = orchestrator_raw.get("heuristic_complexity_llm_fallback", True)
+        raw_llm_fallback = orchestrator_raw.get("heuristic_complexity_llm_fallback", False)
         if isinstance(raw_llm_fallback, bool):
             cfg.heuristic_complexity_llm_fallback = raw_llm_fallback
 
@@ -2625,6 +2655,11 @@ class TGsConfig:
                 "heuristic_intent_templates": self.heuristic_intent_templates,
                 "heuristic_coupled_strategy": self.heuristic_coupled_strategy,
                 "heuristic_complexity_llm_fallback": self.heuristic_complexity_llm_fallback,
+                "host_fast_start": {
+                    "enabled": self.host_fast_start.enabled,
+                    "max_handoff_ms": self.host_fast_start.max_handoff_ms,
+                    "llm_refinement": self.host_fast_start.llm_refinement,
+                },
             },
             "parallelism": {
                 "enabled": self.parallelism.enabled,

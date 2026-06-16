@@ -42,6 +42,30 @@ TASK_PACKS: dict[str, dict[str, Any]] = {
 }
 
 
+def _build_waves(subtasks: list[dict[str, Any]]) -> list[list[Any]]:
+    known_ids = [st.get("id") for st in subtasks if st.get("id") is not None]
+    known = set(known_ids)
+    remaining: dict[Any, set[Any]] = {}
+    for st in subtasks:
+        sid = st.get("id")
+        if sid is None:
+            continue
+        deps = st.get("depends_on") or []
+        remaining[sid] = {dep for dep in deps if dep in known} if isinstance(deps, list) else set()
+    completed: set[Any] = set()
+    waves: list[list[Any]] = []
+    while remaining:
+        ready = [sid for sid, deps in remaining.items() if deps.issubset(completed)]
+        if not ready:
+            waves.append(list(remaining))
+            break
+        waves.append(ready)
+        for sid in ready:
+            del remaining[sid]
+            completed.add(sid)
+    return waves or [known_ids]
+
+
 def list_task_packs() -> list[dict[str, Any]]:
     return [
         {"name": name, **deepcopy(meta)}
@@ -60,6 +84,9 @@ def plan_task_pack(pack: str, task: str, *, max_agents: int | None = None) -> di
         default_tier=str(meta.get("default_tier") or "medium"),
         max_agents=max_agents,
     )
+    subtasks = payload.get("subtasks")
+    if isinstance(subtasks, list) and "waves" not in payload:
+        payload["waves"] = _build_waves([st for st in subtasks if isinstance(st, dict)])
     payload["task_pack"] = {"name": name, **deepcopy(meta)}
     payload["planner_host_execution_mode"] = "host_native"
     return payload

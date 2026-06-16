@@ -246,10 +246,15 @@ def test_execute_swarm_host_native_skips_runtime_handoff(monkeypatch, tmp_path: 
         topology = "linear"
 
     class FakePlanner:
+        plan_calls = 0
+        plan_heuristic_calls = 0
+
         def plan(self, _task_text: str, **_kwargs) -> FakePlan:
+            self.plan_calls += 1
             return FakePlan()
 
         def plan_heuristic(self, _task_text: str, **_kwargs) -> FakePlan:
+            self.plan_heuristic_calls += 1
             return FakePlan()
 
         def plan_to_dict(self, _plan: FakePlan) -> dict[str, object]:
@@ -274,10 +279,11 @@ def test_execute_swarm_host_native_skips_runtime_handoff(monkeypatch, tmp_path: 
         handoff_calls.append(swarm_id)
 
     monkeypatch.setattr(mcp_server, "_spawn_execute_swarm_runtime_handoff", _record_handoff)
+    fake_planner = FakePlanner()
     monkeypatch.setattr(
         mcp_server,
         "_ensure_init",
-        lambda: (TGsConfig(db_path=tmp_path / "execute-swarm.db"), db, None, FakePlanner(), None),
+        lambda: (TGsConfig(db_path=tmp_path / "execute-swarm.db"), db, None, fake_planner, None),
     )
 
     result = mcp_server.handle_execute_swarm({"task": "refactor auth module", "max_agents": 2})
@@ -289,6 +295,13 @@ def test_execute_swarm_host_native_skips_runtime_handoff(monkeypatch, tmp_path: 
     assert payload["awaiting_host_execution"] is True
     assert isinstance(payload.get("host_spawn_waves"), list)
     assert payload["host_spawn_waves"]
+    assert fake_planner.plan_calls == 0
+    assert fake_planner.plan_heuristic_calls == 1
+    assert payload["fast_start_target_ms"] == 30000
+    latency = payload.get("latency_ms")
+    assert isinstance(latency, dict)
+    assert {"prepare_request", "plan", "attach_host_spawn", "persist_minimal", "total_to_handoff"} <= set(latency)
+    assert latency["total_to_handoff"] < payload["fast_start_target_ms"]
     assert payload.get("host_execution_contract") == "spawn_subagents"
     assert payload["host_spawn_waves"][0]["agents"][0]["spawn_required"] is True
     assert payload["host_spawn_waves"][0]["agents"][0]["method"] == "host_task"

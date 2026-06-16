@@ -194,6 +194,46 @@ def test_background_config_honors_legacy_health_interval() -> None:
         assert cfg.background.warm_path_interval_s == 120.0
 
 
+def test_host_fast_start_defaults_and_legacy_dict() -> None:
+    cfg = TGsConfig.defaults()
+
+    assert cfg.host_fast_start.enabled is True
+    assert cfg.host_fast_start.max_handoff_ms == 30000
+    assert cfg.host_fast_start.llm_refinement is False
+    assert cfg.heuristic_complexity_llm_fallback is False
+    legacy = cfg.to_legacy_dict()["orchestrator"]
+    assert legacy["host_fast_start"] == {
+        "enabled": True,
+        "max_handoff_ms": 30000,
+        "llm_refinement": False,
+    }
+
+
+def test_host_fast_start_config_parses_overrides() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        config_path = Path(td) / "config.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "orchestrator:",
+                    "  host_fast_start:",
+                    "    enabled: false",
+                    "    max_handoff_ms: 45000",
+                    "    llm_refinement: true",
+                    "  heuristic_complexity_llm_fallback: true",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = TGsConfig.from_yaml(config_path)
+
+        assert cfg.host_fast_start.enabled is False
+        assert cfg.host_fast_start.max_handoff_ms == 45000
+        assert cfg.host_fast_start.llm_refinement is True
+        assert cfg.heuristic_complexity_llm_fallback is True
+
+
 def test_routing_policy_legacy_defaults_are_advisory_for_all_shells() -> None:
     """Missing routing_policy should preserve recommended advisory defaults."""
     with tempfile.TemporaryDirectory() as td:

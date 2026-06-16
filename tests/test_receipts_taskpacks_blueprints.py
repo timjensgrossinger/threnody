@@ -103,6 +103,38 @@ def test_task_packs_plan_injects_pack_metadata() -> None:
     assert "security review" in plan["subtasks"][0]["description"].lower()
 
 
+def test_task_pack_handler_returns_batch_spawn_handoff_without_planner(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cfg = TGsConfig(db_path=tmp_path / "taskpack.db")
+    db = Database(db_path=cfg.db_path)
+
+    class FailPlanner:
+        def plan(self, *_args, **_kwargs):
+            raise AssertionError("task packs must not call the LLM planner")
+
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (cfg, db, None, FailPlanner(), None),
+    )
+
+    result = mcp_server.handle_plan_task_pack(
+        {
+            "pack": "docs-sync",
+            "task": "Update README.md and docs/usage.md",
+            "cwd": str(tmp_path),
+        }
+    )
+
+    assert result["planner_host_execution_mode"] == "host_native"
+    assert result["host_spawn_waves"]
+    first_wave = result["host_spawn_waves"][0]
+    assert first_wave["parallel_start_required"] is True
+    assert first_wave["spawn_batch"] == first_wave["agents"]
+
+
 def test_workflow_blueprint_export_and_run(tmp_path: Path) -> None:
     db = Database(tmp_path / "blueprints.db")
     cost = build_cost_receipt(

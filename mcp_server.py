@@ -2130,7 +2130,14 @@ def _planner_plan_for_caller(
         # Escape hatch: for genuinely complex tasks (coupled file group, many
         # source files, or design keywords) the lexical heuristic produces poor
         # plans. When enabled and a real LLM planner backend is reachable, escalate.
-        if getattr(config, "heuristic_complexity_llm_fallback", False):
+        fast_start = getattr(config, "host_fast_start", None)
+        fast_start_enabled = bool(getattr(fast_start, "enabled", True))
+        llm_refinement = bool(getattr(fast_start, "llm_refinement", False))
+        allow_pre_spawn_llm = (
+            bool(getattr(config, "heuristic_complexity_llm_fallback", False))
+            and (not fast_start_enabled or llm_refinement)
+        )
+        if allow_pre_spawn_llm:
             try:
                 from shared.heuristic_plan import assess_task_complexity
 
@@ -3383,6 +3390,10 @@ def _execute_swarm_host_native_response(
     request_meta: Mapping[str, object],
     estimated_cost: float,
 ) -> dict[str, object]:
+    handoff_started = time.monotonic()
+    latency_ms: dict[str, int] = {
+        "prepare_request": int(request_meta.get("prepare_request_ms") or 0),
+    }
     topology = request_meta.get("topology")
     topology_value = topology if isinstance(topology, str) else None
     max_agents_raw = request_meta.get("effective_agents")
@@ -3392,6 +3403,7 @@ def _execute_swarm_host_native_response(
         max_agents = int(max_agents_raw) if max_agents_raw is not None else None
     except (TypeError, ValueError):
         max_agents = None
+    plan_started = time.monotonic()
     try:
         plan, used_heuristic = _planner_plan_for_caller(
             config,
@@ -3409,9 +3421,11 @@ def _execute_swarm_host_native_response(
             "parse_diagnostics_id": exc.parse_diagnostics_id,
             "swarm_id": swarm_id,
         }
+    latency_ms["plan"] = int((time.monotonic() - plan_started) * 1000)
     plan_dict = _attach_models_to_subtasks(planner.plan_to_dict(plan))
     if used_heuristic:
         plan_dict["planner_host_execution_mode"] = "host_native"
+    attach_started = time.monotonic()
     _attach_host_spawn_metadata(
         plan_dict,
         config=config,
@@ -3422,6 +3436,7 @@ def _execute_swarm_host_native_response(
         workspace_root=str(request_meta.get("workspace_root") or _active_workspace_root()),
         topology=str(request_meta.get("topology") or plan.topology or "linear"),
     )
+    latency_ms["attach_host_spawn"] = int((time.monotonic() - attach_started) * 1000)
     host_waves = plan_dict.get("host_spawn_waves")
     if not isinstance(host_waves, list):
         host_waves = []
@@ -3482,6 +3497,7 @@ def _execute_swarm_host_native_response(
                     personas=[str(p) for p in consensus_wave.get("personas") or []],
                     queen_tier=getattr(config, "consensus_queen_tier", "low"),
                 )
+    persist_started = time.monotonic()
     try:
         db.persist_swarm_run(
             {
@@ -3526,6 +3542,10 @@ def _execute_swarm_host_native_response(
             _run_log.set_active_run(swarm_id, workspace_root=resolved_workspace)
         except Exception:
             log.debug("set_active_run failed for %s", swarm_id, exc_info=True)
+    latency_ms["persist_minimal"] = int((time.monotonic() - persist_started) * 1000)
+    latency_ms["total_to_handoff"] = int((time.monotonic() - handoff_started) * 1000)
+    fast_start = getattr(config, "host_fast_start", None)
+    fast_start_target_ms = int(getattr(fast_start, "max_handoff_ms", 30_000) or 30_000)
     swarm_result: dict[str, object] = {
         "swarm_id": swarm_id,
         "host_execution_mode": "host_native",
@@ -3534,6 +3554,8 @@ def _execute_swarm_host_native_response(
         "host_spawn_waves": host_waves,
         "workspace_root": resolved_workspace,
         "learning_report_contract": learning_contract,
+        "latency_ms": latency_ms,
+        "fast_start_target_ms": fast_start_target_ms,
         "plan": plan_dict,
         "cost_estimate": {
             "estimated": float(estimated_cost),
@@ -3543,7 +3565,9 @@ def _execute_swarm_host_native_response(
         },
         "execution_note": (
             "Execute each host_spawn_waves entry via the host Agent/Task tool; "
-            "do not use direct Write/Edit on planned target_files — spawn one subagent per agent entry. "
+            "for each wave, start every agent in that wave as a batch before waiting at the wave barrier. "
+            "Use spawn_batch when present; otherwise use agents. "
+            "Do not use direct Write/Edit on planned target_files. "
             "Do not call execute_subtask for same-host work. "
             "After each wave completes, call report_host_wave(swarm_id, wave, workspace_root, agents[]) "
             "with per-agent task_id, spawn_id, success, touched_files, and output_excerpt "
@@ -6011,12 +6035,14 @@ def handle_execute_swarm(args: dict) -> dict:
                     "error": "invalid_preview_token",
                     "details": "preview_token is invalid, expired, or already used",
                 }
+        prepare_started = time.monotonic()
         request_meta = prepare_swarm_execution_request(
             request_args,
             config=config,
             db=db,
             swarm_id=preview_swarm_id,
         )
+        request_meta["prepare_request_ms"] = int((time.monotonic() - prepare_started) * 1000)
     except ValueError as exc:
         return {"error": "invalid_request", "details": str(exc)}
     except Exception:

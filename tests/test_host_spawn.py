@@ -44,7 +44,38 @@ def test_build_host_spawn_waves_from_plan() -> None:
     assert waves[1]["agents"][0]["method"] == "host_task"
     assert waves[1]["agents"][0]["spawn_required"] is True
     assert waves[1]["execution_contract"] == "spawn_subagents"
+    assert waves[1]["parallel_start_required"] is True
+    assert waves[1]["spawn_batch"] == waves[1]["agents"]
     assert waves[1]["agents"][0]["target_files"] == ["tests/test_auth.py"]
+
+
+def test_build_host_spawn_waves_exposes_batch_metadata_for_same_wave_agents() -> None:
+    cfg = TGsConfig.defaults()
+    plan = {
+        "subtasks": [
+            {"id": "a", "description": "edit auth", "tier": "medium"},
+            {
+                "id": "b",
+                "description": "add tests",
+                "tier": "low",
+                "target_file": "tests/test_auth.py",
+            },
+        ],
+        "waves": [["a", "b"]],
+    }
+
+    waves = build_host_spawn_waves(plan, config=cfg, caller="claude-code")
+
+    assert len(waves) == 1
+    wave = waves[0]
+    assert wave["parallel"] is True
+    assert wave["execution_contract"] == HOST_EXECUTION_CONTRACT
+    assert wave["parallel_start_required"] is True
+    assert wave["spawn_batch"] == wave["agents"]
+    assert [agent["id"] for agent in wave["spawn_batch"]] == ["a", "b"]
+    for agent in wave["spawn_batch"]:
+        assert agent["method"] == "host_task"
+        assert agent["spawn_required"] is True
 
 
 def test_would_self_delegate_blocks_same_host_without_provider_id() -> None:
@@ -113,6 +144,9 @@ def test_enrich_host_spawn_waves_forces_host_task_contract() -> None:
         ]
     )
     assert waves[0]["execution_contract"] == HOST_EXECUTION_CONTRACT
+    assert waves[0]["parallel_start_required"] is True
+    assert waves[0]["spawn_batch"] == waves[0]["agents"]
+    assert [agent["id"] for agent in waves[0]["spawn_batch"]] == ["1", "2"]
     for agent in waves[0]["agents"]:
         assert agent["method"] == "host_task"
         assert agent["spawn_required"] is True

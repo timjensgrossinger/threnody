@@ -15,6 +15,17 @@ Threnody tier model, not one session model), with multi-queen consensus and
 learning — then lets you **save a permanent, documented, zero-config `/<slug>`**
 command teammates run with no setup.
 
+## Fast-start contract
+
+Workflow-emitting skills must produce a runnable `workflow_script` quickly:
+target **under 5 seconds** to handoff and **under 30 seconds** to first worker
+spawn. The emitted script must start same-wave workers in a batch, for example
+with `parallel([...])`, before waiting on the wave barrier.
+
+Do not block initial workflow emission on optional refinement, consensus,
+learning aggregation, or permanent-workflow export. Run those after the first
+worker wave has started or after the workflow returns.
+
 ## Prerequisite (claude-code only)
 
 This path needs `routing_policy.shells.claude-code.workflow_emit: true` in
@@ -29,6 +40,8 @@ Requires Claude Code **v2.1.154+** (Workflow tool).
    - **`workflow_emit: true` + `workflow_script`** — the tier-aware script. Launch it
      via the **Workflow** tool (paste/run `workflow_script`). It runs in the background,
      keeps intermediate results out of your context, and routes each agent to its model.
+     Same-wave agents must be represented as a batch in the script, not as a
+     sequential loop.
    - No `workflow_script` — emission is off; use **`/threnody-swarm`** instead.
 3. When the workflow returns, call
    **`report_workflow_result(workflow_name, agents)`** with the `agents` array the
@@ -61,6 +74,8 @@ Requires Claude Code **v2.1.154+** (Workflow tool).
 
 - Launch the **`workflow_script`** via the Workflow tool — do not hand-spawn its worker
   agents as host Tasks (that defeats the background + tier-routing benefit).
+- Launch the script immediately once returned; refinement, consensus, learning,
+  and export are post-first-spawn work.
 - Always `report_workflow_result` after the run so telemetry + shape learning happen.
 - Hybrid consensus queens are **read-only** — never let them write files.
 - Saving a permanent workflow is **approval-gated** — approve the draft before export.

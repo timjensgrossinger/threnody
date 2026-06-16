@@ -21,9 +21,18 @@ _LOC_COMPLEX = 200
 _RISKY_EXTENSIONS = frozenset({".py", ".js", ".ts", ".go", ".rb", ".java", ".php", ".cs", ".cpp", ".c"})
 
 _RISK_SIGNALS = re.compile(
-    r"\b(?:sql|exec\s*\(|eval\s*\(|subprocess|os\.system|auth(?:enticate)?|"
-    r"password|secret|credential|token|query|cursor\.execute|raw_query|shell\s*=\s*True|"
-    r"pickle\.loads|yaml\.load\s*\()\b",
+    r"(?:\b(?:sql|subprocess|os\.system|auth(?:enticate|entication|orization)?|"
+    r"crypto|cryptograph(?:y|ic)|encrypt(?:ion)?|decrypt(?:ion)?|payment|billing|card|"
+    r"password|secret|credential|token|api[_ -]?key|rce|remote code execution|"
+    r"cursor\.execute|raw_query|shell\s*=\s*True|deseriali[sz](?:e|ation)|"
+    r"pickle\.loads|ssrf|server-side request forgery|"
+    r"path traversal|directory traversal)\b|\b(?:exec|eval)\s*\(|\byaml\.load\s*\()",
+    re.IGNORECASE,
+)
+
+_HIGH_REVIEW_TASK_SIGNALS = re.compile(
+    r"\b(?:deep(?:\s+security)?\s+review|threat[-\s]?model(?:ing)?|"
+    r"security[-\s]?critical|critical\s+security|high[-\s]?risk)\b",
     re.IGNORECASE,
 )
 
@@ -150,6 +159,10 @@ def _has_risk_signals(content: str) -> bool:
     return bool(_RISK_SIGNALS.search(content))
 
 
+def _task_requests_high_tier(task: str) -> bool:
+    return bool(_HIGH_REVIEW_TASK_SIGNALS.search(task))
+
+
 Complexity = str  # "trivial" | "moderate" | "complex"
 
 
@@ -200,13 +213,18 @@ def dimensions_for(band: Complexity, has_risk: bool) -> list[_Dim]:
     return [_DIM_BY_KEY[k] for k in keys]
 
 
-def tier_for(dim: _Dim, band: Complexity, has_risk: bool) -> str:
+def tier_for(dim: _Dim, band: Complexity, has_risk: bool, force_high: bool = False) -> str:
     """Routing tier for a dimension + band combination."""
-    if dim.key == "security" and (band == "complex" or has_risk):
+    if dim.key == "security" and (has_risk or force_high):
         return "high"
     if band == "trivial":
         return "low"
     return "medium"
+
+
+def synthesis_tier(requires_high: bool) -> str:
+    """Routing tier for review synthesis."""
+    return "high" if requires_high else "medium"
 
 
 def build_review_subtasks(
@@ -239,11 +257,15 @@ def build_review_subtasks(
     if is_fast_review_intent(task):
         return build_fast_review_subtasks(entries, task, max_agents=max_agents)
 
+    task_force_high = _task_requests_high_tier(task)
+
     # Compute per-file (dims, band, risk)
     file_dims: list[tuple[str, list[_Dim], Complexity, bool]] = []
     for path, _ in entries:
         band, has_risk = estimate_complexity(path)
         dims = dimensions_for(band, has_risk)
+        if task_force_high and not any(dim.key == "security" for dim in dims):
+            dims = [_DIM_BY_KEY["security"]] + dims
         file_dims.append((path, dims, band, has_risk))
 
     # Flatten to (path, dim, band, has_risk) ordered by never-drop first
@@ -276,8 +298,10 @@ def build_review_subtasks(
 
     subtasks: list[dict] = []
     review_ids: list[int] = []
+    review_requires_high = task_force_high or any(has_risk for _, _, _, has_risk in all_cells)
+
     for idx, (path, dim, band, has_risk) in enumerate(all_cells, start=1):
-        t = tier_for(dim, band, has_risk)
+        t = tier_for(dim, band, has_risk, force_high=task_force_high)
         subtasks.append({
             "id": idx,
             "description": dim.prompt_template.format(path=path),
@@ -298,7 +322,7 @@ def build_review_subtasks(
             _SYNTHESIS_PROMPT
             + f"\n\nFiles reviewed: {', '.join(reviewed_files)}"
         ),
-        "tier": "high",
+        "tier": synthesis_tier(review_requires_high),
         "depends_on": review_ids,
         "subagent_type": "",  # empty → resolved to threnody-high by tier in host_spawn
         "read_only": True,
@@ -340,9 +364,12 @@ def build_fast_review_subtasks(
 
     subtasks: list[dict] = []
     review_ids: list[int] = []
+    task_force_high = _task_requests_high_tier(task)
+    file_risks: list[bool] = []
     for idx, (path, _hint) in enumerate(file_entries, start=1):
         band, has_risk = estimate_complexity(path)
-        tier = "high" if has_risk or band == "complex" else "medium"
+        file_risks.append(has_risk)
+        tier = "high" if has_risk or task_force_high else "medium"
         subtasks.append({
             "id": idx,
             "description": (
@@ -362,13 +389,14 @@ def build_fast_review_subtasks(
 
     synth_id = len(file_entries) + 1
     reviewed_files = [path for path, _ in file_entries]
+    review_requires_high = task_force_high or any(file_risks)
     subtasks.append({
         "id": synth_id,
         "description": (
             _SYNTHESIS_PROMPT
             + f"\n\nFast review mode: one review agent per file. Files reviewed: {', '.join(reviewed_files)}"
         ),
-        "tier": "high",
+        "tier": synthesis_tier(review_requires_high),
         "depends_on": review_ids,
         "subagent_type": "",
         "read_only": True,

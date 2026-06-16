@@ -3,9 +3,10 @@
 ## Current throughput bottlenecks
 
 1. **Provider round-trip latency** — planner, subtask execution, and synthesis still rely on blocking CLI subprocess calls, so process startup and remote model latency are now the dominant cost.
-2. **Serial planner and synthesis stages** — wave parallelism only speeds up the middle of execution because planning happens once up front and synthesis happens once at the end.
-3. **Speculative fallback pool** — partially addressed: `parallelism.speculation_workers` (default `1`) scales the higher-tier speculation pool; planner/synthesis remain serial.
-4. **Warm-path eval batching** — partially addressed: `parallelism.warm_path_workers` (default `2`) parallelizes rework eval prompts inside each warm-path batch.
+2. **Fast-start critical path** — agent-emitting skills should return `host_spawn_waves` or `workflow_script` in under 5 seconds and reach first host spawn in under 30 seconds. Old behavior that blocks on rich planner calls, consensus, learning aggregation, or sequential same-wave spawn can miss this target before any worker starts.
+3. **Serial planner and synthesis stages** — wave parallelism only speeds up the middle of execution when planning happens once up front and synthesis happens once at the end.
+4. **Speculative fallback pool** — partially addressed: `parallelism.speculation_workers` (default `1`) scales the higher-tier speculation pool; planner/synthesis remain serial.
+5. **Warm-path eval batching** — partially addressed: `parallelism.warm_path_workers` (default `2`) parallelizes rework eval prompts inside each warm-path batch.
 
 ## Previously documented (now configurable)
 

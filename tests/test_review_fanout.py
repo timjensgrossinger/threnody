@@ -174,11 +174,14 @@ class TestTierFor:
         from shared.review_fanout import _DIM_BY_KEY
         return _DIM_BY_KEY[key]
 
-    def test_security_complex_is_high(self):
-        assert tier_for(self._dim("security"), "complex", False) == "high"
+    def test_security_complex_without_risk_is_medium(self):
+        assert tier_for(self._dim("security"), "complex", False) == "medium"
 
     def test_security_with_risk_is_high(self):
         assert tier_for(self._dim("security"), "trivial", True) == "high"
+
+    def test_security_explicit_high_request_is_high(self):
+        assert tier_for(self._dim("security"), "moderate", False, force_high=True) == "high"
 
     def test_logic_trivial_is_low(self):
         assert tier_for(self._dim("logic"), "trivial", False) == "low"
@@ -253,6 +256,34 @@ class TestBuildReviewSubtasks:
         assert sec is not None
         assert sec["tier"] == "high"
 
+    def test_ordinary_security_review_worker_is_medium_tier(self, tmp_path: Path):
+        f = tmp_path / "ordinary.md"
+        f.write_text("\n".join(f"line {i}" for i in range(210)), encoding="utf-8")
+        result = build_review_subtasks([(str(f), "")], f"REVIEW: security review {f}")
+        sec = next(s for s in result["subtasks"] if s.get("subagent_type") == "review-security")
+        assert sec["tier"] == "medium"
+
+    def test_explicit_deep_security_review_escalates_security_worker(self, tmp_path: Path):
+        f = tmp_path / "ordinary.md"
+        f.write_text("\n".join(f"line {i}" for i in range(100)), encoding="utf-8")
+        result = build_review_subtasks([(str(f), "")], f"REVIEW: deep security review {f}")
+        sec = next(s for s in result["subtasks"] if s.get("subagent_type") == "review-security")
+        assert sec["tier"] == "high"
+
+    def test_synthesis_defaults_to_medium(self, tmp_path: Path):
+        f = tmp_path / "tiny.md"
+        f.write_text("\n".join(f"line {i}" for i in range(10)), encoding="utf-8")
+        result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
+        synth = next(s for s in result["subtasks"] if s.get("depends_on"))
+        assert synth["tier"] == "medium"
+
+    def test_synthesis_high_only_on_risk(self, tmp_path: Path):
+        f = tmp_path / "secrets.md"
+        f.write_text("token = 'abc'\n", encoding="utf-8")
+        result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
+        synth = next(s for s in result["subtasks"] if s.get("depends_on"))
+        assert synth["tier"] == "high"
+
     def test_max_agents_drops_lowest_priority_first(self, tmp_path: Path):
         # Complex file would have 5 dims → cap to 3 review + 1 synthesis = 4 total
         f = tmp_path / "big.md"
@@ -311,6 +342,23 @@ class TestBuildReviewSubtasks:
         assert len(review) == 3
         assert len(synthesis) == 1
         assert all(s["subagent_type"] == "review-fast-file" for s in review)
+        assert all(s["tier"] == "medium" for s in review)
+        assert synthesis[0]["tier"] == "medium"
+
+    def test_fast_review_high_tier_only_on_risk(self, tmp_path: Path):
+        risky = tmp_path / "auth.py"
+        risky.write_text("token = request.headers['Authorization']\n", encoding="utf-8")
+        ordinary = tmp_path / "plain.py"
+        ordinary.write_text("x = 1\n", encoding="utf-8")
+        result = build_review_subtasks(
+            [(str(risky), ""), (str(ordinary), "")],
+            f"FAST_REVIEW: {risky} {ordinary}",
+        )
+        review = [s for s in result["subtasks"] if not s.get("depends_on")]
+        synthesis = next(s for s in result["subtasks"] if s.get("depends_on"))
+        tiers = {Path(s["target_file"]).name: s["tier"] for s in review}
+        assert tiers == {"auth.py": "high", "plain.py": "medium"}
+        assert synthesis["tier"] == "high"
 
     def test_fast_review_respects_max_agents_cap(self, tmp_path: Path):
         files = []
