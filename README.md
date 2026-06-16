@@ -364,7 +364,7 @@ Full reference: [docs/CLI.md](docs/CLI.md)
 
 ## Beta status
 
-Public alpha **v0.3.0-alpha.1** — MCP tool schemas may change between releases; pin a git tag for stability. See [CHANGELOG.md](CHANGELOG.md).
+Public alpha **v0.3.0-alpha.2** — MCP tool schemas may change between releases; pin a git tag for stability. See [CHANGELOG.md](CHANGELOG.md).
 
 - macOS and Linux; `zsh` and `bash`
 - Windows not supported by the installer

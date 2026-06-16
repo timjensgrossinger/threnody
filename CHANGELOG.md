@@ -7,6 +7,30 @@ Versioning for public releases.
 
 ## [Unreleased]
 
+## [0.3.0-alpha.2] - 2026-06-16
+
+Local resource-usage hardening for many concurrent host-native subagents.
+Agent counts stay unlimited; these are throughput/footprint changes only —
+no behavior change.
+
+### Changed
+
+- **Batched per-wave DB writes** — `Database.flush_host_wave_records` coalesces
+  the per-agent `track_pattern` + `log_agent_result` +
+  `routing_guard_record_execution` writes (≈3N auto-commits) into a single
+  transaction per wave. Shared `_apply_pattern_row` / `_telemetry_columns_values`
+  primitives keep rows byte-identical; `ingest_host_wave` and the workflow
+  ingest path buffer then flush once.
+- **Wave-scoped source cache** — `context.read_source_cached` (mtime+size keyed
+  LRU) reads each source file once per fan-out wave instead of once per subtask;
+  `review_fanout` reuses it. Auto-invalidates on any mid-wave write.
+
+### Added
+
+- **`background` config block** — tunable, disablable health-probe (default
+  60 s) and warm-path (default 120 s) daemon cadence; legacy
+  `resilience.health_probe_interval_s` honored as a fallback.
+
 ## [0.3.0-alpha.1] - 2026-06-14
 
 Host-native swarm safety hardening and tier-aware Dynamic Workflow emission.
@@ -186,7 +210,8 @@ hardening (older internal tags such as `v3.2.0-alpha.1` remain in git history).
 
 - Last internal milestone before the public release hardening cycle.
 
-[Unreleased]: https://github.com/timjensgrossinger/threnody/compare/v0.3.0-alpha.1...HEAD
+[Unreleased]: https://github.com/timjensgrossinger/threnody/compare/v0.3.0-alpha.2...HEAD
+[0.3.0-alpha.2]: https://github.com/timjensgrossinger/threnody/compare/v0.3.0-alpha.1...v0.3.0-alpha.2
 [0.3.0-alpha.1]: https://github.com/timjensgrossinger/threnody/compare/v0.2.0-alpha.1...v0.3.0-alpha.1
 [0.2.0-alpha.1]: https://github.com/timjensgrossinger/threnody/releases/tag/v0.2.0-alpha.1
 [0.1.0-alpha.1]: https://github.com/timjensgrossinger/threnody/releases/tag/v0.1.0-alpha.1
