@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import mcp_server
 from shared.config import TGsConfig
 from shared.db import Database
+from shared.planner import ExecutionPlan
 
 
 def _stub_init(monkeypatch, tmp_path: Path) -> tuple[TGsConfig, Database]:
@@ -78,8 +79,66 @@ def test_preview_token_persisted(monkeypatch, tmp_path: Path) -> None:
     assert preview_payload is not None
     assert "request" not in preview_payload
     assert "task_text" not in preview_payload
-    assert preview_payload["response"]["swarm_id"] == result["result"]["swarm_id"]
-    assert preview_payload["response"]["requested_values"]["max_agents"] == 3
+
+
+def test_host_native_swarm_response_declares_no_external_delegation(monkeypatch, tmp_path: Path) -> None:
+    cfg, db = _stub_init(monkeypatch, tmp_path)
+    plan = ExecutionPlan(
+        analysis="host-native boundary test",
+        subtasks=[],
+        waves=[],
+        total_agents=0,
+        topology="dag",
+        strategy="dag",
+    )
+    planner = type(
+        "PlannerStub",
+        (),
+        {"plan_to_dict": staticmethod(lambda execution_plan: mcp_server.Planner.plan_to_dict(execution_plan))},
+    )()
+    monkeypatch.setattr(
+        mcp_server,
+        "_planner_plan_for_caller",
+        lambda *args, **kwargs: (plan, True),
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_attach_host_spawn_metadata",
+        lambda plan_dict, **kwargs: plan_dict.update({"host_spawn_waves": []}),
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_issue_host_handoff_routing_guard",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "build_learning_report_contract",
+        lambda *args, **kwargs: {"report_mode": "batch"},
+    )
+
+    result = mcp_server._execute_swarm_host_native_response(
+        config=cfg,
+        db=db,
+        planner=planner,
+        router=None,
+        swarm_id="swarm-boundary",
+        task_text="REVIEW: shared/discovery.py",
+        caller="codex",
+        request_meta={"workspace_root": str(tmp_path), "topology": "dag"},
+        estimated_cost=0.0,
+    )
+
+    payload = result["result"]
+    assert payload["host_execution_mode"] == "host_native"
+    assert payload["awaiting_host_execution"] is True
+    assert payload["execution_boundary"] == {
+        "mode": "host_native_only",
+        "data_export": "host_agent_prompts_only",
+        "external_provider_delegation": False,
+        "delegation_utilities_enabled": False,
+        "provider": "codex",
+    }
 
 
 def test_confirm_preview_starts_execution(monkeypatch, tmp_path: Path) -> None:

@@ -2541,6 +2541,20 @@ ROUTER_ONLY_PROVIDERS = frozenset({"claude-code"})
 DELEGATION_UTILITY_DEFAULTS = frozenset(DEFAULT_DELEGATION_UTILITIES)
 
 
+def _normalize_caller_for_discovery(caller: str | None) -> str | None:
+    if not caller:
+        return None
+    normalized = re.sub(r"[\s_]+", "-", caller.strip().lower())
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    if normalized in {"copilot", "github-copilot-cli", "gh-copilot", "gh"}:
+        return "github-copilot"
+    if normalized == "claude":
+        return "claude-code"
+    if normalized == "openai-codex":
+        return "codex"
+    return normalized
+
+
 def installer_provider_inventory(
     *,
     verify_readiness: bool = False,
@@ -4605,15 +4619,54 @@ class ProviderRegistry:
             "total_available": len(self.available_providers),
         }
 
-    def to_compact_dict(self) -> dict[str, Any]:
+    def to_compact_dict(self, caller: str | None = None) -> dict[str, Any]:
         """Return compact, secret-safe provider summary for MCP consumption.
 
         Per D-03: compact default with diagnostic fields (source, detect_reason,
         health). No credentials, tokens, file paths, or raw environment values.
         """
+        normalized_caller = _normalize_caller_for_discovery(caller)
         providers: list[dict[str, Any]] = []
         for provider in self.available_providers:
             readiness = provider.readiness
+            provider_id = self._normalize_identifier(provider.name)
+            is_current_host = bool(
+                normalized_caller
+                and provider_id == self._normalize_identifier(normalized_caller)
+                and self._provider_is_host_execution_target(provider)
+            )
+            execution_routeable = bool(readiness.routeable if readiness else False)
+            execution_routeable = execution_routeable and self._router_only_execution_allowed(
+                provider,
+                caller=normalized_caller,
+                tier="low",
+                caller_allowlists=None,
+            )
+            if is_current_host:
+                execution_routeable = False
+            elif not self._delegation_utilities_enabled():
+                execution_routeable = False
+            elif not self._provider_allowed_as_delegation_target(provider):
+                execution_routeable = False
+
+            execution_mode = "delegation"
+            execution_note = "Eligible for execute_subtask utility delegation."
+            if is_current_host:
+                execution_mode = "host_native"
+                execution_note = "Current host CLI executes via host_spawn; not a subprocess delegation target."
+            elif self._provider_is_host_execution_target(provider):
+                execution_mode = "disabled"
+                execution_note = "Other host CLIs are not subprocess delegation targets."
+            elif not self._delegation_utilities_enabled():
+                execution_mode = "disabled"
+                execution_note = (
+                    "Utility delegation is disabled; detected provider is diagnostics-only "
+                    "unless providers.delegation_utilities_enabled is true."
+                )
+            elif not execution_routeable:
+                execution_mode = "disabled"
+                execution_note = self._delegation_target_exclusion_reason(provider)
+
             # Build tier model count summary
             models_summary = {}
             for tier in ("low", "medium", "high"):
@@ -4631,14 +4684,9 @@ class ProviderRegistry:
                 "binary": provider.binary,
                 "routeable": readiness.routeable if readiness else False,
                 "router_only": self._provider_is_router_only(provider),
-                "execution_routeable": bool(
-                    readiness.routeable if readiness else False
-                ) and self._router_only_execution_allowed(
-                    provider,
-                    caller=None,
-                    tier="low",
-                    caller_allowlists=None,
-                ),
+                "execution_routeable": execution_routeable,
+                "execution_mode": execution_mode,
+                "execution_note": execution_note,
                 "detect_reason": readiness.reason.value if readiness else "unknown",
                 "models_summary": models_summary,
                 "billing": self._billing_summary_for_provider(provider),
@@ -4675,6 +4723,11 @@ class ProviderRegistry:
                 1 for p in self.available_providers
                 if p.readiness and p.readiness.routeable
             ),
+            "execution_routeable_count": sum(
+                1 for p in providers if p.get("execution_routeable") is True
+            ),
+            "delegation_utilities_enabled": self._delegation_utilities_enabled(),
+            "caller": normalized_caller,
         }
 
     @staticmethod

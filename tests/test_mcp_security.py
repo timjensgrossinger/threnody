@@ -188,6 +188,21 @@ def test_check_providers_compact_structure():
         assert not missing_keys, f"Provider {provider_entry.get('name')} missing keys: {missing_keys}"
 
 
+def test_check_providers_marks_subprocess_execution_disabled_by_default(monkeypatch):
+    """Detected providers stay diagnostic-only unless utility delegation is opted in."""
+    from shared.discovery import ProviderRegistry
+
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
+    registry = ProviderRegistry()
+    compact = registry.to_compact_dict(caller="codex")
+
+    assert compact["caller"] == "codex"
+    assert compact["delegation_utilities_enabled"] is False
+    assert compact["routeable_count"] >= 1
+    assert compact["execution_routeable_count"] == 0
+    assert all(provider["execution_routeable"] is False for provider in compact["providers"])
+
+
 def test_check_providers_compact_detect_reason_is_string():
     """detect_reason values are strings (not Enum objects).
     

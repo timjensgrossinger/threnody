@@ -3549,6 +3549,15 @@ def _execute_swarm_host_native_response(
     swarm_result: dict[str, object] = {
         "swarm_id": swarm_id,
         "host_execution_mode": "host_native",
+        "execution_boundary": {
+            "mode": "host_native_only",
+            "data_export": "host_agent_prompts_only",
+            "external_provider_delegation": False,
+            "delegation_utilities_enabled": bool(
+                getattr(config, "delegation_utilities_enabled", False)
+            ),
+            "provider": normalize_caller_id(caller) or "host",
+        },
         "started": False,
         "awaiting_host_execution": True,
         "host_spawn_waves": host_waves,
@@ -10683,7 +10692,8 @@ def handle_check_providers(_args: dict) -> dict:
     and health per provider. No credentials or sensitive state exposed.
     """
     registry = _get_registry_with_config()
-    base = registry.to_compact_dict()
+    caller = _resolve_caller()
+    base = registry.to_compact_dict(caller=caller)
 
     try:
         config, db, router, planner, orchestrator = _ensure_init()
