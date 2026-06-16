@@ -177,6 +177,8 @@ learning:
     enabled: true
     providers:
       - claude-code
+      # - codex               # writes to .codex/skills/<slug>/SKILL.md or ~/.agents/skills/<slug>/SKILL.md
+      # - cursor              # writes to .cursor/skills/<slug>/SKILL.md
       # - github-copilot-cli   # writes to .github/agents/<slug>.md
       # - opencode             # writes to .opencode/agent/<slug>.md
     promotion_threshold: 10    # match_count before promoting to user-global skills dir

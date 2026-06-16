@@ -488,15 +488,17 @@ The custom instruction sync:
    - `~/.codex/AGENTS.md` (Codex)
    - `~/.cursor/rules/threnody.mdc` (Cursor)
    - `~/.junie/AGENTS.md` (Junie)
-3. Installs tier agent templates + skill manifests to `~/.claude/agents`,
-   `~/.cursor/agents`
+3. Installs tier agent templates to `~/.claude/agents`, `~/.cursor/agents`;
+   bundled Threnody skills to `~/.claude/skills`, `~/.cursor/skills`,
+   `~/.agents/skills`, `~/.codex/skills`; and flat agent guides to
+   `~/.copilot/agents`, `~/.config/opencode/agent`
 4. Optionally registers the Claude PreToolUse routing enforcement hook in
    `~/.claude/settings.json`
 
 ### Why skip in plugin-mode
 
 1. **The plugin manifest already handles skills.** `.claude-plugin/plugin.json`
-   has `"skills": "./skills"` which delivers the six `threnody-*` skills as part
+   has `"skills": "./skills"` which delivers the bundled `threnody-*` skills as part
    of the plugin install. Writing skill manifests via install.sh would be
    redundant and could conflict with what the plugin manager placed.
 

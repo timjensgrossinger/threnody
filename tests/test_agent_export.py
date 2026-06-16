@@ -111,6 +111,32 @@ def test_export_writes_skill_md(temp_db_fixture: Database, tmp_path: Path) -> No
     assert "does things" in written_path.read_text()
 
 
+@pytest.mark.parametrize(
+    ("provider", "expected_path"),
+    [
+        ("codex", ".codex/skills/test-pattern/SKILL.md"),
+        ("cursor", ".cursor/skills/test-pattern/SKILL.md"),
+    ],
+)
+def test_export_writes_provider_skill_dirs(
+    temp_db_fixture: Database,
+    tmp_path: Path,
+    provider: str,
+    expected_path: str,
+) -> None:
+    _insert_agent(temp_db_fixture, f"active-{provider}", "active")
+    result = export_agent_skill(
+        temp_db_fixture,
+        f"active-{provider}",
+        providers=[provider],
+        scope="project",
+        project_path=str(tmp_path),
+    )
+    assert result["errors"] == []
+    assert Path(result["written"][0]["path"]) == tmp_path / expected_path
+    assert (tmp_path / expected_path).is_file()
+
+
 def test_export_dry_run_no_write(temp_db_fixture: Database, tmp_path: Path) -> None:
     _insert_agent(temp_db_fixture, "active-hash2", "active")
     result = export_agent_skill(

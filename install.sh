@@ -640,6 +640,7 @@ SYNCED_COPILOT_INSTRUCTIONS=0
 SYNCED_CODEX_INSTRUCTIONS=0
 SYNCED_CURSOR_INSTRUCTIONS=0
 SYNCED_JUNIE_INSTRUCTIONS=0
+SYNCED_THRENODY_SKILLS=0
 INSTRUCTION_RENDER_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t threnody-instructions)"
 
 render_instruction_artifacts() {
@@ -838,6 +839,40 @@ install_threnody_skills() {
     info "Installed Threnody skills to $target_dir"
 }
 
+install_threnody_flat_agents() {
+    local target_dir="$1"
+    if [[ ! -d "$INSTALL_DIR/skills" ]]; then
+        return 0
+    fi
+    mkdir -p "$target_dir"
+    for skill_dir in "$INSTALL_DIR/skills"/threnody-*/; do
+        [[ -d "$skill_dir" ]] || continue
+        local skill_name
+        skill_name="$(basename "$skill_dir")"
+        if [[ -f "$skill_dir/SKILL.md" ]]; then
+            cp "$skill_dir/SKILL.md" "$target_dir/$skill_name.md" 2>/dev/null || true
+        fi
+    done
+    info "Installed Threnody agent guides to $target_dir"
+}
+
+install_provider_skill_targets() {
+    install_threnody_skills "$HOME/.claude/skills"
+    install_threnody_skills "$HOME/.cursor/skills"
+
+    # Codex discovers user skills from the shared agents skill root. Also seed
+    # ~/.codex/skills for Codex builds that support a provider-local skill root,
+    # while leaving ~/.codex/skills/.system untouched.
+    install_threnody_skills "$HOME/.agents/skills"
+    install_threnody_skills "$HOME/.codex/skills"
+
+    # Providers with flat custom-agent layouts get the same operational guides
+    # as markdown agents rather than directory-style SKILL.md packages.
+    install_threnody_flat_agents "$HOME/.copilot/agents"
+    install_threnody_flat_agents "$HOME/.config/opencode/agent"
+    SYNCED_THRENODY_SKILLS=1
+}
+
 write_managed_file() {
     local target="$1"
     local body="$2"
@@ -858,6 +893,8 @@ path.write_text(body + "\n", encoding="utf-8")
 PY
 }
 
+install_provider_skill_targets
+
 # --- Claude Code instructions ---
 if [[ "$HAS_CLAUDE" -eq 1 ]]; then
     CLAUDE_MD="$HOME/.claude/CLAUDE.md"
@@ -871,7 +908,6 @@ if [[ "$HAS_CLAUDE" -eq 1 ]]; then
         info "Synced managed routing instructions to $CLAUDE_MD"
         SYNCED_CLAUDE_INSTRUCTIONS=1
         install_threnody_tier_agents "$HOME/.claude/agents"
-        install_threnody_skills "$HOME/.claude/skills"
     fi
 
     if routing_hooks_enabled "claude-code"; then
@@ -1322,6 +1358,16 @@ if [[ "$SYNCED_CURSOR_INSTRUCTIONS" -eq 1 ]]; then
 fi
 if [[ "$SYNCED_JUNIE_INSTRUCTIONS" -eq 1 ]]; then
     echo "    ~/.junie/AGENTS.md                  JetBrains Junie"
+fi
+if [[ "$SYNCED_THRENODY_SKILLS" -eq 1 ]]; then
+    echo ""
+    echo "  Installed Threnody skills:"
+    echo "    ~/.agents/skills/threnody-*         Codex shared skill root"
+    echo "    ~/.codex/skills/threnody-*          Codex provider skill root"
+    echo "    ~/.claude/skills/threnody-*         Claude Code"
+    echo "    ~/.cursor/skills/threnody-*         Cursor"
+    echo "    ~/.copilot/agents/threnody-*.md     GitHub Copilot CLI"
+    echo "    ~/.config/opencode/agent/threnody-*.md  OpenCode"
 fi
 echo ""
 echo "  Available commands (after shell restart):"

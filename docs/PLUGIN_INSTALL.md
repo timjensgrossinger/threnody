@@ -21,7 +21,7 @@ The installer detects which CLI(s) you have; at least one must be present (or se
 
 ## Installation Path 1: Claude Code Plugin Marketplace (Recommended)
 
-This is the richest install experience: the plugin bundles the MCP server, six routing skills, and the coordination hook as a single installable unit.
+This is the richest install experience: the plugin bundles the MCP server, the Threnody routing skills, and the coordination hook as a single installable unit.
 
 ### One-time: Register the marketplace
 
@@ -64,7 +64,7 @@ Drop this into your project's `.claude/settings.json` to prompt teammates to ins
 }
 ```
 
-The plugin automatically registers the MCP server via `uvx threnody-mcp` and installs the six skills.
+The plugin automatically registers the MCP server via `uvx threnody-mcp` and installs the Threnody skills.
 
 ---
 
@@ -122,6 +122,7 @@ This step:
 - Validates Python 3.10+ is available
 - Scans for installed host CLIs
 - Writes `providers.json` (the fallback provider inventory)
+- Installs bundled Threnody skills into provider-native roots for Claude Code, Cursor, Codex, Copilot CLI, and OpenCode
 - Skips file copy, shell aliases, and wizard
 
 Then register the MCP server manually in your host CLI config. For Claude Code:
@@ -223,6 +224,7 @@ This installs:
 - Shell aliases: `ghc`, `ghcs`, `ghce`, `threnody`, `threnody-watch` to `~/.local/bin/`
 - MCP server registration in Claude Code, Copilot CLI, Cursor, and other connected hosts
 - Custom instruction sync (routing policy blocks in shell instruction files)
+- Bundled Threnody skills in `~/.agents/skills`, `~/.codex/skills`, `~/.claude/skills`, `~/.cursor/skills`, `~/.copilot/agents`, and `~/.config/opencode/agent`
 - Interactive first-run configuration wizard
 
 After installation, restart your shell to pick up the aliases, then connect from your host CLI.

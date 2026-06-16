@@ -118,7 +118,7 @@ Threnody documents operator responsibilities; it does not provide legal certific
 
 ## Project skills
 
-Nine repo-local skills under [`skills/`](skills/) guide MCP workflows from any connected host (Cursor, Copilot, Claude Code, Codex, etc.). Host shells discover them via repo symlinks (`.cursor/skills`, `.claude/skills`) and the skill index in [copilot-instructions.md](copilot-instructions.md).
+Nine repo-local skills under [`skills/`](skills/) guide MCP workflows from any connected host (Cursor, Copilot, Claude Code, Codex, etc.). `install.sh` installs them into provider-native roots: directory-style skills for Claude Code, Cursor, and Codex (`~/.claude/skills`, `~/.cursor/skills`, `~/.agents/skills`, plus `~/.codex/skills`), and flat markdown agent guides for Copilot CLI and OpenCode (`~/.copilot/agents`, `~/.config/opencode/agent`).
 
 | Skill | Use when |
 |---|---|

@@ -65,6 +65,10 @@ def _run_installer(
     )
 
 
+def _bundled_skill_names(source: Path) -> set[str]:
+    return {path.parent.name for path in source.glob("skills/threnody-*/SKILL.md")}
+
+
 def test_clean_install_with_spaces_and_portable_copy(tmp_path: Path) -> None:
     source = _copy_source(tmp_path / "source tree")
     home = tmp_path / "home with spaces"
@@ -87,6 +91,24 @@ def test_clean_install_with_spaces_and_portable_copy(tmp_path: Path) -> None:
     assert (home / ".local/bin/threnody").is_symlink()
     assert "using portable Python copy fallback" in result.stderr
     assert not list(temp_dir.iterdir())
+
+    skill_names = _bundled_skill_names(source)
+    assert skill_names
+    for target in (
+        home / ".agents/skills",
+        home / ".codex/skills",
+        home / ".claude/skills",
+        home / ".cursor/skills",
+    ):
+        installed = {path.parent.name for path in target.glob("threnody-*/SKILL.md")}
+        assert installed == skill_names
+
+    for target in (
+        home / ".copilot/agents",
+        home / ".config/opencode/agent",
+    ):
+        installed = {path.stem for path in target.glob("threnody-*.md")}
+        assert installed == skill_names
 
 
 def test_reinstall_is_idempotent_and_preserves_runtime_data(tmp_path: Path) -> None:

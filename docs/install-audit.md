@@ -81,7 +81,7 @@ Registers MCP server entry points in host CLI config files:
   - Codex: `~/.codex/AGENTS.md`
   - Cursor: `~/.cursor/rules/threnody.mdc`
   - Junie: `~/.junie/AGENTS.md`
-- **Installs:** Tier agent templates + skill manifests to `~/.claude/agents`, `~/.cursor/agents`
+- **Installs:** Tier agent templates to `~/.claude/agents`, `~/.cursor/agents`; bundled Threnody skills to `~/.claude/skills`, `~/.cursor/skills`, `~/.agents/skills`, `~/.codex/skills`; flat agent guides to `~/.copilot/agents`, `~/.config/opencode/agent`
 - **Hook install:** Registers Claude PreToolUse hook for routing enforcement (if enabled in config)
 
 ---

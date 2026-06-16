@@ -39,6 +39,18 @@ _BUILTIN_TARGETS: list[ExportTarget] = [
         layout="flat_md",
     ),
     ExportTarget(
+        provider_id="codex",
+        project_subdir=".codex/skills",
+        global_dir=Path.home() / ".agents" / "skills",
+        layout="skill_dir",
+    ),
+    ExportTarget(
+        provider_id="cursor",
+        project_subdir=".cursor/skills",
+        global_dir=Path.home() / ".cursor" / "skills",
+        layout="skill_dir",
+    ),
+    ExportTarget(
         provider_id="opencode",
         project_subdir=".opencode/agent",
         global_dir=Path.home() / ".config" / "opencode" / "agent",
