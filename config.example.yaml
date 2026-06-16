@@ -18,6 +18,22 @@ background:
   warm_path_enabled: true
   warm_path_interval_s: 120      # drain learning_queue plus warm-path backlog (min 5)
 
+host_native:
+  # How host-native wave runs (swarm / plan_task / fleet / workflow) report learning.
+  # batch (default): accumulate per-agent results into ~/.local/lib/threnody/runs/<id>/wave.jsonl
+  #   and import ONCE at terminal — worker-wave report_host_wave becomes a fast noop, keeping the
+  #   hot path as fast as native subagent spawning. Only consensus waves / expand_host_plan
+  #   still round-trip mid-run.
+  # inline: legacy per-wave synchronous ingest (fallback for resume / debugging).
+  report_mode: batch
+  # hook (default): a PostToolUse Edit|Write hook appends run-log lines with zero model tokens.
+  # model: the host appends / passes records itself. off: no per-agent capture.
+  learning_capture: hook
+  # deferred (default): check_draft_ready (LLM call per pattern) runs in the warm-path daemon,
+  #   never on a reporting call. inline: legacy (run during ingest).
+  draft_ready_mode: deferred
+  runs_keep: 20                  # per-run log dirs to retain (rotation, like cache.backup_keep)
+
 swarm:
   max_agents: 12
   # host_native (default for MCP host shells): plan in Threnody, execute waves via host Agent/Task

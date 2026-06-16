@@ -697,3 +697,147 @@ def test_expand_host_plan_skips_already_assigned_files(tmp_path: Path) -> None:
         assert result.get("new_files") == ["style.css"]
     finally:
         database.close()
+
+
+def _occ_and_telemetry(db: Database, run_id: str) -> tuple[int, int]:
+    with db.conn() as conn:
+        occ = conn.execute(
+            "SELECT COALESCE(SUM(occurrence_count), 0) FROM subtask_patterns"
+        ).fetchone()[0]
+        tel = conn.execute(
+            "SELECT COUNT(*) FROM telemetry WHERE session_id = ? AND reason = ?",
+            (run_id, "host_agent_complete"),
+        ).fetchone()[0]
+    return occ, tel
+
+
+def _setup_run(db: Database, run_id: str, n: int) -> None:
+    specs = [
+        {"id": str(i), "tier": "low", "model": "m", "prompt": f"create file_{i}.py"}
+        for i in range(1, n + 1)
+    ]
+    register_host_run_handoff(
+        db,
+        run_id=run_id,
+        host_spawn_waves=[{"wave": 1, "agents": specs}],
+        planned_subtasks=n,
+        workspace_root="/tmp/project",
+    )
+    db.persist_swarm_run(
+        {"swarm_id": run_id, "status": "running", "resume_status": "running",
+         "requested_agents": n, "effective_agents": n}
+    )
+
+
+def _agent_records(run_id: str, n: int) -> list[dict]:
+    return [
+        {
+            "wave": 1,
+            "spawn_id": str(i),
+            "task_id": host_task_id(run_id, str(i)),
+            "success": True,
+            "touched_files": [f"file_{i}.py"],
+            "output_excerpt": f"created file_{i}.py",
+        }
+        for i in range(1, n + 1)
+    ]
+
+
+def test_batch_import_parity_with_inline(tmp_path: Path, monkeypatch) -> None:
+    """import_run_log (batch) must produce the same learning rows as inline ingest."""
+    from shared import run_log
+    from shared.host_learning import import_run_log
+
+    monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", tmp_path / "runs" / "active.json")
+
+    n = 5
+    cfg = TGsConfig()
+
+    # --- inline path ---
+    inline_db = Database(tmp_path / "inline.db")
+    inline_db._init_schema(inline_db._get_connection())
+    _setup_run(inline_db, "swarm-inline", n)
+    ingest_host_wave(
+        inline_db,
+        run_id="swarm-inline",
+        wave_index=1,
+        agents=[{k: v for k, v in r.items() if k != "wave"} for r in _agent_records("swarm-inline", n)],
+        workspace_root="/tmp/project",
+        terminal=True,
+        outcome="accepted",
+        config=cfg,
+    )
+    inline_occ, inline_tel = _occ_and_telemetry(inline_db, "swarm-inline")
+    inline_db.close()
+
+    # --- batch path: write JSONL, then import once ---
+    batch_db = Database(tmp_path / "batch.db")
+    batch_db._init_schema(batch_db._get_connection())
+    _setup_run(batch_db, "swarm-batch", n)
+    for rec in _agent_records("swarm-batch", n):
+        run_log.append_agent_record("swarm-batch", rec)
+    result = import_run_log(
+        batch_db, "swarm-batch", outcome="accepted", config=cfg,
+    )
+    assert result["finalize"]["status"] == "completed"
+    batch_occ, batch_tel = _occ_and_telemetry(batch_db, "swarm-batch")
+    batch_db.close()
+
+    assert batch_occ == inline_occ == n
+    assert batch_tel == inline_tel == n
+
+
+def test_import_run_log_is_idempotent(tmp_path: Path, monkeypatch) -> None:
+    from shared import run_log
+    from shared.host_learning import import_run_log
+
+    monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", tmp_path / "runs" / "active.json")
+
+    db = Database(tmp_path / "idem.db")
+    db._init_schema(db._get_connection())
+    _setup_run(db, "swarm-idem", 3)
+    for rec in _agent_records("swarm-idem", 3):
+        run_log.append_agent_record("swarm-idem", rec)
+
+    import_run_log(db, "swarm-idem", outcome="accepted", config=TGsConfig())
+    occ1, tel1 = _occ_and_telemetry(db, "swarm-idem")
+    # Second import must be a no-op (already marked imported).
+    second = import_run_log(db, "swarm-idem", outcome="accepted", config=TGsConfig())
+    assert second.get("already_imported") is True
+    occ2, tel2 = _occ_and_telemetry(db, "swarm-idem")
+    assert (occ1, tel1) == (occ2, tel2)
+    db.close()
+
+
+def test_effective_capture_falls_back_to_model_for_non_claude() -> None:
+    from shared.config import HostNativeConfig
+    from shared.host_learning import build_learning_report_contract, effective_learning_capture
+
+    cfg = TGsConfig()
+    cfg.host_native = HostNativeConfig(report_mode="batch", learning_capture="hook")
+
+    # Claude has a wired PostToolUse hook → hook capture.
+    assert effective_learning_capture(cfg, "claude-code") == "hook"
+    # Other CLIs have no wired hook → model capture (no learning loss).
+    for caller in ("github-copilot", "copilot", "codex", "cursor", "junie", "opencode"):
+        assert effective_learning_capture(cfg, caller) == "model", caller
+
+    # Contract advertises the resolved per-caller mode.
+    c_claude = build_learning_report_contract("/tmp/p", run_id="swarm-x", config=cfg, caller="claude-code")
+    c_codex = build_learning_report_contract("/tmp/p", run_id="swarm-x", config=cfg, caller="codex")
+    assert c_claude["learning_capture"] == "hook"
+    assert c_codex["learning_capture"] == "model"
+    assert c_claude["report_mode"] == c_codex["report_mode"] == "batch"
+
+
+def test_effective_capture_respects_explicit_model_and_off() -> None:
+    from shared.config import HostNativeConfig
+    from shared.host_learning import effective_learning_capture
+
+    cfg = TGsConfig()
+    cfg.host_native = HostNativeConfig(learning_capture="off")
+    assert effective_learning_capture(cfg, "claude-code") == "off"
+    cfg.host_native = HostNativeConfig(learning_capture="model")
+    assert effective_learning_capture(cfg, "claude-code") == "model"

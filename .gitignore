@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 
 # Runtime data
+runs/
 cache.db
 cache.db-wal
 cache.db-shm
@@ -63,3 +64,6 @@ tests/eval/baseline.json
 # TLS / key material
 *.pem
 *.key
+
+# Local security test scratch (contains live tokens — never commit)
+sectest.sh

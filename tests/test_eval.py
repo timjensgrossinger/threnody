@@ -185,6 +185,25 @@ def test_tracker_detect_rework_on_overlap():
     assert events[0]["scope_match"] is True
 
 
+def test_tracker_prunes_old_wave_snapshots():
+    # Resident snapshot content must stay bounded to the last 2 waves so a
+    # long multi-wave run under large fan-out cannot accumulate every file's
+    # content in RAM. Older waves' content (and bookkeeping) is evicted.
+    tracker = WaveFileTracker()
+    for w in range(5):
+        path = f"w{w}.py"
+        tracker.record_wave(w, {path}, content_after={path: f"x = {w}\n"})
+    # Only the final two waves' files survive.
+    assert set(tracker.snapshots_after) == {"w3.py", "w4.py"}
+    assert set(tracker.wave_files) == {3, 4}
+    # The most recent wave pair still detects rework correctly post-prune.
+    tracker.record_wave(5, {"w4.py"}, content_before={"w4.py": "x = 4\n"},
+                        content_after={"w4.py": "x = 99\n"})
+    events = tracker.detect_rework(5)
+    assert len(events) == 1
+    assert events[0]["file_path"] == "w4.py"
+
+
 def test_tracker_detect_rework_wave_0_returns_empty():
     tracker = WaveFileTracker()
     tracker.record_wave(0, {"a.py"})

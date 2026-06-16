@@ -17,7 +17,7 @@ from .consensus import (
     parse_judge_decision,
     persona_id_from_spawn_id,
 )
-from .context import is_within_repo, normalize_target_path
+from .context import is_within_repo, normalize_target_path, read_source_cached
 from .db import Database
 from .eval import BackgroundEvaluator, WaveFileTracker, cold_path_adjust
 from .host_spawn import build_judge_spawn
@@ -145,10 +145,54 @@ def _auto_output_excerpt(
     return "; ".join(parts)
 
 
-def build_learning_report_contract(workspace_root: str | None) -> dict[str, Any]:
-    """Host-facing contract for report_host_wave learning fields."""
-    return {
+def effective_learning_capture(config: TGsConfig | None, caller: str | None) -> str:
+    """Resolve the capture mode for *caller*.
+
+    ``hook`` capture only works where install.sh actually registered a PostToolUse
+    learning hook (``ROUTING_POLICY_HOOK_CAPABLE_SHELLS``). Every other host CLI
+    (Copilot, Codex, Cursor, Junie, OpenCode, …) falls back to ``model`` capture:
+    the host passes per-agent results in the single terminal report. Same fidelity,
+    one call, no per-wave round-trip — so no CLI loses learning when it lacks a
+    wired hook.
+    """
+    from .config import (
+        ROUTING_POLICY_HOOK_CAPABLE_SHELLS,
+        normalize_routing_policy_shell_id,
+    )
+
+    cap = getattr(config.host_native, "learning_capture", "hook") if config else "hook"
+    if cap != "hook":
+        return cap
+    shell_id = normalize_routing_policy_shell_id(caller)
+    if shell_id in ROUTING_POLICY_HOOK_CAPABLE_SHELLS:
+        return "hook"
+    return "model"
+
+
+def build_learning_report_contract(
+    workspace_root: str | None,
+    *,
+    run_id: str | None = None,
+    config: TGsConfig | None = None,
+    caller: str | None = None,
+) -> dict[str, Any]:
+    """Host-facing contract for report learning fields.
+
+    Advertises the active ``report_mode`` so the host knows whether to report
+    learning per wave (``inline``) or accumulate it and report once at terminal
+    (``batch`` — the default; worker waves need no ``report_host_wave`` call,
+    capture happens via the PostToolUse hook or the host's own appends).
+    """
+    report_mode = "batch"
+    if config is not None:
+        report_mode = getattr(config.host_native, "report_mode", "batch")
+    # Resolve per-caller: only hook-capable shells get `hook`; others → `model`.
+    learning_capture = effective_learning_capture(config, caller)
+
+    contract: dict[str, Any] = {
         "workspace_root": workspace_root,
+        "report_mode": report_mode,
+        "learning_capture": learning_capture,
         "per_agent": [
             "task_id",
             "spawn_id",
@@ -161,6 +205,28 @@ def build_learning_report_contract(workspace_root: str | None) -> dict[str, Any]
         ),
         "terminal": {"outcome": "accepted|revised|reworked|rejected"},
     }
+    if report_mode == "batch":
+        contract["batch"] = {
+            "worker_waves": (
+                "Do NOT call report_host_wave for plain worker waves. Spawn the "
+                "wave natively; per-agent learning is captured automatically "
+                "(PostToolUse hook) or, when learning_capture=model, by passing "
+                "agents to a single terminal report."
+            ),
+            "round_trips": (
+                "report_host_wave is only needed for consensus waves and "
+                "expand_host_plan. Report once at terminal via "
+                "report_host_swarm_complete(outcome=...)."
+            ),
+        }
+        if run_id:
+            try:
+                from . import run_log
+
+                contract["batch"]["run_log_path"] = str(run_log.run_log_path(run_id))
+            except Exception:
+                log.debug("run_log path for contract failed", exc_info=True)
+    return contract
 
 
 def _wave_tracker(run_id: str) -> WaveFileTracker:
@@ -769,8 +835,16 @@ def ingest_host_wave(
     router: TaskRouter | None = None,
     expand_plan: bool = False,
     discovered_files: list[str] | None = None,
+    defer_draft_ready: bool = False,
 ) -> dict[str, Any]:
-    """Ingest one host-reported wave and optionally finalize the run."""
+    """Ingest one host-reported wave and optionally finalize the run.
+
+    When *defer_draft_ready* is true the per-pattern ``check_draft_ready`` LLM
+    calls are NOT run here; the ``(project, pattern_hash)`` pairs are accumulated
+    into ``meta["pending_draft_hashes"]`` and drained off the hot path in
+    ``finalize_host_swarm`` / the warm-path daemon. This keeps the only LLM cost
+    out of any reporting call.
+    """
     if wave_index < 1:
         raise ValueError("wave must be >= 1")
     meta = _ensure_host_run_meta(db, run_id)
@@ -888,11 +962,16 @@ def ingest_host_wave(
             resolved = _resolve_touched_path(effective_root, path)
             if resolved is None:
                 continue
-            try:
-                content_after[norm_key] = resolved.read_text(encoding="utf-8", errors="replace")
-                files_read += 1
-            except OSError:
-                log.debug("could not read %s for rework tracking", resolved, exc_info=True)
+            # Use the mtime-keyed cache and the 2 MiB byte cap: under large
+            # fan-out this avoids re-reading the same source per agent and
+            # never pulls an oversized/generated file fully into RAM. Oversized
+            # or unreadable files return None and are skipped (rework
+            # classification degrades to EXTENSION for them — telemetry only).
+            text = read_source_cached(resolved)
+            if text is None:
+                continue
+            content_after[norm_key] = text
+            files_read += 1
 
     # Flush all buffered per-agent writes for this wave in one transaction,
     # then run draft-readiness once per unique pattern hash (kept strictly
@@ -908,12 +987,20 @@ def ingest_host_wave(
         except Exception as exc:
             wave_warnings.append(f"wave_flush:{exc}")
             log.warning("host wave flush failed for run %s wave %d", run_id, wave_index, exc_info=True)
-    for ph, proj in draft_projects_by_hash.items():
-        try:
-            check_draft_ready(db, proj, ph)
-        except Exception as exc:
-            wave_warnings.append(f"pattern_tracking:{exc}")
-            log.warning("host draft-readiness check failed for %s", ph, exc_info=True)
+    if defer_draft_ready:
+        # Off-hot-path: stash pairs in meta; drained in finalize / warm-path.
+        pending = meta.get("pending_draft_hashes")
+        if not isinstance(pending, dict):
+            pending = {}
+        pending.update(draft_projects_by_hash)
+        meta["pending_draft_hashes"] = pending
+    else:
+        for ph, proj in draft_projects_by_hash.items():
+            try:
+                check_draft_ready(db, proj, ph)
+            except Exception as exc:
+                wave_warnings.append(f"pattern_tracking:{exc}")
+                log.warning("host draft-readiness check failed for %s", ph, exc_info=True)
     if processed_agents:
         meta["reported_agents"] = int(meta.get("reported_agents") or 0) + processed_agents
 
@@ -1063,6 +1150,88 @@ def ingest_host_wave(
     return response
 
 
+def import_run_log(
+    db: Database,
+    run_id: str,
+    *,
+    outcome: str,
+    config: TGsConfig | None = None,
+    router: TaskRouter | None = None,
+    workspace_root: str | None = None,
+) -> dict[str, Any]:
+    """Batch-import a run's JSONL worker-wave log into the DB, once, at terminal.
+
+    Replays each captured wave through ``ingest_host_wave`` (with
+    ``defer_draft_ready=True``) in wave order so cross-wave rework detection and
+    the single batched ``flush_host_wave_records`` still happen — just off the
+    per-wave hot path. The terminal wave triggers ``finalize_host_swarm``, which
+    drains the deferred draft-readiness checks.
+
+    Consensus waves are NOT in the log (they are processed live during the run),
+    so they are never double-counted here. Idempotent: a run already marked
+    imported is skipped, so the warm-path daemon can safely retry crashed
+    terminals.
+    """
+    from . import run_log
+
+    if run_log.is_imported(run_id):
+        return {"already_imported": True, "run_id": run_id}
+
+    records = run_log.read_run_log(run_id)
+    waves: dict[int, list[dict[str, Any]]] = {}
+    for rec in records:
+        if not isinstance(rec, Mapping):
+            continue
+        try:
+            w = int(rec.get("wave", 1))
+        except (TypeError, ValueError):
+            w = 1
+        waves.setdefault(max(1, w), []).append(dict(rec))
+
+    ordered = sorted(waves)
+    result: dict[str, Any] = {"run_id": run_id, "imported_waves": len(ordered)}
+
+    if not ordered:
+        # No captured worker records (e.g. capture=off, or all read-only):
+        # still terminalize so the run is finalized exactly once.
+        result["finalize"] = finalize_host_swarm(
+            db,
+            run_id,
+            outcome,
+            config=config,
+            router=router,
+            workspace_root=workspace_root,
+        )
+        run_log.mark_imported(run_id)
+        return result
+
+    last = ordered[-1]
+    for w in ordered:
+        wave_result = ingest_host_wave(
+            db,
+            run_id=run_id,
+            wave_index=w,
+            agents=waves[w],
+            workspace_root=workspace_root,
+            config=config,
+            router=router,
+            defer_draft_ready=True,
+            terminal=(w == last),
+            outcome=outcome if w == last else None,
+        )
+        if w == last:
+            result["finalize"] = wave_result.get("finalize")
+            result["rework_events"] = wave_result.get("rework_events", [])
+
+    run_log.mark_imported(run_id)
+    try:
+        keep = config.host_native.runs_keep if config is not None else 20
+        run_log.prune_runs(keep=keep)
+    except Exception:
+        log.debug("run_log prune failed", exc_info=True)
+    return result
+
+
 def finalize_host_swarm(
     db: Database,
     run_id: str,
@@ -1084,6 +1253,19 @@ def finalize_host_swarm(
     topology = str(meta.get("topology") or "linear")
     success = normalized_outcome in {"accepted", "revised"}
     finalize_warnings: list[str] = []
+
+    # Drain deferred draft-readiness checks accumulated across waves (the only
+    # LLM calls in the learning path). This runs at terminal — off the per-wave
+    # hot path — and is backgrounded by the MCP terminal handler.
+    pending_drafts = meta.get("pending_draft_hashes")
+    if isinstance(pending_drafts, dict) and pending_drafts:
+        for ph, proj in list(pending_drafts.items()):
+            try:
+                check_draft_ready(db, proj, ph)
+            except Exception as exc:
+                finalize_warnings.append(f"draft_ready:{exc}")
+                log.debug("deferred draft-readiness failed for %s", ph, exc_info=True)
+        meta["pending_draft_hashes"] = {}
 
     status = "completed" if success else "failed"
     db.persist_swarm_run(

@@ -152,6 +152,8 @@ The planner is advisory — it only returns decomposition metadata. The orchestr
 | `shared/worktree.py` | Git worktree isolation for `execute_subtask`; leases at `~/.local/lib/threnody/worktrees/<task_id>`, released with `merge` or `discard` |
 | `shared/replay.py` | Trace replay and state forking from coordinator checkpoints; requires idempotency keys on `SIDE_EFFECTING` subtasks |
 | `shared/routing_hook.py` | Standalone PreToolUse routing guard bridge — no MCP stdio required; backs the Claude Code `guarded` policy hook |
+| `shared/run_log.py` | Append-only per-run JSONL log under `~/.local/lib/threnody/runs/<run_id>/` — the capture plane for `batch` host-native reporting. Worker-wave learning is appended here (by the PostToolUse hook or the host) and imported once at terminal via `host_learning.import_run_log`, eliminating the per-wave `report_host_wave` round-trip. Holds an `active.json` pointer + idempotency/`runs_keep` rotation |
+| `shared/learning_hook.py` | Standalone PostToolUse learning-capture bridge — appends one `run_log` line per Edit/Write with zero model tokens. Depends only on `run_log` (no MCP/DB), never blocks the tool. Backs the Claude `PostToolUse` hook when `host_native.learning_capture=hook` |
 | `shared/agent_export.py` | Export approved learned agent definitions as provider-native skill files |
 | `shared/host_spawn.py` | Host-native spawn contract helpers — produces `host_spawn` / `host_spawn_waves` payloads, enforces `HostNativeRequired`; honors per-subtask `subagent_type` and `read_only` overrides. `sanitize_plan_for_host()` is the workspace-containment safety gate: before host-wave OR Dynamic Workflow emission it strips `target_file`s that escape the workspace root and drops fragment/empty prompts, collapsing to a single coherent agent if nothing safe survives (records a `sanitization` report). Host-native swarm agents edit via their own native Edit/Write tools — the `execute_subtask` surgical edit modes (`rewrite`/`blocks`/`patch`) are utility-delegation-only and do not apply to host-native waves |
 | `shared/review_fanout.py` | Per-file × dimension review fanout for `REVIEW:` tasks — complexity gating (trivial/moderate/complex), dimension selection, tier assignment, `build_review_subtasks()` |
@@ -225,6 +227,12 @@ Routing eval fixtures live in `tests/eval/` organised by tier (`low_tier/`, `med
 ## Config
 
 `config.yaml` controls complexity-scoring signals, tier bounds, parallelism, speculation, and per-provider effort defaults. Loaded via `TGsConfig.from_yaml()` in `shared/config.py`.
+
+`host_native` (in `config.yaml`, `HostNativeConfig`) controls how host-native wave runs report learning:
+- `report_mode: batch` (default) — host accumulates per-agent results into the `run_log` and reports **once** at terminal (`report_host_swarm_complete` → `import_run_log`), so worker-wave `report_host_wave` calls are eliminated and the hot path matches native subagent spawning. `inline` is the legacy per-wave ingest, kept as a fallback (`report_mode: inline` reverts).
+- `learning_capture: hook` (default) — PostToolUse hook appends run-log lines with zero model tokens; `model` makes the host pass agents in the terminal call; `off` disables per-agent capture. Resolved **per caller** by `effective_learning_capture()`: only shells in `ROUTING_POLICY_HOOK_CAPABLE_SHELLS` (currently `claude-code`) use `hook`; every other CLI (Copilot, Codex, Cursor, Junie, OpenCode) falls back to `model` so no host loses learning when it has no wired hook. The per-wave elimination applies to all CLIs regardless.
+- `draft_ready_mode: deferred` (default) — `check_draft_ready` (the only LLM call in learning) runs off the hot path (terminal/warm-path), never on a reporting call.
+- `runs_keep` — per-run log dir rotation count. Consensus waves are always reported mid-run regardless of mode (a failed quorum spawns a judge).
 
 ## Legal and provider compliance
 

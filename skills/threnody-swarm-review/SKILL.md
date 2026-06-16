@@ -81,8 +81,7 @@ On `awaiting_host_execution: true` + `host_spawn_waves`:
 - **All agents in a wave → one parallel message** (never sequential)
 - Pass each agent its `prompt`, `model`, and `subagent_type` from the handoff
 - Do **not** `Write`/`Edit` any `target_files` — review is read-only
-- After each wave: `report_host_wave(swarm_id, wave, workspace_root, agents[...])`
-  with `output_excerpt` = one-sentence finding summary per agent
+- **Reporting** (see `learning_report_contract.report_mode`): in `batch` mode (default) do **not** call `report_host_wave` per wave — hold each agent's `output_excerpt` in your own context for the synthesis wave, and report once at terminal. In `inline` mode call `report_host_wave` after each wave.
 
 ### 5. Synthesis wave
 
@@ -95,12 +94,10 @@ The synthesis agent deduplicates, ranks by severity → category, and outputs th
 ### 6. Terminal report
 
 ```python
-report_host_wave(
+report_host_swarm_complete(
   swarm_id="<id>",
-  wave=<n>,
-  workspace_root="<root>",
-  terminal=True,
   outcome="accepted",
+  workspace_root="<root>",
   agents=[{
     "task_id": "...",
     "spawn_id": "...",
@@ -120,7 +117,7 @@ Output the full ranked findings report to the user.
 - `REVIEW:` sentinel in the task string — required for fanout to activate
 - One host `Agent` per entry in `host_spawn_waves[].agents`
 - Never `Write`/`Edit` target files — read-only context only
-- Always call `report_host_wave` after each wave with `output_excerpt`
+- Report learning once at terminal (`batch`, default) or after each wave (`inline`); always include `output_excerpt`
 - Linter pass before swarm, feed results to synthesis
 
 ## Do not

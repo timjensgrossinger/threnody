@@ -987,6 +987,115 @@ PY
     else
         warn "Could not update $CLAUDE_SETTINGS_JSON routing hook"
     fi
+
+    # --- Claude PostToolUse learning-capture hook ---
+    # Installed when host_native.learning_capture == "hook" (the default), so
+    # batch-mode swarms capture per-edit learning with zero model tokens.
+    LEARN_ACTION="remove"
+    if python3 - "$INSTALL_DIR" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+try:
+    from shared.config import TGsConfig, CONFIG_YAML
+    cfg = TGsConfig.from_yaml(CONFIG_YAML) if Path(CONFIG_YAML).exists() else TGsConfig()
+    capture = getattr(cfg.host_native, "learning_capture", "hook")
+    report_mode = getattr(cfg.host_native, "report_mode", "batch")
+    raise SystemExit(0 if (capture == "hook" and report_mode == "batch") else 1)
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(0)  # default-on if config can't be read
+PY
+    then
+        LEARN_ACTION="install"
+    fi
+
+    LEARN_HOOK_SCRIPT="$INSTALL_DIR/shell/threnody-learning-hook.sh"
+    if [[ -f "$LEARN_HOOK_SCRIPT" ]]; then
+        chmod +x "$LEARN_HOOK_SCRIPT"
+    fi
+
+    if python3 - "$CLAUDE_SETTINGS_JSON" "$LEARN_ACTION" "$LEARN_HOOK_SCRIPT" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+_home = Path.home().resolve()
+path = Path(sys.argv[1]).resolve()
+if not str(path).startswith(str(_home)):
+    raise SystemExit(f"path outside home: {path}")
+action = sys.argv[2]
+hook_script = sys.argv[3]
+path.parent.mkdir(parents=True, exist_ok=True)
+
+if path.exists():
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        cfg = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in {path}: {exc}") from exc
+else:
+    cfg = {}
+if not isinstance(cfg, dict):
+    raise SystemExit(f"Expected JSON object in {path}")
+
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}
+    cfg["hooks"] = hooks
+
+post_tool_use = hooks.get("PostToolUse")
+if not isinstance(post_tool_use, list):
+    post_tool_use = []
+
+
+def _is_managed_learning_hook(hook: object) -> bool:
+    return (
+        isinstance(hook, dict)
+        and hook.get("type") == "command"
+        and "threnody-learning-hook" in str(hook.get("command") or "")
+    )
+
+
+managed_entry = {
+    "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+    "hooks": [{"type": "command", "command": hook_script}],
+}
+
+filtered = []
+for group in post_tool_use:
+    if not isinstance(group, dict):
+        filtered.append(group)
+        continue
+    group_hooks = group.get("hooks")
+    managed = isinstance(group_hooks, list) and any(
+        _is_managed_learning_hook(h) for h in group_hooks
+    )
+    if not managed:
+        filtered.append(group)
+
+if action == "install":
+    filtered.append(managed_entry)
+hooks["PostToolUse"] = filtered
+
+if not hooks.get("PostToolUse"):
+    hooks.pop("PostToolUse", None)
+if not hooks:
+    cfg.pop("hooks", None)
+
+path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+PY
+    then
+        if [[ "$LEARN_ACTION" == "install" ]]; then
+            info "Installed Claude PostToolUse learning hook in $CLAUDE_SETTINGS_JSON"
+            SYNCED_CLAUDE_HOOKS=1
+        else
+            info "Removed managed Claude PostToolUse learning hook from $CLAUDE_SETTINGS_JSON"
+        fi
+    else
+        warn "Could not update $CLAUDE_SETTINGS_JSON learning hook"
+    fi
 fi
 
 # --- GitHub Copilot instructions ---

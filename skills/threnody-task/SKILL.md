@@ -34,10 +34,12 @@ persistence contract (`swarm_id`, budget preview, resume checkpoints).
 4. **Execute waves in order** via host `Task`/`Agent`:
    - Agents within one wave may run **in parallel**.
    - Respect wave ordering (later waves wait for earlier dependencies).
-5. **After each wave:** `report_host_wave(host_run_id|plan_run_id, wave, workspace_root, agents[])` — include `task_id`, `spawn_id`, `success`, `touched_files`, and **`output_excerpt`** per agent (see `learning_report_contract` on the plan response).
+5. **Reporting** — check `learning_report_contract.report_mode`:
+   - **`batch` (default):** do **NOT** call `report_host_wave` per worker wave. Spawn waves; learning is captured automatically (PostToolUse hook) or passed in the single terminal call (`learning_capture=model`).
+   - **`inline` (legacy):** `report_host_wave(host_run_id|plan_run_id, wave, workspace_root, agents[])` after each wave with `task_id`, `spawn_id`, `success`, `touched_files`, **`output_excerpt`**.
 6. **Mid-run:** `expand_host_plan(discovered_files=[...])` when wave 1 discovers files not in the initial plan.
-7. **Final wave:** `terminal=true` + `outcome`, or `report_host_swarm_complete`. Check `finalize.swarm_outcome`.
-7. **Optional:** `fleet_plan(task)` when you want ready-made fleet command strings per wave.
+7. **Final:** `report_host_swarm_complete(outcome=...)` once (batch imports + finalizes). Check `finalize.swarm_outcome`.
+8. **Optional:** `fleet_plan(task)` when you want ready-made fleet command strings per wave.
 
 ## Rules
 
@@ -58,11 +60,12 @@ decompose_task(task="Refactor auth across services and UI")
      { wave: 2, parallel: true, agents: [...] }
    ]
 → Spawn each agent via host Task tool; wait for wave N before wave N+1.
-→ report_host_wave(
+→ (batch mode, default) report once at the end:
+   report_host_swarm_complete(
      host_run_id,
-     wave=N,
+     outcome="accepted",
      workspace_root="<from plan handoff>",
-     agents=[{
+     agents=[{                       # only when learning_capture=model
        task_id, spawn_id, success,
        touched_files: ["relative/path.py"],
        output_excerpt: "short agent summary",

@@ -397,6 +397,40 @@ class BackgroundConfig:
     warm_path_interval_s: float = 120.0     # was hardcoded 45
 
 
+@dataclass
+class HostNativeConfig:
+    """Controls how host-native wave execution reports learning.
+
+    ``report_mode``:
+      - ``batch`` (default): the host accumulates per-agent results (captured via
+        the PostToolUse learning hook or its own appends) into a per-run JSONL log
+        and reports learning ONCE at terminal. Worker-wave ``report_host_wave``
+        calls become near-noops; only consensus waves and ``expand_host_plan``
+        require a mid-run round-trip. This keeps the swarm/orchestration hot path
+        as fast as native subagent spawning.
+      - ``inline``: legacy behaviour — ingest every wave synchronously through the
+        MCP server. Kept as a fallback / for resume + debugging.
+
+    ``learning_capture``:
+      - ``hook`` (default): a PostToolUse Edit|Write hook appends run-log lines with
+        zero model tokens.
+      - ``model``: the host appends / passes records itself (no hook installed).
+      - ``off``: no per-agent capture (terminal payload only).
+
+    ``draft_ready_mode``:
+      - ``deferred`` (default): ``check_draft_ready`` (an LLM call per pattern) runs
+        in the warm-path daemon, never on a reporting call.
+      - ``inline``: legacy — run it during ingest.
+
+    ``runs_keep``: number of per-run log dirs under ``~/.local/lib/threnody/runs``
+    to retain (rotation mirrors ``cache.backup_keep``).
+    """
+    report_mode: str = "batch"
+    learning_capture: str = "hook"
+    draft_ready_mode: str = "deferred"
+    runs_keep: int = 20
+
+
 def normalize_parallelism_limit(
     value: Any,
     *,
@@ -1255,6 +1289,7 @@ class TGsConfig:
     planner_timeout: int = DEFAULT_PLANNER_TIMEOUT
     parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
+    host_native: HostNativeConfig = field(default_factory=HostNativeConfig)
     budgets: BudgetConfig = field(default_factory=BudgetConfig)
 
     # Cache
@@ -2343,6 +2378,28 @@ class TGsConfig:
                 ),
             )
 
+        # Host-native learning reporting (batch vs inline, capture mode, draft cadence).
+        hn_raw = raw.get("host_native", {})
+        if isinstance(hn_raw, Mapping):
+            def _choice(key: str, allowed: set[str], default: str) -> str:
+                val = str(hn_raw.get(key, default)).strip().lower()
+                return val if val in allowed else default
+
+            cfg.host_native = HostNativeConfig(
+                report_mode=_choice("report_mode", {"batch", "inline"}, "batch"),
+                learning_capture=_choice(
+                    "learning_capture", {"hook", "model", "off"}, "hook"
+                ),
+                draft_ready_mode=_choice(
+                    "draft_ready_mode", {"deferred", "inline"}, "deferred"
+                ),
+                runs_keep=_coerce_config_int(
+                    hn_raw.get("runs_keep", 20),
+                    default=20,
+                    field_name="host_native.runs_keep",
+                ),
+            )
+
         # Surgical edit settings
         surgical_raw = raw.get("surgical_edits", {})
         if isinstance(surgical_raw, dict):
@@ -2571,6 +2628,12 @@ class TGsConfig:
                 "health_probe_interval_s": self.background.health_probe_interval_s,
                 "warm_path_enabled": self.background.warm_path_enabled,
                 "warm_path_interval_s": self.background.warm_path_interval_s,
+            },
+            "host_native": {
+                "report_mode": self.host_native.report_mode,
+                "learning_capture": self.host_native.learning_capture,
+                "draft_ready_mode": self.host_native.draft_ready_mode,
+                "runs_keep": self.host_native.runs_keep,
             },
             "swarm": {
                 "max_agents": self.swarm_max_agents,

@@ -150,6 +150,9 @@ from shared.consensus import (
 from shared.host_learning import (
     build_host_agent_record,
     build_learning_report_contract,
+    effective_learning_capture,
+    finalize_host_swarm,
+    import_run_log,
     ingest_host_wave,
     inspect_host_swarm,
     plan_run_id,
@@ -3181,8 +3184,15 @@ def _attach_host_spawn_metadata(
             resolved_root = workspace_root or str(_active_workspace_root())
             payload["workspace_root"] = resolved_root
             payload["learning_report_contract"] = build_learning_report_contract(
-                resolved_root
+                resolved_root, run_id=run_id, config=config, caller=caller
             )
+            if run_id and payload["learning_report_contract"].get("report_mode") == "batch":
+                try:
+                    from shared import run_log as _run_log
+
+                    _run_log.set_active_run(run_id, workspace_root=resolved_root)
+                except Exception:
+                    log.debug("set_active_run failed for %s", run_id, exc_info=True)
         return
     hint = execution_hint if isinstance(execution_hint, dict) else {}
     if hint.get("mode") != "host_native":
@@ -3388,7 +3398,16 @@ def _execute_swarm_host_native_response(
         source_tool="execute_swarm",
         payload=plan_dict,
     )
-    learning_contract = build_learning_report_contract(resolved_workspace)
+    learning_contract = build_learning_report_contract(
+        resolved_workspace, run_id=swarm_id, config=config, caller=_resolve_caller(),
+    )
+    if learning_contract.get("report_mode") == "batch":
+        try:
+            from shared import run_log as _run_log
+
+            _run_log.set_active_run(swarm_id, workspace_root=resolved_workspace)
+        except Exception:
+            log.debug("set_active_run failed for %s", swarm_id, exc_info=True)
     swarm_result: dict[str, object] = {
         "swarm_id": swarm_id,
         "host_execution_mode": "host_native",
@@ -6064,10 +6083,17 @@ def handle_report_host_wave(args: dict) -> dict:
     try:
         wave_index = int(wave_raw)
     except (TypeError, ValueError):
-        return {"error": "wave must be an integer >= 1"}
+        # Terminal batch reports import the whole run log regardless of wave, so
+        # a missing wave number is tolerated there (hook capture loses waves).
+        if bool(args.get("terminal", False)):
+            wave_index = 1
+        else:
+            return {"error": "wave must be an integer >= 1"}
     agents_raw = args.get("agents")
-    if not isinstance(agents_raw, list) or not agents_raw:
-        return {"error": "agents must be a non-empty list"}
+    if agents_raw is None:
+        agents_raw = []
+    if not isinstance(agents_raw, list):
+        return {"error": "agents must be a list"}
     workspace_root = args.get("workspace_root")
     if workspace_root is not None and not isinstance(workspace_root, str):
         return {"error": "workspace_root must be a string when provided"}
@@ -6078,6 +6104,78 @@ def handle_report_host_wave(args: dict) -> dict:
     discovered_files: list[str] | None = None
     if isinstance(discovered_raw, list):
         discovered_files = [str(p) for p in discovered_raw if str(p).strip()]
+
+    report_mode = getattr(config.host_native, "report_mode", "batch")
+    # Resolve capture per-caller: only hook-capable shells use `hook`; every other
+    # CLI (Copilot, Codex, Cursor, Junie, OpenCode) falls back to `model` so the
+    # handler appends the passed agents to the run log and nothing is lost.
+    learning_capture = effective_learning_capture(config, args.get("caller") or _resolve_caller())
+    draft_deferred = getattr(config.host_native, "draft_ready_mode", "deferred") == "deferred"
+    # A consensus wave must be ingested live even in batch mode — a failed quorum
+    # spawns a judge mid-run (the decision can't wait for terminal).
+    wave_kind = str(args.get("wave_kind") or "")
+    is_consensus = wave_kind == "consensus" or any(
+        isinstance(a, dict) and (a.get("persona") or a.get("verdict")) for a in agents_raw
+    )
+    live = (report_mode == "inline") or is_consensus or expand_plan
+
+    from shared import run_log
+
+    # ---- Batch worker wave: capture cheaply, no MCP-side ingest. -----------
+    if report_mode == "batch" and not terminal and not live:
+        captured = 0
+        if learning_capture == "model":
+            for a in agents_raw:
+                if isinstance(a, dict):
+                    rec = dict(a)
+                    rec["wave"] = wave_index
+                    run_log.append_agent_record(run_id, rec)
+                    captured += 1
+        # capture == "hook": records already appended by the PostToolUse hook.
+        return {
+            "run_id": run_id,
+            "wave": wave_index,
+            "report_mode": "batch",
+            "captured": captured,
+            "deferred": True,
+        }
+
+    # ---- Batch terminal (non-consensus): import the whole run log once. ----
+    if report_mode == "batch" and terminal and not is_consensus:
+        if outcome is None:
+            return {"error": "outcome is required when terminal=true"}
+        # Capture the final wave's agents (model mode) before importing.
+        if learning_capture == "model":
+            for a in agents_raw:
+                if isinstance(a, dict):
+                    rec = dict(a)
+                    rec["wave"] = wave_index
+                    run_log.append_agent_record(run_id, rec)
+        # Persist outcome for crash-recovery by the warm-path daemon.
+        try:
+            meta = run_log.read_run_meta(run_id)
+            meta["outcome"] = str(outcome)
+            run_log.write_run_meta(run_id, meta)
+        except Exception:
+            log.debug("run_log meta outcome write failed for %s", run_id, exc_info=True)
+        try:
+            result = import_run_log(
+                db,
+                run_id,
+                outcome=str(outcome),
+                config=config,
+                router=router,
+                workspace_root=workspace_root,
+            )
+            run_log.clear_active_run(run_id)
+            return result
+        except Exception as exc:
+            log.warning("batch import_run_log failed for %s", run_id, exc_info=True)
+            return {"error": type(exc).__name__, "details": str(exc)}
+
+    # ---- Live ingest: inline mode, consensus waves, mid-run expansion. -----
+    if not agents_raw and not (terminal and is_consensus):
+        return {"error": "agents must be a non-empty list"}
     try:
         return ingest_host_wave(
             db,
@@ -6091,6 +6189,7 @@ def handle_report_host_wave(args: dict) -> dict:
             router=router,
             expand_plan=expand_plan,
             discovered_files=discovered_files,
+            defer_draft_ready=(report_mode == "batch" and draft_deferred),
         )
     except ValueError as exc:
         return {"error": str(exc)}

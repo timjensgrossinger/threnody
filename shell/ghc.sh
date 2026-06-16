@@ -1568,8 +1568,7 @@ alias ghcw="ghc --stats"
 # ? — natural language shorthand
 # ---------------------------------------------------------------------------
 if [[ -n "${ZSH_VERSION:-}" ]]; then
-    eval '
-    function ? {
+    functions[?]='
         if [[ $# -eq 0 ]]; then
             echo "Usage: ? <natural language prompt>" >&2
             return 1
@@ -1587,7 +1586,6 @@ if [[ -n "${ZSH_VERSION:-}" ]]; then
                 ghc agent "$prompt"
                 ;;
         esac
-    }
     '
 fi
 

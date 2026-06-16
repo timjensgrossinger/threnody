@@ -22,7 +22,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import Callable, ClassVar
 
 from .config import TGsConfig
 from .db import Database
@@ -181,7 +181,31 @@ def run_warm_path_background_tasks(db: Database) -> dict[str, str | int | dict]:
     except Exception as e:
         log.error("Outcome snapshot computation failed: %s", e, exc_info=True)
         results["snapshot"] = {"error": str(e)}
-    
+
+    # Safety net: import any run-log that has a recorded terminal outcome but
+    # was never imported (e.g. the MCP process crashed between the terminal
+    # report and the backgrounded import). Idempotent — already-imported runs
+    # are skipped. Lazy imports avoid an eval <-> host_learning/run_log cycle.
+    try:
+        from . import run_log
+        from .host_learning import import_run_log
+
+        imported = 0
+        for rid in run_log.iter_pending_runs():
+            meta = run_log.read_run_meta(rid)
+            outcome = meta.get("outcome")
+            if not outcome:
+                continue  # run not terminal yet — leave for its terminal call
+            try:
+                import_run_log(db, rid, outcome=str(outcome))
+                imported += 1
+            except Exception:
+                log.debug("warm-path run-log import failed for %s", rid, exc_info=True)
+        results["run_log_import"] = imported
+    except Exception as e:
+        log.debug("run-log import scan failed: %s", e, exc_info=True)
+        results["run_log_import"] = {"error": str(e)}
+
     return results
 
 
@@ -359,10 +383,24 @@ def build_eval_prompt(
 
 @dataclass
 class WaveFileTracker:
-    """Tracks which files each wave touches and stores content snapshots."""
+    """Tracks which files each wave touches and stores content snapshots.
+
+    Snapshot content is retained only for the most recent ``_RETAIN_WAVES``
+    waves. Rework detection only ever compares a wave to its immediate
+    predecessor, and the terminal warm-path eval only inspects the final wave
+    pair — so retaining every wave's full file content for the whole run was
+    pure RAM overhead. Under large fan-out (30-50+ agents across many waves)
+    that cumulative retention was the dominant local memory cost; pruning
+    bounds resident content to ~2 waves.
+    """
     wave_files: dict[int, set[str]] = field(default_factory=dict)
     snapshots_before: dict[str, str] = field(default_factory=dict)
     snapshots_after: dict[str, str] = field(default_factory=dict)
+
+    # Keep current + previous wave: detect_rework(N) needs N-1's content, and
+    # the terminal warm-path eval needs the final wave pair. Nothing older is
+    # ever read back.
+    _RETAIN_WAVES: ClassVar[int] = 2
 
     def record_wave(
         self,
@@ -377,6 +415,23 @@ class WaveFileTracker:
             self.snapshots_before.update(content_before)
         if content_after:
             self.snapshots_after.update(content_after)
+        self._prune_snapshots()
+
+    def _prune_snapshots(self) -> None:
+        """Drop snapshot content (and bookkeeping) for waves older than the
+        retention window so resident memory stays bounded across a long run."""
+        if len(self.wave_files) <= self._RETAIN_WAVES:
+            return
+        recent = sorted(self.wave_files)[-self._RETAIN_WAVES:]
+        keep: set[str] = set()
+        for w in recent:
+            keep |= self.wave_files.get(w, set())
+        for store in (self.snapshots_before, self.snapshots_after):
+            for stale_key in [k for k in store if k not in keep]:
+                del store[stale_key]
+        recent_set = set(recent)
+        for old_wave in [w for w in self.wave_files if w not in recent_set]:
+            del self.wave_files[old_wave]
 
     def detect_rework(
         self,

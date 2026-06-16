@@ -77,8 +77,11 @@ def _render_claude_pointer_block(
         "| medium | `threnody-medium` | sonnet |",
         "| high | `threnody-high` | opus |",
         "",
-        "After each host wave completes, call `report_host_wave` with `workspace_root`, per-agent results, "
-        "and `output_excerpt`. On the final wave set `terminal=true`.",
+        "Learning reporting follows `learning_report_contract.report_mode`. In `batch` mode (default) do "
+        "NOT call `report_host_wave` per worker wave — capture is automatic (PostToolUse hook) or passed in "
+        "the single terminal call; report once via `report_host_swarm_complete(outcome=...)`. In `inline` mode "
+        "call `report_host_wave` after each wave with `workspace_root`, per-agent results, and `output_excerpt`. "
+        "Consensus waves (`wave_kind=consensus`) are always reported mid-run in both modes.",
         "",
         "### Multi-queen consensus",
         "",
@@ -217,8 +220,8 @@ def render_shell_instructions(
             "`execute_swarm` defaults to `host_native`: execute `host_spawn_waves` in the host shell; Threnody persists the plan as `awaiting_host_execution` without subprocess fanout.",
             "Heuristic planning fans out **one host agent per file** when task intent implies multiple files (webapp, html/css/js, fullstack) or when paths are listed.",
             "After scaffold/contract waves, call `expand_host_plan` with `discovered_files` or use `report_host_wave(expand_plan=true, discovered_files=[...])` to spawn remaining file agents.",
-            "After each host wave completes, call `report_host_wave` with `workspace_root` from the handoff (`learning_report_contract`) and per-agent results: `task_id`, `spawn_id`, `success`, `touched_files`, and `output_excerpt` (required for learning quality).",
-            "On the final wave, set `terminal=true` and `outcome=accepted|revised|reworked|rejected`, or call `report_host_swarm_complete`. Check `finalize.swarm_outcome` and `swarm_outcome_error`.",
+            "Reporting follows `learning_report_contract.report_mode`. `batch` (default): do NOT call `report_host_wave` per worker wave — capture is automatic (PostToolUse learning hook) or passed in the single terminal call; report once. `inline`: call `report_host_wave` after each wave with `workspace_root`, per-agent results (`task_id`, `spawn_id`, `success`, `touched_files`, `output_excerpt`). Consensus waves are always reported mid-run.",
+            "Terminalize with `report_host_swarm_complete(outcome=accepted|revised|reworked|rejected)` (batch imports the run log + finalizes), or set `terminal=true` on the last `report_host_wave` in inline mode. Check `finalize.swarm_outcome` and `swarm_outcome_error`.",
             "Use `inspect_swarm` to verify run status (`awaiting_host_execution` → `running` → `completed`).",
         ]
     )

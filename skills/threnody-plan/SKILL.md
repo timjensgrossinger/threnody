@@ -77,7 +77,7 @@ Include `consumes` / `produces` / `depends_on` when the plan exposes them.
 
 - Show a **brief** wave summary (can be shorter than full table).
 - Immediately spawn `host_spawn_waves` via `threnody-task` or `threnody-swarm` — the orchestrator does **not** implement subtasks with direct edits.
-- **Mandatory:** after each wave, call `report_host_wave`; use `inspect_swarm` to confirm status transitions.
+- **Reporting:** in `batch` mode (default, see `learning_report_contract.report_mode`) report once at terminal via `report_host_swarm_complete` — no per-worker-wave round-trip. In `inline` mode call `report_host_wave` after each wave. Use `inspect_swarm` to confirm status transitions.
 
 ## Full-stack prompt boilerplate
 

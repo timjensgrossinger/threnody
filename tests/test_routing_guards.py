@@ -1056,7 +1056,14 @@ def test_install_removes_claude_routing_hook_when_policy_disables_it() -> None:
         assert result.returncode == 0, result.stderr
 
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
-        assert "hooks" not in settings
+        # Advisory policy removes the PreToolUse routing guard. The PostToolUse
+        # learning hook is independent of routing policy (default-on), so it may
+        # remain — but no routing guard should survive.
+        hooks = settings.get("hooks", {})
+        assert "PreToolUse" not in hooks
+        for group in hooks.get("PostToolUse", []):
+            for hook in group.get("hooks", []):
+                assert "threnody-routing-hook" not in str(hook.get("command", ""))
 
 
 def test_route_task_issues_execute_subtask_guard_for_delegate_low_tier(

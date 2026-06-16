@@ -29,9 +29,12 @@ This path is **unaffected** by utility-only delegation rules.
    - **`awaiting_host_execution` + `host_spawn_waves`** — execute waves via host agents.
    - **`preview: true` + `preview_token`** — cost over budget; confirm then re-call with token.
    - **`started: true`** (delegate mode only) — Threnody subprocess orchestrator running.
-4. **After each wave:** call `report_host_wave` with `workspace_root` from the handoff (`workspace_root` / `learning_report_contract`) and per-agent results: `task_id`, `spawn_id`, `success`, `touched_files`, **`output_excerpt`** (1–2 sentence summary).
-5. **Mid-run expansion:** after scaffold/contract waves, call `expand_host_plan(discovered_files=[...])` or `report_host_wave(expand_plan=true, discovered_files=[...])` to spawn additional file-scoped agents.
-6. **Terminal wave:** set `terminal=true` and `outcome=accepted|revised|reworked|rejected`, or call `report_host_swarm_complete`. Verify `finalize.swarm_outcome.stored`.
+   - Check `learning_report_contract.report_mode` (`batch` default, or `inline`).
+4. **Reporting — depends on `report_mode`:**
+   - **`batch` (default):** Do **NOT** call `report_host_wave` for plain worker waves. Just spawn each wave natively. Per-agent learning is captured automatically (PostToolUse hook) or, when `learning_capture=model`, by passing the agents to the single terminal call. This is the fast path — no per-wave MCP round-trip.
+   - **`inline` (legacy):** call `report_host_wave` after **each** wave with `workspace_root` and per-agent results (`task_id`, `spawn_id`, `success`, `touched_files`, **`output_excerpt`**).
+5. **Mid-run expansion** (both modes): after scaffold/contract waves, call `expand_host_plan(discovered_files=[...])` to spawn additional file-scoped agents.
+6. **Terminal:** call `report_host_swarm_complete(outcome=accepted|revised|reworked|rejected)` once at the end (in `batch` mode this imports the whole run and finalizes). In `inline` mode you may instead set `terminal=true` on the last `report_host_wave`. Verify `finalize.swarm_outcome.stored`.
 7. Monitor:
    - Host-native: `inspect_swarm` for status; optional `inspect_status`.
    - Delegate: `list_subtasks`, `resume_swarm_inspect`, `resume_swarm_confirm`.
@@ -42,15 +45,21 @@ This path is **unaffected** by utility-only delegation rules.
 - Pass each agent its `prompt`, `target_files`, `model`, and `subagent_type` from the handoff.
 - Do **not** use `Write`/`Edit` yourself on any `target_files` from the plan.
 - Do not follow `route_task`'s `direct_edit` hint while a handoff is active (`execution_hint.active_handoff` or pending `host_spawn_waves`).
-- After the wave: `report_host_wave` (with `workspace_root` + `output_excerpt`) → `inspect_swarm`.
+- In **`batch`** mode report only once at terminal (plus consensus/expand). In **`inline`** mode report after each wave.
 
-## Wave report example
+## Consensus waves
+
+A wave with `wave_kind: "consensus"` is **always** reported via `report_host_wave` even in batch mode — a failed quorum spawns a judge mid-run, so the decision can't wait for terminal. Follow any returned `consensus_followup` (spawn the judge, report its verdict), then proceed to the terminal call.
+
+## Terminal report example
 
 ```python
-report_host_wave(
+report_host_swarm_complete(
   swarm_id="<from handoff>",
-  wave=1,
+  outcome="accepted",
   workspace_root="<workspace_root from handoff>",
+  # batch + learning_capture=model: pass the final wave's agents here.
+  # batch + learning_capture=hook (default): agents already captured; omit.
   agents=[{
     "task_id": "swarm-...:2",
     "spawn_id": "<host-agent-id>",

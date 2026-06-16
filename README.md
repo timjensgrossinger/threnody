@@ -243,6 +243,7 @@ Workflow guide: [docs/COST_SAVINGS.md](docs/COST_SAVINGS.md)
 | 🎯 | **Tier routing** | Heuristic complexity scoring + `host_spawn` / `execution_hint` for host-native work |
 | 🧠 | **Learning loop** | Pattern tracking → draft agents → approval queue → plan-time context injection for matching work |
 | 🐝 | **Swarm orchestration** | `execute_swarm` returns `host_spawn_waves` by default (`awaiting_host_execution`); heuristic intent fans out one agent per file; `expand_host_plan` for mid-run discovery |
+| 🚀 | **Batch learning capture** | `host_native.report_mode: batch` (default) eliminates per-wave `report_host_wave` round-trips — learning is captured to a per-run JSONL log (PostToolUse hook, zero model tokens) and imported once at terminal, keeping swarms as fast as native subagent spawning. `inline` reverts to per-wave ingest |
 | ⚡ | **Dynamic Workflows** | Opt-in (claude-code): fan-out plans emit a tier-aware [Workflow](https://code.claude.com/docs/en/workflows) script — each `agent()` routes to its Threnody tier model; recurring shapes export to permanent `/workflow` commands (`report_workflow_result`, `routing_policy.shells.claude-code.workflow_emit`) |
 | 💾 | **Cross-session memory** | `memory_*` MCP tools backed by local SQLite — shared across all MCP hosts via `~/.local/lib/threnody/cache.db` |
 | 🔌 | **MCP-native** | 40+ tools over stdio JSON-RPC; works with any MCP-compatible host shell |

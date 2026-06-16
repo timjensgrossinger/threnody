@@ -8,7 +8,7 @@
 6. `execute_swarm` defaults to `host_native` — run returned waves in the host; no subprocess fanout.
 7. Host-native heuristic planning fans out **one agent per file** for webapp/fullstack intent or listed paths (`orchestrator.heuristic_intent_templates`, default true).
 8. After scaffold waves, call `expand_host_plan(discovered_files=[...])` or `report_host_wave(expand_plan=true)` for additional file agents.
-9. Report waves with `workspace_root` from handoff (`learning_report_contract`), per-agent `task_id`, `spawn_id`, `success`, `touched_files`, and `output_excerpt`; terminal reports must set `outcome` and check `finalize.swarm_outcome`.
+9. Reporting follows `learning_report_contract.report_mode`. `batch` (default): do **not** call `report_host_wave` per worker wave — capture is automatic (PostToolUse learning hook) or passed in the single terminal call; report once via `report_host_swarm_complete(outcome=...)`. `inline`: report each wave with `workspace_root`, per-agent `task_id`, `spawn_id`, `success`, `touched_files`, `output_excerpt`. Consensus waves are always reported mid-run. Terminal reports set `outcome` and check `finalize.swarm_outcome`.
 
 Same-host `execute_subtask` returns `HostNativeRequired`.
 
