@@ -1094,13 +1094,18 @@ def test_handle_route_task_prefers_free_low_tier_metadata(monkeypatch) -> None:
 
         result = mcp_server.handle_route_task({"task": "quick fix"})
 
-        assert result["provider"] == "GitHub Copilot"
+        hint = result["execution_hint"]
+        assert hint["mode"] == "host_native"
+        assert result.get("provider") is None
+        assert result.get("provider_id") is None
         assert result["model"] == "gpt-5-mini"
-        assert result["is_free"] is True
-        assert result["billing_tier"] == "free"
-        assert result["provider_cost_hint"] == "free"
-        assert result["cost_rank"] == 0
-        assert result["billing_source"] == "user_override"
+        assert result["host_model"] == "gpt-5-mini"
+        assert result.get("is_free") is None
+        assert result.get("billing_tier") is None
+        economics = hint["economics"]
+        assert economics["host_provider"] == "github-copilot"
+        assert economics["host_model"] == "gpt-5-mini"
+        assert economics.get("selected_provider") is None
 
 
 def test_handle_route_task_execution_hint_host_native_for_claude(monkeypatch) -> None:
@@ -1675,7 +1680,8 @@ def test_handle_route_task_uses_code_only_hint_for_write_tasks(monkeypatch) -> N
 
         result = mcp_server.handle_route_task({"task": "quick fix in parser.py"})
 
-        assert result["provider"] == "GitHub Copilot"
+        assert result["execution_hint"]["mode"] == "host_native"
+        assert result.get("provider") is None
         assert registry.calls == [{
             "tier": "low",
             "prefer_free": True,

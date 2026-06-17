@@ -261,6 +261,114 @@ def test_route_task_issues_low_tier_direct_guard_for_host(monkeypatch: pytest.Mo
         assert stored["mode"] == ROUTING_GUARD_MODE_DIRECT
 
 
+def _assert_host_native_route(
+    result: dict[str, object],
+    *,
+    host_provider: str,
+    expected_host_model: str | None = None,
+) -> None:
+    hint = result["execution_hint"]
+    assert isinstance(hint, dict)
+    assert hint["mode"] == "host_native"
+    host_model = hint.get("host_native_model")
+    assert isinstance(host_model, str)
+    assert host_model
+    if expected_host_model is not None:
+        assert host_model == expected_host_model
+    assert result["model"] == host_model
+    assert result["host_model"] == host_model
+    assert result.get("delegate_model") is None
+    assert result.get("provider_id") is None
+    assert result.get("provider") is None
+    assert result.get("billing_tier") is None
+
+    economics = hint.get("economics")
+    assert isinstance(economics, dict)
+    assert economics.get("host_provider") == host_provider
+    assert economics.get("host_model") == host_model
+    assert economics.get("selected_provider") != "github-copilot"
+    assert economics.get("selected_model") != "gpt-5-mini"
+
+    receipt = result.get("cost_receipt")
+    assert isinstance(receipt, dict)
+    selected = receipt.get("selected")
+    assert isinstance(selected, dict)
+    assert selected["host_native"] is True
+    assert selected["provider"] == host_provider
+    assert selected["model"] == host_model
+
+
+def test_route_task_keeps_codex_host_native_metadata_separate_from_provider_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        cfg, db = _prepare_db(td)
+        monkeypatch.chdir(ROOT)
+        router = SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
+                tier="low",
+                score=0.21,
+                reason="low-tier task",
+                agents=2,
+                override=False,
+            )
+        )
+        registry = SelectionRegistry(provider="GitHub Copilot", model="gpt-5-mini")
+
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: _stub_init(cfg, db, router=router))
+        monkeypatch.setattr(mcp_server, "_get_registry_with_config", lambda: registry)
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "codex")
+
+        result = mcp_server.handle_route_task({"task": "fix shared/db.py", "cwd": str(ROOT)})
+
+        _assert_host_native_route(
+            result,
+            host_provider="codex",
+            expected_host_model="gpt-5.5",
+        )
+        row = db._conn.execute(
+            "SELECT model, provider_name FROM telemetry WHERE task_hash = ?",
+            (result["task_id"],),
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == ("gpt-5.5", "codex")
+
+
+@pytest.mark.parametrize("caller", ["github-copilot", "cursor", "junie", "opencode"])
+def test_route_task_keeps_other_host_provider_metadata_separate_from_provider_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        cfg, db = _prepare_db(td)
+        monkeypatch.chdir(ROOT)
+        router = SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
+                tier="low",
+                score=0.21,
+                reason="low-tier task",
+                agents=2,
+                override=False,
+            )
+        )
+        registry = SelectionRegistry(provider="GitHub Copilot", model="gpt-5-mini")
+
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: _stub_init(cfg, db, router=router))
+        monkeypatch.setattr(mcp_server, "_get_registry_with_config", lambda: registry)
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: caller)
+
+        result = mcp_server.handle_route_task({"task": "fix shared/db.py", "cwd": str(ROOT)})
+
+        _assert_host_native_route(result, host_provider=caller)
+        row = db._conn.execute(
+            "SELECT model, provider_name FROM telemetry WHERE task_hash = ?",
+            (result["task_id"],),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == result["host_model"]
+        assert row[1] == caller
+
+
 def test_validate_routing_guard_denies_without_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         cfg, db = _prepare_db(td)
@@ -686,6 +794,138 @@ def test_route_task_preserves_routed_plan_guard_during_active_handoff(
 
         routed = mcp_server.handle_route_task({"task": "quick follow-up", "cwd": str(ROOT)})
         assert routed["execution_hint"].get("active_handoff") is True
+        guard = routed.get("routing_guard")
+        assert isinstance(guard, dict)
+        assert guard.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN
+
+
+def test_route_task_active_handoff_keeps_codex_host_native_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        cfg, db = _prepare_db(td)
+        monkeypatch.chdir(ROOT)
+        registry = SelectionRegistry(provider="GitHub Copilot", model="gpt-5-mini")
+        fake_plan = SimpleNamespace(total_agents=1, waves=[[1]])
+        planner = SimpleNamespace(
+            plan=lambda _task, **_kwargs: fake_plan,
+            plan_heuristic=lambda _task, **_kwargs: fake_plan,
+            plan_to_dict=lambda _plan: {
+                "subtasks": [
+                    {
+                        "id": 1,
+                        "description": "edit shared/db.py",
+                        "tier": "medium",
+                        "depends_on": [],
+                        "target_file": "shared/db.py",
+                    }
+                ],
+                "waves": [[1]],
+                "total_agents": 1,
+            },
+        )
+        router = SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
+                tier="low",
+                score=0.16,
+                reason="low",
+                agents=1,
+                override=False,
+            )
+        )
+
+        monkeypatch.setattr(
+            mcp_server,
+            "_ensure_init",
+            lambda: _stub_init(cfg, db, router=router, planner=planner),
+        )
+        monkeypatch.setattr(mcp_server, "_get_registry_with_config", lambda: registry)
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "codex")
+
+        mcp_server.handle_plan_task({"task": "update shared/db.py", "cwd": str(ROOT)})
+        db.persist_swarm_run(
+            {
+                "swarm_id": "plan-handoff",
+                "status": "awaiting_host_execution",
+                "requested_agents": 1,
+                "effective_agents": 1,
+            }
+        )
+
+        routed = mcp_server.handle_route_task({"task": "quick follow-up", "cwd": str(ROOT)})
+
+        _assert_host_native_route(
+            routed,
+            host_provider="codex",
+            expected_host_model="gpt-5.5",
+        )
+        assert routed["execution_hint"].get("active_handoff") is True
+        assert routed["execution_hint"].get("host_native_method") == "host_task"
+        guard = routed.get("routing_guard")
+        assert isinstance(guard, dict)
+        assert guard.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN
+
+
+@pytest.mark.parametrize("caller", ["github-copilot", "cursor", "junie", "opencode"])
+def test_route_task_active_handoff_keeps_other_host_provider_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        cfg, db = _prepare_db(td)
+        monkeypatch.chdir(ROOT)
+        registry = SelectionRegistry(provider="GitHub Copilot", model="gpt-5-mini")
+        fake_plan = SimpleNamespace(total_agents=1, waves=[[1]])
+        planner = SimpleNamespace(
+            plan=lambda _task, **_kwargs: fake_plan,
+            plan_heuristic=lambda _task, **_kwargs: fake_plan,
+            plan_to_dict=lambda _plan: {
+                "subtasks": [
+                    {
+                        "id": 1,
+                        "description": "edit shared/db.py",
+                        "tier": "medium",
+                        "depends_on": [],
+                        "target_file": "shared/db.py",
+                    }
+                ],
+                "waves": [[1]],
+                "total_agents": 1,
+            },
+        )
+        router = SimpleNamespace(
+            classify=lambda _task, project_path=None: SimpleNamespace(
+                tier="low",
+                score=0.16,
+                reason="low",
+                agents=1,
+                override=False,
+            )
+        )
+
+        monkeypatch.setattr(
+            mcp_server,
+            "_ensure_init",
+            lambda: _stub_init(cfg, db, router=router, planner=planner),
+        )
+        monkeypatch.setattr(mcp_server, "_get_registry_with_config", lambda: registry)
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: caller)
+
+        mcp_server.handle_plan_task({"task": "update shared/db.py", "cwd": str(ROOT)})
+        db.persist_swarm_run(
+            {
+                "swarm_id": f"plan-handoff-{caller}",
+                "status": "awaiting_host_execution",
+                "requested_agents": 1,
+                "effective_agents": 1,
+            }
+        )
+
+        routed = mcp_server.handle_route_task({"task": "quick follow-up", "cwd": str(ROOT)})
+
+        _assert_host_native_route(routed, host_provider=caller)
+        assert routed["execution_hint"].get("active_handoff") is True
+        assert routed["execution_hint"].get("host_native_method") == "host_task"
         guard = routed.get("routing_guard")
         assert isinstance(guard, dict)
         assert guard.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN

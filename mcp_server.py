@@ -4369,25 +4369,34 @@ def _build_execution_hint_economics(
     mode: str,
     selection: dict[str, object] | None,
     delegation_targets: list[str],
+    host_model: str | None = None,
 ) -> dict[str, object]:
-    is_free = bool(selection.get("is_free")) if isinstance(selection, dict) else False
-    cost_rank = selection.get("cost_rank") if isinstance(selection, dict) else None
-    billing_tier = (
-        str(selection.get("billing_tier"))
-        if isinstance(selection, dict) and selection.get("billing_tier") is not None
-        else "unknown"
-    )
-    provider_cost_hint = (
-        str(selection.get("provider_cost_hint"))
-        if isinstance(selection, dict) and selection.get("provider_cost_hint") is not None
-        else ""
-    )
-    provider = (
-        str(selection.get("provider_id") or selection.get("provider") or "")
-        if isinstance(selection, dict)
-        else ""
-    )
-    model = str(selection.get("model") or "") if isinstance(selection, dict) else ""
+    if mode == "host_native":
+        is_free = False
+        cost_rank = None
+        billing_tier = "host_entitlement"
+        provider_cost_hint = "host-native"
+        provider = ""
+        model = str(host_model or "")
+    else:
+        is_free = bool(selection.get("is_free")) if isinstance(selection, dict) else False
+        cost_rank = selection.get("cost_rank") if isinstance(selection, dict) else None
+        billing_tier = (
+            str(selection.get("billing_tier"))
+            if isinstance(selection, dict) and selection.get("billing_tier") is not None
+            else "unknown"
+        )
+        provider_cost_hint = (
+            str(selection.get("provider_cost_hint"))
+            if isinstance(selection, dict) and selection.get("provider_cost_hint") is not None
+            else ""
+        )
+        provider = (
+            str(selection.get("provider_id") or selection.get("provider") or "")
+            if isinstance(selection, dict)
+            else ""
+        )
+        model = str(selection.get("model") or "") if isinstance(selection, dict) else ""
     estimated_cost_usd = _estimate_route_cost_usd(model or None, tier)
 
     if mode == "host_native":
@@ -4442,7 +4451,11 @@ def _build_execution_hint_economics(
     if provider:
         economics["selected_provider"] = provider
     if model:
-        economics["selected_model"] = model
+        if mode == "host_native":
+            economics["host_provider"] = normalize_caller_id(caller) or "host"
+            economics["host_model"] = model
+        else:
+            economics["selected_model"] = model
     if estimated_cost_usd is not None:
         economics["estimated_cost_usd"] = estimated_cost_usd
     return economics
@@ -4499,6 +4512,7 @@ def _build_route_execution_hint(
             mode="host_native",
             selection=selection,
             delegation_targets=delegation_targets,
+            host_model=host_native_model,
         )
         payload: dict[str, object] = {
             "mode": "host_native",
@@ -4533,6 +4547,7 @@ def _build_route_execution_hint(
         mode="host_native",
         selection=selection,
         delegation_targets=[],
+        host_model=host_native_model,
     )
     payload = {
         "mode": "host_native",
@@ -4617,11 +4632,26 @@ def handle_route_task(args: dict) -> dict:
         selection=selection if isinstance(selection, dict) else None,
         config=config,
     )
+    execution_mode = str(execution_hint.get("mode") or "")
     host_model = execution_hint.get("host_native_model")
-    delegate_model = model if execution_hint.get("mode") == "delegate" else None
+    route_model = (
+        str(host_model)
+        if execution_mode == "host_native" and isinstance(host_model, str) and host_model
+        else model
+    )
+    route_provider = (
+        normalize_caller_id(caller)
+        if execution_mode == "host_native"
+        else (
+            str(selection.get("provider"))
+            if isinstance(selection, dict) and isinstance(selection.get("provider"), str)
+            else None
+        )
+    )
+    delegate_model = model if execution_mode == "delegate" else None
     result = {
         "tier": decision.tier,
-        "model": delegate_model if delegate_model is not None else (host_model or model),
+        "model": route_model,
         "score": decision.score,
         "reason": decision.reason,
         "agents": decision.agents,
@@ -4630,7 +4660,7 @@ def handle_route_task(args: dict) -> dict:
         "override": decision.override,
         "execution_hint": execution_hint,
     }
-    if host_model and execution_hint.get("mode") == "host_native":
+    if host_model and execution_mode == "host_native":
         result["host_model"] = host_model
     if delegate_model is not None:
         result["delegate_model"] = delegate_model
@@ -4639,7 +4669,11 @@ def handle_route_task(args: dict) -> dict:
         caller=caller,
         execution_hint=execution_hint,
     )
-    if isinstance(selection, dict) and _has_executable_routing_metadata(selection):
+    if (
+        execution_mode == "delegate"
+        and isinstance(selection, dict)
+        and _has_executable_routing_metadata(selection)
+    ):
         result.update({
             key: value
             for key, value in selection.items()
@@ -4706,8 +4740,8 @@ def handle_route_task(args: dict) -> dict:
         source_tool="route_task",
         task=task,
         tier=decision.tier,
-        model=str(result.get("model") or model),
-        provider=str(result.get("provider") or ""),
+        model=str(route_model or ""),
+        provider=str(route_provider or ""),
         payload=result,
         estimated_cost_usd=estimated_cost if isinstance(estimated_cost, (int, float)) else None,
         rationale=(
@@ -4735,12 +4769,8 @@ def handle_route_task(args: dict) -> dict:
         task_id=task_id,
         tier=decision.tier,
         complexity_score=decision.score,
-        model=str(result.get("model") or model),
-        provider=(
-            str(result.get("provider"))
-            if isinstance(result.get("provider"), str)
-            else None
-        ),
+        model=str(route_model or ""),
+        provider=route_provider if isinstance(route_provider, str) else None,
         caller=caller,
     )
     _print_dispatch_info(
