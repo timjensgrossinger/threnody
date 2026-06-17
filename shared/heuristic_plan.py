@@ -668,11 +668,13 @@ def build_heuristic_plan_payload(
 ) -> dict[str, object]:
     """Build planner JSON compatible with ``Planner._build_plan`` without an LLM."""
     # Review fanout: REVIEW: sentinel → per-file × dimension DAG plan
-    from .review_fanout import is_review_intent, build_review_subtasks
+    from .review_fanout import is_review_intent, build_review_subtasks, strip_dims_token
     if isinstance(task, str) and is_review_intent(task):
         # Review fanout is read-only — allow absolute/out-of-root review targets.
+        # Strip the [dims=...] intent token first so it is never mistaken for a
+        # file path; build_review_subtasks re-parses intent from the full task.
         entries = extract_task_file_entries(
-            task, intent_templates=False, allow_external=True
+            strip_dims_token(task), intent_templates=False, allow_external=True
         )
         return build_review_subtasks(entries, task, max_agents=max_agents)  # type: ignore[return-value]
 

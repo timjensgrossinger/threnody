@@ -190,7 +190,109 @@ class TestTierFor:
         assert tier_for(self._dim("logic"), "moderate", False) == "medium"
 
     def test_performance_complex_no_risk_is_medium(self):
+        # Legacy 2-band behavior preserved when loc is omitted.
         assert tier_for(self._dim("performance"), "complex", False) == "medium"
+
+    # --- LOC-aware tiering (loc passed) ---
+
+    def test_small_reasoning_light_is_low(self):
+        assert tier_for(self._dim("types"), "complex", False, loc=100) == "low"
+
+    def test_small_reasoning_heavy_is_low(self):
+        assert tier_for(self._dim("performance"), "complex", False, loc=200) == "low"
+
+    def test_mid_reasoning_heavy_is_medium(self):
+        assert tier_for(self._dim("performance"), "complex", False, loc=400) == "medium"
+
+    def test_large_reasoning_heavy_is_high(self):
+        assert tier_for(self._dim("performance"), "complex", False, loc=700) == "high"
+        assert tier_for(self._dim("logic"), "complex", False, loc=700) == "high"
+
+    def test_large_reasoning_light_stays_medium(self):
+        # edge/types never auto-escalate to high on size alone.
+        assert tier_for(self._dim("types"), "complex", False, loc=900) == "medium"
+        assert tier_for(self._dim("edge"), "complex", False, loc=900) == "medium"
+
+    def test_security_with_risk_is_high_any_size(self):
+        assert tier_for(self._dim("security"), "trivial", True, loc=50) == "high"
+
+    def test_boundary_230_is_medium(self):
+        # _LOC_LOW boundary is exclusive: exactly 230 → not low.
+        assert tier_for(self._dim("logic"), "complex", False, loc=230) == "medium"
+
+
+# ---------------------------------------------------------------------------
+# estimate_review_profile + requested dimensions
+# ---------------------------------------------------------------------------
+
+class TestEstimateReviewProfile:
+    def test_returns_loc(self, tmp_path: Path):
+        from shared.review_fanout import estimate_review_profile
+        f = tmp_path / "f.md"
+        f.write_text("\n".join(f"line {i}" for i in range(42)), encoding="utf-8")
+        prof = estimate_review_profile(str(f))
+        assert prof.loc == 42
+        assert prof.has_risk is False
+
+    def test_unreadable_defaults_mid(self):
+        from shared.review_fanout import estimate_review_profile, _LOC_COMPLEX
+        prof = estimate_review_profile("/nonexistent/path/zzz.py")
+        assert prof.loc == _LOC_COMPLEX
+        assert prof.band == "moderate"
+
+
+class TestRequestedDimensions:
+    def test_bracket_single(self):
+        from shared.review_fanout import _requested_dimensions
+        assert _requested_dimensions("REVIEW: [dims=performance] a.py") == ["performance"]
+
+    def test_bracket_multi(self):
+        from shared.review_fanout import _requested_dimensions
+        assert _requested_dimensions("REVIEW: [dims=performance,security] a.py") == [
+            "performance",
+            "security",
+        ]
+
+    def test_alias_perf(self):
+        from shared.review_fanout import _requested_dimensions
+        assert _requested_dimensions("REVIEW: [dims=perf] a.py") == ["performance"]
+
+    def test_unknown_keys_dropped(self):
+        from shared.review_fanout import _requested_dimensions
+        assert _requested_dimensions("REVIEW: [dims=foo,performance] a.py") == ["performance"]
+
+    def test_bare_word_fallback(self):
+        from shared.review_fanout import _requested_dimensions
+        assert _requested_dimensions("REVIEW: performance review of a.py") == ["performance"]
+
+    def test_no_intent_returns_empty(self):
+        from shared.review_fanout import _requested_dimensions
+        assert _requested_dimensions("REVIEW: a.py b.py") == []
+
+    def test_strip_dims_token(self):
+        from shared.review_fanout import strip_dims_token
+        out = strip_dims_token("REVIEW: [dims=performance] a.py b.py")
+        assert "[dims=" not in out
+        assert "a.py" in out and "b.py" in out
+
+
+class TestDimensionsForRequested:
+    def test_requested_only_runs_named(self):
+        dims = dimensions_for("complex", False, requested=["performance"])
+        assert [d.key for d in dims] == ["performance"]
+
+    def test_requested_adds_security_on_risk(self):
+        dims = dimensions_for("complex", True, requested=["performance"])
+        keys = [d.key for d in dims]
+        assert "performance" in keys and "security" in keys
+
+    def test_requested_does_not_add_security_without_risk(self):
+        dims = dimensions_for("complex", False, requested=["performance"])
+        assert "security" not in [d.key for d in dims]
+
+    def test_empty_requested_falls_back_to_band(self):
+        dims = dimensions_for("moderate", False, requested=[])
+        assert {d.key for d in dims} == {"logic", "edge", "types"}
 
 
 # ---------------------------------------------------------------------------
@@ -257,8 +359,10 @@ class TestBuildReviewSubtasks:
         assert sec["tier"] == "high"
 
     def test_ordinary_security_review_worker_is_medium_tier(self, tmp_path: Path):
+        # Mid-sized file (230–600 LOC), no risk signals → security worker = medium.
+        # (Files < 230 LOC now tier to low; > 600 reasoning-heavy → high.)
         f = tmp_path / "ordinary.md"
-        f.write_text("\n".join(f"line {i}" for i in range(210)), encoding="utf-8")
+        f.write_text("\n".join(f"line {i}" for i in range(300)), encoding="utf-8")
         result = build_review_subtasks([(str(f), "")], f"REVIEW: security review {f}")
         sec = next(s for s in result["subtasks"] if s.get("subagent_type") == "review-security")
         assert sec["tier"] == "medium"
@@ -295,6 +399,47 @@ class TestBuildReviewSubtasks:
         dropped_keys = {s.get("subagent_type") for s in review}
         # At least security and logic should be kept (drop_priority 0 and 1)
         assert "review-security" in dropped_keys or "review-logic" in dropped_keys
+
+    def test_requested_dim_survives_cap_over_security(self, tmp_path: Path):
+        # Defect-3 regression: a risky file + explicit [dims=performance] under a
+        # tight cap must KEEP performance — it is drop-protected — even though the
+        # file also triggers security (which is only ADDED, never evicting).
+        f = tmp_path / "risky.py"
+        lines = ["password = 'x'"] + [f"line {i}" for i in range(210)]
+        f.write_text("\n".join(lines), encoding="utf-8")
+        result = build_review_subtasks(
+            [(str(f), "")], f"REVIEW: [dims=performance] {f}", max_agents=2
+        )
+        review = [s for s in result["subtasks"] if not s.get("depends_on")]
+        kept = {s.get("subagent_type") for s in review}
+        assert "review-performance" in kept
+
+    def test_performance_intent_does_not_collapse_to_security(self, tmp_path: Path):
+        # Even when the file has risk signals, a performance request keeps a
+        # performance agent (it is not silently replaced by security-only).
+        f = tmp_path / "svc.py"
+        lines = ["token = get_secret()"] + [f"line {i}" for i in range(300)]
+        f.write_text("\n".join(lines), encoding="utf-8")
+        result = build_review_subtasks([(str(f), "")], f"REVIEW: [dims=performance] {f}")
+        review_types = {
+            s.get("subagent_type")
+            for s in result["subtasks"]
+            if not s.get("depends_on")
+        }
+        assert "review-performance" in review_types
+
+    def test_synthesis_scales_high_on_many_agents(self, tmp_path: Path):
+        # >=12 review cells → high-tier synthesis even with no risk.
+        entries = []
+        for i in range(6):
+            f = tmp_path / f"f{i}.md"
+            # 210 LOC .md → complex band → 5 dims each (no risk) = 30 cells
+            f.write_text("\n".join(f"line {j}" for j in range(210)), encoding="utf-8")
+            entries.append((str(f), ""))
+        task = "REVIEW: " + " ".join(p for p, _ in entries)
+        result = build_review_subtasks(entries, task)
+        synth = next(s for s in result["subtasks"] if s.get("depends_on"))
+        assert synth["tier"] == "high"
 
     def test_max_agents_one_still_produces_synthesis(self, tmp_path: Path):
         f = tmp_path / "f.md"

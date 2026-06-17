@@ -492,3 +492,65 @@ def test_default_swarm_max_agents_unlimited() -> None:
         assert prepared["effective_agents"] == 36
         assert prepared["clamped"] is False
         db.close()
+
+
+def test_review_run_response_is_compact(monkeypatch, tmp_path: Path) -> None:
+    """Review-intent host-native response drops the heavy plan + workflow_script
+    but keeps host_spawn_waves, a plan_summary, and all learning side effects."""
+    from shared.planner import CLIBackend, Planner
+
+    class _NoBackend(CLIBackend):
+        def call(self, prompt, model=None, timeout=120):  # pragma: no cover
+            raise AssertionError("review heuristic must not call the LLM backend")
+
+    db_path = tmp_path / "review-compact.db"
+    cfg = TGsConfig(db_path=db_path)
+    db = Database(db_path=db_path)
+    db._init_schema(db._get_connection())
+    planner = Planner(cfg, _NoBackend())
+
+    f1 = tmp_path / "big.py"
+    f1.write_text("password = 'x'\n" + "\n".join(f"line {i}" for i in range(700)), encoding="utf-8")
+    f2 = tmp_path / "small.py"
+    f2.write_text("\n".join(f"line {i}" for i in range(40)), encoding="utf-8")
+
+    task = f"REVIEW: [dims=performance] {f1} {f2}"
+    out = mcp_server._execute_swarm_host_native_response(
+        config=cfg,
+        db=db,
+        planner=planner,
+        router=None,
+        swarm_id="swarm-review-compact",
+        task_text=task,
+        caller="claude-code",
+        request_meta={"topology": "dag", "workspace_root": str(tmp_path)},
+        estimated_cost=0.0,
+    )
+    result = out["result"]
+
+    # Compact wire payload
+    assert "host_spawn_waves" in result and result["host_spawn_waves"]
+    assert "plan_summary" in result
+    assert "plan" not in result
+    assert "workflow_script" not in result
+    assert result["plan_summary"]["subtask_count"] >= 1
+
+    # Learning setup preserved: swarm row persisted
+    with db.conn() as conn:
+        swarm_row = conn.execute(
+            "SELECT status FROM swarm_runs WHERE swarm_id = ?", ("swarm-review-compact",)
+        ).fetchone()
+    assert swarm_row is not None
+    assert swarm_row[0] == "awaiting_host_execution"
+
+    # Receipt keeps full plan fidelity server-side even though the wire is trimmed
+    assert db.get_run_receipt("swarm-review-compact") is not None
+
+    # Tiering: large reasoning-heavy perf file → high; small file → low
+    tiers = {
+        a.get("tier")
+        for w in result["host_spawn_waves"]
+        for a in w.get("agents", [])
+    }
+    assert "high" in tiers and "low" in tiers  # mixed tiers, not all-medium
+    db.close()

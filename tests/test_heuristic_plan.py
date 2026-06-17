@@ -192,3 +192,21 @@ def test_all_absolute_paths_collapse_to_single_subtask() -> None:
     assert len(payload["subtasks"]) == 1
     assert payload["subtasks"][0]["description"] == task.strip()
     assert payload["topology"] == "linear"
+
+
+def test_review_dims_token_not_parsed_as_file(tmp_path: Path) -> None:
+    """[dims=...] intent token must not be extracted as a review target, and the
+    fanout must run only the requested dimension (+ synthesis)."""
+    f = tmp_path / "svc.py"
+    f.write_text("\n".join(f"line {i}" for i in range(300)), encoding="utf-8")
+    payload = build_heuristic_plan_payload(
+        f"REVIEW: [dims=performance] {f}", max_agents=8
+    )
+    review = [s for s in payload["subtasks"] if not s.get("depends_on")]
+    subagent_types = {s.get("subagent_type") for s in review}
+    target_files = {str(s.get("target_file")) for s in review}
+    # Only the performance dimension ran (no logic/edge/types collapse)
+    assert subagent_types == {"review-performance"}
+    # The bracket token never became a file target
+    assert all("[dims" not in p and "=performance]" not in p for p in target_files)
+    assert all(p.endswith("svc.py") for p in target_files)

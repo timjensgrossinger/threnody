@@ -18,6 +18,12 @@ _FAST_REVIEW_SENTINEL = "FAST_REVIEW:"
 _LOC_TRIVIAL = 50
 _LOC_COMPLEX = 200
 
+# Raw-LOC thresholds for per-agent tier selection (independent of the risk-bumped
+# band used for dimension selection). Small files get a cheap low-tier reviewer;
+# large reasoning-heavy dimensions escalate to high.
+_LOC_LOW = 230
+_LOC_HIGH = 600
+
 _RISKY_EXTENSIONS = frozenset({".py", ".js", ".ts", ".go", ".rb", ".java", ".php", ".cs", ".cpp", ".c"})
 
 _RISK_SIGNALS = re.compile(
@@ -42,6 +48,7 @@ class _Dim(NamedTuple):
     subagent_type: str
     prompt_template: str
     drop_priority: int  # higher = drop first; 0 = never drop
+    reasoning_heavy: bool = False  # escalates to high tier on large files
 
 
 REVIEW_DIMENSIONS: list[_Dim] = [
@@ -56,6 +63,7 @@ REVIEW_DIMENSIONS: list[_Dim] = [
             "Output nothing if no issues found."
         ),
         drop_priority=0,
+        reasoning_heavy=True,
     ),
     _Dim(
         key="logic",
@@ -67,6 +75,7 @@ REVIEW_DIMENSIONS: list[_Dim] = [
             "Output nothing if no issues found."
         ),
         drop_priority=1,
+        reasoning_heavy=True,
     ),
     _Dim(
         key="edge",
@@ -102,6 +111,7 @@ REVIEW_DIMENSIONS: list[_Dim] = [
             "Output nothing if no issues found."
         ),
         drop_priority=4,
+        reasoning_heavy=True,
     ),
 ]
 
@@ -163,7 +173,74 @@ def _task_requests_high_tier(task: str) -> bool:
     return bool(_HIGH_REVIEW_TASK_SIGNALS.search(task))
 
 
+# Explicit dimension intent: the skill emits "REVIEW: [dims=performance] <paths>".
+# The bracket token never matches a file pattern in extraction, so it is dropped
+# from the path set and recovered here.
+_REQUESTED_DIMS = re.compile(r"\[dims?=([a-z,\s/-]+)\]", re.IGNORECASE)
+_DIM_ALIASES = {
+    "perf": "performance",
+    "sec": "security",
+    "null": "edge",
+    "edge-cases": "edge",
+    "edgecases": "edge",
+    "type": "types",
+}
+_DIM_KEYS = ("performance", "security", "logic", "types", "edge")
+
+
+def _requested_dimensions(task: str) -> list[str]:
+    """Dimensions the user explicitly asked for, in request order.
+
+    Primary form: ``[dims=performance,security]``. Falls back to a bare keyword
+    scan only when no bracket is present. Returns [] when nothing recognized.
+    """
+    if not isinstance(task, str) or not task:
+        return []
+    out: list[str] = []
+    m = _REQUESTED_DIMS.search(task)
+    if m:
+        for tok in m.group(1).split(","):
+            key = _DIM_ALIASES.get(tok.strip().lower(), tok.strip().lower())
+            if key in _DIM_BY_KEY and key not in out:
+                out.append(key)
+        return out
+    for key in _DIM_KEYS:
+        if re.search(rf"\b{key}\b", task, re.IGNORECASE) and key not in out:
+            out.append(key)
+    return out
+
+
+def strip_dims_token(task: str) -> str:
+    """Remove the ``[dims=...]`` intent token so file extraction never sees it."""
+    if not isinstance(task, str):
+        return task
+    return _REQUESTED_DIMS.sub(" ", task)
+
+
 Complexity = str  # "trivial" | "moderate" | "complex"
+
+
+class ReviewProfile(NamedTuple):
+    band: Complexity
+    has_risk: bool
+    loc: int
+
+
+def estimate_review_profile(path: str) -> ReviewProfile:
+    """Return (band, has_risk, loc) for path.
+
+    Additive companion to estimate_complexity: exposes raw LOC for per-agent
+    tier selection while preserving the risk-bumped band for dimension choice.
+    Reuses the mtime+size-keyed cached read in _read_file_safe, so this adds no
+    extra disk I/O on top of estimate_complexity.
+    """
+    content = _read_file_safe(path)
+    if content is None:
+        # Unreadable → mid-sized default so tiering lands on medium, not low/high.
+        return ReviewProfile("moderate", False, _LOC_COMPLEX)
+    loc = _count_loc(content)
+    band, has_risk = estimate_complexity(path)
+    return ReviewProfile(band, has_risk, loc)
 
 
 def estimate_complexity(path: str) -> tuple[Complexity, bool]:
@@ -198,8 +275,25 @@ def estimate_complexity(path: str) -> tuple[Complexity, bool]:
     return band, risk
 
 
-def dimensions_for(band: Complexity, has_risk: bool) -> list[_Dim]:
-    """Dimensions to run for a given complexity band + risk flag."""
+def dimensions_for(
+    band: Complexity,
+    has_risk: bool,
+    requested: list[str] | None = None,
+) -> list[_Dim]:
+    """Dimensions to run for a given complexity band + risk flag.
+
+    When ``requested`` names explicit dimensions, run *only* those; security is
+    appended (never evicting a named dim) only when the file carries real risk
+    signals. With no explicit request, fall back to band-derived selection.
+    """
+    if requested:
+        keys = [k for k in requested if k in _DIM_BY_KEY]
+        if has_risk and "security" not in keys:
+            keys.append("security")
+        if keys:
+            return [_DIM_BY_KEY[k] for k in keys]
+        # requested held only unknown keys → fall through to band logic
+
     if band == "trivial":
         keys = ["logic", "edge"]
     elif band == "moderate":
@@ -213,18 +307,62 @@ def dimensions_for(band: Complexity, has_risk: bool) -> list[_Dim]:
     return [_DIM_BY_KEY[k] for k in keys]
 
 
-def tier_for(dim: _Dim, band: Complexity, has_risk: bool, force_high: bool = False) -> str:
-    """Routing tier for a dimension + band combination."""
+def _effective_drop_priority(dim: _Dim, requested_keys: set[str], has_risk: bool) -> int:
+    """Per-run drop priority. Lower = more protected; dropped highest-first.
+
+    User-requested dimensions are the most protected (-1) so they survive the
+    max_agents cap even against security: security is *added* on risk (0) but
+    must never evict a dimension the user explicitly asked for. Everything else
+    keeps its static rank, shifted below the protected set.
+    """
+    if dim.key in requested_keys:
+        return -1
+    if dim.key == "security" and has_risk:
+        return 0
+    return dim.drop_priority + 1
+
+
+def tier_for(
+    dim: _Dim,
+    band: Complexity,
+    has_risk: bool,
+    *,
+    loc: int | None = None,
+    force_high: bool = False,
+) -> str:
+    """Routing tier for a dimension + file profile.
+
+    Security on risky/critical surfaces always escalates. When ``loc`` is given,
+    tier on raw LOC + dimension reasoning-weight: small files → low, large
+    reasoning-heavy dimensions → high, else medium. With ``loc`` omitted, the
+    legacy 2-band behavior is preserved for back-compat.
+    """
     if dim.key == "security" and (has_risk or force_high):
         return "high"
-    if band == "trivial":
+    if loc is None:
+        if band == "trivial":
+            return "low"
+        return "medium"
+    if loc < _LOC_LOW:
         return "low"
+    if loc > _LOC_HIGH and dim.reasoning_heavy:
+        return "high"
     return "medium"
 
 
-def synthesis_tier(requires_high: bool) -> str:
-    """Routing tier for review synthesis."""
-    return "high" if requires_high else "medium"
+def synthesis_tier(
+    requires_high: bool,
+    n_cells: int = 0,
+    has_risk_files: bool = False,
+) -> str:
+    """Routing tier for review synthesis.
+
+    Scales up for large or risky runs — consolidating/dedup-ranking many
+    findings is reasoning-heavy — but never drops below medium.
+    """
+    if requires_high or has_risk_files or n_cells >= 12:
+        return "high"
+    return "medium"
 
 
 def build_review_subtasks(
@@ -258,29 +396,37 @@ def build_review_subtasks(
         return build_fast_review_subtasks(entries, task, max_agents=max_agents)
 
     task_force_high = _task_requests_high_tier(task)
+    requested = _requested_dimensions(task)
+    requested_keys = set(requested)
 
-    # Compute per-file (dims, band, risk)
-    file_dims: list[tuple[str, list[_Dim], Complexity, bool]] = []
+    # Compute per-file (dims, profile) — profile carries raw LOC for tiering
+    file_dims: list[tuple[str, list[_Dim], ReviewProfile]] = []
     for path, _ in entries:
-        band, has_risk = estimate_complexity(path)
-        dims = dimensions_for(band, has_risk)
+        prof = estimate_review_profile(path)
+        dims = dimensions_for(prof.band, prof.has_risk, requested=requested)
+        # Only force-add security on an explicit high-tier signal, not merely
+        # because the user named some other dimension.
         if task_force_high and not any(dim.key == "security" for dim in dims):
             dims = [_DIM_BY_KEY["security"]] + dims
-        file_dims.append((path, dims, band, has_risk))
+        file_dims.append((path, dims, prof))
 
-    # Flatten to (path, dim, band, has_risk) ordered by never-drop first
-    all_cells: list[tuple[str, _Dim, Complexity, bool]] = []
-    for path, dims, band, has_risk in file_dims:
-        for dim in sorted(dims, key=lambda d: d.drop_priority):
-            all_cells.append((path, dim, band, has_risk))
+    # Flatten to (path, dim, profile) ordered by never-drop first (per-run priority)
+    all_cells: list[tuple[str, _Dim, ReviewProfile]] = []
+    for path, dims, prof in file_dims:
+        for dim in sorted(
+            dims, key=lambda d: _effective_drop_priority(d, requested_keys, prof.has_risk)
+        ):
+            all_cells.append((path, dim, prof))
 
-    # Cap: drop highest drop_priority cells first; reserve 1 slot for synthesis
+    # Cap: drop highest effective-priority cells first; reserve 1 slot for synthesis
     if max_agents is not None and max_agents > 0:
         review_cap = max(1, max_agents - 1)
         if len(all_cells) > review_cap:
             by_priority = sorted(
                 range(len(all_cells)),
-                key=lambda i: all_cells[i][1].drop_priority,
+                key=lambda i: _effective_drop_priority(
+                    all_cells[i][1], requested_keys, all_cells[i][2].has_risk
+                ),
                 reverse=True,
             )
             n_drop = len(all_cells) - review_cap
@@ -298,10 +444,10 @@ def build_review_subtasks(
 
     subtasks: list[dict] = []
     review_ids: list[int] = []
-    review_requires_high = task_force_high or any(has_risk for _, _, _, has_risk in all_cells)
+    review_requires_high = task_force_high or any(prof.has_risk for _, _, prof in all_cells)
 
-    for idx, (path, dim, band, has_risk) in enumerate(all_cells, start=1):
-        t = tier_for(dim, band, has_risk, force_high=task_force_high)
+    for idx, (path, dim, prof) in enumerate(all_cells, start=1):
+        t = tier_for(dim, prof.band, prof.has_risk, loc=prof.loc, force_high=task_force_high)
         subtasks.append({
             "id": idx,
             "description": dim.prompt_template.format(path=path),
@@ -315,14 +461,15 @@ def build_review_subtasks(
         review_ids.append(idx)
 
     synth_id = len(all_cells) + 1
-    reviewed_files = sorted({path for path, _, _, _ in all_cells})
+    reviewed_files = sorted({path for path, _, _ in all_cells})
+    has_risk_files = any(prof.has_risk for _, _, prof in all_cells)
     subtasks.append({
         "id": synth_id,
         "description": (
             _SYNTHESIS_PROMPT
             + f"\n\nFiles reviewed: {', '.join(reviewed_files)}"
         ),
-        "tier": synthesis_tier(review_requires_high),
+        "tier": synthesis_tier(review_requires_high, len(all_cells), has_risk_files),
         "depends_on": review_ids,
         "subagent_type": "",  # empty → resolved to threnody-high by tier in host_spawn
         "read_only": True,

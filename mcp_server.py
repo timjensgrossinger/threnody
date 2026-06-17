@@ -3546,6 +3546,12 @@ def _execute_swarm_host_native_response(
     latency_ms["total_to_handoff"] = int((time.monotonic() - handoff_started) * 1000)
     fast_start = getattr(config, "host_fast_start", None)
     fast_start_target_ms = int(getattr(fast_start, "max_handoff_ms", 30_000) or 30_000)
+    try:
+        from shared.review_fanout import is_review_intent as _is_review_intent
+
+        review_run = bool(_is_review_intent(task_text))
+    except Exception:
+        review_run = False
     swarm_result: dict[str, object] = {
         "swarm_id": swarm_id,
         "host_execution_mode": "host_native",
@@ -3632,6 +3638,31 @@ def _execute_swarm_host_native_response(
         )
     except Exception:
         log.debug("execute_swarm receipt persist failed for %s", swarm_id, exc_info=True)
+    if review_run:
+        # Compact wire payload: the receipt above already captured full plan
+        # fidelity (inspect_run_receipt), and handoff snapshots were registered
+        # from host_spawn_waves — so the host only needs the lean spawn manifest.
+        # Drop the heavy duplicate `plan` (its subtask descriptions duplicate the
+        # wave prompts) and any workflow_script, which review never executes.
+        p = swarm_result.pop("plan", {}) or {}
+        if isinstance(p, dict):
+            swarm_result["plan_summary"] = {
+                "swarm_id": swarm_id,
+                "topology": p.get("topology"),
+                "strategy": p.get("strategy"),
+                "subtask_count": len(p.get("subtasks") or []),
+                "wave_count": len(host_waves),
+                "analysis": p.get("analysis"),
+            }
+        for _k in (
+            "workflow_emit",
+            "workflow_execution_contract",
+            "workflow_name",
+            "workflow_script",
+            "workflow_execution_note",
+            "consensus_in_workflow",
+        ):
+            swarm_result.pop(_k, None)
     return {
         "result": swarm_result,
         "started": False,

@@ -126,7 +126,7 @@ Nine repo-local skills under [`skills/`](skills/) guide MCP workflows from any c
 | [threnody-routing](skills/threnody-routing/SKILL.md) | `route_task`, routing guard, host-native vs utility delegation |
 | [threnody-task](skills/threnody-task/SKILL.md) | `plan_task`, `decompose_task`, `fleet_plan`, `host_spawn_waves` |
 | [threnody-swarm](skills/threnody-swarm/SKILL.md) | `execute_swarm`, topology, budget preview, resume |
-| [threnody-swarm-review](skills/threnody-swarm-review/SKILL.md) | Complexity-gated review swarm — one agent per file × dimension, ranked report (read-only) |
+| [threnody-swarm-review](skills/threnody-swarm-review/SKILL.md) | Complexity-gated review swarm — one agent per file × dimension, LOC-aware per-agent tiering (haiku/sonnet/opus), optional `[dims=...]` focus, compact fast-start handoff, ranked report (read-only) |
 | [threnody-fast-review](skills/threnody-fast-review/SKILL.md) | Fast broad review swarm — one read-only agent per file plus synthesis |
 | [threnody-workflow](skills/threnody-workflow/SKILL.md) | Consensus swarm via tier-aware Dynamic Workflows; save pre-tuned, zero-config `/workflow` commands (claude-code) |
 | [threnody-fullstack](skills/threnody-fullstack/SKILL.md) | Contract-first parallel frontend + backend + API |

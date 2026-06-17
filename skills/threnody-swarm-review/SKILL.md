@@ -21,11 +21,20 @@ Complexity gating prevents token blowout:
 | complex | > 200 | logic, edge, types, security, performance |
 
 Security is always added when the file contains risk signals (SQL, exec, auth, tokens, etc.).
-Tier → model: trivial → low, moderate/standard review → medium. Use high tier
-only for explicit deep review or clear high-risk surfaces such as auth, crypto,
-payments, secrets, remote code execution, or a targeted threat-model/security
-request. Default synthesis is medium; escalate synthesis to high only when the
-review scope or findings justify it.
+
+**Tier → model is chosen per agent from raw file size × dimension reasoning-weight** (no LLM call — pure heuristic, keeps fast-start):
+
+| File size (LOC) | edge / types (light) | logic / performance / security (reasoning-heavy) |
+|-----------------|----------------------|--------------------------------------------------|
+| small `< 230`   | low → haiku          | low → haiku                                      |
+| mid `230–600`   | medium → sonnet      | medium → sonnet                                  |
+| large `> 600`   | medium → sonnet      | **high → opus**                                  |
+| security + risk | —                    | **high → opus** (any size)                        |
+
+Synthesis scales with the run: `high → opus` when ≥12 review agents or any risky
+file present, else `medium → sonnet`. Never below medium (dedup/ranking is
+reasoning-heavy). This mix — haiku on small files, opus on large reasoning-heavy
+ones — is automatic; you do not hardcode a tier.
 
 ---
 
@@ -89,6 +98,30 @@ execute_swarm(
 The `REVIEW:` sentinel activates per-file × dimension fanout in the heuristic planner.
 Files listed after `REVIEW:` are extracted automatically.
 
+**Explicit dimension intent.** When the user names the review focus (e.g. "review
+for performance"), emit it so the swarm runs *only* those dimensions instead of
+the full band set:
+
+```python
+execute_swarm(
+  task="REVIEW: [dims=performance] <space-separated file paths>",
+  topology="dag",
+)
+```
+
+`[dims=...]` is comma-separated; accepted keys: `performance, security, logic,
+types, edge` (aliases `perf, sec, type, null`). Named dimensions are
+drop-protected under the agent cap; `security` is still *added* (never evicting a
+named dimension) when a file has real risk signals. With no `[dims=...]`, the
+band-based default set runs.
+
+**Response is a compact spawn manifest.** For review runs the response carries
+`host_spawn_waves` (the lean per-agent spawn list) plus a small `plan_summary` —
+the heavy duplicate `plan` and any `workflow_script` are omitted so the host
+reads it in one chunk and hits the <20s first-spawn target. Full plan fidelity is
+still recorded server-side (`inspect_run_receipt`). Spawn directly from
+`host_spawn_waves`; do not expect a full `plan` object.
+
 ### 4. Execute host_spawn_waves
 
 On `awaiting_host_execution: true` + `host_spawn_waves`:
@@ -99,12 +132,17 @@ On `awaiting_host_execution: true` + `host_spawn_waves`:
 
 ### 5. Synthesis wave
 
-The final wave contains a single synthesis subtask (`tier: medium` by default;
-`high` only for risk/deep review). Inject:
+The final wave contains a single synthesis subtask (`tier` auto-scaled: `high` for
+≥12 review agents or any risky file, else `medium`). Inject:
 - Linter output from step 1
-- All `output_excerpt` summaries from prior waves
+- All `output_excerpt` summaries from prior waves — **all of them**
 
 The synthesis agent deduplicates, ranks by severity → category, and outputs the report.
+
+> Do **not** pre-filter or drop low-severity findings before synthesis to save
+> time — that loses findings. Synthesis input lives in your context (batch mode),
+> not the swarm payload; latency is addressed by the compact response (step 3) and
+> cheaper per-agent tiers, never by trimming findings.
 
 ### 6. Terminal report
 
