@@ -1091,6 +1091,14 @@ def approval_queue_approve(
     if not isinstance(draft, dict):
         raise ValueError(f"approval queue draft is invalid: {queue_id}")
 
+    # Workflow drafts are a different kind: they are not agent definitions, so we
+    # must not run them through save_agent_definition. Mark approved, then
+    # best-effort export the script to .claude/workflows/<slug>.js.
+    if str(draft.get("kind")) == "workflow":
+        return _approve_workflow_draft(
+            project_id, queue_id, draft, operator=operator, db=database
+        )
+
     existing = database.get_agent_definition(row["fingerprint"])
     definition = json.dumps(draft, sort_keys=True)
     match_count = existing.get("match_count", 1) if existing else 1
@@ -1125,12 +1133,76 @@ def approval_queue_approve(
             "created_at": updated_at,
         },
     )
+    # Best-effort export of the now-active agent to provider-native skill files.
+    # Non-blocking: an export failure must never undo an approval.
+    export_result = _export_approved_agent(
+        database, row["fingerprint"], project_path=project_id
+    )
     return {
         "approved": True,
         "queue_id": queue_id,
         "agent_id": row["fingerprint"],
         "operator_id": operator,
         "status": "approved",
+        "export_result": export_result,
+    }
+
+
+def _export_approved_agent(
+    database: Database, agent_id: str, *, project_path: str | None
+) -> dict | None:
+    """Write an approved agent to .claude/skills/<slug>/. Best-effort, logged."""
+    try:
+        from .agent_export import export_agent_skill
+
+        return export_agent_skill(
+            database,
+            agent_id,
+            providers=["claude-code"],
+            scope="project",
+            project_path=project_path,
+        )
+    except Exception as exc:  # pragma: no cover - best-effort export
+        log.warning("agent skill export failed for %s: %s", agent_id, exc, exc_info=True)
+        return {"errors": [str(exc)]}
+
+
+def _approve_workflow_draft(
+    project_id: str,
+    queue_id: int,
+    draft: dict,
+    *,
+    operator: str,
+    db: Database,
+) -> dict:
+    """Promote a queued workflow draft: mark approved + export the .js script."""
+    updated_at = _timestamp()
+    with db.conn() as conn:
+        conn.execute(
+            """
+            UPDATE approval_queue
+            SET status = 'approved', updated_at = ?
+            WHERE id = ? AND project_path = ?
+            """,
+            (updated_at, queue_id, project_id),
+        )
+    export_result: dict | None = None
+    try:
+        from .workflow_export import export_workflow
+
+        export_result = export_workflow(
+            draft, project_path=project_id, db=db, tune=True
+        )
+    except Exception as exc:  # pragma: no cover - best-effort export
+        log.warning("workflow export failed for queue %s: %s", queue_id, exc, exc_info=True)
+        export_result = {"errors": [str(exc)]}
+    return {
+        "approved": True,
+        "queue_id": queue_id,
+        "kind": "workflow",
+        "operator_id": operator,
+        "status": "approved",
+        "export_result": export_result,
     }
 
 

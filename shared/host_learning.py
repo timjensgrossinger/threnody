@@ -688,6 +688,66 @@ def record_consensus_learning(
         log.debug("consensus bandit update failed for %s", run_id, exc_info=True)
 
 
+_REVIEW_SUBAGENT_TO_DIM = {
+    "review-security": "security",
+    "review-logic": "logic",
+    "review-edge-cases": "edge",
+    "review-types": "types",
+    "review-performance": "performance",
+}
+
+
+def _build_review_outcome(
+    agent_spec: Mapping[str, Any], result: Mapping[str, Any], tier: str
+) -> dict[str, Any] | None:
+    """Extract a review-tier learning record from a read-only review agent.
+
+    Returns None for non-review agents or when the host did not report findings,
+    so the loop simply skips them. Pure — no DB access.
+    """
+    review_meta = result.get("review_meta")
+    if not isinstance(review_meta, Mapping):
+        return None
+    dim = _REVIEW_SUBAGENT_TO_DIM.get(str(agent_spec.get("subagent_type") or ""))
+    target_file = str(agent_spec.get("target_file") or "").strip()
+    if not dim or not target_file:
+        return None
+    try:
+        findings_total = int(review_meta.get("findings_total") or 0)
+        findings_high = int(review_meta.get("findings_high") or 0)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "target_file": target_file,
+        "dimension": dim,
+        "tier": tier,
+        "findings_total": findings_total,
+        "findings_high": findings_high,
+        "kept_by_synthesis": bool(review_meta.get("kept_by_synthesis", True)),
+    }
+
+
+def _record_review_outcome(db: Database, outcome: Mapping[str, Any]) -> None:
+    """Resolve the profile key and EMA-update review_tier_bias. Best-effort."""
+    try:
+        from .review_fanout import estimate_review_profile, profile_key_for
+        from .review_learning import record_review_tier_outcome
+
+        prof = estimate_review_profile(outcome["target_file"])
+        profile_key = profile_key_for(prof, outcome["target_file"])
+        record_review_tier_outcome(
+            db,
+            profile_key=profile_key,
+            dimension=str(outcome["dimension"]),
+            tier=str(outcome["tier"]),
+            findings_high=int(outcome["findings_high"]),
+            findings_total=int(outcome["findings_total"]),
+            kept_by_synthesis=bool(outcome["kept_by_synthesis"]),
+        )
+    except Exception:  # pragma: no cover - best-effort learning
+        log.debug("review-tier outcome capture failed", exc_info=True)
+
+
 def build_host_agent_record(
     db: Database,
     *,
@@ -749,12 +809,15 @@ def build_host_agent_record(
     ph = pattern_hash(description)
     resolved_project = project_id or _HOST_RUN_META.get(run_id, {}).get("project_id") or "default-project"
 
+    review_outcome = _build_review_outcome(agent_spec, result, tier)
+
     return {
         "task_id": task_id,
         "pattern_hash": ph,
         "eval_quality": eval_quality,
         "touched_files": touched_files,
         "resolved_project": resolved_project,
+        "review_outcome": review_outcome,
         "pattern_payload": {
             "pattern_hash": ph,
             "pattern_desc": description,
@@ -927,6 +990,7 @@ def ingest_host_wave(
             "output_excerpt": output_excerpt,
             "rework_detected": enriched.get("rework_detected", False),
             "duration_ms": enriched.get("duration_ms"),
+            "review_meta": enriched.get("review_meta"),
         }
         rec = build_host_agent_record(
             db,
@@ -938,6 +1002,9 @@ def ingest_host_wave(
         # Buffer the per-agent writes; they are flushed once after the loop.
         pattern_buffer.append(rec["pattern_payload"])
         telemetry_buffer.append(rec["telemetry_payload"])
+        # Profile-keyed review-tier learning (read-only review agents). Best-effort.
+        if rec.get("review_outcome"):
+            _record_review_outcome(db, rec["review_outcome"])
         draft_projects_by_hash.setdefault(rec["pattern_hash"], rec["resolved_project"])
         processed_agents += 1
         recorded = {

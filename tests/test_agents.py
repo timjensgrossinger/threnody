@@ -722,6 +722,100 @@ def test_non_native_provider_receives_learned_agent_runtime_context():
     assert "Use the retry helper" in enriched.description
 
 
+def test_approve_agent_draft_triggers_skill_export(monkeypatch):
+    """Approving an agent draft must best-effort export it to skill files (W2a)."""
+    import shared.agent_export as agent_export
+    calls = {}
+
+    def _fake_export(db, agent_id, **kw):
+        calls["agent_id"] = agent_id
+        return {"written": ["SKILL.md"], "skipped": [], "errors": []}
+
+    monkeypatch.setattr(agent_export, "export_agent_skill", _fake_export)
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(db_path=Path(td) / "test.db")
+        agents_module._DEFAULT_DB = db
+        try:
+            draft = agents_module.generate_agent_draft(
+                "project-a",
+                {"name": "exp-agent", "instructions": "## Context\nExport me."},
+            )
+            queued = agents_module.approval_queue_enqueue("project-a", draft)
+            result = agents_module.approval_queue_approve(
+                "project-a", queued["id"], operator_id="op-1"
+            )
+            assert result["approved"] is True
+            assert calls.get("agent_id") == draft["fingerprint"]
+            assert result["export_result"]["written"] == ["SKILL.md"]
+        finally:
+            agents_module._DEFAULT_DB = None
+            db.close()
+
+
+def test_export_failure_does_not_block_approval(monkeypatch):
+    """A failing exporter must never undo an approval (best-effort)."""
+    import shared.agent_export as agent_export
+
+    def _boom(db, agent_id, **kw):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(agent_export, "export_agent_skill", _boom)
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(db_path=Path(td) / "test.db")
+        agents_module._DEFAULT_DB = db
+        try:
+            draft = agents_module.generate_agent_draft(
+                "project-a", {"name": "a", "instructions": "## Context\nx."}
+            )
+            queued = agents_module.approval_queue_enqueue("project-a", draft)
+            result = agents_module.approval_queue_approve(
+                "project-a", queued["id"], operator_id="op-1"
+            )
+            assert result["approved"] is True
+            assert "errors" in result["export_result"]
+            assert db.get_agent_definition(draft["fingerprint"])["promotion_state"] == "active"
+        finally:
+            agents_module._DEFAULT_DB = None
+            db.close()
+
+
+def test_approve_workflow_draft_exports_js_not_agent(monkeypatch):
+    """A workflow-kind draft routes to export_workflow, never the agent save path."""
+    import shared.workflow_export as workflow_export
+    seen = {}
+
+    def _fake_wf_export(draft, **kw):
+        seen["name"] = draft.get("name")
+        seen["tune"] = kw.get("tune")
+        return {"written": ["wf.js"], "skipped": [], "errors": []}
+
+    monkeypatch.setattr(workflow_export, "export_workflow", _fake_wf_export)
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(db_path=Path(td) / "test.db")
+        agents_module._DEFAULT_DB = db
+        try:
+            wf_draft = {
+                "kind": "workflow",
+                "name": "threnody-demo",
+                "fingerprint": "wf-fp-1",
+                "script": "export const meta = {name:'x'}\n",
+                "status": "draft",
+            }
+            queued = agents_module.approval_queue_enqueue("project-a", wf_draft)
+            result = agents_module.approval_queue_approve(
+                "project-a", queued["id"], operator_id="op-1"
+            )
+            assert result["approved"] is True
+            assert result["kind"] == "workflow"
+            assert seen.get("name") == "threnody-demo"
+            assert seen.get("tune") is True
+            # Must NOT have been saved as an agent definition.
+            assert db.get_agent_definition("wf-fp-1") is None
+        finally:
+            agents_module._DEFAULT_DB = None
+            db.close()
+
+
 def test_test_approval_queue_reject():
     """D-05..D-08: queued drafts must support reject/defer without auto-promotion."""
     with tempfile.TemporaryDirectory() as td:

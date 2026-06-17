@@ -495,6 +495,19 @@ class Database:
                 PRIMARY KEY (band, version, tier)
             );
 
+            -- Learned per-profile review-tier bias (profile-keyed, transferable
+            -- across files/repos). escalate_ema: cheap tier under-reviewed (kept
+            -- high-severity findings); idle_ema: high tier found nothing.
+            CREATE TABLE IF NOT EXISTS review_tier_bias (
+                profile_key  TEXT NOT NULL,
+                dimension    TEXT NOT NULL,
+                escalate_ema REAL DEFAULT 0,
+                idle_ema     REAL DEFAULT 0,
+                sample_count INTEGER DEFAULT 0,
+                updated_at   REAL NOT NULL,
+                PRIMARY KEY (profile_key, dimension)
+            );
+
             -- Learned agent definitions
             CREATE TABLE IF NOT EXISTS agent_definitions (
                 pattern_hash TEXT PRIMARY KEY,

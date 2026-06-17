@@ -220,6 +220,161 @@ class TestTierFor:
         # _LOC_LOW boundary is exclusive: exactly 230 → not low.
         assert tier_for(self._dim("logic"), "complex", False, loc=230) == "medium"
 
+    # --- learned tier bias ---
+
+    def test_bias_up_escalates(self):
+        # medium heuristic + learned +1 → high.
+        assert tier_for(self._dim("logic"), "complex", False, loc=400, bias=1) == "high"
+
+    def test_bias_down_deescalates(self):
+        assert tier_for(self._dim("logic"), "complex", False, loc=400, bias=-1) == "low"
+
+    def test_bias_clamps_at_bounds(self):
+        # already low, bias -1 stays low; already high, bias +1 stays high.
+        assert tier_for(self._dim("types"), "complex", False, loc=100, bias=-2) == "low"
+        assert tier_for(
+            self._dim("performance"), "complex", False, loc=700, density_score=0.3, bias=2
+        ) == "high"
+
+    def test_bias_never_overrides_security_on_risk(self):
+        # security+risk is high and must ignore a learned de-escalation.
+        assert tier_for(self._dim("security"), "trivial", True, loc=100, bias=-2) == "high"
+
+    def test_bias_zero_is_noop(self):
+        assert tier_for(self._dim("logic"), "complex", False, loc=400, bias=0) == "medium"
+
+    # --- profile_key_for ---
+
+    def test_profile_key_transferable(self):
+        from shared.review_fanout import profile_key_for
+        from shared.review_fanout import ReviewProfile
+        prof = ReviewProfile("complex", False, 250, 0.6)
+        # Same shape, different paths → same key (path-independent).
+        k1 = profile_key_for(prof, "a/b/llm_client.py")
+        k2 = profile_key_for(prof, "totally/other/thing.py")
+        assert k1 == k2 == ".py|mid|dense"
+
+    def test_build_review_subtasks_applies_bias(self, tmp_path: Path):
+        # A flat mid-size .py logic review is medium; a learned +1 bias lifts it.
+        f = tmp_path / "m.py"
+        f.write_text("\n".join(f"x{i} = {i}" for i in range(300)), encoding="utf-8")
+        pk = "%s|mid|flat" % ".py"
+        plan = build_review_subtasks(
+            [(str(f), "")],
+            f"REVIEW: {f} [dims=logic]",
+            tier_bias={(pk, "logic"): 1},
+        )
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        assert logic and logic[0]["tier"] == "high"
+        # Without bias the same cell is medium.
+        plan2 = build_review_subtasks([(str(f), "")], f"REVIEW: {f} [dims=logic]")
+        logic2 = [s for s in plan2["subtasks"] if s.get("subagent_type") == "review-logic"]
+        assert logic2 and logic2[0]["tier"] == "medium"
+
+    # --- density-aware tiering (density_score passed) ---
+
+    def test_dense_midsize_reasoning_heavy_escalates_to_high(self):
+        # 250 LOC but dense + reasoning-heavy → high, where LOC alone gave medium.
+        assert tier_for(
+            self._dim("performance"), "complex", False, loc=250, density_score=0.6
+        ) == "high"
+
+    def test_flat_large_reasoning_heavy_held_at_medium(self):
+        # 700 LOC but flat (config-ish) → medium instead of LOC-only high.
+        assert tier_for(
+            self._dim("performance"), "complex", False, loc=700, density_score=0.05
+        ) == "medium"
+
+    def test_large_reasoning_heavy_with_moderate_density_stays_high(self):
+        # Real code (density above the flat floor) keeps the prior escalation.
+        assert tier_for(
+            self._dim("logic"), "complex", False, loc=700, density_score=0.3
+        ) == "high"
+
+    def test_dense_small_reasoning_heavy_climbs_to_medium(self):
+        # Sub-230 but dense + reasoning-heavy → medium over low.
+        assert tier_for(
+            self._dim("logic"), "complex", False, loc=180, density_score=0.5
+        ) == "medium"
+
+    def test_dense_small_reasoning_light_stays_low(self):
+        # Density only lifts reasoning-heavy dims; edge/types stay low when small.
+        assert tier_for(
+            self._dim("edge"), "complex", False, loc=180, density_score=0.9
+        ) == "low"
+
+    def test_density_omitted_preserves_loc_only_escalation(self):
+        # density_score=None → exact legacy LOC-only behavior.
+        assert tier_for(self._dim("performance"), "complex", False, loc=700) == "high"
+        assert tier_for(self._dim("performance"), "complex", False, loc=250) == "medium"
+
+
+class TestStructuralDensity:
+    def test_flat_file_low_density(self):
+        from shared.review_fanout import _structural_density
+        flat = "\n".join(f"FIELD_{i} = {i}" for i in range(60))
+        assert _structural_density(flat) < 0.18
+
+    def test_nested_branchy_file_high_density(self):
+        from shared.review_fanout import _structural_density
+        nested = (
+            "def f(x):\n"
+            "    if x:\n"
+            "        for i in x:\n"
+            "            while i:\n"
+            "                if i and x:\n"
+            "                    try:\n"
+            "                        return i\n"
+            "                    except Exception:\n"
+            "                        continue\n"
+        ) * 5
+        assert _structural_density(nested) >= 0.45
+
+    def test_nested_outscores_flat(self, tmp_path: Path):
+        from shared.review_fanout import _structural_density
+        flat = "\n".join(f"x{i} = {i}" for i in range(80))
+        nested = (
+            "func handle(a) {\n"
+            "  if (a) {\n"
+            "    for (i) {\n"
+            "      while (i) { if (i && a) { return i } }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        ) * 8
+        assert _structural_density(nested) > _structural_density(flat)
+
+    def test_empty_content_is_zero(self):
+        from shared.review_fanout import _structural_density
+        assert _structural_density("") == 0.0
+        assert _structural_density("\n\n   \n") == 0.0
+
+    def test_comment_only_lines_ignored(self):
+        from shared.review_fanout import _effective_loc
+        content = "# a\n# b\nx = 1\n// c\ny = 2\n"
+        assert _effective_loc(content) == 2
+
+    def test_profile_carries_density(self, tmp_path: Path):
+        from shared.review_fanout import estimate_review_profile
+        f = tmp_path / "nested.py"
+        f.write_text(
+            (
+                "def g(x):\n"
+                "    if x:\n"
+                "        for i in x:\n"
+                "            if i:\n"
+                "                return i\n"
+            ) * 10,
+            encoding="utf-8",
+        )
+        prof = estimate_review_profile(str(f))
+        assert prof.density_score > 0.0
+
+    def test_profile_back_compat_three_positional(self):
+        from shared.review_fanout import ReviewProfile
+        prof = ReviewProfile("complex", True, 300)
+        assert prof.density_score == 0.0
+
 
 # ---------------------------------------------------------------------------
 # estimate_review_profile + requested dimensions

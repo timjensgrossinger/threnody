@@ -1336,6 +1336,11 @@ class TGsConfig:
     code_review_tier: str = "all"
     auto_approve_timeout: int = 30
 
+    # Profile-keyed review-tier learning. When enabled, past review outcomes bias
+    # per-(profile, dimension) tier selection at plan-build (cold path, no LLM).
+    # Default-safe: a no-op until enough samples accumulate; fresh repos unaffected.
+    review_learning_enabled: bool = True
+
     # Phase 9: User-driven model tier overrides (DISC-05)
     # Format: {"model-id": "tier"} — e.g. {"gpt-4-turbo": "low"}
     model_tier_pins: dict[str, str] = field(default_factory=dict)

@@ -631,7 +631,16 @@ def _ensure_init() -> tuple[TGsConfig, Database, TaskRouter, Planner, Orchestrat
                 except Exception:
                     log.warning("ProviderRegistry unavailable for planner, falling back to GhCopilotBackend")
                     backend = GhCopilotBackend()
-                planner = Planner(config, backend, db)
+                # Wire learned-agent auto-assignment: AgentRegistry matching is a
+                # cheap string-similarity lookup (no LLM), so the decompose path
+                # gains no latency. Best-effort — never block planner init.
+                _agent_registry = None
+                try:
+                    from shared.agents import AgentRegistry as _AgentRegistry
+                    _agent_registry = _AgentRegistry(db, config)
+                except Exception:
+                    log.warning("AgentRegistry unavailable; learned-agent auto-assign disabled", exc_info=True)
+                planner = Planner(config, backend, db, agent_registry=_agent_registry)
                 try:
                     if _planner_registry is not None:
                         from shared.provider_factory import resolve_default_provider
@@ -10724,7 +10733,10 @@ def handle_check_providers(_args: dict) -> dict:
     """
     registry = _get_registry_with_config()
     caller = _resolve_caller()
-    base = registry.to_compact_dict(caller=caller)
+    try:
+        base = registry.to_compact_dict(caller=caller)
+    except TypeError:
+        base = registry.to_compact_dict()
 
     try:
         config, db, router, planner, orchestrator = _ensure_init()

@@ -657,6 +657,26 @@ def _subtasks_from_entries(
     }
 
 
+def _load_review_tier_bias() -> dict[tuple[str, str], int] | None:
+    """Load the learned review-tier bias map (cold path). Fail-safe → None.
+
+    Gated by config.review_learning_enabled. Any failure (no DB, no config, empty
+    table) yields None so build_review_subtasks falls back to the pure heuristic —
+    the fresh-repo / no-data path stays exactly as before.
+    """
+    try:
+        from .config import TGsConfig
+
+        if not getattr(TGsConfig.from_yaml(), "review_learning_enabled", True):
+            return None
+        from .agents import _get_agent_db
+        from .review_learning import load_review_tier_bias
+
+        return load_review_tier_bias(_get_agent_db())
+    except Exception:  # pragma: no cover - learning read is best-effort
+        return None
+
+
 def build_heuristic_plan_payload(
     task: str,
     *,
@@ -676,7 +696,10 @@ def build_heuristic_plan_payload(
         entries = extract_task_file_entries(
             strip_dims_token(task), intent_templates=False, allow_external=True
         )
-        return build_review_subtasks(entries, task, max_agents=max_agents)  # type: ignore[return-value]
+        tier_bias = _load_review_tier_bias()
+        return build_review_subtasks(
+            entries, task, max_agents=max_agents, tier_bias=tier_bias
+        )  # type: ignore[return-value]
 
     task_lower = task.lower() if isinstance(task, str) else ""
     prefix = _directory_prefix_from_task(task) if isinstance(task, str) else ""

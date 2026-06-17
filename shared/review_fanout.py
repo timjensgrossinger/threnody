@@ -24,6 +24,13 @@ _LOC_COMPLEX = 200
 _LOC_LOW = 230
 _LOC_HIGH = 600
 
+# Structural-density cutoffs for tier selection. density_score (0.0–1.0) blends
+# nesting depth, branch density, and definition surface — see _structural_density.
+# A dense reasoning-heavy file climbs even when mid-sized; a flat large file is
+# held at medium instead of auto-escalating on raw LOC alone.
+_HIGH_DENSITY = 0.45
+_LOW_DENSITY = 0.18
+
 _RISKY_EXTENSIONS = frozenset({".py", ".js", ".ts", ".go", ".rb", ".java", ".php", ".cs", ".cpp", ".c"})
 
 _RISK_SIGNALS = re.compile(
@@ -169,6 +176,68 @@ def _has_risk_signals(content: str) -> bool:
     return bool(_RISK_SIGNALS.search(content))
 
 
+# Comment-only line prefixes across the common review languages. Heuristic — a
+# line whose first non-space char starts one of these is treated as non-code.
+_COMMENT_PREFIXES = ("#", "//", "*", "--", "/*")
+
+# Definition / control-flow keyword signals. Language-agnostic approximations,
+# not a real parser — that is the point: microsecond cost, no AST, no LLM.
+_DEF_SIGNALS = re.compile(r"\b(?:def|class|function|func|fn)\b|=>")
+_BRANCH_SIGNALS = re.compile(
+    r"\b(?:if|elif|else|for|while|case|switch|catch|except)\b|&&|\|\||\?"
+)
+
+
+def _effective_loc(content: str) -> int:
+    """Non-blank, non-comment-only lines — strips license headers / dead blocks."""
+    n = 0
+    for line in content.splitlines():
+        s = line.strip()
+        if not s or s.startswith(_COMMENT_PREFIXES):
+            continue
+        n += 1
+    return n
+
+
+def _max_nesting_depth(content: str) -> int:
+    """Approximate max nesting via indentation units and running brace balance."""
+    max_indent_units = 0
+    brace = 0
+    max_brace = 0
+    for line in content.splitlines():
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        indent = line[: len(line) - len(stripped)]
+        # tab → 1 unit; 4 spaces → 1 unit (common indent widths)
+        units = indent.count("\t") + (indent.count(" ") // 4)
+        if units > max_indent_units:
+            max_indent_units = units
+        brace += stripped.count("{") - stripped.count("}")
+        if brace > max_brace:
+            max_brace = brace
+    return max(max_indent_units, max_brace)
+
+
+def _structural_density(content: str) -> float:
+    """Blend nesting, branch density, and definition surface into a 0.0–1.0 score.
+
+    Pure-Python over already-read content — no disk I/O, no AST, no LLM. Lets a
+    dense, deeply-nested mid-sized file out-rank a flat large one for tiering.
+    """
+    eloc = _effective_loc(content)
+    if eloc <= 0:
+        return 0.0
+    defs = len(_DEF_SIGNALS.findall(content))
+    branches = len(_BRANCH_SIGNALS.findall(content))
+    depth = _max_nesting_depth(content)
+    depth_n = min(depth / 8.0, 1.0)
+    branch_n = min((branches / eloc) / 0.4, 1.0)
+    def_n = min((defs / eloc) / 0.25, 1.0)
+    score = 0.5 * depth_n + 0.35 * branch_n + 0.15 * def_n
+    return round(min(score, 1.0), 3)
+
+
 def _task_requests_high_tier(task: str) -> bool:
     return bool(_HIGH_REVIEW_TASK_SIGNALS.search(task))
 
@@ -224,15 +293,16 @@ class ReviewProfile(NamedTuple):
     band: Complexity
     has_risk: bool
     loc: int
+    density_score: float = 0.0  # structural density (0.0–1.0); default keeps 3-arg back-compat
 
 
 def estimate_review_profile(path: str) -> ReviewProfile:
-    """Return (band, has_risk, loc) for path.
+    """Return (band, has_risk, loc, density_score) for path.
 
-    Additive companion to estimate_complexity: exposes raw LOC for per-agent
-    tier selection while preserving the risk-bumped band for dimension choice.
-    Reuses the mtime+size-keyed cached read in _read_file_safe, so this adds no
-    extra disk I/O on top of estimate_complexity.
+    Additive companion to estimate_complexity: exposes raw LOC plus a structural
+    density score for per-agent tier selection while preserving the risk-bumped
+    band for dimension choice. Reuses the mtime+size-keyed cached read in
+    _read_file_safe, so this adds no extra disk I/O on top of estimate_complexity.
     """
     content = _read_file_safe(path)
     if content is None:
@@ -240,7 +310,8 @@ def estimate_review_profile(path: str) -> ReviewProfile:
         return ReviewProfile("moderate", False, _LOC_COMPLEX)
     loc = _count_loc(content)
     band, has_risk = estimate_complexity(path)
-    return ReviewProfile(band, has_risk, loc)
+    density = _structural_density(content)
+    return ReviewProfile(band, has_risk, loc, density)
 
 
 def estimate_complexity(path: str) -> tuple[Complexity, bool]:
@@ -322,6 +393,46 @@ def _effective_drop_priority(dim: _Dim, requested_keys: set[str], has_risk: bool
     return dim.drop_priority + 1
 
 
+_TIER_ORDER = ("low", "medium", "high")
+
+
+def _apply_tier_bias(tier: str, bias: int) -> str:
+    """Shift a tier up/down by ``bias`` steps, clamped to low..high."""
+    if not bias:
+        return tier
+    try:
+        idx = _TIER_ORDER.index(tier)
+    except ValueError:
+        return tier
+    return _TIER_ORDER[max(0, min(len(_TIER_ORDER) - 1, idx + bias))]
+
+
+def _loc_bucket(loc: int) -> str:
+    if loc < _LOC_LOW:
+        return "low"
+    if loc > _LOC_HIGH:
+        return "high"
+    return "mid"
+
+
+def _density_bucket(density_score: float) -> str:
+    if density_score >= _HIGH_DENSITY:
+        return "dense"
+    if density_score < _LOW_DENSITY:
+        return "flat"
+    return "mid"
+
+
+def profile_key_for(prof: "ReviewProfile", path: str) -> str:
+    """Transferable learning key: ext|loc_bucket|density_bucket.
+
+    Path-independent on purpose — a learned bias for ``.py|mid|dense`` applies to
+    any file with that shape, including files never seen and brand-new repos.
+    """
+    ext = Path(path).suffix.lower() or "noext"
+    return f"{ext}|{_loc_bucket(prof.loc)}|{_density_bucket(prof.density_score)}"
+
+
 def tier_for(
     dim: _Dim,
     band: Complexity,
@@ -329,25 +440,43 @@ def tier_for(
     *,
     loc: int | None = None,
     force_high: bool = False,
+    density_score: float | None = None,
+    bias: int = 0,
 ) -> str:
     """Routing tier for a dimension + file profile.
 
     Security on risky/critical surfaces always escalates. When ``loc`` is given,
-    tier on raw LOC + dimension reasoning-weight: small files → low, large
-    reasoning-heavy dimensions → high, else medium. With ``loc`` omitted, the
-    legacy 2-band behavior is preserved for back-compat.
+    tier on raw LOC + dimension reasoning-weight, refined by ``density_score``:
+    a dense reasoning-heavy file climbs even when mid-sized; a flat large file is
+    held at medium instead of escalating on raw LOC alone. With ``loc`` omitted
+    the legacy 2-band behavior is preserved; with ``density_score`` omitted the
+    prior LOC-only escalation is preserved (back-compat for both).
+
+    ``bias`` is a learned per-profile adjustment (clamped step) applied AFTER the
+    heuristic — it never overrides the security-on-risk escalation, and is a no-op
+    (0) when no learning data exists, so fresh repos keep the pure heuristic.
     """
     if dim.key == "security" and (has_risk or force_high):
         return "high"
+    have_density = density_score is not None
     if loc is None:
-        if band == "trivial":
-            return "low"
-        return "medium"
+        tier = "low" if band == "trivial" else "medium"
+        return _apply_tier_bias(tier, bias)
     if loc < _LOC_LOW:
-        return "low"
-    if loc > _LOC_HIGH and dim.reasoning_heavy:
-        return "high"
-    return "medium"
+        # A small but dense reasoning-heavy file earns medium over low.
+        if dim.reasoning_heavy and have_density and density_score >= _HIGH_DENSITY:
+            tier = "medium"
+        else:
+            tier = "low"
+    elif dim.reasoning_heavy and have_density and density_score >= _HIGH_DENSITY:
+        # Dense reasoning-heavy mid-sized file escalates without needing huge LOC.
+        tier = "high"
+    elif loc > _LOC_HIGH and dim.reasoning_heavy:
+        # Hold a genuinely flat large file at medium; otherwise escalate as before.
+        tier = "medium" if (have_density and density_score < _LOW_DENSITY) else "high"
+    else:
+        tier = "medium"
+    return _apply_tier_bias(tier, bias)
 
 
 def synthesis_tier(
@@ -370,12 +499,16 @@ def build_review_subtasks(
     task: str,
     *,
     max_agents: int | None = None,
+    tier_bias: dict[tuple[str, str], int] | None = None,
 ) -> dict:
     """Build a DAG plan dict with per-(file, dimension) subtasks + synthesis.
 
     entries: (path, description_hint) pairs from extract_task_file_entries.
     task: original REVIEW: ... task string.
     max_agents: hard cap; lowest-priority dimensions dropped first.
+    tier_bias: optional learned {(profile_key, dimension): step} map. Looked up
+        per cell (microsecond dict hit) and applied as a clamped tier shift. An
+        empty/None map is a no-op — fresh repos keep the pure heuristic.
     """
     if not entries:
         return {
@@ -447,7 +580,18 @@ def build_review_subtasks(
     review_requires_high = task_force_high or any(prof.has_risk for _, _, prof in all_cells)
 
     for idx, (path, dim, prof) in enumerate(all_cells, start=1):
-        t = tier_for(dim, prof.band, prof.has_risk, loc=prof.loc, force_high=task_force_high)
+        bias = 0
+        if tier_bias:
+            bias = int(tier_bias.get((profile_key_for(prof, path), dim.key), 0))
+        t = tier_for(
+            dim,
+            prof.band,
+            prof.has_risk,
+            loc=prof.loc,
+            force_high=task_force_high,
+            density_score=prof.density_score,
+            bias=bias,
+        )
         subtasks.append({
             "id": idx,
             "description": dim.prompt_template.format(path=path),
