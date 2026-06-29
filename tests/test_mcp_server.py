@@ -970,6 +970,65 @@ def test_handle_request_sanitizes_and_clears_progress_token(monkeypatch) -> None
     assert getattr(mcp_server._request_context, "progress_token", None) is None
 
 
+def test_handle_request_returns_sanitized_tool_failure_details(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    captured_response: list[dict[str, object]] = []
+    attempts = 0
+    original_handler = mcp_server.HANDLERS["route_task"]
+
+    def failing_handler(_args: dict) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("router crashed with token=super-secret-value")
+
+    try:
+        mcp_server.HANDLERS["route_task"] = failing_handler
+        monkeypatch.setattr(
+            mcp_server,
+            "send_response",
+            lambda _req_id, payload: captured_response.append(payload),
+        )
+        monkeypatch.setattr(
+            mcp_server.uuid,
+            "uuid4",
+            lambda: SimpleNamespace(hex="abc123def4567890"),
+        )
+
+        with caplog.at_level("WARNING"):
+            mcp_server.handle_request({
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "route_task",
+                    "arguments": {
+                        "task": "fix shared/router.py",
+                        "cwd": "/repo",
+                    },
+                },
+            })
+    finally:
+        mcp_server.HANDLERS["route_task"] = original_handler
+
+    assert attempts == mcp_server._RETRY_LIMIT + 1
+    assert captured_response[0]["isError"] is True
+    body = json.loads(captured_response[0]["content"][0]["text"])
+    assert body == {
+        "error": "Tool 'route_task' failed after 3 attempt(s).",
+        "code": "TOOL_EXECUTION_FAILED",
+        "tool": "route_task",
+        "attempts": 3,
+        "exception_type": "RuntimeError",
+        "diagnostic_id": "abc123def456",
+        "log_hint": "Search the Threnody server log for diagnostic_id=abc123def456.",
+        "message": "router crashed with token=<redacted>",
+    }
+    assert "super-secret-value" not in json.dumps(body)
+    assert "diagnostic_id=abc123def456" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+
+
 def test_execute_subtask_rejects_empty_target_path(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "execute.db"

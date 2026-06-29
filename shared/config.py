@@ -244,16 +244,63 @@ DEFAULT_COMPLEXITY_SIGNALS: dict[str, list[str]] = {
         "database layer", "microservice",
         "end-to-end", "e2e", "full stack", "cross-cutting", "system-wide",
         "multi-step", "pipeline", "workflow engine",
+        # Parsing / compiler / VM
+        # "parser" omitted — too common as filename (parser.py), causes false positives
+        "lexer", "grammar", "recursive descent", "abstract syntax",
+        "codegen", "bytecode", "type inference",
+        # ML / AI
+        "neural network", "training loop", "inference engine",
+        "backprop", "tensor",
+        # Graphics / GPU
+        "shader", "gpu", "vulkan", "opengl", "wgpu",
+        "render pipeline", "rasteriz",
+        # Embedded / firmware
+        "firmware", "embedded", "interrupt handler", "bare metal", "bootloader",
+        # Systems-level (word-boundary for "rust"/"ffi" handled separately in router)
+        "tokio", "lifetimes", "borrow checker", "unsafe rust", "bindgen",
+        "lock-free", "zero copy", "memory pool", "memory layout",
+        # GUI / TUI frameworks (distinctive tokens; bare "gui"/"tui" are
+        # word-boundary matched in router to avoid "guide"/"intuitive" hits)
+        "ratatui", "egui", "tauri",
     ],
     "medium": [
         "implement", "integrate", "migrate", "test suite", "error handling",
         "middleware", "authentication", "authorization",
         "build", "set up", "configure", "scaffold", "bootstrap", "wire up",
         "connect", "hook up", "register", "provision",
+        # DB / storage
+        "sqlite", "sqlx", "diesel", "migration",
+        # Web / app frameworks (distinctive tokens; "rails"/"spring"/"crate"/"redis"
+        # are word-boundary matched in router to avoid "guardrails"/"offspring" hits)
+        "fastapi", "django", "axum",
+        # Messaging / streaming
+        "kafka", "rabbitmq", "pub/sub",
+        # Serialization / protocols
+        "protobuf", "grpc", "avro", "websocket",
+        # Broader integration surface
+        "integration",
     ],
     "low": [
         "add", "update", "fix", "change", "write", "create", "remove",
     ],
+}
+
+# Systems programming languages — word-boundary matched in router._compute_score()
+# Any single match adds SYSTEMS_LANGUAGE_SCORE_BONUS (applied once per task).
+SYSTEMS_LANGUAGE_SIGNALS: list[str] = [
+    "rust", "golang", "c++", "cpp", "zig", "nim", "haskell", "ocaml",
+]
+SYSTEMS_LANGUAGE_SCORE_BONUS: float = 0.15
+
+# Complexity signals matched with WORD BOUNDARIES (whole token) rather than the
+# default substring match used for DEFAULT_COMPLEXITY_SIGNALS. These tokens are
+# short and appear inside common unrelated words — substring matching would
+# false-positive (e.g. "gui" in "guide", "tui" in "intuitive", "ffi" in
+# "office", "rails" in "guardrails", "redis" in "redistribute"). Weighted by
+# the same DEFAULT_SIGNAL_WEIGHTS level as the substring signals.
+WORD_BOUNDARY_COMPLEXITY_SIGNALS: dict[str, list[str]] = {
+    "high": ["gui", "tui", "ffi"],
+    "medium": ["rails", "spring", "crate", "redis"],
 }
 
 DEFAULT_SIGNAL_WEIGHTS: dict[str, float] = {
@@ -337,12 +384,14 @@ DEFAULT_OVERRIDES: dict[str, list[str]] = {
         "add log", "add logging statement", "print statement",
     ],
     "high": [
-        "architect", "architecture", "design", "security review", "threat model",
+        "architect", "architecture", "design", "deep security review",
+        "security-critical", "critical security", "threat model",
         "multi-tenant", "system design", "compliance",
         "penetration test", "vulnerability", "cryptograph",
         "zero trust", "audit trail", "rbac", "role-based", "sso", "oauth",
         "saml", "pen test", "pentest",
         "scaffold", "database connection",
+        "systems programming", "memory safety", "kernel module",
     ],
 }
 

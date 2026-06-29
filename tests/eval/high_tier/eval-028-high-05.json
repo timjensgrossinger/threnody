@@ -4,7 +4,7 @@
   "tags": [
     "stable"
   ],
-  "prompt": "Perform a security review of a WAF rule set and identify risky rules plus safer alternatives.",
+  "prompt": "Perform a security-critical review of a WAF rule set and identify risky rules plus safer alternatives.",
   "expected": {
     "tier": "high",
     "score_min": 0.85,

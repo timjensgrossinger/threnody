@@ -39,10 +39,11 @@ to high tier, but it must not be low.
 ## 4. Route a High-Risk Review
 
 ```text
-route_task("Perform a security review of the admin platform and identify mitigations")
+route_task("Perform a deep security review of the admin platform and identify mitigations")
 ```
 
-Expected: high tier.
+Expected: high tier. Generic "security review" scores naturally; explicit deep
+or security-critical review remains high.
 
 ## 5. Execute a File-Writing Subtask
 

@@ -45,6 +45,12 @@ For parallel full-stack work, prefer contract wave → parallel workers →
 integration subtask over multi-agent voting consensus. See
 [COMPETITIVE.md](COMPETITIVE.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
+For broad code review, prefer `FAST_REVIEW:`: one reviewer per file plus
+medium-tier synthesis. Use the file × dimension `REVIEW:` swarm only for
+explicit deep/security-critical audits or named specialist dimensions. Verify
+only synthesized high/critical findings instead of running consensus over every
+file.
+
 ## Typical savings patterns by host
 
 | Host | Prefer | Delegate when |

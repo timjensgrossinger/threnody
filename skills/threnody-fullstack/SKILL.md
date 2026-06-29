@@ -85,6 +85,10 @@ Use coordinator **star** topology only in **delegate** swarm mode when you
 want Threnody to auto-amend the plan when workers disagree. Default host-native
 swarms rely on contract + integration subtask + human/agent review.
 
+For cost control, treat the contract wave and integration wave as the default
+alignment mechanism. Do not add multi-queen consensus or high-tier review unless
+the user explicitly asks for deep/security-critical validation.
+
 ## Pitfalls
 
 - Parallel frontend/backend **without** a contract wave → API drift and merge conflicts.

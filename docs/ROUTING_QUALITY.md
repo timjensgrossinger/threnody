@@ -33,13 +33,14 @@ The correction:
 
 - Removed generic `authentication` and `authorization` hard overrides.
 - Retained a medium floor so auth work cannot route to low.
-- Retained high overrides for security review, threat modeling, OAuth, SSO,
-  RBAC, vulnerabilities, cryptography, compliance, architecture, and system
-  design.
+- Retained high overrides for deep/security-critical review, threat modeling,
+  OAuth, SSO, RBAC, vulnerabilities, cryptography, compliance, architecture,
+  and system design. Generic "security review" now scores naturally unless the
+  prompt includes explicit deep/critical wording.
 
 ## Safety Checks
 
-All stable fixtures for security review, migration, distributed systems,
+All stable fixtures for deep/security-critical review, migration, distributed systems,
 database rollout, concurrency, production incidents, rollback planning, and
 swarm topology pass after the change.
 

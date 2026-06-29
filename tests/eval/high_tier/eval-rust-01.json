@@ -1,0 +1,13 @@
+{
+  "id": "eval-rust-01",
+  "category": "high_tier",
+  "tags": ["stable"],
+  "prompt": "Implement Rust GUI integration with async event handling and render pipeline using egui.",
+  "expected": {
+    "tier": "high",
+    "score_min": 0.85,
+    "score_max": 1.0,
+    "urgency_expected": false,
+    "fanout_expected": "none"
+  }
+}

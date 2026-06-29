@@ -43,6 +43,14 @@ _RISK_SIGNALS = re.compile(
     re.IGNORECASE,
 )
 
+_CONCRETE_HIGH_RISK_SIGNALS = re.compile(
+    r"(?:\b(?:rce|remote code execution|os\.system|cursor\.execute|raw_query|"
+    r"shell\s*=\s*True|deseriali[sz](?:e|ation)|pickle\.loads|ssrf|"
+    r"server-side request forgery|path traversal|directory traversal)\b|"
+    r"\b(?:exec|eval)\s*\(|\byaml\.load\s*\()",
+    re.IGNORECASE,
+)
+
 _HIGH_REVIEW_TASK_SIGNALS = re.compile(
     r"\b(?:deep(?:\s+security)?\s+review|threat[-\s]?model(?:ing)?|"
     r"security[-\s]?critical|critical\s+security|high[-\s]?risk)\b",
@@ -176,6 +184,10 @@ def _has_risk_signals(content: str) -> bool:
     return bool(_RISK_SIGNALS.search(content))
 
 
+def _has_concrete_high_risk_signals(content: str) -> bool:
+    return bool(_CONCRETE_HIGH_RISK_SIGNALS.search(content))
+
+
 # Comment-only line prefixes across the common review languages. Heuristic — a
 # line whose first non-space char starts one of these is treated as non-code.
 _COMMENT_PREFIXES = ("#", "//", "*", "--", "/*")
@@ -294,6 +306,7 @@ class ReviewProfile(NamedTuple):
     has_risk: bool
     loc: int
     density_score: float = 0.0  # structural density (0.0–1.0); default keeps 3-arg back-compat
+    concrete_high_risk: bool = False
 
 
 def estimate_review_profile(path: str) -> ReviewProfile:
@@ -311,7 +324,8 @@ def estimate_review_profile(path: str) -> ReviewProfile:
     loc = _count_loc(content)
     band, has_risk = estimate_complexity(path)
     density = _structural_density(content)
-    return ReviewProfile(band, has_risk, loc, density)
+    concrete_high_risk = _has_concrete_high_risk_signals(content)
+    return ReviewProfile(band, has_risk, loc, density, concrete_high_risk)
 
 
 def estimate_complexity(path: str) -> tuple[Complexity, bool]:
@@ -441,30 +455,40 @@ def tier_for(
     loc: int | None = None,
     force_high: bool = False,
     density_score: float | None = None,
+    concrete_high_risk: bool = False,
     bias: int = 0,
 ) -> str:
     """Routing tier for a dimension + file profile.
 
-    Security on risky/critical surfaces always escalates. When ``loc`` is given,
-    tier on raw LOC + dimension reasoning-weight, refined by ``density_score``:
-    a dense reasoning-heavy file climbs even when mid-sized; a flat large file is
-    held at medium instead of escalating on raw LOC alone. With ``loc`` omitted
-    the legacy 2-band behavior is preserved; with ``density_score`` omitted the
-    prior LOC-only escalation is preserved (back-compat for both).
+    Risk signals add the security dimension but do not automatically escalate to
+    high. High tier is reserved for explicit deep/high-risk review requests,
+    concrete exploit primitives, or genuinely large/dense reasoning-heavy files.
+    When ``loc`` is given, tier on raw LOC + dimension reasoning-weight, refined
+    by ``density_score``: a dense reasoning-heavy file climbs even when
+    mid-sized; a flat large file is held at medium instead of escalating on raw
+    LOC alone. With ``loc`` omitted the legacy 2-band behavior is preserved; with
+    ``density_score`` omitted the prior LOC-only escalation is preserved
+    (back-compat for both).
 
     ``bias`` is a learned per-profile adjustment (clamped step) applied AFTER the
-    heuristic — it never overrides the security-on-risk escalation, and is a no-op
-    (0) when no learning data exists, so fresh repos keep the pure heuristic.
+    heuristic — it never overrides explicit or concrete high-risk escalation, and
+    is a no-op (0) when no learning data exists, so fresh repos keep the pure
+    heuristic.
     """
-    if dim.key == "security" and (has_risk or force_high):
+    if dim.key == "security" and (force_high or concrete_high_risk):
         return "high"
     have_density = density_score is not None
     if loc is None:
-        tier = "low" if band == "trivial" else "medium"
+        if dim.key == "security" and has_risk:
+            tier = "medium"
+        else:
+            tier = "low" if band == "trivial" else "medium"
         return _apply_tier_bias(tier, bias)
     if loc < _LOC_LOW:
         # A small but dense reasoning-heavy file earns medium over low.
-        if dim.reasoning_heavy and have_density and density_score >= _HIGH_DENSITY:
+        if dim.key == "security" and has_risk:
+            tier = "medium"
+        elif dim.reasoning_heavy and have_density and density_score >= _HIGH_DENSITY:
             tier = "medium"
         else:
             tier = "low"
@@ -482,14 +506,14 @@ def tier_for(
 def synthesis_tier(
     requires_high: bool,
     n_cells: int = 0,
-    has_risk_files: bool = False,
+    has_high_risk_files: bool = False,
 ) -> str:
     """Routing tier for review synthesis.
 
-    Scales up for large or risky runs — consolidating/dedup-ranking many
-    findings is reasoning-heavy — but never drops below medium.
+    Scales up for explicit high-risk runs, concrete exploit primitives, or large
+    finding sets — but never for ordinary security-adjacent risk words alone.
     """
-    if requires_high or has_risk_files or n_cells >= 12:
+    if requires_high or has_high_risk_files or n_cells >= 12:
         return "high"
     return "medium"
 
@@ -577,7 +601,9 @@ def build_review_subtasks(
 
     subtasks: list[dict] = []
     review_ids: list[int] = []
-    review_requires_high = task_force_high or any(prof.has_risk for _, _, prof in all_cells)
+    review_requires_high = task_force_high or any(
+        prof.concrete_high_risk for _, _, prof in all_cells
+    )
 
     for idx, (path, dim, prof) in enumerate(all_cells, start=1):
         bias = 0
@@ -590,6 +616,7 @@ def build_review_subtasks(
             loc=prof.loc,
             force_high=task_force_high,
             density_score=prof.density_score,
+            concrete_high_risk=prof.concrete_high_risk,
             bias=bias,
         )
         subtasks.append({
@@ -606,14 +633,14 @@ def build_review_subtasks(
 
     synth_id = len(all_cells) + 1
     reviewed_files = sorted({path for path, _, _ in all_cells})
-    has_risk_files = any(prof.has_risk for _, _, prof in all_cells)
+    has_high_risk_files = any(prof.concrete_high_risk for _, _, prof in all_cells)
     subtasks.append({
         "id": synth_id,
         "description": (
             _SYNTHESIS_PROMPT
             + f"\n\nFiles reviewed: {', '.join(reviewed_files)}"
         ),
-        "tier": synthesis_tier(review_requires_high, len(all_cells), has_risk_files),
+        "tier": synthesis_tier(review_requires_high, len(all_cells), has_high_risk_files),
         "depends_on": review_ids,
         "subagent_type": "",  # empty → resolved to threnody-high by tier in host_spawn
         "read_only": True,
@@ -656,11 +683,11 @@ def build_fast_review_subtasks(
     subtasks: list[dict] = []
     review_ids: list[int] = []
     task_force_high = _task_requests_high_tier(task)
-    file_risks: list[bool] = []
+    file_high_risks: list[bool] = []
     for idx, (path, _hint) in enumerate(file_entries, start=1):
-        band, has_risk = estimate_complexity(path)
-        file_risks.append(has_risk)
-        tier = "high" if has_risk or task_force_high else "medium"
+        prof = estimate_review_profile(path)
+        file_high_risks.append(prof.concrete_high_risk)
+        tier = _fast_review_tier(prof, force_high=task_force_high)
         subtasks.append({
             "id": idx,
             "description": (
@@ -680,7 +707,7 @@ def build_fast_review_subtasks(
 
     synth_id = len(file_entries) + 1
     reviewed_files = [path for path, _ in file_entries]
-    review_requires_high = task_force_high or any(file_risks)
+    review_requires_high = task_force_high or any(file_high_risks)
     subtasks.append({
         "id": synth_id,
         "description": (
@@ -705,3 +732,19 @@ def build_fast_review_subtasks(
         "review_mode": "fast_file",
         "dropped_file_count": dropped,
     }
+
+
+def _fast_review_tier(prof: ReviewProfile, *, force_high: bool = False) -> str:
+    """Tier for one-agent-per-file broad review.
+
+    Broad review agents cover all dimensions, so medium is the default. Escalate
+    only for explicit deep/high-risk intent, concrete exploit primitives, or
+    large/dense files where a single reviewer needs extra reasoning depth.
+    """
+    if force_high or prof.concrete_high_risk:
+        return "high"
+    if prof.loc > _LOC_HIGH and prof.density_score >= _LOW_DENSITY:
+        return "high"
+    if prof.loc >= _LOC_LOW and prof.density_score >= _HIGH_DENSITY:
+        return "high"
+    return "medium"

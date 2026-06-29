@@ -1,0 +1,13 @@
+{
+  "id": "eval-rust-shim-01",
+  "category": "medium_tier",
+  "tags": ["stable"],
+  "prompt": "Create a Rust crate shim that wraps agent file emission with tui output handling.",
+  "expected": {
+    "tier": "medium",
+    "score_min": 0.56,
+    "score_max": 0.79,
+    "urgency_expected": false,
+    "fanout_expected": "favor_parallel"
+  }
+}

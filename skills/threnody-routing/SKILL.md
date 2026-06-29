@@ -11,6 +11,10 @@ description: >-
 Threnody is a **meta-harness**: the MCP host shell executes work; Threnody
 coordinates routing, planning, and optional utility delegation.
 
+The portable contract is `host_spawn` / `host_spawn_waves`. Claude Code Dynamic
+Workflow emission is an optional Claude-only optimization; do not depend on it
+for behavior that must work across Codex, Cursor, Copilot, Junie, or OpenCode.
+
 ## Default path (always try first)
 
 1. Call `route_task(task=...)` (MCP: Threnody).

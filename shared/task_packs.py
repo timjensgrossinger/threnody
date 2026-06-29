@@ -15,8 +15,12 @@ TASK_PACKS: dict[str, dict[str, Any]] = {
     },
     "security-review": {
         "description": "Review inputs, auth, filesystem, subprocess, and secret handling.",
-        "prefix": "Perform a security review first; prioritize concrete exploit paths and safe fixes.",
-        "default_tier": "high",
+        "prefix": (
+            "Perform a security review first; prioritize concrete exploit paths "
+            "and safe fixes. Use high tier only for explicit deep/security-critical "
+            "review or concrete exploit primitives."
+        ),
+        "default_tier": "medium",
         "read_only_first": True,
     },
     "docs-sync": {

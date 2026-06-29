@@ -44,11 +44,15 @@ persistence contract (`swarm_id`, budget preview, resume checkpoints).
 ## Rules
 
 - Host-native heuristic planning fans out **one agent per file** for webapp/fullstack intent or explicit paths; single-file tasks stay one agent.
+- Keep handoffs compact: use `host_spawn_waves` as the executable manifest and
+  avoid inlining duplicate full plans/prompts into user-facing summaries.
 - When `host_spawn_waves` or `host_execution_contract: spawn_subagents` is present, spawn one `Task`/`Agent` per agent — never use direct `Write`/`Edit` on planned `target_files`.
 - Do **not** call `execute_subtask` for same-host work — use `host_spawn` entries.
 - Do not follow `route_task` `direct_edit` while a plan handoff is active; use `routing_guard` and `host_run_id` from the plan response.
 - Utility delegation only when `delegation_utilities_enabled: true` (see `threnody-routing`).
 - For frontend + backend + API in parallel, use the contract-first pattern in `threnody-fullstack`.
+- For broad review work, use `threnody-fast-review`; reserve
+  `threnody-swarm-review` for explicit deep/specialist review.
 
 ## Example
 

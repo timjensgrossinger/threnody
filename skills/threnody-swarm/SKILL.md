@@ -32,6 +32,10 @@ Within each wave, spawn every agent as the same batch before waiting on the wave
 barrier. A host loop that starts one same-wave agent, waits, then starts the
 next is a fast-start regression.
 
+Token discipline applies to all swarm shapes: keep host-native handoff compact,
+prefer bounded file-level fanout for broad sweeps, and reserve star/consensus or
+high-tier synthesis for explicit deep-risk work.
+
 ## Workflow
 
 0. If not already planned, follow **`threnody-plan`** (plan-only swarm preview stops before spawn).
@@ -50,6 +54,11 @@ next is a fast-start regression.
 7. Monitor:
    - Host-native: `inspect_swarm` for status; optional `inspect_status`.
    - Delegate: `list_subtasks`, `resume_swarm_inspect`, `resume_swarm_confirm`.
+
+For broad review swarms, use `FAST_REVIEW:` unless the user explicitly asks for
+deep/security-critical review, threat modeling, or a named specialist dimension.
+Ordinary auth/token/secret wording should add review attention, not force every
+agent to high tier.
 
 ## Must (when awaiting_host_execution)
 

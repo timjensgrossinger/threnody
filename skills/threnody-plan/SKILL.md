@@ -23,6 +23,11 @@ plan-only qualifiers
 
 Host-native plans auto-fan out to **one agent per file** when intent implies a webapp/fullstack stack (`heuristic_intent_templates`). Use `expand_host_plan` after scaffold waves if more files appear.
 
+For broad code review, prefer the token-cheap `FAST_REVIEW:` shape (one
+read-only reviewer per file plus synthesis). Use the deeper `REVIEW:` file ×
+dimension swarm only when the user explicitly asks for deep review,
+security-critical audit, threat modeling, or a named specialist dimension.
+
 ## Fast-start contract
 
 Any plan path that emits agents must return a spawnable `host_spawn_waves`
@@ -109,6 +114,8 @@ See **`threnody-fullstack`** for details.
 - Prefer **host-native** plans (`host_spawn_waves`) — one planner call, host Task/Agent bills once.
 - Avoid **delegate swarm + star coordinator rounds** unless expert — each round adds LLM synthesis cost.
 - Alignment = **contract artifacts + verify gates**, not multi-agent voting consensus.
+- Keep ordinary security-adjacent work at medium unless the task says
+  deep/security-critical or the files expose concrete exploit primitives.
 
 ## Execution handoff
 

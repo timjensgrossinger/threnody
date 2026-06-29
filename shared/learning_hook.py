@@ -125,7 +125,21 @@ def capture_edit(fields: dict[str, Any]) -> dict[str, Any]:
     return {"captured": True, "run_id": str(run_id), "files": targets}
 
 
-def _emit(result: dict[str, Any]) -> int:
+def _hook_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a neutral PostToolUse response accepted by host hook parsers."""
+    del result
+    return {
+        "continue": True,
+        "suppressOutput": True,
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+        },
+    }
+
+
+def _emit(result: dict[str, Any], *, hook_response: bool = False) -> int:
+    if hook_response:
+        result = _hook_response(result)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0  # PostToolUse must never block.
 
@@ -136,6 +150,11 @@ def main(argv: list[str] | None = None) -> int:
     capture = sub.add_parser("capture", help="Capture one PostToolUse event")
     capture.add_argument("--stdin", action="store_true", help="Read hook JSON from stdin")
     capture.add_argument("--json", default="", help="Inline hook JSON payload")
+    capture.add_argument(
+        "--hook-response",
+        action="store_true",
+        help="Emit a neutral host hook response instead of the raw capture result",
+    )
 
     args = parser.parse_args(argv)
     if args.command != "capture":
@@ -145,13 +164,22 @@ def main(argv: list[str] | None = None) -> int:
     _MAX_PAYLOAD = 8 * 1024 * 1024  # 8 MB
     raw_text = sys.stdin.read(_MAX_PAYLOAD) if args.stdin else args.json
     if not raw_text or not raw_text.strip():
-        return _emit({"captured": False, "reason": "empty payload"})
+        return _emit(
+            {"captured": False, "reason": "empty payload"},
+            hook_response=args.hook_response,
+        )
     try:
         payload = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        return _emit({"captured": False, "reason": f"invalid JSON: {exc}"})
+        return _emit(
+            {"captured": False, "reason": f"invalid JSON: {exc}"},
+            hook_response=args.hook_response,
+        )
     if not isinstance(payload, dict):
-        return _emit({"captured": False, "reason": "payload must be an object"})
+        return _emit(
+            {"captured": False, "reason": "payload must be an object"},
+            hook_response=args.hook_response,
+        )
 
     # Accept file-edit events across host CLIs: Claude (Edit/Write/MultiEdit/
     # NotebookEdit), Codex (apply_patch), Copilot (edit/write/create), Cursor
@@ -165,12 +193,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         fields = parse_hook_payload(payload)
         if not any(tok in name for tok in _EDIT_TOKENS) and not fields.get("target_files"):
-            return _emit({"captured": False, "reason": f"ignored tool {name}"})
+            return _emit(
+                {"captured": False, "reason": f"ignored tool {name}"},
+                hook_response=args.hook_response,
+            )
         result = capture_edit(fields)
     except Exception as exc:  # never break the tool
         log.debug("learning hook capture failed", exc_info=True)
         result = {"captured": False, "reason": f"{type(exc).__name__}: {exc}"}
-    return _emit(result)
+    return _emit(result, hook_response=args.hook_response)
 
 
 if __name__ == "__main__":

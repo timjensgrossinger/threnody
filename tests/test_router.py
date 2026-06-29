@@ -43,12 +43,20 @@ def test_override_low() -> None:
     assert decision.override is True
 
 
-def test_override_high() -> None:
-    """Override keywords should force high tier."""
+def test_deep_security_review_override_high() -> None:
+    """Explicit deep security review should force high tier."""
     router = _make_router()
-    decision = router.classify("do a security review of this module")
+    decision = router.classify("do a deep security review of this module")
     assert decision.tier == "high"
     assert decision.override is True
+
+
+def test_generic_security_review_is_not_hard_high_override() -> None:
+    router = _make_router()
+    decision = router.classify("do a security review of this module")
+
+    assert decision.tier in {"low", "medium"}
+    assert decision.override is False
 
 
 def test_routine_authentication_implementation_is_medium() -> None:

@@ -4,7 +4,7 @@
   "tags": [
     "stable"
   ],
-  "prompt": "Perform a security review of an admin platform and identify likely misconfigurations plus mitigations.",
+  "prompt": "Perform a deep security review of an admin platform and identify likely misconfigurations plus mitigations.",
   "expected": {
     "tier": "high",
     "score_min": 0.85,

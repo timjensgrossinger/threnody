@@ -15,6 +15,9 @@ Threnody tier model, not one session model), with multi-queen consensus and
 learning — then lets you **save a permanent, documented, zero-config `/<slug>`**
 command teammates run with no setup.
 
+This is Claude Code-only. Other hosts use `host_spawn_waves` through
+`threnody-swarm`; all shared behavior must work there first.
+
 ## Fast-start contract
 
 Workflow-emitting skills must produce a runnable `workflow_script` quickly:
@@ -25,6 +28,11 @@ with `parallel([...])`, before waiting on the wave barrier.
 Do not block initial workflow emission on optional refinement, consensus,
 learning aggregation, or permanent-workflow export. Run those after the first
 worker wave has started or after the workflow returns.
+
+For review workflows, use the nested cheap shape: the Workflow script performs
+medium-tier orchestration, launches file reviewers in parallel, and returns a
+compact synthesis to the main session. Keep high-tier judgment for explicit
+deep/security-critical review or validated high/critical findings.
 
 ## Prerequisite (claude-code only)
 
@@ -56,6 +64,8 @@ Requires Claude Code **v2.1.154+** (Workflow tool).
      workflow's returned `consensus` array to `report_workflow_result(..., consensus=[...])`.
      If it returns `consensus_followup`, spawn one judge Agent and re-call with
      `consensus` set to just the selected queen's proposal.
+   - For ordinary reviews, prefer a targeted verifier pass for synthesized
+     `HIGH`/`CRITICAL` findings instead of running consensus over every file.
 5. **Save a permanent workflow (the payoff):** once a shape recurs across successful runs,
    `report_workflow_result` returns `workflow_draft.enqueued: true`. Then:
    - `approval_queue_approve(<queue_id>, operator=<you>)` to approve the learned workflow.
@@ -86,6 +96,7 @@ Requires Claude Code **v2.1.154+** (Workflow tool).
   **`/threnody-swarm`** (host_spawn_waves).
 - Hand-edit a saved `.claude/workflows/*.js` — re-run and re-export to change it.
 - Call `execute_subtask` for same-host agents.
+- Treat Workflow support as portable across hosts.
 
 ## Relationship to other skills
 

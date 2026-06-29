@@ -3,8 +3,8 @@ name: threnody-fast-review
 description: >-
   Fast broad code review swarm: one read-only host agent per file, then one
   synthesis agent. Use when asked for a fast swarm review, one-agent-per-file
-  review, broad review sweep, or when reviewing many files where coverage and
-  speed matter more than per-dimension depth.
+  review, broad review sweep, ordinary swarm review, or when reviewing many
+  files where coverage and speed matter more than per-dimension depth.
 ---
 
 # Threnody fast review
@@ -19,6 +19,15 @@ for faster file-level parallelism:
 wave 1: one read-only review agent per file
 wave 2: one synthesis agent
 ```
+
+This is the **default for broad swarm review**. Use `threnody-swarm-review` only
+when the user explicitly asks for deep review, security-critical audit,
+threat-modeling, or a named specialist dimension.
+
+Tiering is medium by default. Ordinary risk words such as auth, token, or secret
+add security attention inside the file reviewer but do not automatically force
+high tier. High tier is reserved for explicit deep/security-critical wording,
+concrete exploit primitives, or large/dense files.
 
 The global `swarm.max_agents` cap still applies. If the requested count is
 clamped, report the `requested_vs_effective_agent_count` field and tell the
@@ -74,6 +83,11 @@ On `awaiting_host_execution: true` + `host_spawn_waves`:
 Use `report_host_swarm_complete` once at terminal in batch mode, or
 `report_host_wave` per wave in inline mode, following `learning_report_contract`.
 
+Before final reporting, run a cheap targeted verifier only for synthesized
+`HIGH` or `CRITICAL` findings. Do not run a second full review swarm; verify the
+specific finding with file:line grounding and mark it `valid`, `false_positive`,
+or `needs_more_evidence`.
+
 ## Must
 
 - Use `FAST_REVIEW:` exactly.
@@ -86,3 +100,5 @@ Use `report_host_swarm_complete` once at terminal in batch mode, or
 - Use this for a deep security-critical audit where per-dimension specialists
   are needed. Use `threnody-swarm-review` instead.
 - Collapse a large review into one general agent unless the user explicitly asks.
+- Escalate every file to high tier just because it mentions auth, token, or
+  credentials.

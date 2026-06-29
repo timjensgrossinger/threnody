@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -145,6 +147,51 @@ def test_main_captures_codex_apply_patch(capsys: pytest.CaptureFixture) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["captured"] is True
     assert run_log.read_run_log("swarm-codex")[0]["touched_files"] == ["a.py"]
+
+
+def test_main_hook_response_wraps_capture_result(capsys: pytest.CaptureFixture) -> None:
+    run_log.set_active_run("swarm-codex-hook-response")
+    payload = json.dumps({
+        "tool_name": "apply_patch",
+        "tool_input": {"command": "*** Update File: b.py\n@@\n-x\n+y\n"},
+        "tool_response": "ok",
+    })
+
+    assert learning_hook.main(["capture", "--json", payload, "--hook-response"]) == 0
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["continue"] is True
+    assert out["suppressOutput"] is True
+    assert out["hookSpecificOutput"] == {"hookEventName": "PostToolUse"}
+    assert "threnody" not in out
+    assert run_log.read_run_log("swarm-codex-hook-response")[0]["touched_files"] == ["b.py"]
+
+
+def test_shell_hook_emits_valid_post_tool_use_response(tmp_path: Path) -> None:
+    script = Path(__file__).resolve().parent.parent / "shell" / "threnody-learning-hook.sh"
+    payload = json.dumps({
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(tmp_path / "edited.py")},
+        "tool_response": {"success": True},
+    })
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+
+    proc = subprocess.run(
+        [str(script)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["continue"] is True
+    assert out["suppressOutput"] is True
+    assert out["hookSpecificOutput"] == {"hookEventName": "PostToolUse"}
+    assert "threnody" not in out
+    assert proc.stderr == ""
 
 
 def test_main_captures_cursor_event(capsys: pytest.CaptureFixture) -> None:

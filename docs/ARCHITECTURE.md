@@ -103,6 +103,10 @@ recommended; optional coordinator star (delegate mode) or a final integration
 wave replaces peer consensus. Host-native swarms rely on operator or lead-agent
 review after parallel waves.
 
+For code review, broad sweeps use one read-only reviewer per file plus synthesis.
+Deep file × dimension review is reserved for explicit specialist/security-critical
+requests, with targeted verification for synthesized high/critical findings.
+
 ## Guarded vs advisory routing
 
 | Mode | Meaning |

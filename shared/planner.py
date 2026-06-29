@@ -581,8 +581,8 @@ scaffolding, formatting — anything a junior dev could write correctly
 - "medium" = multi-file changes with shared interfaces, complex business \
 logic, concurrency, error handling with retries, integration code that \
 must coordinate multiple modules
-- "high"   = architecture design, security review, complex algorithms, \
-system design, threat modelling, performance-critical code
+- "high"   = architecture design, deep or security-critical review, complex \
+algorithms, system design, threat modelling, performance-critical code
 
 BIAS TOWARD LOW: most single-file modules (even with moderate logic) \
 should be "low". Only use "medium" when the subtask genuinely requires \

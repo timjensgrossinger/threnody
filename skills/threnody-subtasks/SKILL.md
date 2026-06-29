@@ -13,6 +13,10 @@ description: >-
 Host-native swarms and `host_spawn_waves` do **not** appear here — track those
 by wave completion in the host shell.
 
+Token-cheap review and swarm changes happen on the host-native wave path, not in
+this utility subprocess monitor. Use this skill only after explicit
+`execute_subtask` delegation to utilities.
+
 ## When to use
 
 - User enabled `providers.delegation_utilities_enabled: true`

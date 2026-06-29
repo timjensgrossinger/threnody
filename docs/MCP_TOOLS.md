@@ -53,6 +53,10 @@ subprocess with coordinator rounds on star topology. Resume via
 Full-stack parallel frontend/backend/API: use contract-first DAG waves — see
 `skills/threnody-fullstack/SKILL.md` and [ARCHITECTURE.md](ARCHITECTURE.md).
 
+Broad review swarms should use `FAST_REVIEW:` for one reviewer per file plus
+synthesis. Use `REVIEW:` file × dimension fanout only for explicit deep,
+security-critical, threat-model, or dimension-focused review.
+
 ## Delegation
 
 Optional subprocess routing to **utility backends only** when

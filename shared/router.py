@@ -23,6 +23,9 @@ from .config import (
     LOW_TIER_CEILING,
     MEDIUM_HIGH_BOUNDARY_FLOOR,
     MEDIUM_HIGH_BOUNDARY_CEILING,
+    SYSTEMS_LANGUAGE_SIGNALS,
+    SYSTEMS_LANGUAGE_SCORE_BONUS,
+    WORD_BOUNDARY_COMPLEXITY_SIGNALS,
 )
 from .db import Database
 
@@ -202,6 +205,15 @@ class TaskRouter:
                     score += weight
                     matched.append(f"{kw}(+{weight})")
 
+        # Word-boundary signals: short tokens that are substrings of common words
+        # (gui/tui/ffi/rails/...). Matched whole-token to avoid false positives.
+        for level, keywords in WORD_BOUNDARY_COMPLEXITY_SIGNALS.items():
+            weight = self._weights.get(level, 0.0)
+            for kw in keywords:
+                if re.search(r'\b' + re.escape(kw) + r'\b', task_lower):
+                    score += weight
+                    matched.append(f"{kw}(+{weight})")
+
         word_count = len(task_lower.split())
         if word_count > 30:
             score += 0.10
@@ -214,6 +226,19 @@ class TaskRouter:
         if file_refs >= 3:
             score += 0.10
             matched.append("multi_file(+0.10)")
+
+        # Systems language detection — word-boundary matching avoids "trust"→"rust" etc.
+        for lang in SYSTEMS_LANGUAGE_SIGNALS:
+            if re.search(r'\b' + re.escape(lang) + r'\b', task_lower):
+                score += SYSTEMS_LANGUAGE_SCORE_BONUS
+                matched.append(f"systems_lang:{lang}(+{SYSTEMS_LANGUAGE_SCORE_BONUS})")
+                break  # apply bonus once regardless of how many langs are named
+
+        # Systems language file reference bonus (.rs / .go / .c / .cpp variants)
+        _sys_file_refs = len(re.findall(r'\b\w+\.(?:rs|go|cpp|cc|cxx|c)\b', task_lower))
+        if _sys_file_refs >= 1:
+            score += 0.15
+            matched.append(f"sys_lang_files:{_sys_file_refs}(+0.15)")
 
         return min(score, 1.0), matched
 

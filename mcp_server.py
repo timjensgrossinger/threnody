@@ -929,6 +929,54 @@ def send_error(request_id: int | str | None, code: int, message: str) -> None:
         sys.stdout.flush()
 
 
+_MAX_TOOL_EXCEPTION_MESSAGE_LENGTH = 500
+_TOOL_EXCEPTION_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"(?i)\b(api[_-]?key|authorization|bearer|password|secret|token)\b"
+            r"\s*[:=]\s*['\"]?[^'\"\s,;]+"
+        ),
+        r"\1=<redacted>",
+    ),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"), "Bearer <redacted>"),
+)
+
+
+def _sanitize_tool_exception_message(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if not message:
+        return ""
+    message = " ".join(message.split())
+    for pattern, replacement in _TOOL_EXCEPTION_REDACTIONS:
+        message = pattern.sub(replacement, message)
+    if len(message) > _MAX_TOOL_EXCEPTION_MESSAGE_LENGTH:
+        return f"{message[:_MAX_TOOL_EXCEPTION_MESSAGE_LENGTH - 3]}..."
+    return message
+
+
+def _tool_failure_payload(
+    *,
+    tool_name: object,
+    attempts: int,
+    exc: BaseException,
+    diagnostic_id: str,
+) -> dict[str, object]:
+    normalized_tool = str(tool_name or "")
+    message = _sanitize_tool_exception_message(exc)
+    payload: dict[str, object] = {
+        "error": f"Tool '{normalized_tool}' failed after {attempts} attempt(s).",
+        "code": "TOOL_EXECUTION_FAILED",
+        "tool": normalized_tool,
+        "attempts": attempts,
+        "exception_type": type(exc).__name__,
+        "diagnostic_id": diagnostic_id,
+        "log_hint": f"Search the Threnody server log for diagnostic_id={diagnostic_id}.",
+    }
+    if message:
+        payload["message"] = message
+    return payload
+
+
 def send_notification(method: str, params: dict) -> None:
     msg = {"jsonrpc": "2.0", "method": method, "params": params}
     with _stdout_lock:
@@ -11563,11 +11611,32 @@ def handle_request(request: dict) -> None:
                             )
                             _retry_policy.wait(_attempt)
                 if _last_exc is not None:
-                    log.exception("Tool %s failed after %d attempt(s)", tool_name, _max_attempts, exc_info=_last_exc)
+                    diagnostic_id = uuid.uuid4().hex[:12]
+                    arg_keys = (
+                        sorted(str(key) for key in tool_args.keys())
+                        if isinstance(tool_args, Mapping)
+                        else []
+                    )
+                    log.exception(
+                        "Tool %s failed after %d attempt(s); diagnostic_id=%s request_id=%r arg_keys=%s exception_type=%s",
+                        tool_name,
+                        _max_attempts,
+                        diagnostic_id,
+                        req_id,
+                        arg_keys,
+                        type(_last_exc).__name__,
+                        exc_info=_last_exc,
+                    )
                     send_response(req_id, {
-                        "content": [{"type": "text", "text": json.dumps({
-                            "error": f"Tool '{tool_name}' failed — see server log for details.",
-                        })}],
+                        "content": [{
+                            "type": "text",
+                            "text": json.dumps(_tool_failure_payload(
+                                tool_name=tool_name,
+                                attempts=_max_attempts,
+                                exc=_last_exc,
+                                diagnostic_id=diagnostic_id,
+                            ), indent=2),
+                        }],
                         "isError": True,
                     })
             else:
@@ -11598,9 +11667,55 @@ _BLOCKING_TOOLS = frozenset({"execute_subtask", "plan_task", "decompose_task", "
 _RETRYABLE_TOOLS = frozenset({"route_task", "plan_task", "decompose_task", "execute_subtask"})
 _RETRY_LIMIT = 2  # up to 2 retries = 3 total attempts
 
+# How often the parent-death watchdog polls (seconds).
+_WATCHDOG_POLL_SECONDS = 5.0
+
+
+def _parent_death_watchdog(poll: float = _WATCHDOG_POLL_SECONDS) -> None:
+    """Exit promptly if this server is orphaned.
+
+    Each Claude Code / Copilot session spawns its own stdio MCP server as a child
+    process. Normally the server exits when the client closes stdin (EOF on the
+    ``for line in sys.stdin`` loop). But when the client is SIGKILLed or crashes,
+    the stdin read can block forever on macOS, leaving an orphaned server alive.
+    Many such orphans accumulate and all write the same WAL-mode ``cache.db``
+    concurrently, which eventually desyncs the shared-memory WAL index and yields
+    ``database disk image is malformed`` on the next writer (e.g. execute_swarm).
+
+    When the original parent dies, the OS reparents this process to launchd/init
+    (``getppid() == 1``). Detecting that and exiting immediately keeps at most one
+    live server per active client and prevents the multi-writer corruption at its
+    source. ``os._exit`` is used deliberately: an orphan must not run atexit
+    handlers that could checkpoint a stale page cache back into the shared DB.
+    """
+    try:
+        initial_ppid = os.getppid()
+    except Exception:  # pragma: no cover - platform guard
+        return
+    # If we are already orphaned at startup, there is no client to serve.
+    if initial_ppid <= 1:
+        return
+    while True:
+        time.sleep(poll)
+        try:
+            ppid = os.getppid()
+        except Exception:  # pragma: no cover - platform guard
+            continue
+        if ppid <= 1:
+            log.warning(
+                "Parent %s gone (reparented to ppid=%s) — orphaned MCP server "
+                "exiting to avoid shared cache.db WAL contention",
+                initial_ppid,
+                ppid,
+            )
+            os._exit(0)
+
 
 def main() -> None:
     log.info("Threnody MCP server %s — cross-provider orchestrator", get_version())
+    threading.Thread(
+        target=_parent_death_watchdog, daemon=True, name="parent-death-watchdog"
+    ).start()
     dispatch_threads: list[threading.Thread] = []
     try:
         for line in sys.stdin:

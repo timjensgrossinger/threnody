@@ -57,8 +57,9 @@ platform-scale autonomy; they work against Threnody's lean meta-harness story.
   recommendation (`single_agent`, `two_agent_pair`, `bounded_swarm`, or
   `review_file_sweep`) so Threnody can show when fewer agents are cheaper and
   when broad file-level review should actually scale out.
-- **Fast review override**: the `threnody-fast-review` skill uses `FAST_REVIEW:`
-  to request one read-only agent per file plus synthesis for broad code review.
+- **Fast review default**: broad code review uses `FAST_REVIEW:` — one
+  read-only agent per file plus synthesis. Deep file × dimension review is
+  opt-in for explicit specialist/security-critical audits.
 
 ## Cheap alignment (Threnody's "consensus")
 
@@ -67,7 +68,8 @@ Instead of voting protocols:
 1. **Contract-first wave** — OpenAPI, shared types (`produces` / `consumes`)
 2. **Parallel workers** — same wave after contract lands
 3. **Integration wave** — wire-up, smoke tests, or operator verify gates
-4. **Optional soft review** — one host integration Task agent (single medium-tier call)
+4. **Optional targeted verify** — only synthesized high/critical findings get a
+   follow-up read-only verifier
 
 Expert path: **delegate** swarm mode with **star** topology and a single
 coordinator — legacy/expert only, not default.

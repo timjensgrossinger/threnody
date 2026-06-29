@@ -4,15 +4,20 @@ description: >-
   Run a complexity-gated review swarm: fans out one agent per (file × dimension)
   — logic, security, edge/null, types, performance — then synthesizes findings
   into a ranked report. Model selection per agent routed through Threnody.
-  Use when asked to "swarm review", "review with swarm", or "deep parallel review"
-  of one or more files. Read-only — never writes or edits target files.
+  Use for deep parallel review, security-critical audit, threat-modeling, or
+  explicit dimension-focused review. For broad or ordinary swarm review, prefer
+  threnody-fast-review. Read-only — never writes or edits target files.
 ---
 
 # Threnody swarm review
 
 ## Overview
 
-Complexity gating prevents token blowout:
+This is the **deep specialist** review mode. It is intentionally more expensive
+than `threnody-fast-review`; use it when the user asks for deep/security-critical
+review, threat modeling, or a named dimension such as `[dims=performance]`.
+
+Complexity gating limits token blowout:
 
 | Band | LOC | Dimensions run |
 |------|-----|----------------|
@@ -20,21 +25,23 @@ Complexity gating prevents token blowout:
 | moderate | 50–200 | logic, edge, types |
 | complex | > 200 | logic, edge, types, security, performance |
 
-Security is always added when the file contains risk signals (SQL, exec, auth, tokens, etc.).
+Security is always added when the file contains risk signals (SQL, exec, auth,
+tokens, etc.), but ordinary risk words do **not** automatically force high tier.
 
 **Tier → model is chosen per agent from raw file size × dimension reasoning-weight** (no LLM call — pure heuristic, keeps fast-start):
 
-| File size (LOC) | edge / types (light) | logic / performance / security (reasoning-heavy) |
-|-----------------|----------------------|--------------------------------------------------|
-| small `< 230`   | low → haiku          | low → haiku                                      |
-| mid `230–600`   | medium → sonnet      | medium → sonnet                                  |
-| large `> 600`   | medium → sonnet      | **high → opus**                                  |
-| security + risk | —                    | **high → opus** (any size)                        |
+| File/profile | edge / types (light) | logic / performance / security (reasoning-heavy) |
+|--------------|----------------------|--------------------------------------------------|
+| small `< 230` | low → cheap tier | low, or medium for dense/security-risk code |
+| mid `230–600` | medium | medium, high only when dense |
+| large `> 600` | medium | high unless the file is flat/config-like |
+| ordinary security risk | — | medium by default |
+| concrete exploit primitive or explicit deep/critical request | — | high |
 
-Synthesis scales with the run: `high → opus` when ≥12 review agents or any risky
-file present, else `medium → sonnet`. Never below medium (dedup/ranking is
-reasoning-heavy). This mix — haiku on small files, opus on large reasoning-heavy
-ones — is automatic; you do not hardcode a tier.
+Synthesis is `medium` by default. It escalates to `high` only for explicit
+deep/security-critical intent, concrete exploit primitives, or large finding
+sets (for example ≥12 review agents). Never below medium; dedup/ranking is
+reasoning-heavy.
 
 ---
 
@@ -42,7 +49,8 @@ ones — is automatic; you do not hardcode a tier.
 
 Review swarm paths must return `host_spawn_waves` quickly: target **under 5
 seconds** to handoff and **under 30 seconds** to first review-agent spawn. Cheap
-review tiers are the default; high tier is reserved for risk/deep review.
+review tiers are the default; high tier is reserved for explicit deep review,
+security-critical wording, concrete exploit primitives, or large/dense files.
 
 Do not block first spawn on optional refinement, consensus, learning
 aggregation, or deep planner calls. Run deterministic lint/context collection
@@ -89,10 +97,7 @@ src/utils.py      | 2    | low    | haiku
 ### 3. Call execute_swarm
 
 ```python
-execute_swarm(
-  task="REVIEW: <space-separated file paths>",
-  topology="dag",
-)
+execute_swarm(task="REVIEW: <space-separated file paths>", topology="dag")
 ```
 
 The `REVIEW:` sentinel activates per-file × dimension fanout in the heuristic planner.
@@ -132,12 +137,21 @@ On `awaiting_host_execution: true` + `host_spawn_waves`:
 
 ### 5. Synthesis wave
 
-The final wave contains a single synthesis subtask (`tier` auto-scaled: `high` for
-≥12 review agents or any risky file, else `medium`). Inject:
+The final wave contains a single synthesis subtask (`medium` by default; `high`
+only for explicit deep/security-critical review, concrete exploit primitives, or
+large finding sets). Inject:
 - Linter output from step 1
 - All `output_excerpt` summaries from prior waves — **all of them**
 
 The synthesis agent deduplicates, ranks by severity → category, and outputs the report.
+
+### 5b. Targeted verification
+
+If synthesis reports `HIGH` or `CRITICAL` findings, run a cheap targeted verify
+pass before final reporting: one read-only verifier per finding or small finding
+cluster. Ask each verifier to answer `valid`, `false_positive`, or
+`needs_more_evidence` with file:line grounding. Do not run multi-queen consensus
+over every file for ordinary reviews.
 
 > Do **not** pre-filter or drop low-severity findings before synthesis to save
 > time — that loses findings. Synthesis input lives in your context (batch mode),
@@ -180,6 +194,8 @@ Output the full ranked findings report to the user.
 - Start one same-wave review agent and wait before starting the next
 - Spawn review agents for generated files, lock files, or binary assets
 - Skip the synthesis wave — it dedupes + ranks all dimension findings
+- Run broad many-file reviews in this mode by default — use `threnody-fast-review`
+  unless the user explicitly asks for deep/specialist review
 
 ---
 

@@ -177,8 +177,13 @@ class TestTierFor:
     def test_security_complex_without_risk_is_medium(self):
         assert tier_for(self._dim("security"), "complex", False) == "medium"
 
-    def test_security_with_risk_is_high(self):
-        assert tier_for(self._dim("security"), "trivial", True) == "high"
+    def test_security_with_ordinary_risk_is_medium(self):
+        assert tier_for(self._dim("security"), "trivial", True) == "medium"
+
+    def test_security_with_concrete_high_risk_is_high(self):
+        assert tier_for(
+            self._dim("security"), "trivial", True, concrete_high_risk=True
+        ) == "high"
 
     def test_security_explicit_high_request_is_high(self):
         assert tier_for(self._dim("security"), "moderate", False, force_high=True) == "high"
@@ -213,8 +218,8 @@ class TestTierFor:
         assert tier_for(self._dim("types"), "complex", False, loc=900) == "medium"
         assert tier_for(self._dim("edge"), "complex", False, loc=900) == "medium"
 
-    def test_security_with_risk_is_high_any_size(self):
-        assert tier_for(self._dim("security"), "trivial", True, loc=50) == "high"
+    def test_security_with_ordinary_risk_is_medium_any_size(self):
+        assert tier_for(self._dim("security"), "trivial", True, loc=50) == "medium"
 
     def test_boundary_230_is_medium(self):
         # _LOC_LOW boundary is exclusive: exactly 230 → not low.
@@ -236,9 +241,18 @@ class TestTierFor:
             self._dim("performance"), "complex", False, loc=700, density_score=0.3, bias=2
         ) == "high"
 
-    def test_bias_never_overrides_security_on_risk(self):
-        # security+risk is high and must ignore a learned de-escalation.
-        assert tier_for(self._dim("security"), "trivial", True, loc=100, bias=-2) == "high"
+    def test_bias_can_deescalate_ordinary_security_risk(self):
+        assert tier_for(self._dim("security"), "trivial", True, loc=100, bias=-2) == "low"
+
+    def test_bias_never_overrides_concrete_security_high_risk(self):
+        assert tier_for(
+            self._dim("security"),
+            "trivial",
+            True,
+            loc=100,
+            concrete_high_risk=True,
+            bias=-2,
+        ) == "high"
 
     def test_bias_zero_is_noop(self):
         assert tier_for(self._dim("logic"), "complex", False, loc=400, bias=0) == "medium"
@@ -500,10 +514,22 @@ class TestBuildReviewSubtasks:
         review = [s for s in result["subtasks"] if not s.get("depends_on")]
         assert len(review) <= 2
 
-    def test_complex_risky_file_gets_security_high_tier(self, tmp_path: Path):
+    def test_complex_ordinary_risky_file_gets_security_medium_tier(self, tmp_path: Path):
         # .md extension so extension doesn't bump, but content has auth + 210 lines
         f = tmp_path / "big.md"
         lines = ["auth = 'secret'"] + [f"line {i}" for i in range(210)]
+        f.write_text("\n".join(lines), encoding="utf-8")
+        result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
+        sec = next(
+            (s for s in result["subtasks"] if s.get("subagent_type") == "review-security"),
+            None,
+        )
+        assert sec is not None
+        assert sec["tier"] == "medium"
+
+    def test_concrete_high_risk_file_gets_security_high_tier(self, tmp_path: Path):
+        f = tmp_path / "big.md"
+        lines = ["subprocess.run(cmd, shell=True)"] + [f"line {i}" for i in range(210)]
         f.write_text("\n".join(lines), encoding="utf-8")
         result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
         sec = next(
@@ -536,9 +562,16 @@ class TestBuildReviewSubtasks:
         synth = next(s for s in result["subtasks"] if s.get("depends_on"))
         assert synth["tier"] == "medium"
 
-    def test_synthesis_high_only_on_risk(self, tmp_path: Path):
+    def test_synthesis_stays_medium_on_ordinary_risk(self, tmp_path: Path):
         f = tmp_path / "secrets.md"
         f.write_text("token = 'abc'\n", encoding="utf-8")
+        result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
+        synth = next(s for s in result["subtasks"] if s.get("depends_on"))
+        assert synth["tier"] == "medium"
+
+    def test_synthesis_high_on_concrete_high_risk(self, tmp_path: Path):
+        f = tmp_path / "runner.md"
+        f.write_text("subprocess.run(cmd, shell=True)\n", encoding="utf-8")
         result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
         synth = next(s for s in result["subtasks"] if s.get("depends_on"))
         assert synth["tier"] == "high"
@@ -645,7 +678,7 @@ class TestBuildReviewSubtasks:
         assert all(s["tier"] == "medium" for s in review)
         assert synthesis[0]["tier"] == "medium"
 
-    def test_fast_review_high_tier_only_on_risk(self, tmp_path: Path):
+    def test_fast_review_ordinary_risk_stays_medium(self, tmp_path: Path):
         risky = tmp_path / "auth.py"
         risky.write_text("token = request.headers['Authorization']\n", encoding="utf-8")
         ordinary = tmp_path / "plain.py"
@@ -657,7 +690,22 @@ class TestBuildReviewSubtasks:
         review = [s for s in result["subtasks"] if not s.get("depends_on")]
         synthesis = next(s for s in result["subtasks"] if s.get("depends_on"))
         tiers = {Path(s["target_file"]).name: s["tier"] for s in review}
-        assert tiers == {"auth.py": "high", "plain.py": "medium"}
+        assert tiers == {"auth.py": "medium", "plain.py": "medium"}
+        assert synthesis["tier"] == "medium"
+
+    def test_fast_review_high_tier_on_concrete_high_risk(self, tmp_path: Path):
+        risky = tmp_path / "runner.py"
+        risky.write_text("subprocess.run(cmd, shell=True)\n", encoding="utf-8")
+        ordinary = tmp_path / "plain.py"
+        ordinary.write_text("x = 1\n", encoding="utf-8")
+        result = build_review_subtasks(
+            [(str(risky), ""), (str(ordinary), "")],
+            f"FAST_REVIEW: {risky} {ordinary}",
+        )
+        review = [s for s in result["subtasks"] if not s.get("depends_on")]
+        synthesis = next(s for s in result["subtasks"] if s.get("depends_on"))
+        tiers = {Path(s["target_file"]).name: s["tier"] for s in review}
+        assert tiers == {"runner.py": "high", "plain.py": "medium"}
         assert synthesis["tier"] == "high"
 
     def test_fast_review_respects_max_agents_cap(self, tmp_path: Path):

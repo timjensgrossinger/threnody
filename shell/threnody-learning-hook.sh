@@ -8,5 +8,5 @@ INSTALL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 export PYTHONPATH="$INSTALL_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 # Tolerate any failure — a PostToolUse hook must not break the tool.
-python3 -m shared.learning_hook capture --stdin || true
+python3 -m shared.learning_hook capture --stdin --hook-response || printf '{"continue":true,"suppressOutput":true}\n'
 exit 0

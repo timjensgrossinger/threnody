@@ -510,7 +510,17 @@ def test_review_run_response_is_compact(monkeypatch, tmp_path: Path) -> None:
     planner = Planner(cfg, _NoBackend())
 
     f1 = tmp_path / "big.py"
-    f1.write_text("password = 'x'\n" + "\n".join(f"line {i}" for i in range(700)), encoding="utf-8")
+    f1.write_text(
+        "def handle(items):\n"
+        + "\n".join(
+            "    if items:\n"
+            "        for item in items:\n"
+            "            if item:\n"
+            "                return item"
+            for _ in range(180)
+        ),
+        encoding="utf-8",
+    )
     f2 = tmp_path / "small.py"
     f2.write_text("\n".join(f"line {i}" for i in range(40)), encoding="utf-8")
 
