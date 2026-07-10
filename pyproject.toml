@@ -1,0 +1,132 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "threnody-mcp"
+dynamic = ["version"]
+description = "Local-first MCP meta-harness for routing, planning, and host-native multi-agent coding work."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Tim Grossinger", email = "tim.grossinger@movec.com" },
+]
+keywords = ["mcp", "routing", "multi-agent", "orchestration", "swarm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+ui = [
+    "rich>=13.0,<15",
+    "questionary>=2.0,<3",
+]
+dev = [
+    "pytest>=7.0",
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[project.scripts]
+threnody-mcp = "threnody.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/timjensgrossinger/threnody"
+Repository = "https://github.com/timjensgrossinger/threnody"
+Documentation = "https://github.com/timjensgrossinger/threnody#readme"
+
+[tool.hatch.version]
+path = "VERSION"
+pattern = "(?P<version>.+)"
+
+[tool.hatch.build.targets.wheel]
+packages = ["threnody"]
+exclude = [
+    "**/*.db",
+    "**/*.db-*",
+    "**/*.py[cod]",
+    "**/__pycache__",
+    "**/.runtime",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"mcp_server.py" = "mcp_server.py"
+"shared" = "shared"
+"claude-code" = "claude_code"
+"copilot" = "copilot"
+"codex" = "codex"
+"cursor" = "cursor"
+"junie" = "junie"
+"mistral" = "mistral"
+"opencode" = "opencode"
+"blackbox" = "blackbox"
+"cli" = "cli"
+"config.example.yaml" = "config.example.yaml"
+"VERSION" = "VERSION"
+"LICENSE" = "LICENSE"
+"NOTICE" = "NOTICE"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "threnody/",
+    "shared/",
+    "claude-code/",
+    "copilot/",
+    "codex/",
+    "cursor/",
+    "junie/",
+    "mistral/",
+    "opencode/",
+    "blackbox/",
+    "cli/",
+    "mcp_server.py",
+    "config.example.yaml",
+    "VERSION",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "AUTHORS",
+    "CHANGELOG.md",
+    "requirements.txt",
+    "threnody.manifest.json",
+]
+exclude = [
+    "tests/",
+    "sandbox/",
+    "docs/",
+    "scripts/",
+    "shell/",
+    "skills/",
+    ".claude/",
+    ".cursor/",
+    ".github/",
+    "**/*.db",
+    "**/*.db-*",
+    "providers.json",
+    "config.yaml",
+    "install.sh",
+    "uninstall.sh",
+    "sectest.sh",
+    "copilot-instructions.md",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "INSTRUCTIONS.md",
+    "**/__pycache__/",
+    "**/*.pyc",
+    ".planning/",
+    "backup/",
+    ".runtime/",
+    "audit_secret",
+]
