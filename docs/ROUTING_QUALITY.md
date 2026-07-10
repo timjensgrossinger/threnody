@@ -2,7 +2,7 @@
 
 ## Current Result
 
-Evaluation date: 2026-06-08
+Evaluation date: 2026-07-11
 
 Command:
 
@@ -15,13 +15,14 @@ Result:
 | Category | Pass | Fail | Skip | Executed Accuracy |
 |---|---:|---:|---:|---:|
 | Low tier | 10 | 0 | 0 | 100% |
-| Medium tier | 11 | 0 | 0 | 100% |
-| High tier | 8 | 0 | 2 | 100% |
+| Medium tier | 12 | 0 | 0 | 100% |
+| High tier | 14 | 0 | 2 | 100% |
 | Urgency | 3 | 0 | 0 | 100% |
-| **Total** | **32** | **0** | **2** | **100%** |
+| **Total** | **39** | **0** | **2** | **100%** |
 
-The two skipped high-tier fixtures are intentionally marked boundary fixtures.
-Including skips in the denominator gives 94.1% corpus completion.
+The two skipped high-tier fixtures are intentionally marked `boundary` fixtures.
+Executed accuracy is 100% (39/39); including the two intentional skips in the
+denominator gives 95.1% corpus completion (39/41).
 
 ## Corrected Failure Pattern
 
@@ -40,9 +41,10 @@ The correction:
 
 ## Safety Checks
 
-All stable fixtures for deep/security-critical review, migration, distributed systems,
-database rollout, concurrency, production incidents, rollback planning, and
-swarm topology pass after the change.
+The current corpus includes stable low-, medium-, high-, urgency-, and swarm
+fixtures. Stable fixtures for deep/security-critical review, migration,
+distributed systems, database rollout, concurrency, production incidents,
+rollback planning, and swarm topology pass in this run.
 
 See `tests/eval/` for the fixture corpus and `docs/ROUTING_EVAL.md` for the
 evaluation methodology.

@@ -1,6 +1,9 @@
 # MCP Tools Reference
 
-Threnody exposes **53 public MCP tools** over JSON-RPC/stdio. Tests enforce that every published schema has a callable handler.
+Threnody exposes **53 published MCP tools** over JSON-RPC/stdio. Every
+published schema has a callable dispatch handler. The module currently also
+contains seven unpublished trace/session handlers; they are not returned by
+`tools/list` and are not part of the public contract.
 
 Tools are grouped by role: **coordination** (plan and route), **delegation** (optional subprocess to utility backends only), **learning**, **memory**, and **operator** surfaces.
 
@@ -22,6 +25,16 @@ Plan, classify, and orchestrate work. Prefer host-native execution using
 | `workflow_blueprint_run(name, inputs?)` | Replay saved host-native waves without a fresh planner call |
 | `validate_routing_guard(...)` | Check whether a host edit/write is allowed by the active routing policy |
 | `apply_preview(preview_token, approve)` | Approve/deny file writes outside workspace |
+
+Host execution reporting is part of the coordination contract:
+
+| Tool | Required input | Description |
+|---|---|---|
+| `report_host_wave` | `wave`, `agents` | Record one completed host wave; supports terminal and plan-expansion metadata |
+| `report_workflow_result` | `workflow_name`, `agents` | Record a Claude Code Dynamic Workflow result and optional consensus |
+| `expand_host_plan` | `discovered_files` | Add discovered files to an active host plan |
+| `report_host_swarm_complete` | `wave`, `agents`, `outcome` | Finalize host-native swarm learning and receipts |
+| `inspect_swarm` | `swarm_id` | Inspect an active or completed host-native swarm |
 
 ### Normal orchestration (`plan_task` / `decompose_task`)
 
@@ -67,7 +80,7 @@ for same-host targets.
 
 | Tool | Description |
 |---|---|
-| `execute_subtask(prompt, tier, provider_id?, target_file?, effort?)` | Utility delegation only when opt-in enabled; host CLI targets are hard-rejected |
+| `execute_subtask(prompt, tier?, provider_id?, target_file?, effort?, mode?)` | Utility delegation only when opt-in enabled; host CLI targets are hard-rejected |
 
 Optional `effort` is a provider-level reasoning hint (e.g. `"low"`, `"high"`, `"max"`, `"xhigh"`). Honored by supported utility backends when explicitly delegated; unsupported providers reject explicit overrides.
 
@@ -98,7 +111,10 @@ See [config.example.yaml](../config.example.yaml) and [INSTRUCTIONS.md](../INSTR
 | `learning_outcome_stats()` | Recent outcome distribution and feedback coverage |
 | `record_outcome(task_id, outcome, operator_id?, note?)` | Persist an explicit routed-task outcome |
 
-Approval workflow: `agent_queue_list`, `agent_queue_approve`, `agent_queue_reject`, `agent_queue_merge`, and `approval_queue_*` aliases.
+Approval workflow: `agent_queue_list`, `agent_queue_approve`,
+`agent_queue_reject`, and `agent_queue_merge`, with `approval_queue_*`
+compatibility aliases. Mutating tools require `project_id`, `queue_id`, and
+explicit `operator_id`; merge also requires `canonical_agent_id`.
 
 ## Memory
 
@@ -140,3 +156,10 @@ Approval workflow: `agent_queue_list`, `agent_queue_approve`, `agent_queue_rejec
 | `routing_exception_remove(exception_type, pattern)` | Remove a bypass rule |
 
 Shell wrapper: `threnody tune set|reset`, `threnody inspect`, `threnody doctor`.
+
+## Protocol handshake
+
+`initialize` returns protocol version `2024-11-05`, capabilities
+`{"tools": {"listChanged": false}}`, and server identity
+`{"name": "Threnody", "version": "<VERSION>"}`. The `threnody-mcp` packaged
+entry point uses the same stdio JSON-RPC server as the repository entry point.

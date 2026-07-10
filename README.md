@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.timjensgrossinger/threnody -->
+
 <h1 align="center">Threnody</h1>
 <h3 align="center">Lean MCP coordination for host-native swarms, receipts, replayable workflows, and approval-gated learning</h3>
 
@@ -36,7 +38,10 @@ For operators who want multi-agent coding without a permanent agent army, a seco
 
 ## Install
 
-**Requires:** Python 3.10+, macOS or Linux, and at least one host AI CLI (`gh`, `claude`, `codex`, `cursor-agent`, `junie`, or `opencode`).
+**Requires:** Python 3.10+ and macOS or Linux for the supported installation
+paths. The full `install.sh` workflow expects at least one host AI CLI (`gh`,
+`claude`, `codex`, `cursor-agent`, `junie`, or `opencode`); the packaged MCP
+server can start without one for setup and diagnostics.
 
 **Claude Code plugin marketplace** (recommended) — bundles the MCP server and nine routing skills, no shell restart:
 
@@ -45,14 +50,20 @@ claude plugin marketplace add timjensgrossinger/threnody
 claude plugin install threnody@threnody
 ```
 
-**MCP registry via `uvx`** — works with any MCP-aware host:
+**MCP package via `uvx` or `pip`** — works with any MCP-aware host:
 
 ```bash
 claude mcp add threnody -- uvx threnody-mcp
-pip install threnody-mcp        # or: python3 -m threnody.mcp_server
+pip install threnody-mcp
+threnody-mcp
 ```
 
-**Full CLI install** (adds `ghc`/`ghcs`/`ghce` aliases, syncs routing instructions; restart shell after):
+The package entry point is a local stdio server. Set
+`THRENODY_ALLOW_NO_HOST=1` when deliberately starting it on a machine with no
+host CLI.
+
+**Full CLI install** (adds `ghc`/`ghcs`/`ghce` aliases, syncs routing
+instructions; restart shell after):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/timjensgrossinger/threnody/main/install.sh | bash
@@ -115,7 +126,7 @@ Host shell (Claude / Copilot / Codex / Cursor / …)
 | 🧾 | **Receipts and run cards** | `cost_receipt` + `inspect_run_receipt(format=json\|markdown\|html)` record plan, waves, model rationale, skipped calls, policy decisions, outcomes |
 | 🧩 | **Task packs and blueprints** | Curated packs (`security-review`, `test-gap`, `release-check`); successful runs export to replayable workflow blueprints |
 | 💾 | **Cross-session memory** | `memory_*` MCP tools backed by local SQLite, shared across all MCP hosts |
-| 🔌 | **MCP-native** | 40+ tools over stdio JSON-RPC; works with any MCP-compatible host |
+| 🔌 | **MCP-native** | 53 published tools over stdio JSON-RPC; works with any MCP-compatible host |
 | 📈 | **Adaptive thresholds** | EMA threshold learning from `record_outcome` (per-project, opt-in) |
 | 🛡️ | **Write safety** | Path validation, outside-workspace grant model + audit trail |
 | 🔒 | **Guarded routing** | Optional coordination gate + Claude PreToolUse hooks (`routing_policy.mode: guarded`) |
