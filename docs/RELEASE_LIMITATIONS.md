@@ -1,16 +1,28 @@
 # Release Limitations and Roadmap
 
+## Release workflow
+
+Tagged releases run `.github/workflows/release.yml`. The workflow checks the
+generated manifests, runs packaging and clean-install tests, builds the wheel
+and sdist, validates metadata with `twine check`, inspects each archive for
+forbidden files, publishes to PyPI, and creates a GitHub release. Ordinary
+source-tree installation remains available through `install.sh`; it is not a
+post-install hook for the package.
+
 ## Known Alpha Limitations
 
 - Windows is not supported by the installer or process-control helpers.
 - Provider behavior depends on locally installed CLI versions and account
   entitlements.
-- Live provider smoke tests are machine-specific and remain a release gate.
+- Live provider smoke tests are machine-specific and remain a release gate;
+  hermetic adapter tests do not prove provider login, quota, or entitlement.
 - MCP transport-disconnect cleanup still needs an explicit regression test.
-- Branch protection and final release archive inspection are repository-hosting
-  operations and cannot be completed from the local source tree alone.
-- OpenCode defaults to low-only routing.
-- Junie defaults to medium-only routing.
+- Branch protection, tag creation, publishing credentials, and final release
+  archive inspection are repository-hosting operations and cannot be completed
+  from the local source tree alone.
+- OpenCode is a host provider but defaults to low-only automatic routing and is
+  also the first default utility-delegation target when delegation is enabled.
+- Junie is a host provider with medium-only automatic routing.
 - Windsurf is detection-only.
 
 ## Honest limitations
@@ -19,6 +31,8 @@ Plain-language constraints that matter in practice:
 
 - Threnody orchestrates CLIs that can execute arbitrary code with your user
   permissions — it is not a sandbox
+- The packaged `threnody-mcp` entry point is a local stdio server; it does not
+  provide a hosted service or remote execution plane
 - Provider risk is real; routing policy reduces it but cannot change a
   provider's underlying trust model
 - Cost rank is a routing hint, not a bill estimate
@@ -105,7 +119,8 @@ quota windows can change independently from Threnody.
 
 - Add explicit MCP transport-disconnect cancellation tests.
 - Complete live smoke matrix for supported providers.
-- Add Linux and macOS clean install/reinstall/uninstall CI jobs with real shell
-  environments.
+- Add Linux and macOS clean reinstall/uninstall CI jobs with real shell
+  environments; tagged release CI already covers wheel/sdist clean-install
+  smoke tests.
 - Add a managed command for project-local OpenCode deregistration guidance.
 - Publish versioned release archives after archive inspection and secret scans.

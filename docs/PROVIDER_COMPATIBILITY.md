@@ -1,24 +1,24 @@
 # Provider Compatibility
 
-This table describes the shipped provider contract and the current hermetic
-test coverage. It does not claim that every provider subscription is available
-on every machine.
+This table describes the shipped provider registry and current hermetic adapter
+coverage. It does not claim that a provider subscription, login, model catalog,
+or entitlement is available on every machine.
 
-| Provider | Default Routeability | Hermetic Coverage | Live Smoke Needed |
+| Provider | Registry role / default routeability | Hermetic Coverage | Live Smoke Observed in This Audit |
 |---|---|---|---|
-| GitHub Copilot | low, medium, high | detection, command construction, isolated env, execution parsing, auth failure, generic timeout path | passed 2026-06-08 |
-| Claude Code | low, medium, high | command construction, effort mapping, execution parsing, timeout, auth-status preflight, caller opt-out/preference | passed 2026-06-08 |
-| OpenAI Codex | low, medium, high | noninteractive command contract, output cleanup, API-key detection, login probe, quota parsing, timeout, adapter metadata | yes |
-| Cursor | low, medium, high | entrypoint adapter, host instructions, MCP registration shape, caller detection, routing policy | yes |
-| JetBrains Junie | medium-only by default | entrypoint adapter, medium-only model projection, caller detection, instructions, routeability diagnostics | yes |
-| OpenCode | low-only by default | command construction, entrypoint adapter, caller detection, low-only projection after catalog refresh | yes |
-| Aider | low, medium, high | API-key detection, missing binary, command builder, model discovery fallback, result extraction | yes |
-| Amazon Q/Kiro | low, medium, high | binary selection, auth fallback/failure metadata, static models, result extraction | yes |
-| Mistral Vibe | low, medium, high | command execution parsing, timeout, active model behavior, workdir cleanup, spillover routing | yes |
-| Blackbox AI | low, medium, high | registry inclusion, detection and command path coverage, generic execution parsing | yes |
-| Windsurf | detect-only | detect reason, non-routeable status, skipped by execution | no execution by design |
-| Ollama loopback | local endpoint | metadata tiering, loopback discovery, execution fallback | optional |
-| OpenAI-compatible endpoint | configured endpoint | TLS rules, credential handling, local/network scope validation, execution fallback | optional |
+| GitHub Copilot (`gh`) | Host; low, medium, high; low cost rank 0 | detection, command construction, isolated env, execution parsing, auth failure, timeout paths | Not run |
+| Claude Code (`claude`) | Host and router-only by default; low, medium, high | command construction, effort mapping, execution parsing, timeout, auth-status and caller policy | Not run |
+| OpenAI Codex (`codex`) | Host; low, medium, high | noninteractive command contract, output cleanup, API-key/login detection, quota, timeout, metadata | Not run |
+| Cursor (`cursor-agent`) | Host; low, medium, high | adapter, instructions, MCP registration shape, caller detection, routing policy | Not run |
+| JetBrains Junie (`junie`) | Host; medium-only automatic routing | adapter, medium-only projection, caller detection, instructions, diagnostics | Not run |
+| OpenCode (`opencode`) | Host and default utility allowlist; low-only automatic routing | command/entrypoint, caller detection, low-only projection and catalog refresh | Not run |
+| Aider (`aider`) | Non-host utility adapter; in the default utility allowlist when delegation is enabled | API-key detection, missing binary, command builder, model fallback, result extraction | Not run |
+| Amazon Q/Kiro (`q`/`kiro`) | Non-host adapter; requires explicit utility allowlisting for delegation | binary selection, auth fallback/failure metadata, static models, result extraction | Not run |
+| Mistral Vibe (`vibe`) | Non-host adapter; requires explicit utility allowlisting for delegation | command parsing, timeout, model behavior, workdir cleanup, spillover | Not run |
+| Blackbox AI (`blackbox`) | Non-host adapter; requires explicit utility allowlisting for delegation | registry inclusion, detection/command path, generic parsing | Not run |
+| Windsurf (`windsurf`) | Detect-only; never routeable | detect reason and non-routeable execution skip | Not applicable |
+| Ollama loopback | Configured/local HTTP utility endpoint | metadata tiering, discovery, execution fallback | Not run |
+| OpenAI-compatible endpoint | Configured HTTP utility endpoint | TLS, credential handling, scope validation, execution fallback | Not run |
 
 ## Compatibility Rules
 
@@ -32,7 +32,7 @@ on every machine.
 
 ## Current Verification
 
-Run:
+Run the hermetic adapter suite:
 
 ```bash
 THRENODY_TEST_MODE=1 python3 -m pytest \
@@ -43,9 +43,7 @@ THRENODY_TEST_MODE=1 python3 -m pytest \
   tests/test_model_catalog.py -q
 ```
 
-The required two-provider live gate passed through the full
-`handle_execute_subtask()` path with GitHub Copilot and Claude Code on
-2026-06-08. Other provider live rows remain optional compatibility expansion
-work for the alpha.
-
-Current hermetic result: **298 passed, 2 live-smoke skips** on 2026-06-08.
+The command above exercises mocked/test-mode and adapter contracts; it does not
+authenticate to or invoke provider CLIs. No live provider smoke was run for
+this documentation refresh. Live coverage remains an operator/release gate
+because it depends on local binaries, credentials, quotas, and entitlements.
