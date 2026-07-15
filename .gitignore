@@ -67,3 +67,9 @@ tests/eval/baseline.json
 
 # Local security test scratch (contains live tokens — never commit)
 sectest.sh
+
+# AI assistant instruction files (contain internal details — keep local only)
+AGENTS.md
+CLAUDE.md
+copilot-instructions.md
+.github/copilot-instructions.md
