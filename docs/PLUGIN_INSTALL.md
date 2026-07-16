@@ -88,7 +88,7 @@ claude mcp add -e THRENODY_INSTALL_DIR="$HOME/.threnody" threnody -- uvx threnod
 
 **Environment variables:**
 - `THRENODY_INSTALL_DIR`: Override the data/config directory (defaults to `~/.local/lib/threnody`)
-- `THRENODY_ALLOW_NO_HOST`: Set to `1` to allow startup with no host AI CLI detected
+- `THRENODY_ALLOW_NO_HOST`: Set to `1` for `install.sh` to bypass its host-CLI check
 
 This path works with any registry-aware client that supports the official MCP registry.
 
@@ -144,6 +144,9 @@ The first time you call a Threnody tool, the MCP server initializes with sensibl
   - All detected host CLIs are enabled
   - To customize, run `threnody settings` (or call `route_task` and follow guidance)
   - If no host CLI was detected, install one before using `execute_subtask` or agent spawning
+- **First task:** Call `start_task` with `mode="implement"` for the guided
+  install -> project profile -> host-native next-action flow. Use
+  `mode="review"` or `mode="investigate"` for read-only workflows.
 
 No configuration is required to get started — defaults are safe.
 

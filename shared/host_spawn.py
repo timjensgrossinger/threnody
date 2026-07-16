@@ -212,10 +212,24 @@ def build_host_spawn(
 
 
 def _subtask_target_files(subtask: Mapping[str, Any]) -> list[str]:
+    target_files = subtask.get("target_files")
+    if isinstance(target_files, list):
+        normalized = [
+            target.strip()
+            for target in target_files
+            if isinstance(target, str) and target.strip()
+        ]
+        if normalized:
+            return normalized
     target_file = subtask.get("target_file")
     if isinstance(target_file, str) and target_file.strip():
         return [target_file.strip()]
     return []
+
+
+def _subtask_id_key(value: Any) -> tuple[str, str]:
+    """Build a hashable key that preserves the ID's runtime type."""
+    return type(value).__name__, repr(value)
 
 
 def enrich_host_spawn_waves(
@@ -300,6 +314,8 @@ def sanitize_plan_for_host(
     workspace_root: str | None,
     task: str | None,
     default_tier: str = "medium",
+    allow_external_read_only: bool = True,
+    collapse_unsafe_to_single: bool = True,
 ) -> dict[str, Any]:
     """Drop unsafe/incoherent subtasks before host-wave or workflow emission.
 
@@ -322,20 +338,64 @@ def sanitize_plan_for_host(
     root = str(workspace_root).strip() if workspace_root else ""
 
     surviving: list[dict[str, Any]] = []
-    dropped_ids: set[Any] = set()
+    dropped_ids: set[tuple[str, str]] = set()
+    stable_id = _subtask_id_key
     for raw in subtasks:
         if not isinstance(raw, dict):
             continue
         st = dict(raw)
         sid = st.get("id")
         target = st.get("target_file")
+        target_files = st.get("target_files")
         target_basename: str | None = None
+        read_only = bool(st.get("read_only"))
+        external_targets: list[str] = []
+        if isinstance(target, str) and target.strip():
+            if root and not _target_within_workspace(target.strip(), root):
+                external_targets.append(target.strip())
+        if isinstance(target_files, list):
+            for candidate in target_files:
+                if (
+                    isinstance(candidate, str)
+                    and candidate.strip()
+                    and root
+                    and not _target_within_workspace(candidate.strip(), root)
+                ):
+                    external_targets.append(candidate.strip())
+        if external_targets and not allow_external_read_only:
+            report.setdefault("dropped_subtasks", []).append(
+                {"id": sid, "target_files": external_targets}
+            )
+            report.setdefault("reasons", []).append(
+                f"subtask {sid}: target outside workspace root"
+            )
+            if sid is not None:
+                dropped_ids.add(stable_id(sid))
+            continue
+        if (
+            root
+            and isinstance(target_files, list)
+            and (not read_only or not allow_external_read_only)
+        ):
+            safe_target_files = [
+                candidate
+                for candidate in target_files
+                if isinstance(candidate, str)
+                and _target_within_workspace(candidate.strip(), root)
+            ]
+            if safe_target_files:
+                st["target_files"] = safe_target_files
+            else:
+                st.pop("target_files", None)
         if isinstance(target, str) and target.strip():
             target_basename = PurePosixPath(target.strip().replace("\\", "/")).name
             # read_only subtasks (e.g. review fanout) never write — a target
             # outside the workspace is safe, so skip containment stripping.
-            read_only = bool(st.get("read_only"))
-            if root and not read_only and not _target_within_workspace(target.strip(), root):
+            if (
+                root
+                and (not read_only or not allow_external_read_only)
+                and not _target_within_workspace(target.strip(), root)
+            ):
                 report.setdefault("dropped_targets", []).append(
                     {"id": sid, "target_file": target}
                 )
@@ -355,7 +415,7 @@ def sanitize_plan_for_host(
                 f"subtask {sid}: fragment/empty prompt"
             )
             if sid is not None:
-                dropped_ids.add(sid)
+                dropped_ids.add(stable_id(sid))
             continue
         surviving.append(st)
 
@@ -363,22 +423,28 @@ def sanitize_plan_for_host(
         for st in surviving:
             deps = st.get("depends_on")
             if isinstance(deps, list):
-                st["depends_on"] = [d for d in deps if d not in dropped_ids]
+                st["depends_on"] = [
+                    d for d in deps if stable_id(d) not in dropped_ids
+                ]
 
-    surviving_ids = {st.get("id") for st in surviving}
+    surviving_ids = {stable_id(st.get("id")): st.get("id") for st in surviving}
     waves = plan_dict.get("waves")
     if isinstance(waves, list):
         new_waves: list[list[Any]] = []
         for wave in waves:
             if not isinstance(wave, list):
                 continue
-            kept = [sid for sid in wave if sid in surviving_ids]
+            kept = [
+                surviving_ids[stable_id(sid)]
+                for sid in wave
+                if stable_id(sid) in surviving_ids
+            ]
             if kept:
                 new_waves.append(kept)
         plan_dict["waves"] = new_waves
     plan_dict["subtasks"] = surviving
 
-    if not surviving:
+    if not surviving and collapse_unsafe_to_single:
         report["collapsed_to_single"] = True
         report.setdefault("reasons", []).append(
             "all subtasks unsafe/incoherent; collapsed to single full-task agent"
@@ -418,11 +484,11 @@ def build_host_spawn_waves(
     if not isinstance(subtasks, list) or not isinstance(waves, list):
         return []
 
-    subtask_by_id: dict[Any, dict[str, Any]] = {}
+    subtask_by_id: dict[tuple[str, str], dict[str, Any]] = {}
     for raw in subtasks:
         raw_id = raw.get("id") if isinstance(raw, dict) else None
         if raw_id is not None:
-            subtask_by_id[raw_id] = raw
+            subtask_by_id[_subtask_id_key(raw_id)] = raw
 
     host_waves: list[dict[str, Any]] = []
     for wave_idx, wave_ids in enumerate(waves, start=1):
@@ -430,7 +496,7 @@ def build_host_spawn_waves(
             continue
         agents: list[dict[str, Any]] = []
         for sid in wave_ids:
-            subtask = subtask_by_id.get(sid)
+            subtask = subtask_by_id.get(_subtask_id_key(sid))
             if not isinstance(subtask, dict):
                 continue
             tier = str(subtask.get("tier") or "medium")
@@ -471,7 +537,15 @@ def build_host_spawn_waves(
                     prompt=prompt,
                     wave_id=f"wave-{wave_idx}",
                     target_files=_subtask_target_files(subtask),
-                    spawn_id=str(subtask.get("id") or subtask.get("stable_id") or sid),
+                    spawn_id=str(
+                        subtask["id"]
+                        if subtask.get("id") is not None
+                        else (
+                            subtask["stable_id"]
+                            if subtask.get("stable_id") is not None
+                            else sid
+                        )
+                    ),
                     model=model,
                     subagent_type=subtask_subagent_type,
                     read_only=subtask_read_only,

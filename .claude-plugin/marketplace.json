@@ -1,0 +1,38 @@
+{
+  "name": "threnody",
+  "owner": {
+    "name": "Tim Grossinger",
+    "email": "tim.grossinger@movec.com"
+  },
+  "metadata": {
+    "description": "Local-first MCP meta-harness: routes, plans, and swarms multi-agent coding work — emitting tier-aware Dynamic Workflows on Claude Code — while the host shell executes via Agent/Task subagents.",
+    "version": "0.3.0-alpha.2"
+  },
+  "plugins": [
+    {
+      "name": "threnody",
+      "source": ".",
+      "description": "Local-first MCP meta-harness: routes, plans, and swarms multi-agent coding work — emitting tier-aware Dynamic Workflows on Claude Code — while the host shell executes via Agent/Task subagents.",
+      "version": "0.3.0-alpha.2",
+      "homepage": "https://github.com/timjensgrossinger/threnody",
+      "repository": "https://github.com/timjensgrossinger/threnody",
+      "license": "Apache-2.0",
+      "category": "productivity",
+      "tags": [
+        "mcp",
+        "routing",
+        "multi-agent",
+        "orchestration",
+        "swarm"
+      ],
+      "mcpServers": {
+        "threnody": {
+          "command": "uvx",
+          "args": [
+            "threnody-mcp"
+          ]
+        }
+      }
+    }
+  ]
+}

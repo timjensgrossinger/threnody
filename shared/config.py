@@ -10,13 +10,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 import ipaddress
+import os
 import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import logging
-import os
 
 try:
     import yaml
@@ -28,7 +28,11 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-BASE_DIR = Path("~/.local/lib/threnody").expanduser()
+_INSTALL_DIR = os.environ.get("THRENODY_INSTALL_DIR") or "~/.local/lib/threnody"
+try:
+    BASE_DIR = Path(_INSTALL_DIR).expanduser()
+except RuntimeError as exc:
+    raise ValueError(f"Invalid THRENODY_INSTALL_DIR: {_INSTALL_DIR!r}") from exc
 DB_PATH = BASE_DIR / "cache.db"
 CONFIG_YAML = BASE_DIR / "config.yaml"
 

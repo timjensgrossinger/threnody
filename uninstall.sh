@@ -67,11 +67,19 @@ def remove_json_mcp(path_value: str) -> None:
     if not isinstance(data, dict):
         return
     servers = data.get("mcpServers")
-    if not isinstance(servers, dict) or "Threnody" not in servers:
+    if not isinstance(servers, dict):
         return
-    servers.pop("Threnody", None)
+    changed = False
+    if "Threnody" in servers:
+        servers.pop("Threnody", None)
+        changed = True
+    if "TGs-router" in servers:
+        servers.pop("TGs-router", None)
+        changed = True
     if not servers:
         data.pop("mcpServers", None)
+    if not changed:
+        return
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
@@ -97,26 +105,69 @@ def remove_managed_block(path_value: str, block_id: str) -> None:
     path.write_text(updated.rstrip() + ("\n" if updated.strip() else ""), encoding="utf-8")
 
 
+def remove_all_managed_blocks(path_value: str, label: str, block_id: str) -> None:
+    remove_managed_block(path_value, block_id)
+    path = within_home(Path(path_value))
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8")
+    start = f"<!-- {label}:{block_id}:start -->"
+    end = f"<!-- {label}:{block_id}:end -->"
+    while True:
+        start_index = text.find(start)
+        if start_index == -1:
+            break
+        end_index = text.find(end, start_index + len(start))
+        if end_index == -1:
+            break
+        before = text[:start_index].rstrip()
+        after = text[end_index + len(end):].lstrip()
+        text = before
+        if before and after:
+            text += "\n\n"
+        text += after
+    path.write_text(text.rstrip() + ("\n" if text.strip() else ""), encoding="utf-8")
+
+
 def remove_codex_mcp(path_value: str) -> None:
     path = within_home(Path(path_value))
     if not path.exists():
         return
     text = path.read_text(encoding="utf-8")
-    start = "# Threnody:codex-mcp:start"
-    end = "# Threnody:codex-mcp:end"
-    start_index = text.find(start)
-    if start_index == -1:
-        return
-    end_index = text.find(end, start_index + len(start))
-    if end_index == -1:
-        return
-    before = text[:start_index].rstrip()
-    after = text[end_index + len(end):].lstrip()
-    updated = before
-    if before and after:
-        updated += "\n\n"
-    updated += after
-    path.write_text(updated.rstrip() + ("\n" if updated.strip() else ""), encoding="utf-8")
+    for start, end in (
+        ("# Threnody:codex-mcp:start", "# Threnody:codex-mcp:end"),
+        ("# TGs-router:codex-mcp:start", "# TGs-router:codex-mcp:end"),
+    ):
+        start_index = text.find(start)
+        if start_index != -1:
+            end_index = text.find(end, start_index + len(start))
+            if end_index != -1:
+                before = text[:start_index].rstrip()
+                after = text[end_index + len(end):].lstrip()
+                text = before
+                if before and after:
+                    text += "\n\n"
+                text += after
+    lines = text.splitlines()
+    filtered: list[str] = []
+    skip = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped in {'[mcp_servers."TGs-router"]', "[mcp_servers.TGs-router]", '[projects."/Users/tim/.local/lib/TGs-router"]'}:
+            skip = True
+            continue
+        if skip and stripped.startswith("[") and stripped.endswith("]"):
+            skip = False
+        if not skip:
+            filtered.append(line)
+    updated = "\n".join(filtered).rstrip()
+    path.write_text(updated + ("\n" if updated else ""), encoding="utf-8")
+
+
+def remove_cursor_legacy_rule(path_value: str) -> None:
+    path = within_home(Path(path_value))
+    if path.exists():
+        path.unlink()
 
 
 def remove_claude_hook(path_value: str) -> None:
@@ -138,13 +189,21 @@ def remove_claude_hook(path_value: str) -> None:
     filtered = []
     for group in groups:
         group_hooks = group.get("hooks") if isinstance(group, dict) else None
-        is_managed = any(
-            isinstance(hook, dict)
-            and hook.get("type") == "mcp_tool"
-            and hook.get("server") == "Threnody"
-            and hook.get("tool") == "validate_routing_guard"
-            for hook in (group_hooks if isinstance(group_hooks, list) else [])
-        )
+        is_managed = False
+        for hook in (group_hooks if isinstance(group_hooks, list) else []):
+            if not isinstance(hook, dict):
+                continue
+            if (
+                hook.get("type") == "mcp_tool"
+                and hook.get("server") in {"Threnody", "TGs-router"}
+                and hook.get("tool") == "validate_routing_guard"
+            ):
+                is_managed = True
+            command = str(hook.get("command") or "")
+            if hook.get("type") == "command" and "threnody-routing-hook" in command:
+                is_managed = True
+            if is_managed:
+                break
         if not is_managed:
             filtered.append(group)
     if filtered:
@@ -164,7 +223,11 @@ def remove_shell_lines(path_value: str) -> None:
     source = f"source {install_dir}/shell/ghc.sh"
     filtered = []
     for line in lines:
-        if line == source or line == "# Threnody — AI orchestration":
+        if (
+            line == source
+            or "TGs-router/shell/ghc.sh" in line
+            or line in {"# Threnody — AI orchestration", "# TGs-router — AI orchestration"}
+        ):
             continue
         filtered.append(line)
     path.write_text("\n".join(filtered).rstrip() + ("\n" if filtered else ""), encoding="utf-8")
@@ -186,11 +249,13 @@ for path, block_id in (
     (home / ".codex/AGENTS.md", "codex"),
     (home / ".junie/AGENTS.md", "junie"),
 ):
-    remove_managed_block(str(path), block_id)
+    remove_all_managed_blocks(str(path), "Threnody", block_id)
+    remove_all_managed_blocks(str(path), "TGs-router", block_id)
 
 cursor_rule = within_home(home / ".cursor/rules/threnody.mdc")
 if cursor_rule.exists():
     cursor_rule.unlink()
+remove_cursor_legacy_rule(str(home / ".cursor/rules/tgs-router.mdc"))
 
 remove_shell_lines(str(home / ".zshrc"))
 remove_shell_lines(str(home / ".bashrc"))

@@ -45,7 +45,8 @@ BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 
 from shared.config import CONFIG_YAML, TGsConfig, DEFAULT_ROUTING_EXCEPTION_FILETYPES, DEFAULT_ROUTING_EXCEPTION_PATHS
-from shared.version import get_version
+from shared.claude_compat import load_claude_module
+from shared.version import get_display_version, get_version
 from shared.context import is_within_repo, normalize_target_path
 from shared.router import TaskRouter
 from shared.planner import (
@@ -1111,7 +1112,7 @@ TOOLS = [
     {
         "name": "plan_task",
         "description": (
-            "Ask the planner (sonnet 4.6 via gh copilot) to analyse a coding task, "
+            "Ask the planner to analyse a coding task, "
             "decompose it into subtasks, and assign each subtask a model tier.\n\n"
             "Returns an execution plan with:\n"
             "- analysis: the planner's reasoning\n"
@@ -1137,7 +1138,7 @@ TOOLS = [
         "name": "decompose_task",
         "description": (
             "Alias for plan_task. Preferred entry point for multi-file or multi-concern tasks.\n\n"
-            "Calls the LLM planner (sonnet 4.6 via gh copilot) to decompose a task into "
+            "Calls the planner to decompose a task into "
             "independent subtasks with model tier assignments and dependency waves.\n\n"
             "Returns:\n"
             "- analysis: planner reasoning\n"
@@ -1154,6 +1155,35 @@ TOOLS = [
                 "cwd": {
                     "type": "string",
                     "description": "Caller working directory for routing guard scoping",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "start_task",
+        "description": (
+            "Start a host-native task handoff with modes implement, review, investigate.\n\n"
+            "implement: use host-native heuristics for simple tasks and return host_spawn_waves for the host to execute; "
+            "for complex tasks return a planner handoff (no provider subprocesses launched).\n"
+            "review: reuse read-only REVIEW fanout and return host_spawn_waves suitable for review (read-only).\n"
+            "investigate: profile repository and return a machine-readable ProjectProfile; read-only.\n\n"
+            "Returns machine-readable next_action, profile, warnings, selected tier/model/provider metadata, and host_native handoff when applicable. "
+            "Does not launch provider subprocesses."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "Full description of the task"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["implement", "review", "investigate"],
+                    "description": "One of implement, review, investigate",
+                },
+                "cwd": {"type": "string", "description": "Caller working directory for routing guard scoping"},
+                "workspace_root": {
+                    "type": "string",
+                    "description": "Alias for cwd; must be inside the active workspace",
                 },
             },
             "required": ["task"],
@@ -5638,7 +5668,7 @@ def _normalize_mcp_tool_arguments(tool_name: str, tool_args: object) -> dict[str
             parsed = json.loads(tool_args)
             tool_args = parsed if isinstance(parsed, dict) else {"task": tool_args}
         except json.JSONDecodeError:
-            if tool_name == "execute_swarm":
+            if tool_name in {"execute_swarm", "start_task"}:
                 tool_args = {"task": tool_args}
             else:
                 tool_args = {}
@@ -6881,9 +6911,7 @@ def _register_shell_adapters(registry: object) -> None:
 
     register(copilot_adapter())
     try:
-        claude_adapter = importlib.import_module(
-            "claude-code.providers_legacy"
-        ).adapter_from_legacy
+        claude_adapter = load_claude_module("providers_legacy").adapter_from_legacy
         register(claude_adapter())
     except ModuleNotFoundError:
         log.debug("Claude legacy adapter unavailable", exc_info=True)
@@ -7365,10 +7393,19 @@ def _active_workspace_root() -> Path:
     """Return the pre-approved workspace root for direct writes."""
     override = os.environ.get(_ACTIVE_WORKSPACE_ENV)
     if override:
-        candidate = Path(override).expanduser().resolve()
+        try:
+            candidate = Path(override).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            log.warning(
+                "Ignoring invalid %s override: %r",
+                _ACTIVE_WORKSPACE_ENV,
+                override,
+            )
+            candidate = None
         home = Path.home().resolve()
         if (
-            candidate.exists()
+            candidate is not None
+            and candidate.exists()
             and candidate.is_dir()
             and candidate != Path(candidate.anchor)
             and candidate != home
@@ -11475,6 +11512,232 @@ def handle_learning_audit_log(args: dict) -> dict:
         return {"error": str(e), "success": False}
 
 
+_START_TASK_PROFILE_CACHE_TTL = 60.0
+_START_TASK_PROFILE_CACHE_LIMIT = 32
+_START_TASK_PROFILE_CACHE: dict[str, tuple[float, Any]] = {}
+_START_TASK_PROFILE_INFLIGHT: dict[
+    str, tuple[float, threading.Event, threading.Thread]
+] = {}
+_START_TASK_PROFILE_CACHE_LOCK = threading.Lock()
+
+
+def _finish_start_task_profile(key: str, event: threading.Event) -> None:
+    with _START_TASK_PROFILE_CACHE_LOCK:
+        current = _START_TASK_PROFILE_INFLIGHT.get(key)
+        if current is not None and current[1] is event:
+            _START_TASK_PROFILE_INFLIGHT.pop(key, None)
+            event.set()
+
+
+def _cached_start_task_profile(profile_project: Any, workspace_root: Path) -> Any:
+    """Reuse a short-lived profile while keeping start_task responsive."""
+    key = str(workspace_root)
+    while True:
+        now = time.monotonic()
+        with _START_TASK_PROFILE_CACHE_LOCK:
+            cached = _START_TASK_PROFILE_CACHE.get(key)
+            if cached is not None and now - cached[0] < _START_TASK_PROFILE_CACHE_TTL:
+                return cached[1]
+            _START_TASK_PROFILE_CACHE.pop(key, None)
+            inflight_entry = _START_TASK_PROFILE_INFLIGHT.get(key)
+            if inflight_entry is None or not inflight_entry[2].is_alive():
+                if inflight_entry is not None:
+                    inflight_entry[1].set()
+                inflight = threading.Event()
+                _START_TASK_PROFILE_INFLIGHT[key] = (
+                    now,
+                    inflight,
+                    threading.current_thread(),
+                )
+                owner = True
+            else:
+                inflight = inflight_entry[1]
+                owner = False
+        if owner:
+            break
+        inflight.wait(timeout=1.0)
+
+    profile: Any | None = None
+    try:
+        profile = profile_project(workspace_root)
+    finally:
+        if profile is None:
+            _finish_start_task_profile(key, inflight)
+    if profile is None:
+        raise RuntimeError("Project profile did not produce a result")
+
+    with _START_TASK_PROFILE_CACHE_LOCK:
+        if len(_START_TASK_PROFILE_CACHE) >= _START_TASK_PROFILE_CACHE_LIMIT:
+            oldest_key = min(
+                _START_TASK_PROFILE_CACHE,
+                key=lambda item: _START_TASK_PROFILE_CACHE[item][0],
+            )
+            _START_TASK_PROFILE_CACHE.pop(oldest_key, None)
+        _START_TASK_PROFILE_CACHE[key] = (time.monotonic(), profile)
+    _finish_start_task_profile(key, inflight)
+    return profile
+
+
+def handle_start_task(args: dict) -> dict:
+    """Start a host-native task handoff.
+
+    Modes:
+      - implement: use host-native heuristics for simple/file-scoped work and return
+        host_spawn_waves for the host to execute. If the task is complex, return a
+        planner handoff (planner must be run separately) — this function does not
+        launch provider subprocesses.
+      - review: reuse the REVIEW: fanout (read-only) and return host_spawn_waves.
+      - investigate: run a read-only project profile and return the profile.
+
+    Returns a dict suitable for MCP response with keys:
+      next_action: {action_kind, action_reason}
+      profile: machine-readable ProjectProfile
+      warnings: list[str]
+      host_spawn_waves: list (when applicable)
+      handoff: dict (when planner handoff is requested)
+    """
+    try:
+        from shared.project_profile import (
+            InvalidProjectRoot,
+            profile_project,
+            to_public_dict,
+        )
+        from shared.context import extract_references
+        from shared.heuristic_plan import assess_task_complexity, build_heuristic_plan_payload
+        from shared.host_spawn import sanitize_plan_for_host, build_host_spawn_waves
+        from shared.task_packs import _build_waves
+        # Ensure core subsystems available (config is needed to build host_spawn specs)
+        config, db, router, planner, orchestrator = _ensure_init()
+
+        task_value = args.get("task")
+        if not isinstance(task_value, str):
+            return {"error": "task must be a string"}
+        task = task_value.strip()
+        if not task:
+            return {"error": "task is required"}
+        mode = str(args.get("mode") or "implement").strip().lower()
+        if mode not in {"implement", "review", "investigate"}:
+            return {"error": "mode must be one of implement, review, investigate"}
+        raw_cwd = args.get("cwd") or args.get("workspace_root")
+        active_root = _active_workspace_root()
+        if raw_cwd is None:
+            workspace_root = active_root
+        elif not isinstance(raw_cwd, str) or not raw_cwd.strip():
+            return {"error": "cwd/workspace_root must be a non-empty string"}
+        else:
+            try:
+                workspace_root = Path(raw_cwd).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                return {
+                    "error": (
+                        "cwd/workspace_root must be an existing directory "
+                        "within the active workspace"
+                    )
+                }
+            if not workspace_root.is_dir() or not is_within_repo(workspace_root, active_root):
+                return {
+                    "error": (
+                        "cwd/workspace_root must be an existing directory "
+                        "within the active workspace"
+                    )
+                }
+
+        if mode == "review":
+            def is_external_review_reference(path: str) -> bool:
+                try:
+                    candidate = normalize_target_path(path, workspace_root)
+                except (TypeError, ValueError):
+                    return True
+                return not is_within_repo(candidate, workspace_root)
+
+            external_references = [
+                reference.path
+                for reference in extract_references(task)
+                if is_external_review_reference(reference.path)
+            ]
+            if external_references:
+                return {
+                    "error": "review targets must be inside the active workspace"
+                }
+
+        # Profile repository (read-only, bounded)
+        profile = _cached_start_task_profile(profile_project, workspace_root)
+        result: dict = {
+            "profile": to_public_dict(profile),
+            "warnings": profile.warnings or [],
+            "selected_tier": None,
+            "selected_model": None,
+            "provider": None,
+            "host_spawn_waves": [],
+            "handoff": None,
+        }
+
+        if mode == "investigate":
+            result["next_action"] = {"action_kind": "investigate_complete", "action_reason": "profile_complete"}
+            result["selected_tier"] = None
+            result["host_spawn_waves"] = []
+            return result
+
+        # Build a heuristic plan (review fanout or file-scoped heuristics)
+        plan_task = task if mode != "review" or task.lstrip().upper().startswith("REVIEW:") else f"REVIEW: {task}"
+        plan = build_heuristic_plan_payload(plan_task)
+        if not isinstance(plan.get("waves"), list) or not plan.get("waves"):
+            subtasks = plan.get("subtasks")
+            if isinstance(subtasks, list):
+                plan["waves"] = _build_waves(
+                    [subtask for subtask in subtasks if isinstance(subtask, dict)]
+                )
+        sanitize_plan_for_host(
+            plan,
+            workspace_root=str(workspace_root),
+            task=plan_task,
+            allow_external_read_only=False,
+            collapse_unsafe_to_single=False,
+        )
+        host_waves = build_host_spawn_waves(plan, config=config, caller=_resolve_caller())
+
+        if mode == "review":
+            if not host_waves:
+                result["next_action"] = {
+                    "action_kind": "review_unavailable",
+                    "action_reason": "no_review_targets",
+                }
+                return result
+            result["next_action"] = {"action_kind": "host_spawn", "action_reason": "review_fanout"}
+            result["host_spawn_waves"] = host_waves
+            return result
+
+        # implement mode
+        complexity = assess_task_complexity(task)
+        if complexity.get("complex"):
+            # Planner handoff (no LLM/CLI launched here). Caller/host should run plan_task.
+            handoff = {"tool": "plan_task", "arguments": {"task": task, "cwd": str(workspace_root)}}
+            result["next_action"] = {"action_kind": "planner_handoff", "action_reason": "task_complex"}
+            result["handoff"] = handoff
+            return result
+
+        # Heuristic plan is suitable — return host_spawn handoff
+        if not host_waves:
+            result["next_action"] = {
+                "action_kind": "planner_handoff",
+                "action_reason": "no_host_waves",
+            }
+            result["handoff"] = {
+                "tool": "plan_task",
+                "arguments": {"task": task, "cwd": str(workspace_root)},
+            }
+            return result
+        result["next_action"] = {"action_kind": "host_spawn", "action_reason": "heuristic_plan"}
+        result["host_spawn_waves"] = host_waves
+        return result
+
+    except InvalidProjectRoot as e:
+        return {"error": str(e)}
+    except Exception as e:
+        log.exception("handle_start_task failed: %s", e)
+        return {"error": "start_task failed; see server logs for details"}
+
+
 HANDLERS = {
     "plan_task":      handle_plan_task,
     "decompose_task": handle_plan_task,
@@ -11536,6 +11799,7 @@ HANDLERS = {
     "routing_exception_add": handle_routing_exception_add,
     "routing_exception_remove": handle_routing_exception_remove,
     "routing_exception_list": handle_routing_exception_list,
+    "start_task": handle_start_task,
 }
 
 
@@ -11556,7 +11820,7 @@ def handle_request(request: dict) -> None:
         send_response(req_id, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "Threnody", "version": get_version()},
+            "serverInfo": {"name": "Threnody", "version": get_display_version()},
         })
     elif method == "notifications/initialized":
         pass
@@ -11660,7 +11924,23 @@ def _dispatch_request(request: dict) -> None:
 
 
 # Tools that call subprocesses and can block for 30–120 s.
-_BLOCKING_TOOLS = frozenset({"execute_subtask", "plan_task", "decompose_task", "fleet_plan"})
+_BLOCKING_TOOLS = frozenset({
+    "execute_subtask",
+    "plan_task",
+    "decompose_task",
+    "fleet_plan",
+    "start_task",
+})
+
+_MAX_BLOCKING_DISPATCHES = 8
+_blocking_dispatch_slots = threading.BoundedSemaphore(_MAX_BLOCKING_DISPATCHES)
+
+
+def _dispatch_request_with_slot(request: dict) -> None:
+    try:
+        _dispatch_request(request)
+    finally:
+        _blocking_dispatch_slots.release()
 
 # Tools that are safe to retry on transient failure (fast heuristic, no side-effects).
 # execute_subtask is also retried when result dict carries retryable=True.
@@ -11712,7 +11992,10 @@ def _parent_death_watchdog(poll: float = _WATCHDOG_POLL_SECONDS) -> None:
 
 
 def main() -> None:
-    log.info("Threnody MCP server %s — cross-provider orchestrator", get_version())
+    log.info(
+        "Threnody MCP server %s — cross-provider orchestrator",
+        get_display_version(),
+    )
     threading.Thread(
         target=_parent_death_watchdog, daemon=True, name="parent-death-watchdog"
     ).start()
@@ -11733,15 +12016,30 @@ def main() -> None:
             params = request.get("params", {}) if isinstance(request, dict) else {}
             tool_name = params.get("name", "") if isinstance(params, dict) else ""
             method = request.get("method", "") if isinstance(request, dict) else ""
+            dispatch_threads[:] = [thread for thread in dispatch_threads if thread.is_alive()]
             is_blocking = (
                 method == "tools/call" and tool_name in _BLOCKING_TOOLS
             )
             if is_blocking:
+                if not _blocking_dispatch_slots.acquire(blocking=False):
+                    send_error(
+                        request.get("id"),
+                        -32000,
+                        "Too many blocking requests; retry later",
+                    )
+                    continue
                 thread = threading.Thread(
-                    target=_dispatch_request, args=(request,), daemon=True
+                    target=_dispatch_request_with_slot,
+                    args=(request,),
+                    daemon=True,
                 )
-                dispatch_threads.append(thread)
-                thread.start()
+                try:
+                    dispatch_threads.append(thread)
+                    thread.start()
+                except Exception:
+                    dispatch_threads.remove(thread)
+                    _blocking_dispatch_slots.release()
+                    raise
             else:
                 try:
                     handle_request(request)

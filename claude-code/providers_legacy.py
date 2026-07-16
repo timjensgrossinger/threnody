@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import importlib
-
 from shared.adapters import ProviderAdapter, ProviderCapability
+from shared.claude_compat import load_claude_module
 
-ClaudeCodeProvider = importlib.import_module("claude-code.providers").ClaudeCodeProvider
+ClaudeCodeProvider = load_claude_module("providers").ClaudeCodeProvider
 
 
 def _provider_factory(provider_module: Any) -> Any:

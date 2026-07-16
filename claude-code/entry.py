@@ -31,11 +31,10 @@ from shared.orchestrator import Orchestrator
 from shared.db import Database
 from shared.discovery import get_registry
 
-# Import with hyphenated directory workaround
-import importlib
-claude_code_providers = importlib.import_module("claude-code.providers")
-ClaudeCodeProvider = claude_code_providers.ClaudeCodeProvider
-adapter_from_legacy = importlib.import_module("claude-code.providers_legacy").adapter_from_legacy
+from shared.claude_compat import load_claude_module
+
+ClaudeCodeProvider = load_claude_module("providers").ClaudeCodeProvider
+adapter_from_legacy = load_claude_module("providers_legacy").adapter_from_legacy
 
 log = logging.getLogger(__name__)
 

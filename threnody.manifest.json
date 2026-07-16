@@ -44,7 +44,7 @@
         "env": "THRENODY_ALLOW_NO_HOST",
         "env_true": "1",
         "env_false": "0",
-        "description": "Allow startup with no host AI CLI detected."
+        "description": "Allow installer/setup to continue with no host AI CLI detected."
       },
       "skipWizard": {
         "type": "boolean",

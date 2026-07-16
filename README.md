@@ -58,9 +58,9 @@ pip install threnody-mcp
 threnody-mcp
 ```
 
-The package entry point is a local stdio server. Set
-`THRENODY_ALLOW_NO_HOST=1` when deliberately starting it on a machine with no
-host CLI.
+The package entry point is a local stdio server. The packaged server can start
+for setup and diagnostics without a host CLI; `THRENODY_ALLOW_NO_HOST=1` is
+only used by the full `install.sh` workflow to bypass its host-CLI check.
 
 **Full CLI install** (adds `ghc`/`ghcs`/`ghce` aliases, syncs routing
 instructions; restart shell after):
@@ -70,7 +70,8 @@ curl -fsSL https://raw.githubusercontent.com/timjensgrossinger/threnody/main/ins
 # plugin-only (skips shell aliases): ... | bash -s -- --plugin-mode
 ```
 
-On first tool call with no config, Threnody returns setup instructions. Run `threnody settings` to finish.
+For a configured power-user installation, run `threnody settings` to finish
+setup. The packaged stdio entry point does not run the interactive wizard.
 
 **Provider terms:** Threnody is not affiliated with or endorsed by any AI provider. Credentials stay in provider-native stores; configure auth in each host CLI. See [docs/LEGAL.md](docs/LEGAL.md).
 
@@ -99,13 +100,13 @@ With default config, Threnody matches Anthropic's intended MCP pattern for Claud
 
 ```text
 Host shell (Claude / Copilot / Codex / Cursor / …)
-  → route_task / plan_task   tier + host_spawn / host_spawn_waves
-  → host executes            Agent or Task subagents, direct edits
+  → start_task / route_task / plan_task   returns next_action and host_spawn_waves for host-native work
+  → host executes            Agent or Task subagents, direct edits (spawned from host_spawn_waves)
   → utility delegation       execute_subtask → OpenCode / Aider / local (opt-in)
   → swarm / learning         execute_swarm (host_native default), memory_*, learning_*
 ```
 
-1. You give a task to your MCP host shell.
+1. Call the start_task tool (or route_task/plan_task) from your MCP host shell — start_task returns a compact next_action and optional host_spawn_waves for host-native execution.
 2. Threnody scores complexity → low / medium / high tier (no extra LLM call on the hot path).
 3. `route_task` / `plan_task` return spawn metadata — `host_spawn` for single-agent, `host_spawn_waves` for multi-step plans.
 4. The host runs the work — Claude Code uses **Agent**; other shells use **Task**.
@@ -184,8 +185,8 @@ plan_task("add JWT auth with tests")
 ```
 
 ```text
-📋 Wave 1 — spawn Agent (sonnet) → src/auth.py
-📋 Wave 2 — spawn Agent (haiku)  → tests/test_auth.py
+📋 Wave 1 — spawn Agent (host model) → src/auth.py
+📋 Wave 2 — spawn Agent (host model) → tests/test_auth.py
 ```
 
 Optional utility delegation (opt-in via `providers.delegation_utilities_enabled`):
@@ -214,7 +215,7 @@ Full reference: [docs/CLI.md](docs/CLI.md)
 | Doc | Contents |
 |---|---|
 | [Plugin Install](docs/PLUGIN_INSTALL.md) | uvx, plugin marketplace, `--plugin-mode` |
-| [MCP Tools](docs/MCP_TOOLS.md) | All 40+ MCP tool surfaces |
+| [MCP Tools](docs/MCP_TOOLS.md) | All 53 MCP tool surfaces |
 | [CLI Reference](docs/CLI.md) | Shell aliases and operator commands |
 | [Architecture](docs/ARCHITECTURE.md) | Trust boundaries and local-first design |
 | [Configuration](config.example.yaml) | Safe starting config |

@@ -59,6 +59,7 @@ def _render_claude_pointer_block(
     lines.extend([
         "### Orchestration",
         "",
+        "Start ordinary work with `start_task` when you want a guided next action; use the expert routing tools directly when you need their full contract.",
         "Always route work through Threnody so each task runs on the correct tier model.",
         "Every code task — including post-plan execution — follows this contract:",
         "",
@@ -156,7 +157,7 @@ def render_shell_instructions(
             "",
             "Threnody is a local MCP coordination layer — **the host shell executes work** "
             "(Task tool, direct edits, host-configured backends).",
-            "Use coordination tools first: `route_task`, `plan_task`, `execute_swarm`, `memory_*`, `learning_*`.",
+            "Use coordination tools first: `start_task`, `route_task`, `plan_task`, `execute_swarm`, `memory_*`, `learning_*`.",
             "`execute_subtask` is **utility delegation only** (opt-in OpenCode, Aider, local endpoints) — "
             "not for host→host subprocess routing (Copilot, Codex, Cursor, Junie, Claude). "
             "Same-host work uses `host_spawn` / Agent or Task.",

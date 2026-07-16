@@ -14,7 +14,6 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 
 
 def _pep440_version(value: str) -> str:
@@ -26,7 +25,11 @@ def _pep440_version(value: str) -> str:
     return f"{match.group('base')}{stage}{match.group('num') or ''}"
 
 
-EXPECTED_METADATA_VERSION = _pep440_version(EXPECTED_VERSION)
+EXPECTED_PACKAGE_VERSION = _pep440_version(
+    (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+)
+EXPECTED_DISPLAY_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+EXPECTED_METADATA_VERSION = EXPECTED_PACKAGE_VERSION
 INITIALIZE_REQUEST = {
     "jsonrpc": "2.0",
     "id": 1,
@@ -38,15 +41,20 @@ INITIALIZE_REQUEST = {
     },
 }
 
-if sys.version_info >= (3, 14):
+if sys.version_info < (3, 10) or sys.version_info >= (3, 14):
     pytest.skip(
         "clean-install smoke requires a supported Python 3.10-3.13 interpreter; "
-        "the package metadata intentionally rejects Python 3.14+",
+        "the package metadata intentionally rejects interpreters outside that range",
         allow_module_level=True,
     )
 
 
-def _run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run a command with captured text output and a useful failure message."""
     return subprocess.run(
         command,
@@ -55,6 +63,7 @@ def _run(command: list[str], *, cwd: Path, env: dict[str, str] | None = None) ->
         capture_output=True,
         text=True,
         check=True,
+        timeout=120,
     )
 
 
@@ -67,7 +76,14 @@ def _venv_python(venv_dir: Path) -> Path:
 
 def _clean_runtime_env(venv_dir: Path, tmp_path: Path) -> dict[str, str]:
     """Remove repository and host state while retaining system commands."""
-    env = dict(os.environ)
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not any(
+            marker in name.upper()
+            for marker in ("TOKEN", "PASSWORD", "SECRET", "PRIVATE_KEY")
+        )
+    }
     env.pop("PYTHONPATH", None)
     for name in (
         "CLAUDE_CODE",
@@ -116,14 +132,22 @@ def _build_distributions(output_dir: Path) -> tuple[Path, Path]:
     return wheels[0], sdists[0]
 
 
+@pytest.fixture(scope="module")
+def built_distributions(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, Path]:
+    artifacts_dir = tmp_path_factory.mktemp("artifacts")
+    return _build_distributions(artifacts_dir)
+
+
 @pytest.mark.parametrize("artifact_name", ["wheel", "sdist"])
 def test_clean_install_answers_initialize(
-    artifact_name: str, tmp_path: Path
+    artifact_name: str,
+    built_distributions: tuple[Path, Path],
+    tmp_path: Path,
 ) -> None:
     """Install each artifact in a fresh venv and complete the MCP handshake."""
-    artifacts_dir = tmp_path / "artifacts"
-    artifacts_dir.mkdir()
-    wheel, sdist = _build_distributions(artifacts_dir)
+    wheel, sdist = built_distributions
     artifact = wheel if artifact_name == "wheel" else sdist
 
     venv_dir = tmp_path / f"{artifact_name}-venv"
@@ -158,7 +182,11 @@ def test_clean_install_answers_initialize(
         cwd=tmp_path,
         env=_clean_runtime_env(venv_dir, tmp_path),
     ).stdout.splitlines()
-    assert metadata == [EXPECTED_METADATA_VERSION, EXPECTED_VERSION, EXPECTED_VERSION]
+    assert metadata == [
+        EXPECTED_METADATA_VERSION,
+        EXPECTED_DISPLAY_VERSION,
+        EXPECTED_DISPLAY_VERSION,
+    ]
 
     server = venv_dir / ("Scripts" if os.name == "nt" else "bin") / "threnody-mcp"
     assert server.is_file()
@@ -180,5 +208,5 @@ def test_clean_install_answers_initialize(
     assert response["result"]["protocolVersion"] == "2024-11-05"
     assert response["result"]["serverInfo"] == {
         "name": "Threnody",
-        "version": EXPECTED_VERSION,
+        "version": EXPECTED_DISPLAY_VERSION,
     }

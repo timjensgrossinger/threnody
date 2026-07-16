@@ -9,7 +9,10 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -103,4 +106,6 @@ def test_entry_point_shim_delegates_to_existing_server() -> None:
 def test_source_tree_version_matches_version_file() -> None:
     version = importlib.import_module("shared.version")
 
-    assert version.get_version() == (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    expected = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    assert version.get_version() == expected
+    assert version.get_display_version() == expected

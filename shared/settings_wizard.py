@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import logging
+import os
 from pathlib import Path
 
 try:
@@ -93,7 +94,11 @@ except Exception:
     def _load_basic_yaml_mapping(text: str) -> dict:  # type: ignore[no-redef]
         return {}
 
-BASE_DIR = Path("~/.local/lib/threnody").expanduser()
+_INSTALL_DIR = os.environ.get("THRENODY_INSTALL_DIR") or "~/.local/lib/threnody"
+try:
+    BASE_DIR = Path(_INSTALL_DIR).expanduser()
+except RuntimeError as exc:
+    raise ValueError(f"Invalid THRENODY_INSTALL_DIR: {_INSTALL_DIR!r}") from exc
 
 
 # ---------------------------------------------------------------------------

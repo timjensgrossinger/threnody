@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and validate release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install release tooling
+        run: python -m pip install --upgrade build==1.5.1 pyyaml==6.0.3 pytest==9.0.3 twine==6.2.0 tomli==2.2.1
+
+      - name: Check generated manifests
+        run: python3 scripts/build-manifests.py --check
+
+      - name: Verify tag and manifest versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          if not tag.startswith("v"):
+              raise SystemExit(f"release tag must start with v: {tag}")
+          version = Path("VERSION").read_text(encoding="utf-8").strip()
+          manifest = json.loads(Path("threnody.manifest.json").read_text(encoding="utf-8"))
+          if version != manifest["version"]:
+              raise SystemExit("VERSION and threnody.manifest.json version differ")
+          accepted = {version, manifest["version"], manifest["pypi_version"]}
+          if tag[1:] not in accepted:
+              raise SystemExit(
+                  f"tag {tag!r} does not match release versions {sorted(accepted)!r}"
+              )
+          PY
+
+      - name: Run packaging and clean-install tests
+        env:
+          THRENODY_TEST_MODE: "1"
+        run: python -m pytest tests/test_packaging.py tests/test_manifests.py tests/test_clean_install.py -q
+
+      - name: Build wheel and source distribution
+        run: python -m build --sdist --wheel
+
+      - name: Validate distribution metadata
+        run: twine check dist/*
+
+      - name: Verify built package version
+        run: |
+          python3 - <<'PY'
+          import json
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          expected = json.loads(
+              Path("threnody.manifest.json").read_text(encoding="utf-8")
+          )["pypi_version"]
+          wheel = next(Path("dist").glob("*.whl"))
+          with zipfile.ZipFile(wheel) as archive:
+              metadata = next(
+                  name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+              )
+              wheel_version = next(
+                  line.split(": ", 1)[1]
+                  for line in archive.read(metadata).decode().splitlines()
+                  if line.startswith("Version: ")
+              )
+          sdist = next(Path("dist").glob("*.tar.gz"))
+          with tarfile.open(sdist) as archive:
+              metadata = next(
+                  member for member in archive.getmembers() if member.name.endswith("/PKG-INFO")
+              )
+              sdist_version = next(
+                  line.split(": ", 1)[1]
+                  for line in archive.extractfile(metadata).read().decode().splitlines()
+                  if line.startswith("Version: ")
+              )
+          if {wheel_version, sdist_version} != {expected}:
+              raise SystemExit(
+                  f"built versions {(wheel_version, sdist_version)!r} != {expected!r}"
+              )
+          PY
+
+      - name: Inspect release archives
+        run: |
+          for artifact in dist/*; do
+            python3 scripts/check_release_archive.py --archive "$artifact"
+          done
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: threnody-release
+          path: dist/*
+
+  publish-pypi:
+    name: Publish release to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    environment: pypi
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: threnody-release
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0 # v1.9.0
+
+  publish-github:
+    name: Create GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: threnody-release
+          path: dist
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          generate_release_notes: true
+          files: dist/*

@@ -96,6 +96,8 @@ if [[ "$PYTHON_MAJOR" -lt 3 ]] || [[ "$PYTHON_MAJOR" -eq 3 && "$PYTHON_MINOR" -l
     error "Python 3.10+ required (found $PYTHON_VERSION)"
 fi
 info "Python $PYTHON_VERSION"
+INSTALL_DIR_PY="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$INSTALL_DIR")"
+MCP_SERVER_PATH_PY="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$INSTALL_DIR/mcp_server.py")"
 
 # ── Check for CLI tools ─────────────────────────────────────────────────────
 
@@ -366,33 +368,30 @@ if [[ "$HAS_CLAUDE" -eq 1 ]]; then
     CLAUDE_CONFIG="$HOME/.claude.json"
 
     if [[ -f "$CLAUDE_CONFIG" ]]; then
-        if grep -q "Threnody" "$CLAUDE_CONFIG" 2>/dev/null; then
-            info "Claude Code MCP already registered"
-        else
-            # Add to existing config using python for safe JSON manipulation
-            # shellcheck disable=SC2015
-            python3 -c "
+        # Add or refresh the managed entry using Python for safe JSON manipulation.
+        python3 -c "
 import json, sys
 with open('$CLAUDE_CONFIG') as f:
     cfg = json.load(f)
 mcps = cfg.setdefault('mcpServers', {})
 mcps['Threnody'] = {
     'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py'],
-    'type': 'stdio'
+    'args': [$MCP_SERVER_PATH_PY],
+    'type': 'stdio',
+    'env': {'THRENODY_INSTALL_DIR': $INSTALL_DIR_PY}
 }
 with open('$CLAUDE_CONFIG', 'w') as f:
     json.dump(cfg, f, indent=2)
-" && info "Registered MCP server in Claude Code" || warn "Could not update $CLAUDE_CONFIG — register manually"
-        fi
+" && info "Registered Threnody MCP in Claude Code" || warn "Could not update $CLAUDE_CONFIG — register manually"
     else
         # shellcheck disable=SC2015
         python3 -c "
 import json
 cfg = {'mcpServers': {'Threnody': {
     'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py'],
-    'type': 'stdio'
+    'args': [$MCP_SERVER_PATH_PY],
+    'type': 'stdio',
+    'env': {'THRENODY_INSTALL_DIR': $INSTALL_DIR_PY}
 }}}
 with open('$CLAUDE_CONFIG', 'w') as f:
     json.dump(cfg, f, indent=2)
@@ -412,11 +411,7 @@ COPILOT_MCP_CONFIG="$HOME/.copilot/mcp-config.json"
 mkdir -p "$HOME/.copilot"
 
 if [[ -f "$COPILOT_MCP_CONFIG" ]]; then
-    if grep -q "Threnody" "$COPILOT_MCP_CONFIG" 2>/dev/null; then
-        info "Copilot CLI MCP already registered"
-    else
-        # shellcheck disable=SC2015
-        python3 -c "
+    python3 -c "
 import json
 with open('$COPILOT_MCP_CONFIG') as f:
     cfg = json.load(f)
@@ -424,21 +419,20 @@ mcps = cfg.setdefault('mcpServers', {})
 mcps['Threnody'] = {
     'type': 'stdio',
     'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py'],
-    'env': {}
+    'args': [$MCP_SERVER_PATH_PY],
+    'env': {'THRENODY_INSTALL_DIR': $INSTALL_DIR_PY}
 }
 with open('$COPILOT_MCP_CONFIG', 'w') as f:
     json.dump(cfg, f, indent=2)
-" && info "Registered MCP server in Copilot CLI" || warn "Could not update $COPILOT_MCP_CONFIG — register manually"
-    fi
+" && info "Registered Threnody MCP in Copilot CLI" || warn "Could not update $COPILOT_MCP_CONFIG — register manually"
 else
     python3 -c "
 import json
 cfg = {'mcpServers': {'Threnody': {
     'type': 'stdio',
     'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py'],
-    'env': {}
+    'args': [$MCP_SERVER_PATH_PY],
+    'env': {'THRENODY_INSTALL_DIR': $INSTALL_DIR_PY}
 }}}
 with open('$COPILOT_MCP_CONFIG', 'w') as f:
     json.dump(cfg, f, indent=2)
@@ -454,7 +448,7 @@ if [[ "$HAS_CODEX" -eq 1 ]]; then
         info "Codex CLI MCP already registered"
     else
         # shellcheck disable=SC2015
-        python3 - "$CODEX_CONFIG" "$INSTALL_DIR/mcp_server.py" <<'PY' \
+        python3 - "$CODEX_CONFIG" "$INSTALL_DIR/mcp_server.py" "$INSTALL_DIR" <<'PY' \
             && info "Registered MCP server in Codex CLI" \
             || warn "Could not update $CODEX_CONFIG — register manually"
 from pathlib import Path
@@ -465,13 +459,18 @@ config_path = Path(sys.argv[1]).resolve()
 if not str(config_path).startswith(str(_home)):
     raise SystemExit(f"config_path outside home: {config_path}")
 mcp_server_path = sys.argv[2]
+install_dir = sys.argv[3]
+import json
+server_literal = json.dumps(mcp_server_path)
+install_dir_literal = json.dumps(install_dir)
 start_marker = "# Threnody:codex-mcp:start"
 end_marker = "# Threnody:codex-mcp:end"
 managed = (
     f"{start_marker}\n"
     "[mcp_servers.Threnody]\n"
     'command = "python3"\n'
-    f'args = ["{mcp_server_path}"]\n'
+    f"args = [{server_literal}]\n"
+    f"env = {{ THRENODY_INSTALL_DIR = {install_dir_literal} }}\n"
     f"{end_marker}\n"
 )
 
@@ -511,31 +510,26 @@ if [[ "$HAS_CURSOR" -eq 1 ]]; then
     mkdir -p "$HOME/.cursor"
 
     if [[ -f "$CURSOR_MCP_CONFIG" ]]; then
-        if grep -q "Threnody" "$CURSOR_MCP_CONFIG" 2>/dev/null; then
-            info "Cursor MCP already registered"
-        else
-            # shellcheck disable=SC2015
-            python3 -c "
+        python3 -c "
 import json
 with open('$CURSOR_MCP_CONFIG') as f:
     cfg = json.load(f)
 mcps = cfg.setdefault('mcpServers', {})
 mcps['Threnody'] = {
     'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py'],
-    'env': {}
+    'args': [$MCP_SERVER_PATH_PY],
+    'env': {'THRENODY_INSTALL_DIR': $INSTALL_DIR_PY}
 }
 with open('$CURSOR_MCP_CONFIG', 'w') as f:
     json.dump(cfg, f, indent=2)
-" && info "Registered MCP server in Cursor" || warn "Could not update $CURSOR_MCP_CONFIG — register manually"
-        fi
+" && info "Registered Threnody MCP in Cursor" || warn "Could not update $CURSOR_MCP_CONFIG — register manually"
     else
         python3 -c "
 import json
 cfg = {'mcpServers': {'Threnody': {
     'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py'],
-    'env': {}
+    'args': [$MCP_SERVER_PATH_PY],
+    'env': {'THRENODY_INSTALL_DIR': $INSTALL_DIR_PY}
 }}}
 with open('$CURSOR_MCP_CONFIG', 'w') as f:
     json.dump(cfg, f, indent=2)
@@ -549,29 +543,26 @@ if [[ "$HAS_JUNIE" -eq 1 ]]; then
     mkdir -p "$HOME/.junie/mcp"
 
     if [[ -f "$JUNIE_MCP_CONFIG" ]]; then
-        if grep -q "Threnody" "$JUNIE_MCP_CONFIG" 2>/dev/null; then
-            info "Junie MCP already registered"
-        else
-            # shellcheck disable=SC2015
-            python3 -c "
+        python3 -c "
 import json
 with open('$JUNIE_MCP_CONFIG') as f:
     cfg = json.load(f)
 mcps = cfg.setdefault('mcpServers', {})
 mcps['Threnody'] = {
     'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py']
+    'args': [$MCP_SERVER_PATH_PY],
+    'env': {'THRENODY_INSTALL_DIR': $INSTALL_DIR_PY}
 }
 with open('$JUNIE_MCP_CONFIG', 'w') as f:
     json.dump(cfg, f, indent=2)
-" && info "Registered MCP server in Junie" || warn "Could not update $JUNIE_MCP_CONFIG — register manually"
-        fi
+" && info "Registered Threnody MCP in Junie" || warn "Could not update $JUNIE_MCP_CONFIG — register manually"
     else
         python3 -c "
 import json
 cfg = {'mcpServers': {'Threnody': {
     'command': 'python3',
-    'args': ['$INSTALL_DIR/mcp_server.py']
+    'args': [$MCP_SERVER_PATH_PY],
+    'env': {'THRENODY_INSTALL_DIR': $INSTALL_DIR_PY}
 }}}
 with open('$JUNIE_MCP_CONFIG', 'w') as f:
     json.dump(cfg, f, indent=2)
@@ -584,7 +575,7 @@ fi
 echo ""
 echo "🐚 Shell integration"
 
-SHELL_SOURCE="source $INSTALL_DIR/shell/ghc.sh"
+SHELL_SOURCE="source $(printf '%q' "$INSTALL_DIR/shell/ghc.sh")"
 SHELL_RC=""
 
 if [[ -n "${ZSH_VERSION:-}" ]] || [[ "$SHELL" == */zsh ]]; then

@@ -5,6 +5,8 @@ import importlib
 import logging
 from typing import TYPE_CHECKING
 
+from shared.claude_compat import load_claude_module
+
 if TYPE_CHECKING:
     from shared.orchestrator import Provider
     from shared.discovery import ProviderRegistry
@@ -15,7 +17,7 @@ log = logging.getLogger(__name__)
 # Only providers with concrete Provider subclasses are listed here.
 _PROVIDER_CLASS_MAP: dict[str, tuple[str, str]] = {
     "github-copilot": ("copilot.providers", "CopilotProvider"),
-    "claude-code":    ("claude-code.providers", "ClaudeCodeProvider"),
+    "claude-code":    ("claude_code.providers", "ClaudeCodeProvider"),
     "codex":          ("codex.providers", "CodexProvider"),
 }
 
@@ -26,7 +28,11 @@ def _instantiate(provider_name: str) -> "Provider | None":
         return None
     module_path, class_name = spec
     try:
-        mod = importlib.import_module(module_path)
+        mod = (
+            load_claude_module("providers")
+            if module_path == "claude_code.providers"
+            else importlib.import_module(module_path)
+        )
         return getattr(mod, class_name)()
     except Exception:
         log.debug("Could not instantiate provider %s", provider_name, exc_info=True)

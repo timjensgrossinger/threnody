@@ -1,0 +1,55 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.timjensgrossinger/threnody",
+  "title": "Threnody",
+  "description": "Local-first MCP meta-harness: routes, plans, and swarms multi-agent coding work — emitting tier-aware Dynamic Workflows on Claude Code — while the host shell executes via Agent/Task subagents.",
+  "version": "0.3.0-alpha.2",
+  "websiteUrl": "https://github.com/timjensgrossinger/threnody",
+  "repository": {
+    "url": "https://github.com/timjensgrossinger/threnody",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "threnody-mcp",
+      "version": "0.3.0a2",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "uvx",
+      "environmentVariables": [
+        {
+          "name": "THRENODY_INSTALL_DIR",
+          "description": "Override the data/config directory (defaults to ~/.local/lib/threnody).",
+          "isRequired": false
+        },
+        {
+          "name": "THRENODY_ALLOW_NO_HOST",
+          "description": "Allow installer/setup to continue with no host AI CLI detected.",
+          "isRequired": false,
+          "default": "0"
+        },
+        {
+          "name": "THRENODY_SKIP_WIZARD",
+          "description": "Skip the interactive first-run wizard (always true on plugin/uvx paths; no TTY).",
+          "isRequired": false,
+          "default": "1"
+        }
+      ]
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "tags": [
+        "mcp",
+        "routing",
+        "multi-agent",
+        "orchestration",
+        "swarm"
+      ],
+      "license": "Apache-2.0"
+    }
+  }
+}

@@ -14,6 +14,7 @@ Plan, classify, and orchestrate work. Prefer host-native execution using
 
 | Tool | Description |
 |---|---|
+| `start_task(task, mode?, cwd?)` | Guided Developer Front Door: profiles the project and returns the next safe host-native action for implement, review, or investigate |
 | `route_task(task)` | Classify complexity → `{tier, model, execution_hint, host_spawn?}`; includes `host_native_model`, `host_native_method`, and `mode: host_native \| delegate` |
 | `plan_task(task)` | Planner-based decomposition; returns `host_spawn_waves` for host execution |
 | `decompose_task(task)` | Alias for `plan_task`; preferred entry point for multi-concern tasks |
@@ -42,6 +43,12 @@ Host execution reporting is part of the coordination contract:
 2. Read `host_spawn_waves` — ordered waves of host `Task`/`Agent` spawn payloads.
 3. Execute wave 1, then wave 2, etc.; agents within a wave may run in parallel.
 4. Do not use `execute_subtask` for same-host work.
+
+For first-use workflows, prefer `start_task(task, mode="implement")`. It
+returns a compact `next_action`, a read-only project profile, and
+`host_spawn`/`host_spawn_waves` when the host can proceed. Use
+`mode="review"` for read-only review fanout or `mode="investigate"` when only
+project/readiness information is needed.
 
 `fleet_plan(task)` returns the same plan plus ready-made fleet command strings per wave.
 
