@@ -553,7 +553,13 @@ def test_review_run_response_is_compact(monkeypatch, tmp_path: Path) -> None:
     assert swarm_row is not None
     assert swarm_row[0] == "awaiting_host_execution"
 
-    # Receipt keeps full plan fidelity server-side even though the wire is trimmed
+    # Receipt keeps full plan fidelity server-side even though the wire is trimmed.
+    # The persist runs in a background daemon thread — poll briefly to avoid a race.
+    import time as _time
+    for _ in range(40):
+        if db.get_run_receipt("swarm-review-compact") is not None:
+            break
+        _time.sleep(0.05)
     assert db.get_run_receipt("swarm-review-compact") is not None
 
     # Tiering: large reasoning-heavy perf file → high; small file → low

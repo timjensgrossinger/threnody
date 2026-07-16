@@ -2334,18 +2334,25 @@ def _attach_and_persist_plan_receipt(
     )
     result["cost_receipt"] = receipt
     if run_id:
-        try:
-            record_run_receipt(
-                db,
-                run_id=run_id,
-                source_tool=source_tool,
-                task=task,
-                payload=result,
-                cost_receipt=receipt,
-                workspace_root=workspace_root,
-            )
-        except Exception:
-            log.debug("%s receipt persist failed for %s", source_tool, run_id, exc_info=True)
+        # Defer the DB write off the hot path — cost_receipt is already attached
+        # to the wire response; the detailed receipt is available via inspect_run_receipt
+        # after the background persist completes.
+        _snapshot = dict(result)
+        _receipt_snap = dict(receipt)
+        def _bg_persist() -> None:
+            try:
+                record_run_receipt(
+                    db,
+                    run_id=run_id,
+                    source_tool=source_tool,
+                    task=task,
+                    payload=_snapshot,
+                    cost_receipt=_receipt_snap,
+                    workspace_root=workspace_root,
+                )
+            except Exception:
+                log.debug("%s receipt persist failed for %s", source_tool, run_id, exc_info=True)
+        threading.Thread(target=_bg_persist, daemon=True, name=f"receipt-persist-{run_id}").start()
 
 
 def handle_plan_task(args: dict) -> dict:
@@ -3713,18 +3720,30 @@ def _execute_swarm_host_native_response(
         skipped_calls=["delegate coordinator process", "same-host subprocess delegation"],
     )
     swarm_result["cost_receipt"] = cost_receipt
-    try:
-        record_run_receipt(
-            db,
-            run_id=swarm_id,
-            source_tool="execute_swarm",
-            task=task_text,
-            payload=swarm_result,
-            cost_receipt=cost_receipt,
-            workspace_root=resolved_workspace,
-        )
-    except Exception:
-        log.debug("execute_swarm receipt persist failed for %s", swarm_id, exc_info=True)
+    # Defer the detailed receipt DB write off the first-spawn critical path.
+    # cost_receipt is already in the wire response; inspect_run_receipt will be
+    # available once the background persist completes.
+    _swarm_snap = dict(swarm_result)
+    _cost_snap = dict(cost_receipt)
+    _bg_swarm_id = swarm_id
+    _bg_workspace = resolved_workspace
+    _bg_task = task_text
+    def _bg_receipt_persist() -> None:
+        try:
+            record_run_receipt(
+                db,
+                run_id=_bg_swarm_id,
+                source_tool="execute_swarm",
+                task=_bg_task,
+                payload=_swarm_snap,
+                cost_receipt=_cost_snap,
+                workspace_root=_bg_workspace,
+            )
+        except Exception:
+            log.debug("execute_swarm receipt persist failed for %s", _bg_swarm_id, exc_info=True)
+    threading.Thread(
+        target=_bg_receipt_persist, daemon=True, name=f"receipt-persist-{swarm_id}"
+    ).start()
     if review_run:
         # Compact wire payload: the receipt above already captured full plan
         # fidelity (inspect_run_receipt), and handoff snapshots were registered
