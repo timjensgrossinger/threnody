@@ -210,3 +210,60 @@ def test_review_dims_token_not_parsed_as_file(tmp_path: Path) -> None:
     # The bracket token never became a file target
     assert all("[dims" not in p and "=performance]" not in p for p in target_files)
     assert all(p.endswith("svc.py") for p in target_files)
+
+
+# --- routing/planning defect fixes (risk floor, exemptions, ownership) -------
+
+def test_risk_filename_floors_to_medium() -> None:
+    """A security-sensitive basename is never routed to the cheapest tier (#4)."""
+    # Top-level files so they fan out independently (no dir-coupling), isolating
+    # the risk-floor behavior on the credential file.
+    task = "Create setup_credentials.py and helpers.py and notes.py for the plugin"
+    payload = build_heuristic_plan_payload(task, default_tier="medium")
+    by_file = {st["target_file"]: st for st in payload["subtasks"]}
+    assert by_file["setup_credentials.py"]["tier"] in {"medium", "high"}
+    # A plain non-risk sibling still routes cheaply.
+    assert by_file["helpers.py"]["tier"] == "low"
+
+
+def test_test_file_inherits_code_under_test_tier() -> None:
+    """A test file inherits the tier of the code under test, not doc-low (#4)."""
+    task = (
+        "Update credentials.py and test_credentials.py and notes.py at top level"
+    )
+    payload = build_heuristic_plan_payload(task, default_tier="medium")
+    by_file = {st["target_file"]: st for st in payload["subtasks"]}
+    # credentials.py is risk → medium; its test inherits medium (not doc-low).
+    assert by_file["credentials.py"]["tier"] in {"medium", "high"}
+    assert by_file["test_credentials.py"]["tier"] == by_file["credentials.py"]["tier"]
+
+
+def test_markdown_exempt_files_fold_inline_no_agent() -> None:
+    """Direct-edit exempt files (.md) get no agent; they go to inline_files (#5)."""
+    task = "Update handler.py and CLAUDE.md and README.md at top level"
+    payload = build_heuristic_plan_payload(task, default_tier="medium")
+    targets = {st["target_file"] for st in payload["subtasks"]}
+    assert "handler.py" in targets
+    assert "CLAUDE.md" not in targets and "README.md" not in targets
+    inline = set(payload.get("inline_files", []))
+    assert "CLAUDE.md" in inline and "README.md" in inline
+
+
+def test_every_subtask_has_target_files_and_ownership_line() -> None:
+    """target_files is authoritative and prompt scope agrees with it (#3)."""
+    payload = build_heuristic_plan_payload(CALCULATOR_TASK, default_tier="medium")
+    for st in payload["subtasks"]:
+        tfs = st.get("target_files")
+        assert isinstance(tfs, list) and tfs, st
+        assert tfs == [st["target_file"]]
+        assert "You own exactly these files:" in st["description"]
+
+
+def test_same_dir_source_files_couple_without_keyword() -> None:
+    """Distinct-role source files sharing a dir couple into one agent (#6)."""
+    task = "Create core/parser.py and core/lexer.py and core/emitter.py"
+    payload = build_heuristic_plan_payload(
+        task, default_tier="medium", coupled_strategy="single"
+    )
+    assert len(payload["subtasks"]) == 1
+    assert len(payload["subtasks"][0]["target_files"]) == 3

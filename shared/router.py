@@ -48,6 +48,29 @@ class RoutingDecision:
     matched_urgency_signals: list[str] = field(default_factory=list)
 
 
+# Score nudge applied when a low-tier override keyword dominates a single-concern
+# task. Additive (folded into the effective score), never a hard tier set — so
+# downstream intent/reasoning/security-floor logic still runs.
+_LOW_OVERRIDE_DELTA: float = -0.20
+
+# Ordinal rank for tier-floor comparisons.
+_TIER_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+
+
+def _compile_risk_floor_re(patterns: list[str]) -> "re.Pattern[str] | None":
+    """Compile the security-risk vocabulary into a word-start matcher.
+
+    Each pattern matches at a word boundary with optional trailing word chars, so
+    ``auth`` catches ``authentication``/``authorization`` and ``credential`` catches
+    ``credentials``. Errs toward over-matching (flooring an occasional benign token
+    to medium is the safe direction). Returns None when the list is empty.
+    """
+    cleaned = [re.escape(p.strip()) for p in patterns if isinstance(p, str) and p.strip()]
+    if not cleaned:
+        return None
+    return re.compile(r"\b(?:" + "|".join(cleaned) + r")\w*", re.IGNORECASE)
+
+
 class TaskRouter:
     """Classify tasks using keyword overrides, intent modifiers, and complexity scoring.
 
@@ -63,6 +86,7 @@ class TaskRouter:
         self._weights = config.signal_weights
         self._base_score = config.base_score
         self._thresholds = config.thresholds
+        self._risk_floor_re = _compile_risk_floor_re(config.risk_filename_patterns)
 
         if self._db:
             try:
@@ -171,22 +195,31 @@ class TaskRouter:
                 )
         return None
 
-    def _check_low_overrides(
+    def _low_override_delta(
         self, task_lower: str, computed_score: float
-    ) -> RoutingDecision | None:
-        """Check low-tier overrides — soft: only fires when complexity score is already low."""
+    ) -> tuple[float, list[str]]:
+        """Low-tier override as a score nudge, not a hard tier set.
+
+        Returns a negative score delta (and its explainability labels) only when a
+        low keyword genuinely *dominates* a single-concern task. The nudge is
+        suppressed — returns ``(0.0, [])`` — when the keyword merely co-occurs with
+        high-signal content, so a security-sensitive multi-file task is no longer
+        dragged to low just because it also mentions e.g. "docstring":
+
+        - a security/risk token co-occurs (``_risk_floor_re``),
+        - the task references 3+ files (multi-concern; mirrors ``_compute_score``),
+        - the raw complexity score already sits at/above the low boundary.
+        """
         if computed_score >= self._thresholds.low_max:
-            return None
+            return 0.0, []
+        if self._risk_floor_re is not None and self._risk_floor_re.search(task_lower):
+            return 0.0, []
+        if len(re.findall(r'\b\w+\.\w{1,4}\b', task_lower)) >= 3:
+            return 0.0, []
         for kw in self._overrides.get("low", []):
             if re.search(rf"\b{re.escape(kw)}\b", task_lower):
-                return RoutingDecision(
-                    tier="low",
-                    score=0.15,
-                    reason=f"keyword override → low: '{kw}'",
-                    agents=2,
-                    override=True,
-                )
-        return None
+                return _LOW_OVERRIDE_DELTA, [f"low_override:'{kw}'({_LOW_OVERRIDE_DELTA:+.2f})"]
+        return 0.0, []
 
     # ------------------------------------------------------------------
     # Complexity scoring
@@ -564,10 +597,9 @@ class TaskRouter:
         # 2. Compute raw complexity score
         raw_score, complexity_matched = self._compute_score(task_lower)
 
-        # 2b. Low-tier overrides (soft — only when raw score is already low)
-        low_override = self._check_low_overrides(task_lower, raw_score)
-        if low_override:
-            return low_override
+        # 2b. Low-tier override — now a score nudge (never a hard tier set), so a
+        # dominating low keyword lowers the score but downstream floors still apply.
+        low_delta, low_matched = self._low_override_delta(task_lower, raw_score)
 
         # 3. Compute intent modifier
         intent_mod, intent_matched = self._compute_intent_modifier(task_lower)
@@ -577,7 +609,9 @@ class TaskRouter:
         time_mod = self._get_time_modifier()
 
         # 5. Apply all modifiers, clamp within [0.0, 1.0]
-        effective_score = max(0.0, min(1.0, raw_score + intent_mod + project_mod + time_mod))
+        effective_score = max(
+            0.0, min(1.0, raw_score + low_delta + intent_mod + project_mod + time_mod)
+        )
         effective_score = round(effective_score, 2)
 
         # 5b. Compute reasoning score; bump tier to at least medium if it dominates
@@ -596,21 +630,24 @@ class TaskRouter:
         # When reasoning fires, enforce a minimum of "medium"
         if reasoning_fired and tier == "low":
             tier = "medium"
-        # Auth changes are never low-risk, but routine implementation should
-        # still score naturally instead of being forced to high tier.
+        # Security-sensitive work (credential/auth/crypto/keychain/secret/…) is
+        # never low-risk, but routine implementation should still score naturally
+        # instead of being forced to high tier. Floors low → risk_floor_tier.
+        risk_floor = str(self._config.risk_floor_tier or "medium")
         security_floor_fired = (
-            tier == "low"
-            and re.search(r"\b(authentication|authorization)\b", task_lower)
-            is not None
+            self._config.risk_floor_enabled
+            and self._risk_floor_re is not None
+            and _TIER_RANK.get(tier, 0) < _TIER_RANK.get(risk_floor, 1)
+            and self._risk_floor_re.search(task_lower) is not None
         )
         if security_floor_fired:
-            tier = "medium"
+            tier = risk_floor
 
         # 7. Compute urgency explainability surface (Phase 14)
         urgency_score, urgency_matched = self._compute_urgency_modifier(task_lower)
 
         # 8. Build reason string
-        all_matched = complexity_matched + intent_matched
+        all_matched = complexity_matched + low_matched + intent_matched
         if reasoning_fired:
             all_matched = all_matched + reasoning_matched
         # include urgency matches in human-readable reason without changing legacy parts
@@ -619,6 +656,8 @@ class TaskRouter:
             reason_parts = reason_parts + ", " + ", ".join(urgency_matched) if reason_parts != "base score only" else ", ".join(urgency_matched)
 
         mod_parts: list[str] = []
+        if low_delta != 0.0:
+            mod_parts.append(f"low_override={low_delta:+.2f}")
         if intent_mod != 0.0:
             mod_parts.append(f"intent={intent_mod:+.2f}")
         if project_mod != 0.0:
@@ -630,7 +669,7 @@ class TaskRouter:
         if reasoning_fired:
             mod_parts.append(f"reasoning={reasoning_score:+.2f}")
         if security_floor_fired:
-            mod_parts.append("security_floor=medium")
+            mod_parts.append(f"security_floor={risk_floor}")
 
         if mod_parts:
             reason = (

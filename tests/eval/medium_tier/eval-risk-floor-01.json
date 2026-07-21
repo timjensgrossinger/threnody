@@ -1,0 +1,16 @@
+{
+  "id": "eval-risk-floor-01",
+  "category": "medium_tier",
+  "tags": [
+    "stable",
+    "risk-floor"
+  ],
+  "prompt": "Add a docstring and rename a helper while refactoring the credential keychain storage.",
+  "expected": {
+    "tier": "medium",
+    "score_min": 0.30,
+    "score_max": 0.42,
+    "urgency_expected": false,
+    "fanout_expected": "favor_parallel"
+  }
+}

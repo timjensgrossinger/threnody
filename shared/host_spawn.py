@@ -212,19 +212,28 @@ def build_host_spawn(
 
 
 def _subtask_target_files(subtask: Mapping[str, Any]) -> list[str]:
-    target_files = subtask.get("target_files")
-    if isinstance(target_files, list):
-        normalized = [
-            target.strip()
-            for target in target_files
-            if isinstance(target, str) and target.strip()
-        ]
-        if normalized:
-            return normalized
-    target_file = subtask.get("target_file")
-    if isinstance(target_file, str) and target_file.strip():
-        return [target_file.strip()]
-    return []
+    """Authoritative owned-file list for a subtask.
+
+    Prefers the plural ``target_files`` list (coupled groups own several files);
+    falls back to the scalar ``target_file``. Deduped, order-preserving, so a
+    coupled subtask's full ownership is honored downstream instead of dropped.
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: Any) -> None:
+        if isinstance(value, str) and value.strip():
+            cleaned = value.strip()
+            if cleaned.lower() not in seen:
+                seen.add(cleaned.lower())
+                result.append(cleaned)
+
+    plural = subtask.get("target_files")
+    if isinstance(plural, (list, tuple)):
+        for item in plural:
+            _add(item)
+    _add(subtask.get("target_file"))
+    return result
 
 
 def _subtask_id_key(value: Any) -> tuple[str, str]:
@@ -328,6 +337,7 @@ def sanitize_plan_for_host(
     report: dict[str, Any] = {
         "dropped_targets": [],
         "dropped_subtasks": [],
+        "dedup": [],
         "collapsed_to_single": False,
         "reasons": [],
     }
@@ -340,6 +350,7 @@ def sanitize_plan_for_host(
     surviving: list[dict[str, Any]] = []
     dropped_ids: set[tuple[str, str]] = set()
     stable_id = _subtask_id_key
+    claimed: set[str] = set()
     for raw in subtasks:
         if not isinstance(raw, dict):
             continue
@@ -417,6 +428,39 @@ def sanitize_plan_for_host(
             if sid is not None:
                 dropped_ids.add(stable_id(sid))
             continue
+
+        # Disjoint ownership (#2): every file is owned by exactly one subtask.
+        # Trim already-claimed paths; drop a subtask whose ownership is fully
+        # claimed by an earlier one (prevents two agents editing the same file).
+        owned = _subtask_target_files(st)
+        if owned:
+            fresh = [p for p in owned if p.lower() not in claimed]
+            removed = [p for p in owned if p.lower() in claimed]
+            if not fresh:
+                report.setdefault("dedup", []).append(
+                    {"id": sid, "removed": removed, "dropped": True}
+                )
+                report.setdefault("reasons", []).append(
+                    f"subtask {sid}: ownership already claimed; dropped duplicate"
+                )
+                if sid is not None:
+                    dropped_ids.add(stable_id(sid))
+                continue
+            if removed:
+                report.setdefault("dedup", []).append(
+                    {"id": sid, "removed": removed, "dropped": False}
+                )
+                report.setdefault("reasons", []).append(
+                    f"subtask {sid}: removed already-claimed target(s) {removed}"
+                )
+                if isinstance(st.get("target_files"), (list, tuple)):
+                    st["target_files"] = fresh
+                tf = st.get("target_file")
+                if isinstance(tf, str) and tf.strip().lower() in {r.lower() for r in removed}:
+                    st["target_file"] = fresh[0]
+            for p in fresh:
+                claimed.add(p.lower())
+
         surviving.append(st)
 
     if dropped_ids:
@@ -461,12 +505,15 @@ def sanitize_plan_for_host(
     plan_dict["sanitization"] = report
     dropped_targets = report.get("dropped_targets", [])
     dropped_subtasks = report.get("dropped_subtasks", [])
+    deduped = report.get("dedup", [])
     collapsed = report.get("collapsed_to_single", False)
-    if dropped_targets or dropped_subtasks or collapsed:
+    if dropped_targets or dropped_subtasks or deduped or collapsed:
         log.info(
-            "host plan sanitized: %d target(s) dropped, %d subtask(s) dropped, collapsed=%s",
+            "host plan sanitized: %d target(s) dropped, %d subtask(s) dropped, "
+            "%d ownership dedup(s), collapsed=%s",
             len(dropped_targets),
             len(dropped_subtasks),
+            len(deduped),
             collapsed,
         )
     return report

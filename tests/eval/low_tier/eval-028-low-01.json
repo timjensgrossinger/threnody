@@ -7,7 +7,7 @@
   "prompt": "Rename foo.py to bar.py and show the diff.",
   "expected": {
     "tier": "low",
-    "score_min": 0.14,
+    "score_min": 0.0,
     "score_max": 0.16,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"

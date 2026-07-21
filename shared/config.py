@@ -379,6 +379,14 @@ def _shell_tier_model_defaults(shell_id: str) -> dict[str, str]:
     return merged
 
 # Keyword overrides that bypass scoring entirely
+# Security-sensitive vocabulary for the risk-aware tier floor. Matched against
+# task text (router) and file basenames (host fanout). Mirrors the content-scan
+# vocabulary in shared/review_fanout.py::_RISK_SIGNALS; keep the two in sync.
+DEFAULT_RISK_FILENAME_PATTERNS: tuple[str, ...] = (
+    "credential", "auth", "crypto", "keychain", "secret",
+    "password", "token", "oauth", "saml",
+)
+
 DEFAULT_OVERRIDES: dict[str, list[str]] = {
     "low": [
         "docstring", "type hint", "add comment", "rename",
@@ -1394,6 +1402,16 @@ class TGsConfig:
     # Default-safe: a no-op until enough samples accumulate; fresh repos unaffected.
     review_learning_enabled: bool = True
 
+    # Risk-aware tier floor. Security-sensitive tasks (routing) and files (host
+    # fanout) whose text/filename matches risk_filename_patterns are floored to at
+    # least risk_floor_tier, so credential/auth/crypto work is never routed to the
+    # cheapest tier. On by default; operators may tune the vocabulary or disable.
+    risk_floor_enabled: bool = True
+    risk_floor_tier: str = "medium"
+    risk_filename_patterns: list[str] = field(
+        default_factory=lambda: list(DEFAULT_RISK_FILENAME_PATTERNS)
+    )
+
     # Phase 9: User-driven model tier overrides (DISC-05)
     # Format: {"model-id": "tier"} — e.g. {"gpt-4-turbo": "low"}
     model_tier_pins: dict[str, str] = field(default_factory=dict)
@@ -1660,6 +1678,19 @@ class TGsConfig:
         cfg.output_quality_retry_enabled = raw.get("output_quality_retry_enabled", True) is True
         cfg.quality_check_incomplete_output = raw.get("quality_check_incomplete_output", False) is True
         cfg.reasoning_scoring_enabled = raw.get("reasoning_scoring_enabled", True) is True
+
+        cfg.risk_floor_enabled = raw.get("risk_floor_enabled", True) is True
+        raw_risk_floor_tier = raw.get("risk_floor_tier", "medium")
+        if isinstance(raw_risk_floor_tier, str) and raw_risk_floor_tier in {"low", "medium", "high"}:
+            cfg.risk_floor_tier = raw_risk_floor_tier
+        else:
+            cfg.risk_floor_tier = "medium"
+        raw_risk_patterns = raw.get("risk_filename_patterns")
+        if isinstance(raw_risk_patterns, (list, tuple)):
+            parsed_patterns = [str(p).strip().lower() for p in raw_risk_patterns if str(p).strip()]
+            cfg.risk_filename_patterns = parsed_patterns or list(DEFAULT_RISK_FILENAME_PATTERNS)
+        else:
+            cfg.risk_filename_patterns = list(DEFAULT_RISK_FILENAME_PATTERNS)
 
         synthesis_mode = orchestrator_raw.get("synthesis_map_reduce", "auto")
         if isinstance(synthesis_mode, str) and synthesis_mode.strip().lower() in {

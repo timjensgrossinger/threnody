@@ -36,11 +36,27 @@ def test_base_score_low_tier() -> None:
 
 
 def test_override_low() -> None:
-    """Override keywords should force low tier."""
+    """A dominating low keyword nudges the score toward low (no longer a hard set).
+
+    The low override is now an additive score nudge, not a hard tier override, so
+    downstream floors (security/reasoning) still apply. A single-concern docstring
+    task still lands low, but ``override`` is False (only high overrides are hard).
+    """
     router = _make_router()
     decision = router.classify("add a docstring to this function")
     assert decision.tier == "low"
-    assert decision.override is True
+    assert decision.override is False
+    assert "low_override" in decision.reason
+
+
+def test_low_override_suppressed_by_risk_cooccurrence() -> None:
+    """A security-sensitive multi-concern task is not dragged to low by a keyword."""
+    router = _make_router()
+    decision = router.classify(
+        "add a docstring and refactor credential keychain handling in auth.py"
+    )
+    assert decision.tier in {"medium", "high"}
+    assert decision.override is False
 
 
 def test_deep_security_review_override_high() -> None:

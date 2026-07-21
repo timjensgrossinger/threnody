@@ -36,7 +36,7 @@ _RISKY_EXTENSIONS = frozenset({".py", ".js", ".ts", ".go", ".rb", ".java", ".php
 _RISK_SIGNALS = re.compile(
     r"(?:\b(?:sql|subprocess|os\.system|auth(?:enticate|entication|orization)?|"
     r"crypto|cryptograph(?:y|ic)|encrypt(?:ion)?|decrypt(?:ion)?|payment|billing|card|"
-    r"password|secret|credential|token|api[_ -]?key|rce|remote code execution|"
+    r"password|secret|credential|keychain|token|api[_ -]?key|rce|remote code execution|"
     r"cursor\.execute|raw_query|shell\s*=\s*True|deseriali[sz](?:e|ation)|"
     r"pickle\.loads|ssrf|server-side request forgery|"
     r"path traversal|directory traversal)\b|\b(?:exec|eval)\s*\(|\byaml\.load\s*\()",

@@ -5,10 +5,18 @@ via host Task/Agent tools. No subprocess to Copilot, Codex, or other CLIs.
 """
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import PurePosixPath
 
+from .config import (
+    DEFAULT_RISK_FILENAME_PATTERNS,
+    DEFAULT_ROUTING_EXCEPTION_FILETYPES,
+    DEFAULT_ROUTING_EXCEPTION_PATHS,
+)
 from .context import extract_references
+
+log = logging.getLogger(__name__)
 
 _FILE_EXT_GROUP = (
     r"py|ts|tsx|js|jsx|html|htm|css|scss|vue|svelte|go|rs|java|kt|rb|cs|yaml|yml|json|toml|md"
@@ -54,6 +62,31 @@ _COUPLING_KEYWORDS = frozenset(
 )
 
 _TIER_ORDER = ("low", "medium", "high")
+
+
+def _compile_risk_filename_re(patterns) -> "re.Pattern[str] | None":
+    """Compile the security-risk vocabulary into a *filename* matcher.
+
+    Boundary is start-of-string or any non-alphanumeric char (NOT ``\\b``), so a
+    token is caught across underscore/hyphen compounds — ``credential`` matches
+    ``setup_credentials.py`` where ``\\b`` would fail (``_`` is a word char).
+    Returns None for an empty list (risk floor becomes a no-op).
+    """
+    cleaned = [re.escape(str(p).strip()) for p in (patterns or []) if str(p).strip()]
+    if not cleaned:
+        return None
+    return re.compile(r"(?:^|[^a-z0-9])(?:" + "|".join(cleaned) + r")", re.IGNORECASE)
+
+
+# Fallback risk matcher from bundled defaults; live operator config (when
+# available) is compiled in build_heuristic_plan_payload and takes precedence.
+_DEFAULT_RISK_FILENAME_RE = _compile_risk_filename_re(DEFAULT_RISK_FILENAME_PATTERNS)
+
+# Test-file detection: test_*, *_test.*, *.test.*, *.spec.*, or under a tests/ dir.
+_TEST_FILE_RE = re.compile(
+    r"(?:^|/)(?:tests?|__tests__)/|(?:^|/)test_[^/]+$|_test\.[^/]+$|\.(?:test|spec)\.[^/]+$",
+    re.IGNORECASE,
+)
 
 _WORD_NUMBERS: dict[str, int] = {
     "one": 1,
@@ -412,6 +445,116 @@ def _tier_for_subtask(*, file_count: int, default_tier: str) -> str:
     return "low"
 
 
+def _is_test_file(path: str) -> bool:
+    return bool(_TEST_FILE_RE.search(_normalize_path(path)))
+
+
+def _test_subject_stem(path: str) -> str:
+    """Strip common test markers from a stem to find the code-under-test name."""
+    stem = _stem(path)
+    stem = re.sub(r"^test[_-]", "", stem)
+    stem = re.sub(r"[_-]test$", "", stem)
+    stem = re.sub(r"\.(?:test|spec)$", "", stem)
+    return stem
+
+
+def _floor_tier(tier: str, floor: str) -> str:
+    if tier not in _TIER_ORDER:
+        tier = "low"
+    if floor not in _TIER_ORDER:
+        return tier
+    return _TIER_ORDER[max(_TIER_ORDER.index(tier), _TIER_ORDER.index(floor))]
+
+
+def _risk_floor_for(path: str, risk_re, floor_tier: str) -> str | None:
+    """Return floor_tier if the basename matches the risk vocabulary, else None."""
+    if risk_re is None or floor_tier not in _TIER_ORDER:
+        return None
+    return floor_tier if risk_re.search(_basename(path)) else None
+
+
+def _tier_for_file(
+    path: str,
+    *,
+    default_tier: str,
+    entries: list[tuple[str, str]],
+    risk_re=None,
+    floor_tier: str = "medium",
+) -> str:
+    """Per-file tier for the flat (non-coupled) fanout.
+
+    Preserves the historical baseline (plain files → ``low``; ``default_tier``
+    only lifts when it is ``high``) and adds two risk-aware escalations:
+
+    - **Risk floor**: a security-sensitive basename (credential/auth/crypto/…)
+      is floored to ``floor_tier`` so credential code is never routed to the
+      cheapest tier.
+    - **Test-inherit**: a test file inherits the tier of the code under test
+      (matched by stem within ``entries``) instead of collapsing to doc-low; a
+      test with no locatable subject floors to ``floor_tier``.
+    """
+    if _is_test_file(path):
+        subject = _test_subject_stem(path)
+        for other_path, _hint in entries:
+            if _normalize_path(other_path) == _normalize_path(path):
+                continue
+            if _is_test_file(other_path):
+                continue
+            if _stem(other_path) == subject and subject:
+                return _tier_for_file(
+                    other_path,
+                    default_tier=default_tier,
+                    entries=entries,
+                    risk_re=risk_re,
+                    floor_tier=floor_tier,
+                )
+        # No code-under-test sibling — a standalone test is non-trivial enough to
+        # warrant the risk floor rather than doc-low.
+        if default_tier == "high":
+            return "high"
+        return floor_tier if floor_tier in _TIER_ORDER else "medium"
+
+    tier = "high" if default_tier == "high" else "low"
+    risk = _risk_floor_for(path, risk_re, floor_tier)
+    if risk is not None:
+        tier = _floor_tier(tier, risk)
+    return tier
+
+
+def _ownership_line(target_files: list[str]) -> str:
+    """Explicit scope sentence so the prompt agrees with target_files (#3)."""
+    listed = ", ".join(target_files)
+    return (
+        f" You own exactly these files: {listed}. "
+        "Do not create or edit any other file."
+    )
+
+
+def _finalize_subtasks(subtasks: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Give every file-scoped subtask an authoritative target_files list and an
+    ownership sentence, so prompt scope can never exceed declared ownership (#3).
+
+    Task-level subtasks (no target file) are left untouched.
+    """
+    for st in subtasks:
+        tfs = st.get("target_files")
+        if isinstance(tfs, list) and tfs:
+            target_files = [str(p) for p in tfs if str(p).strip()]
+        else:
+            tf = st.get("target_file")
+            target_files = [str(tf)] if isinstance(tf, str) and tf.strip() else []
+        if not target_files:
+            continue
+        # Preserve order, drop dupes.
+        seen: set[str] = set()
+        deduped = [p for p in target_files if not (p.lower() in seen or seen.add(p.lower()))]
+        st["target_files"] = deduped
+        desc = str(st.get("description", "")).rstrip()
+        if "You own exactly these files:" not in desc:
+            st["description"] = desc + _ownership_line(deduped)
+    return subtasks
+
+
 def _complexity_tier(*, paths: list[str], task_lower: str, coupled: bool, default_tier: str) -> str:
     """Tier from file-type, design keywords, and coupling. default_tier is a floor."""
     exts = {PurePosixPath(_normalize_path(p)).suffix.lower() for p in paths}
@@ -437,21 +580,38 @@ def _entry_parent(path: str) -> str:
 
 
 def _coupled_group_indices(entries: list[tuple[str, str]], task_lower: str) -> list[int]:
-    """1-based indices of entries that form a coupled group.
+    """1-based indices of entries that form a coupled group (dir-cohesion proxy).
 
-    Coupling requires BOTH a coupling keyword in the task text AND >=2 entries
-    sharing the same non-empty parent directory. Top-level files (no directory)
-    never couple, so simple multi-file tasks are unaffected.
+    Couples >=2 SOURCE files sharing the same non-empty parent directory — the
+    directory cohesion is the signal, so no coupling keyword is required (the old
+    keyword gate silently split genuinely interdependent modules). Non-source
+    files (docs/config) and top-level files never couple, so flat multi-file
+    tasks and mixed webapp fan-outs (backend vs frontend in different dirs) stay
+    independent. ``task_lower`` is retained for signature stability.
+
+    A true import/call-graph would be more precise, but the heuristic path plans
+    from task TEXT — target files often do not exist yet (scaffolding) — so a
+    dir-cohesion proxy is used deliberately instead of reading files.
     """
-    if not any(kw in task_lower for kw in _COUPLING_KEYWORDS):
-        return []
     by_dir: dict[str, list[int]] = {}
     for index, (path, _hint) in enumerate(entries, start=1):
+        if PurePosixPath(_normalize_path(path)).suffix.lower() not in _SOURCE_EXTS:
+            continue
         parent = _entry_parent(path)
         if not parent:
             continue
         by_dir.setdefault(parent, []).append(index)
-    coupled = {i for ids in by_dir.values() if len(ids) >= 2 for i in ids}
+
+    coupled: set[int] = set()
+    for ids in by_dir.values():
+        if len(ids) < 2:
+            continue
+        # Skip replicated fan-outs (greet1.py/greet2.py/…): distinct *roles* signal
+        # a coupled module; a single repeated base stem signals independent copies.
+        bases = {re.sub(r"\d+$", "", _stem(entries[i - 1][0])) for i in ids}
+        if len(bases) < 2:
+            continue
+        coupled.update(ids)
     return sorted(coupled)
 
 
@@ -485,6 +645,8 @@ def _coupled_subtasks(
     topology: str | None,
     task_lower: str,
     strategy: str,
+    risk_re=None,
+    floor_tier: str = "medium",
 ) -> dict[str, object]:
     """Build a plan for a detected coupled group.
 
@@ -499,6 +661,13 @@ def _coupled_subtasks(
     tier = _complexity_tier(
         paths=member_paths, task_lower=task_lower, coupled=True, default_tier=default_tier
     )
+    # Risk floor: a coupled group containing a security-sensitive file runs at
+    # least at floor_tier, taking the group's max tier (#4).
+    if risk_re is not None:
+        for mp in member_paths:
+            if _risk_floor_for(mp, risk_re, floor_tier) is not None:
+                tier = _floor_tier(tier, floor_tier)
+                break
 
     # Pick the interface/primary file: an integration file if present, else the first.
     primary_idx = 0
@@ -564,7 +733,13 @@ def _coupled_subtasks(
             {
                 "id": next_id,
                 "description": hint or f"Create or update {path} as described in the task.",
-                "tier": _tier_for_subtask(file_count=len(entries), default_tier=default_tier),
+                "tier": _tier_for_file(
+                    path,
+                    default_tier=default_tier,
+                    entries=entries,
+                    risk_re=risk_re,
+                    floor_tier=floor_tier,
+                ),
                 "target_file": path,
                 "single_file_insertion": False,
                 "depends_on": [],
@@ -572,6 +747,7 @@ def _coupled_subtasks(
         )
         next_id += 1
 
+    _finalize_subtasks(subtasks)
     has_deps = any(st.get("depends_on") for st in subtasks)
     normalized_topology = str(topology or "").strip().lower()
     if normalized_topology in {"star", "hierarchical", "dag", "linear"}:
@@ -596,6 +772,8 @@ def _subtasks_from_entries(
     topology: str | None,
     task: str = "",
     coupled_strategy: str = "single",
+    risk_re=None,
+    floor_tier: str = "medium",
 ) -> dict[str, object]:
     # Detect a coupled file group first; if present, plan it coherently instead
     # of fanning out independent low-tier agents that cannot integrate.
@@ -610,6 +788,8 @@ def _subtasks_from_entries(
             topology=topology,
             task_lower=task_lower,
             strategy=strategy,
+            risk_re=risk_re,
+            floor_tier=floor_tier,
         )
 
     integration_ids: list[int] = []
@@ -617,7 +797,13 @@ def _subtasks_from_entries(
     subtasks: list[dict[str, object]] = []
     for index, (path, hint) in enumerate(entries, start=1):
         description = hint or f"Create or update {path} as described in the task."
-        tier = _tier_for_subtask(file_count=len(entries), default_tier=default_tier)
+        tier = _tier_for_file(
+            path,
+            default_tier=default_tier,
+            entries=entries,
+            risk_re=risk_re,
+            floor_tier=floor_tier,
+        )
         subtasks.append(
             {
                 "id": index,
@@ -639,6 +825,7 @@ def _subtasks_from_entries(
             if int(subtask.get("id", -1)) in integration_ids:
                 subtask["depends_on"] = sorted(foundation_set)
 
+    _finalize_subtasks(subtasks)
     has_deps = any(subtask.get("depends_on") for subtask in subtasks)
     normalized_topology = str(topology or "").strip().lower()
     if normalized_topology in {"star", "hierarchical", "dag", "linear"}:
@@ -677,6 +864,57 @@ def _load_review_tier_bias() -> dict[tuple[str, str], int] | None:
         return None
 
 
+def _load_risk_floor() -> tuple["re.Pattern[str] | None", str]:
+    """Resolve the risk-floor matcher + tier from live config. Fail-safe.
+
+    Returns ``(risk_re, floor_tier)``. On any failure (or when disabled) falls
+    back to the bundled default vocabulary so the floor still protects credential
+    filenames — but returns ``(None, ...)`` when the operator disables it.
+    """
+    try:
+        from .config import TGsConfig
+
+        cfg = TGsConfig.from_yaml()
+        if not getattr(cfg, "risk_floor_enabled", True):
+            return None, "medium"
+        floor_tier = getattr(cfg, "risk_floor_tier", "medium")
+        if floor_tier not in _TIER_ORDER:
+            floor_tier = "medium"
+        risk_re = _compile_risk_filename_re(getattr(cfg, "risk_filename_patterns", None))
+        return (risk_re or _DEFAULT_RISK_FILENAME_RE), floor_tier
+    except Exception:  # pragma: no cover - config read is best-effort
+        return _DEFAULT_RISK_FILENAME_RE, "medium"
+
+
+def _load_exempt() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Resolve direct-edit exempt filetypes + path basenames from live config.
+
+    Fail-safe to the bundled defaults (``.md``/``.mdc`` + known AI-assistant
+    instruction files). Used to fold exempt files into an inline bucket instead
+    of spawning an agent for them.
+    """
+    try:
+        from .config import TGsConfig
+
+        cfg = TGsConfig.from_yaml()
+        re_cfg = getattr(cfg, "routing_exceptions", None)
+        filetypes = tuple(getattr(re_cfg, "filetypes", None) or DEFAULT_ROUTING_EXCEPTION_FILETYPES)
+        paths = tuple(getattr(re_cfg, "paths", None) or DEFAULT_ROUTING_EXCEPTION_PATHS)
+        return filetypes, paths
+    except Exception:  # pragma: no cover - config read is best-effort
+        return tuple(DEFAULT_ROUTING_EXCEPTION_FILETYPES), tuple(DEFAULT_ROUTING_EXCEPTION_PATHS)
+
+
+def _is_exempt_entry(path: str, filetypes: tuple[str, ...], paths: tuple[str, ...]) -> bool:
+    """Lightweight, DB-free direct-edit exemption check (suffix + basename)."""
+    normalized = _normalize_path(path)
+    suffix = PurePosixPath(normalized).suffix.lower()
+    if suffix and suffix in {str(ft).strip().lower() for ft in filetypes}:
+        return True
+    base = _basename(normalized)
+    return base in {str(p).strip().lower() for p in paths if "/" not in str(p) and "." in str(p)}
+
+
 def build_heuristic_plan_payload(
     task: str,
     *,
@@ -704,12 +942,21 @@ def build_heuristic_plan_payload(
     task_lower = task.lower() if isinstance(task, str) else ""
     prefix = _directory_prefix_from_task(task) if isinstance(task, str) else ""
 
+    # Config-derived context (loaded once): risk-aware tier floor (#4) and the
+    # direct-edit exemption lists (#5). Both fail-safe to bundled defaults.
+    risk_re, floor_tier = _load_risk_floor()
+    exempt_filetypes, exempt_paths = _load_exempt()
+
     if intent_templates and isinstance(task, str) and _is_fullstack_intent(task_lower):
         raw_subtasks = infer_fullstack_subtasks(task, prefix)
+        fs_entries = [(str(st.get("target_file", "")), "") for st in raw_subtasks]
         for subtask in raw_subtasks:
-            subtask["tier"] = _tier_for_subtask(
-                file_count=len(raw_subtasks),
+            subtask["tier"] = _tier_for_file(
+                str(subtask.get("target_file", "")),
                 default_tier=default_tier,
+                entries=fs_entries,
+                risk_re=risk_re,
+                floor_tier=floor_tier,
             )
             subtask["single_file_insertion"] = False
         if max_agents is not None:
@@ -718,6 +965,7 @@ def build_heuristic_plan_payload(
                 raw_subtasks = raw_subtasks[:cap]
             except (TypeError, ValueError):
                 pass
+        _finalize_subtasks(raw_subtasks)
         normalized_topology = str(topology or "").strip().lower()
         plan_topology = normalized_topology if normalized_topology in {
             "star", "hierarchical", "dag", "linear",
@@ -732,7 +980,19 @@ def build_heuristic_plan_payload(
             "topology": plan_topology,
         }
 
-    entries = extract_task_file_entries(task, intent_templates=intent_templates)
+    all_entries = extract_task_file_entries(task, intent_templates=intent_templates)
+
+    # Fold direct-edit exempt files (.md/.mdc, CLAUDE.md, …) into an inline bucket
+    # instead of spawning a dedicated agent for each (#5).
+    inline_files: list[str] = []
+    entries: list[tuple[str, str]] = []
+    for path, hint in all_entries:
+        if _is_exempt_entry(path, exempt_filetypes, exempt_paths):
+            if path not in inline_files:
+                inline_files.append(path)
+        else:
+            entries.append((path, hint))
+
     if max_agents is not None:
         try:
             cap = max(1, int(max_agents))
@@ -742,6 +1002,20 @@ def build_heuristic_plan_payload(
             entries = entries[:cap]
 
     if not entries:
+        # No agent work remains. If only exempt files were named, surface them as
+        # an inline bucket with no subtasks; otherwise fall back to one task-level
+        # subtask (no file paths detected at all).
+        if inline_files:
+            return {
+                "analysis": (
+                    f"Host-native heuristic plan: {len(inline_files)} direct-edit "
+                    "exempt file(s) folded inline; no agents spawned."
+                ),
+                "subtasks": [],
+                "inline_files": inline_files,
+                "strategy": "sequential",
+                "topology": topology or "linear",
+            }
         tier = default_tier if default_tier in {"low", "medium", "high"} else "medium"
         return {
             "analysis": (
@@ -760,13 +1034,22 @@ def build_heuristic_plan_payload(
             "topology": topology or "linear",
         }
 
-    return _subtasks_from_entries(
+    payload = _subtasks_from_entries(
         entries,
         default_tier=default_tier,
         topology=topology,
         task=task if isinstance(task, str) else "",
         coupled_strategy=coupled_strategy,
+        risk_re=risk_re,
+        floor_tier=floor_tier,
     )
+    if inline_files:
+        payload["inline_files"] = inline_files
+        base_analysis = str(payload.get("analysis", "")).rstrip()
+        payload["analysis"] = (
+            f"{base_analysis} {len(inline_files)} direct-edit exempt file(s) folded inline."
+        )
+    return payload
 
 
 def file_entries_from_paths(

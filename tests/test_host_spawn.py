@@ -265,3 +265,33 @@ def test_sanitize_prunes_dropped_id_from_depends_on(tmp_path) -> None:
     assert set(survivors) == {2}
     assert survivors[2]["depends_on"] == []
     assert plan["waves"] == [[2]]
+
+
+def test_sanitize_dedupes_overlapping_target_ownership() -> None:
+    """Two subtasks claiming the same file → each file owned once (#2)."""
+    plan = {
+        "subtasks": [
+            {"id": 1, "description": "Own the module", "tier": "medium",
+             "target_file": "app/core.py", "target_files": ["app/core.py", "app/util.py"]},
+            {"id": 2, "description": "Also edit util", "tier": "low",
+             "target_file": "app/util.py"},
+            {"id": 3, "description": "Edit view", "tier": "low",
+             "target_file": "app/view.py"},
+        ],
+        "waves": [[1, 2, 3]],
+    }
+    report = sanitize_plan_for_host(plan, workspace_root=None, task="build app")
+    owners: dict[str, list] = {}
+    for st in plan["subtasks"]:
+        for f in st.get("target_files", [st.get("target_file")]):
+            owners.setdefault(f, []).append(st["id"])
+    # No file is owned by more than one surviving subtask.
+    assert all(len(ids) == 1 for ids in owners.values()), owners
+    assert report.get("dedup"), "expected a dedup report entry"
+
+
+def test_subtask_target_files_reads_plural_list() -> None:
+    """_subtask_target_files honors the plural list, not just the scalar (#2)."""
+    from shared.host_spawn import _subtask_target_files
+    st = {"target_file": "a.py", "target_files": ["a.py", "b.py", "c.py"]}
+    assert _subtask_target_files(st) == ["a.py", "b.py", "c.py"]
