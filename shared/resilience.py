@@ -31,6 +31,8 @@ class ErrorCategory(str, enum.Enum):
     BINARY_MISSING = "binary_missing"
     MALFORMED_OUTPUT = "malformed_output"
     TIMEOUT = "timeout"
+    DB_LOCKED = "db_locked"
+    DB_CORRUPT = "db_corrupt"
     UNKNOWN = "unknown"
 
 
@@ -44,6 +46,8 @@ _RETRY_MAP: dict[ErrorCategory, bool] = {
     ErrorCategory.BINARY_MISSING: False,
     ErrorCategory.MALFORMED_OUTPUT: True,
     ErrorCategory.TIMEOUT: False,
+    ErrorCategory.DB_LOCKED: True,
+    ErrorCategory.DB_CORRUPT: False,
     ErrorCategory.UNKNOWN: True,
 }
 
@@ -92,6 +96,57 @@ def classify(
         return ErrorCategory.UNKNOWN
 
     return ErrorCategory.UNKNOWN
+
+
+def classify_sqlite_error(exc: BaseException) -> ErrorCategory:
+    """Classify a SQLite exception into a retry-relevant category.
+
+    Distinguishes a transient ``database is locked``/``busy`` (retryable —
+    another process holds the write lock) from genuine on-disk corruption
+    (``malformed`` / ``not a database`` / ``disk image``), which must NOT be
+    retried and instead trigger guarded recovery. Anything else → UNKNOWN.
+    """
+    msg = str(exc).lower()
+    if any(k in msg for k in ("database is locked", "database is busy", "is locked", "database table is locked")):
+        return ErrorCategory.DB_LOCKED
+    if any(k in msg for k in ("malformed", "not a database", "disk image", "file is encrypted")):
+        return ErrorCategory.DB_CORRUPT
+    return ErrorCategory.UNKNOWN
+
+
+def run_with_retry(
+    fn,
+    *,
+    classify_exc,
+    policy: "RetryPolicy | None" = None,
+    on_retry=None,
+):
+    """Run ``fn()`` with structured backoff, retrying only retryable categories.
+
+    ``classify_exc(exc) -> ErrorCategory`` maps a caught exception to a category;
+    the category's ``_RETRY_MAP`` entry decides whether another attempt is made.
+    ``on_retry(attempt, category, exc)`` is an optional best-effort hook invoked
+    before each backoff sleep (e.g. to drop a stale connection). Re-raises the
+    last exception once retries are exhausted or the category is non-retryable.
+    """
+    active = policy or default_policy()
+    last_exc: BaseException | None = None
+    for attempt in range(max(1, active.attempts)):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - re-raised below after classification
+            last_exc = exc
+            category = classify_exc(exc)
+            if attempt >= active.attempts - 1 or not _RETRY_MAP.get(category, False):
+                raise
+            if on_retry is not None:
+                try:
+                    on_retry(attempt, category, exc)
+                except Exception:  # pragma: no cover - hook is best-effort
+                    log.debug("run_with_retry on_retry hook failed", exc_info=True)
+            active.wait(attempt)
+    if last_exc is not None:  # pragma: no cover - loop always returns or raises
+        raise last_exc
 
 
 class RetryPolicy:

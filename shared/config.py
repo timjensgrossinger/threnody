@@ -1315,6 +1315,11 @@ class ResilienceConfig:
     auth_probe_enabled: bool = True
     stderr_snippet_chars: int = 2000
     health_probe_interval_s: float = 30.0
+    # SQLite contention handling for the shared WAL (concurrent MCP servers).
+    db_busy_timeout_ms: int = 30000
+    db_retry_attempts: int = 5
+    db_lock_base_delay_s: float = 0.1
+    db_lock_max_delay_s: float = 2.0
 
 
 def _dedupe_patterns(*groups: list[str] | tuple[str, ...]) -> list[str]:
@@ -2469,6 +2474,7 @@ class TGsConfig:
             retry_raw = res_raw.get("retry", {}) or {}
             cb_raw = res_raw.get("circuit_breaker", {}) or {}
             auth_raw = res_raw.get("auth_probe", {}) or {}
+            db_raw = res_raw.get("db", {}) or {}
             cfg.resilience = ResilienceConfig(
                 retry_attempts=int(retry_raw.get("attempts", 3)),
                 retry_base_delay_s=float(retry_raw.get("base_delay_s", 0.5)),
@@ -2482,6 +2488,10 @@ class TGsConfig:
                 auth_probe_enabled=bool(auth_raw.get("enabled", True)),
                 stderr_snippet_chars=int(res_raw.get("stderr_snippet_chars", 2000)),
                 health_probe_interval_s=float(res_raw.get("health_probe_interval_s", 30.0)),
+                db_busy_timeout_ms=max(1000, int(db_raw.get("busy_timeout_ms", 30000))),
+                db_retry_attempts=max(1, int(db_raw.get("retry_attempts", 5))),
+                db_lock_base_delay_s=max(0.0, float(db_raw.get("lock_base_delay_s", 0.1))),
+                db_lock_max_delay_s=max(0.01, float(db_raw.get("lock_max_delay_s", 2.0))),
             )
 
         # Background daemon cadence (health-probe + warm-path loops).

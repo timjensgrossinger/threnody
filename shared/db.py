@@ -24,6 +24,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+try:  # POSIX-only; best-effort cross-process lock. No-op where unavailable (e.g. Windows).
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    _fcntl = None
+
+from .resilience import (
+    ErrorCategory,
+    RetryPolicy,
+    classify_sqlite_error,
+    run_with_retry,
+)
+
 from .config import (
     CURRENT_PLAN_SCHEMA_VERSION,
     DB_PATH,
@@ -111,11 +123,19 @@ class Database:
         result_ttl_hours: int = RESULT_CACHE_TTL_HOURS,
         plan_ttl_hours: int = PLAN_CACHE_TTL_HOURS,
         backup_keep: int = 3,
+        resilience: object | None = None,
     ) -> None:
         self._db_path = (db_path or DB_PATH).expanduser() if db_path else DB_PATH
         self._result_ttl = result_ttl_hours * 3600
         self._plan_ttl = plan_ttl_hours * 3600
         self._backup_keep = backup_keep
+        # SQLite contention knobs (shared WAL across concurrent MCP servers). Falls
+        # back to safe hard defaults when no ResilienceConfig is supplied.
+        self._db_busy_timeout_ms = int(getattr(resilience, "db_busy_timeout_ms", 30000) or 30000)
+        self._db_retry_attempts = int(getattr(resilience, "db_retry_attempts", 5) or 5)
+        self._db_lock_base_delay_s = float(getattr(resilience, "db_lock_base_delay_s", 0.1) or 0.1)
+        self._db_lock_max_delay_s = float(getattr(resilience, "db_lock_max_delay_s", 2.0) or 2.0)
+        self._lock_path = self._db_path.with_name(self._db_path.name + ".lock")
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_private_db_directory()
         self._schema_lock = _schema_lock_for_path(self._db_path)
@@ -1260,13 +1280,28 @@ class Database:
             conn.commit()
             self._schema_ready = True
 
+    def _apply_conn_pragmas(self, conn: sqlite3.Connection, *, set_wal: bool) -> None:
+        """Apply the standard pragmas. busy_timeout is the primary lock guard."""
+        if set_wal:
+            conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA busy_timeout = {int(self._db_busy_timeout_ms)}")
+        # Bound WAL growth under long-running swarms (only close() checkpointed before).
+        conn.execute("PRAGMA wal_autocheckpoint = 1000")
+
     def _connect(self) -> sqlite3.Connection:
         """Open a fresh WAL connection for one logical DB operation."""
-        conn = sqlite3.connect(str(self._db_path), timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout = 30000")
-        self._ensure_schema(conn)
+        timeout_s = max(1.0, self._db_busy_timeout_ms / 1000.0)
+
+        def _open() -> sqlite3.Connection:
+            conn = sqlite3.connect(str(self._db_path), timeout=timeout_s)
+            self._apply_conn_pragmas(conn, set_wal=True)
+            self._ensure_schema(conn)
+            return conn
+
+        conn = run_with_retry(
+            _open, classify_exc=classify_sqlite_error, policy=self._db_retry_policy()
+        )
         self._restrict_db_permissions()
         return conn
 
@@ -1288,13 +1323,22 @@ class Database:
         """
         # Check if this thread already has a connection
         if not hasattr(self._thread_local, 'conn'):
-            # Create a new connection for this thread
-            conn = sqlite3.connect(str(self._db_path), timeout=30.0)
-            # Do not attempt to change journal_mode here; it can conflict when multiple threads initialize.
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout = 30000")
-            # Ensure schema is initialized (first thread will create tables)
-            self._ensure_schema(conn)
+            timeout_s = max(1.0, self._db_busy_timeout_ms / 1000.0)
+
+            def _open() -> sqlite3.Connection:
+                conn = sqlite3.connect(str(self._db_path), timeout=timeout_s)
+                # Do not change journal_mode here; it can conflict when multiple
+                # threads/processes initialize (WAL is persisted on the file).
+                self._apply_conn_pragmas(conn, set_wal=False)
+                # Ensure schema is initialized (first thread will create tables).
+                # Retried so a locked schema-init under concurrent init waits instead
+                # of propagating as a swarm "initialization failed".
+                self._ensure_schema(conn)
+                return conn
+
+            conn = run_with_retry(
+                _open, classify_exc=classify_sqlite_error, policy=self._db_retry_policy()
+            )
             self._restrict_db_permissions()
             # Store in thread-local storage for reuse
             self._thread_local.conn = conn
@@ -1321,12 +1365,39 @@ class Database:
         conn = self._get_connection()
         try:
             yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
+            # Commit is the main WAL contention point; retry a locked commit with
+            # backoff (the transaction stays open) before giving up.
+            run_with_retry(
+                conn.commit,
+                classify_exc=classify_sqlite_error,
+                policy=self._db_retry_policy(),
+            )
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:  # pragma: no cover - rollback on a wedged conn
+                log.debug("rollback failed", exc_info=True)
+            # Auto-reconnect: on persistent lock/operational failure, drop the cached
+            # thread-local connection so the next call reopens fresh (the programmatic
+            # equivalent of an MCP reconnect). Best-effort.
+            if classify_sqlite_error(exc) in (ErrorCategory.DB_LOCKED, ErrorCategory.DB_CORRUPT):
+                self._drop_thread_local_conn()
             raise
         # Note: Connection is NOT closed here — it persists in thread-local storage
         # for reuse by subsequent calls in the same thread (FNDX-01)
+
+    def _drop_thread_local_conn(self) -> None:
+        """Close and forget the current thread's cached connection (auto-reconnect)."""
+        conn = getattr(self._thread_local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover
+                log.debug("closing stale thread-local conn failed", exc_info=True)
+            try:
+                del self._thread_local.conn
+            except AttributeError:  # pragma: no cover
+                pass
 
     # ------------------------------------------------------------------
     # Phase 4 operator settings (D-09..D-12)
@@ -1886,23 +1957,93 @@ class Database:
     def last_integrity_ok(self) -> bool | None:
         return self._last_integrity_ok
 
-    def _check_integrity_and_recover(self) -> None:
+    def _db_retry_policy(self) -> RetryPolicy:
+        """RetryPolicy tuned for SQLite lock contention (short, many attempts)."""
+        return RetryPolicy(
+            attempts=self._db_retry_attempts,
+            base_delay_s=self._db_lock_base_delay_s,
+            max_delay_s=self._db_lock_max_delay_s,
+            jitter_ratio=0.5,
+        )
+
+    @contextmanager
+    def _process_lock(self) -> Iterator[None]:
+        """Cross-process exclusive lock (POSIX flock) around integrity/recovery.
+
+        Serializes recovery across the multiple MCP-server processes that share
+        one WAL, so only one process ever mutates the DB file at a time — this is
+        what prevents concurrent recoveries from corrupting each other. Best-effort
+        no-op where ``fcntl`` is unavailable.
+        """
+        if _fcntl is None:
+            yield
+            return
+        fd = None
         try:
-            conn = sqlite3.connect(str(self._db_path), timeout=5)
+            fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            _fcntl.flock(fd, _fcntl.LOCK_EX)
+            yield
+        except OSError:
+            log.debug("process lock unavailable; proceeding without it", exc_info=True)
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+
+    def _integrity_probe(self, path: str) -> bool | None:
+        """Run PRAGMA integrity_check with a busy_timeout, retrying on lock.
+
+        Returns True (ok), False (genuinely corrupt), or None (could not decide —
+        e.g. persistent lock: treat as inconclusive, NOT corruption).
+        """
+        def _probe() -> bool:
+            conn = sqlite3.connect(path, timeout=max(1.0, self._db_busy_timeout_ms / 1000.0))
             try:
+                conn.execute(f"PRAGMA busy_timeout = {int(self._db_busy_timeout_ms)}")
                 row = conn.execute("PRAGMA integrity_check(1)").fetchone()
-                self._last_integrity_ok = row is not None and row[0] == "ok"
+                return row is not None and row[0] == "ok"
             finally:
                 conn.close()
-            if self._last_integrity_ok:
+
+        try:
+            return run_with_retry(
+                _probe,
+                classify_exc=classify_sqlite_error,
+                policy=self._db_retry_policy(),
+            )
+        except Exception as exc:
+            category = classify_sqlite_error(exc)
+            if category == ErrorCategory.DB_CORRUPT:
+                return False
+            # Locked/unknown → inconclusive; do NOT misclassify contention as corruption.
+            log.debug("integrity probe inconclusive (%s)", category, exc_info=True)
+            return None
+
+    def _check_integrity_and_recover(self) -> None:
+        with self._process_lock():
+            result = self._integrity_probe(str(self._db_path))
+            self._last_integrity_ok = result if result is not None else True
+            if result is None:
+                # Contention, not corruption — leave the DB alone.
+                log.debug("integrity check inconclusive under contention; skipping recovery")
                 return
-        except Exception:
-            self._last_integrity_ok = False
-            log.debug("integrity pre-check error", exc_info=True)
-        log.warning("DB integrity check failed at %s — attempting auto-recovery", self._db_path)
-        self._recover_db()
+            if result:
+                return
+            log.warning(
+                "DB integrity check failed at %s — attempting auto-recovery", self._db_path
+            )
+            self._recover_db_locked()
 
     def _recover_db(self) -> None:
+        """Public/legacy entry — always runs under the cross-process lock."""
+        with self._process_lock():
+            self._recover_db_locked()
+
+    def _recover_db_locked(self) -> None:
+        """Recovery body. MUST be called while holding ``_process_lock``."""
         import glob as _glob
         pattern = str(self._db_path) + ".bak.*"
         candidates = sorted(
@@ -1928,11 +2069,21 @@ class Database:
                     log.warning("Discarded invalid backup %s", candidate)
             except Exception:
                 log.debug("Recovery candidate %s failed", candidate, exc_info=True)
+        # No valid backup: QUARANTINE the corrupt DB (rename, don't delete) so it is
+        # preserved for forensics and durable rows aren't silently destroyed.
         try:
-            os.unlink(self._db_path)
-            log.warning("No valid backup found — deleted corrupt DB, will recreate on next connect")
+            quarantine = self._db_path.with_name(
+                self._db_path.name + f".corrupt.{int(time.time())}"
+            )
+            os.replace(self._db_path, quarantine)
+            log.warning(
+                "No valid backup found — quarantined corrupt DB to %s, will recreate on next connect",
+                quarantine,
+            )
+        except FileNotFoundError:
+            log.debug("Corrupt DB already gone before quarantine")
         except Exception:
-            log.debug("Could not delete corrupt DB", exc_info=True)
+            log.debug("Could not quarantine corrupt DB", exc_info=True)
         self._last_integrity_ok = None
 
     def backup_db(self) -> Path | None:
@@ -1941,6 +2092,7 @@ class Database:
         )
         try:
             src = sqlite3.connect(str(self._db_path), timeout=10)
+            src.execute(f"PRAGMA busy_timeout = {int(self._db_busy_timeout_ms)}")
             try:
                 dst = sqlite3.connect(str(backup_path), timeout=10)
                 try:

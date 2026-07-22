@@ -230,10 +230,29 @@ def test_execute_swarm_init_failures_are_controlled(monkeypatch) -> None:
 
     result = mcp_server.handle_execute_swarm({"task": {"id": "t-4"}})
 
-    assert result == {
-        "error": "execution_error",
-        "details": "execute_swarm initialization failed",
-    }
+    # A non-DB init failure is still a controlled execution_error, now with the
+    # real cause preserved in the detail instead of a generic swallowed string.
+    assert result["error"] == "execution_error"
+    assert "execute_swarm initialization failed" in result["details"]
+    assert "RuntimeError: boom" in result["details"]
+
+
+def test_execute_swarm_db_lock_returns_db_contention(monkeypatch) -> None:
+    import sqlite3
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+    )
+
+    result = mcp_server.handle_execute_swarm({"task": {"id": "t-5"}})
+
+    # A shared-WAL contention failure is surfaced as retryable db_contention with an
+    # actionable message, not a generic swallowed string.
+    assert result["error"] == "db_contention"
+    assert result.get("retryable") is True
+    assert "doctor --repair" in result["details"]
 
 
 def test_execute_swarm_host_native_skips_runtime_handoff(monkeypatch, tmp_path: Path) -> None:

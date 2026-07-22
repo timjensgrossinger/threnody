@@ -76,6 +76,12 @@ from shared.db import (
     ROUTING_GUARD_TTL_SECONDS,
 )
 from shared.eval import set_background_loop, run_warm_path_background_tasks
+from shared.resilience import (
+    ErrorCategory,
+    RetryPolicy,
+    classify_sqlite_error,
+    run_with_retry,
+)
 from shared.model_catalog import ModelCatalog
 from shared.memory import (
     MemoryNotFoundError,
@@ -618,7 +624,11 @@ def _ensure_init() -> tuple[TGsConfig, Database, TaskRouter, Planner, Orchestrat
         if needs_full_init:
             try:
                 config = TGsConfig.from_yaml()
-                db = Database(config.db_path, backup_keep=config.db_backup_keep)
+                db = Database(
+                    config.db_path,
+                    backup_keep=config.db_backup_keep,
+                    resilience=config.resilience,
+                )
                 router = TaskRouter(config)
                 _planner_registry = None
                 try:
@@ -6026,6 +6036,7 @@ def confirm_preview_and_start(
 
     del operator_id  # Reserved for future audit enrichment without breaking the helper.
 
+    _config = None
     try:
         token_hmac = _execute_swarm_preview_token_hmac(normalized_preview_token)
         _config, db, *_ = _ensure_init()
@@ -6036,12 +6047,8 @@ def confirm_preview_and_start(
             "error": "execution_error",
             "details": "preview token signing is unavailable",
         }
-    except Exception:
-        log.warning("confirm_preview_and_start initialization failed", exc_info=True)
-        return {
-            "error": "execution_error",
-            "details": "execute_swarm initialization failed",
-        }
+    except Exception as exc:
+        return _swarm_init_error_response(_config, exc)
 
     swarm_id = db.lookup_preview_token_swarm_id(token_hmac)
     if swarm_id is None:
@@ -6108,6 +6115,44 @@ def confirm_preview_and_start(
     _spawn_execute_swarm_runtime_handoff(db, swarm_id, execution_context)
     
     return {"result": confirmed_response, "started": True}
+
+
+def _swarm_db_retry_policy(config) -> RetryPolicy:
+    """RetryPolicy for the swarm-init DB writes, from resilience config (safe defaults)."""
+    res = getattr(config, "resilience", None)
+    return RetryPolicy(
+        attempts=int(getattr(res, "db_retry_attempts", 5) or 5),
+        base_delay_s=float(getattr(res, "db_lock_base_delay_s", 0.1) or 0.1),
+        max_delay_s=float(getattr(res, "db_lock_max_delay_s", 2.0) or 2.0),
+    )
+
+
+def _swarm_init_error_response(config, exc: Exception) -> dict:
+    """Build a specific, actionable swarm-init error instead of a swallowed string.
+
+    DB contention/corruption self-heals via the db-layer retry + guarded recovery;
+    surface that clearly (with the real cause + doctor pointer) rather than a generic
+    'initialization failed'.
+    """
+    category = classify_sqlite_error(exc)
+    log.warning("execute_swarm initialization failed (%s)", category.value, exc_info=True)
+    detail_cause = f"{type(exc).__name__}: {exc}"
+    if category in (ErrorCategory.DB_LOCKED, ErrorCategory.DB_CORRUPT):
+        db_path = getattr(config, "db_path", "the shared Threnody cache.db")
+        return {
+            "error": "db_contention",
+            "details": (
+                f"execute_swarm could not initialize: the shared Threnody database "
+                f"({db_path}) is contended or was being recovered by another concurrent "
+                f"MCP server. It self-heals on retry; if it persists run "
+                f"`threnody doctor --repair`. ({detail_cause})"
+            ),
+            "retryable": True,
+        }
+    return {
+        "error": "execution_error",
+        "details": f"execute_swarm initialization failed: {detail_cause}",
+    }
 
 
 def handle_execute_swarm(args: dict) -> dict:
@@ -6191,6 +6236,7 @@ def handle_execute_swarm(args: dict) -> dict:
     request_args.pop("swarm_id", None)
     request_args.pop("preview_token", None)
     request_args["topology"] = topology
+    config = None
     try:
         config, db, *_ = _ensure_init()
         preview_swarm_id: str | None = None
@@ -6212,21 +6258,23 @@ def handle_execute_swarm(args: dict) -> dict:
                     "details": "preview_token is invalid, expired, or already used",
                 }
         prepare_started = time.monotonic()
-        request_meta = prepare_swarm_execution_request(
-            request_args,
-            config=config,
-            db=db,
-            swarm_id=preview_swarm_id,
+        # Retry the DB-contending prepare step (persist_swarm_run / log_swarm_event) on a
+        # transient lock; the db layer also retries, this is the surface backstop.
+        request_meta = run_with_retry(
+            lambda: prepare_swarm_execution_request(
+                request_args,
+                config=config,
+                db=db,
+                swarm_id=preview_swarm_id,
+            ),
+            classify_exc=classify_sqlite_error,
+            policy=_swarm_db_retry_policy(config),
         )
         request_meta["prepare_request_ms"] = int((time.monotonic() - prepare_started) * 1000)
     except ValueError as exc:
         return {"error": "invalid_request", "details": str(exc)}
-    except Exception:
-        log.warning("execute_swarm initialization failed", exc_info=True)
-        return {
-            "error": "execution_error",
-            "details": "execute_swarm initialization failed",
-        }
+    except Exception as exc:
+        return _swarm_init_error_response(config, exc)
     try:
         request_fingerprint = _execute_swarm_request_fingerprint(
             raw_task,

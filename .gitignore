@@ -12,6 +12,8 @@ cache.db-shm
 cache.db.bak.*
 cache.db.bak-wal
 cache.db.bak-shm
+cache.db.lock
+cache.db.corrupt.*
 .runtime/
 audit_secret
 providers.json

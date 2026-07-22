@@ -183,3 +183,77 @@ def test_claude_auth_probe_falls_back_after_timeout(tmp_path):
         patch("shared.resilience.pathlib.Path.home", return_value=tmp_path),
     ):
         assert AuthProbe._probe("claude-code") is True
+
+
+# --- SQLite classification + generic retry (shared-WAL contention) ----------
+
+def test_classify_sqlite_locked():
+    import sqlite3
+    from shared.resilience import classify_sqlite_error, ErrorCategory
+    assert classify_sqlite_error(sqlite3.OperationalError("database is locked")) == ErrorCategory.DB_LOCKED
+    assert classify_sqlite_error(sqlite3.OperationalError("database table is locked")) == ErrorCategory.DB_LOCKED
+
+
+def test_classify_sqlite_corrupt():
+    import sqlite3
+    from shared.resilience import classify_sqlite_error, ErrorCategory
+    assert classify_sqlite_error(sqlite3.DatabaseError("database disk image is malformed")) == ErrorCategory.DB_CORRUPT
+    assert classify_sqlite_error(sqlite3.DatabaseError("file is not a database")) == ErrorCategory.DB_CORRUPT
+
+
+def test_classify_sqlite_other():
+    from shared.resilience import classify_sqlite_error, ErrorCategory
+    assert classify_sqlite_error(ValueError("nope")) == ErrorCategory.UNKNOWN
+
+
+def test_run_with_retry_retries_locked_then_gives_up():
+    import sqlite3
+    from shared.resilience import run_with_retry, classify_sqlite_error, RetryPolicy
+    calls = {"n": 0}
+
+    def f():
+        calls["n"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    try:
+        run_with_retry(f, classify_exc=classify_sqlite_error,
+                       policy=RetryPolicy(attempts=3, base_delay_s=0.001, max_delay_s=0.002))
+        assert False, "expected raise"
+    except sqlite3.OperationalError:
+        pass
+    assert calls["n"] == 3
+
+
+def test_run_with_retry_no_retry_on_corrupt():
+    import sqlite3
+    from shared.resilience import run_with_retry, classify_sqlite_error, RetryPolicy
+    calls = {"n": 0}
+
+    def f():
+        calls["n"] += 1
+        raise sqlite3.DatabaseError("malformed")
+
+    try:
+        run_with_retry(f, classify_exc=classify_sqlite_error,
+                       policy=RetryPolicy(attempts=5, base_delay_s=0.001))
+        assert False, "expected raise"
+    except sqlite3.DatabaseError:
+        pass
+    assert calls["n"] == 1
+
+
+def test_run_with_retry_succeeds_after_transient():
+    import sqlite3
+    from shared.resilience import run_with_retry, classify_sqlite_error, RetryPolicy
+    calls = {"n": 0}
+
+    def f():
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    result = run_with_retry(f, classify_exc=classify_sqlite_error,
+                            policy=RetryPolicy(attempts=4, base_delay_s=0.001, max_delay_s=0.002))
+    assert result == "ok"
+    assert calls["n"] == 2

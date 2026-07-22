@@ -41,6 +41,27 @@ _DEFAULT_SUGGEST = {
     "quota_exceeded": "check provider subscription/billing",
 }
 
+# Suggested fixes for shared-WAL DB contention/corruption.
+_DB_SUGGEST = {
+    "db_locked":  "another Threnody MCP server is initializing; retry — it self-heals, or run `threnody doctor --repair`",
+    "db_corrupt": "run `threnody db repair` (restores newest valid backup); check quarantined cache.db.corrupt.* files",
+}
+_QUARANTINE_KEEP = 3
+
+
+def _db_contention_report(db) -> dict:
+    """Inspect the DB dir for lock/quarantine evidence (no mutation)."""
+    report = {"corrupt_files": [], "lock_present": False, "db_path": None}
+    db_path = getattr(db, "_db_path", None)
+    if db_path is None:
+        return report
+    import glob as _glob
+    report["db_path"] = str(db_path)
+    report["corrupt_files"] = sorted(_glob.glob(str(db_path) + ".corrupt.*"))
+    lock_path = getattr(db, "_lock_path", None)
+    report["lock_present"] = bool(lock_path and Path(lock_path).exists())
+    return report
+
 
 def _load_providers() -> list[dict]:
     try:
@@ -156,8 +177,22 @@ def diagnose(db, repair: bool = False, dry_run: bool = False) -> int:
 
     if not db_ok:
         print("DB: integrity check FAILED — run: threnody db repair")
+        print(f"  → {_DB_SUGGEST['db_corrupt']}")
     elif db is not None:
         print("DB: ok")
+
+    # DB contention / quarantine evidence (shared WAL across concurrent MCP servers)
+    if db is not None:
+        rep = _db_contention_report(db)
+        corrupt_files = rep.get("corrupt_files") or []
+        if corrupt_files:
+            print(
+                f"DB: {len(corrupt_files)} quarantined corrupt DB file(s) present "
+                f"(e.g. {os.path.basename(corrupt_files[-1])})"
+            )
+            print(f"  → {_DB_SUGGEST['db_corrupt']}")
+        if rep.get("lock_present"):
+            print("DB: recovery lock file present (normal during concurrent init)")
 
     if providers_stale:
         import datetime
@@ -203,7 +238,7 @@ def run_self_repair(db, dry_run: bool = False) -> None:
     else:
         print(f"{tag}repair: providers.json ok")
 
-    # 3. DB integrity — auto-recover if broken
+    # 3. DB integrity — auto-recover if broken (now race-safe via cross-process lock)
     if db is not None:
         try:
             db._check_integrity_and_recover()
@@ -217,6 +252,28 @@ def run_self_repair(db, dry_run: bool = False) -> None:
                 print(f"{tag}repair: db integrity ok")
         except Exception as exc:
             print(f"{tag}repair: db integrity check error — {exc}")
+
+    # 4. Prune old quarantined corrupt DBs (keep the most recent few for forensics)
+    if db is not None:
+        try:
+            import glob as _glob
+            db_path = getattr(db, "_db_path", None)
+            quarantines = sorted(_glob.glob(str(db_path) + ".corrupt.*")) if db_path else []
+            excess = quarantines[:-_QUARANTINE_KEEP] if len(quarantines) > _QUARANTINE_KEEP else []
+            if excess:
+                if not dry_run:
+                    for path in excess:
+                        try:
+                            os.unlink(path)
+                        except Exception:
+                            log.debug("could not prune quarantine %s", path, exc_info=True)
+                    print(f"{tag}repair: pruned {len(excess)} old quarantined corrupt DB(s)")
+                else:
+                    print(f"{tag}repair: would prune {len(excess)} old quarantined corrupt DB(s)")
+            else:
+                print(f"{tag}repair: quarantine files ok ({len(quarantines)} kept)")
+        except Exception as exc:
+            print(f"{tag}repair: quarantine prune error — {exc}")
 
 
 def main(argv: list[str] | None = None) -> None:
