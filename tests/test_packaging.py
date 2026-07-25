@@ -9,6 +9,8 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+import pytest
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
@@ -40,6 +42,10 @@ def test_project_metadata_and_entry_point() -> None:
 
 
 def test_distribution_contains_only_runtime_paths(tmp_path: Path) -> None:
+    # Requires the PEP 517 build frontend; skip cleanly in dev envs that lack it
+    # (still runs in CI where `build` is installed).
+    pytest.importorskip("build")
+
     output_dir = tmp_path / "dist"
     subprocess.run(
         [

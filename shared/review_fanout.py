@@ -74,7 +74,9 @@ REVIEW_DIMENSIONS: list[_Dim] = [
             "Security review of {path}: check for injection (SQL, command, XSS), "
             "auth bypass, hardcoded secrets, SSRF, path traversal, weak crypto, "
             "CSRF, IDOR, insecure deserialization, and input validation gaps. "
-            "Report each finding as: ⚠️ [SEVERITY] security — file:line — description (CWE-XXX). "
+            "Report each finding as: ⚠️ [SEVERITY] security/<category> — file:line — description (CWE-XXX), "
+            "where <category> is a kebab-case vulnerability class "
+            "(e.g. sql-injection, xss, path-traversal, hardcoded-secret, ssrf, weak-crypto). "
             "Output nothing if no issues found."
         ),
         drop_priority=0,
@@ -86,7 +88,8 @@ REVIEW_DIMENSIONS: list[_Dim] = [
         prompt_template=(
             "Logic review of {path}: check for off-by-one errors, wrong conditions, "
             "unreachable code, swapped arguments, missing returns, and state invariant violations. "
-            "Report each finding as: ⚠️ [SEVERITY] logic — file:line — description. "
+            "Report each finding as: ⚠️ [SEVERITY] logic/<category> — file:line — description, "
+            "where <category> is a kebab-case slug (e.g. off-by-one, wrong-condition, missing-return). "
             "Output nothing if no issues found."
         ),
         drop_priority=1,
@@ -99,7 +102,8 @@ REVIEW_DIMENSIONS: list[_Dim] = [
             "Edge and null case review of {path}: check for null/None dereferences, "
             "empty collection access, division by zero, missing error handling, "
             "missing defaults, boundary conditions, and missing I/O error handling. "
-            "Report each finding as: ⚠️ [SEVERITY] edge — file:line — description. "
+            "Report each finding as: ⚠️ [SEVERITY] edge/<category> — file:line — description, "
+            "where <category> is a kebab-case slug (e.g. null-deref, empty-collection, div-by-zero). "
             "Output nothing if no issues found."
         ),
         drop_priority=2,
@@ -110,7 +114,8 @@ REVIEW_DIMENSIONS: list[_Dim] = [
         prompt_template=(
             "Type safety review of {path}: check for type mismatches, unsafe casts, "
             "generic violations, incompatible return types, and serialization/deserialization drift. "
-            "Report each finding as: ⚠️ [SEVERITY] types — file:line — description. "
+            "Report each finding as: ⚠️ [SEVERITY] types/<category> — file:line — description, "
+            "where <category> is a kebab-case slug (e.g. type-mismatch, unsafe-cast, serde-drift). "
             "Output nothing if no issues found."
         ),
         drop_priority=3,
@@ -122,7 +127,8 @@ REVIEW_DIMENSIONS: list[_Dim] = [
             "Performance review of {path}: check for O(n²) algorithms, N+1 queries, "
             "memory leaks, blocking I/O in async contexts, unbounded growth, missing pagination, "
             "and redundant calls. "
-            "Report each finding as: ⚠️ [SEVERITY] performance — file:line — description. "
+            "Report each finding as: ⚠️ [SEVERITY] performance/<category> — file:line — description, "
+            "where <category> is a kebab-case slug (e.g. quadratic, n-plus-1, memory-leak, blocking-io). "
             "Output nothing if no issues found."
         ),
         drop_priority=4,

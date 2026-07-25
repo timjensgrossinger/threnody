@@ -38,7 +38,10 @@ def canonical_project_id(raw: str, workspace_root: str | Path) -> str:
 
 
 def _get_db(db: Database | None) -> Database:
-    return db if db is not None else Database()
+    if db is not None:
+        return db
+    from .db_client import open_database
+    return open_database()
 
 
 def _normalize_scope(scope: str) -> str:

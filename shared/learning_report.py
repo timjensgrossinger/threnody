@@ -13,6 +13,7 @@ from typing import Any
 from .adaptive import get_band_stats
 from .config import DB_PATH
 from .db import Database
+from .db_client import open_database
 
 try:
     from rich.console import Console
@@ -356,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    db = Database(args.db)
+    db = open_database(args.db)
     try:
         report = build_learning_report(db, window_days=args.window_days)
         print(render_report(report, fmt=args.format))

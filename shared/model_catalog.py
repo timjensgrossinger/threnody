@@ -201,7 +201,10 @@ class ModelCatalog:
         stale_ttl_seconds: int = 86_400,
         user_overrides: dict[str, str] | None = None,
     ) -> None:
-        self._db = db or Database()
+        if db is None:
+            from .db_client import open_database
+            db = open_database()
+        self._db = db
         self._stale_ttl_seconds = stale_ttl_seconds
         self._user_overrides = user_overrides or {}
         self._provider_state: dict[str, dict[str, float | int]] = {}

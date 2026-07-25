@@ -143,10 +143,10 @@ def test_codex_entry_open_db_uses_config_path(tmp_path) -> None:
     fake_config.db_path = fake_db_path
 
     with patch.object(entry.TGsConfig, "from_yaml", return_value=fake_config):
-        with patch.object(entry, "Database", wraps=None) as mock_db:
+        with patch.object(entry, "open_database", wraps=None) as mock_db:
             mock_db.return_value = MagicMock()
             entry._open_db()
-            mock_db.assert_called_once_with(fake_db_path)
+            mock_db.assert_called_once_with(fake_db_path, config=fake_config)
 
 
 def test_codex_entry_init_uses_codex_backend_and_provider(tmp_path) -> None:
@@ -214,10 +214,10 @@ def test_cursor_entry_open_db_uses_config_path(tmp_path) -> None:
     fake_config.db_path = fake_db_path
 
     with patch.object(entry.TGsConfig, "from_yaml", return_value=fake_config):
-        with patch.object(entry, "Database", wraps=None) as mock_db:
+        with patch.object(entry, "open_database", wraps=None) as mock_db:
             mock_db.return_value = MagicMock()
             entry._open_db()
-            mock_db.assert_called_once_with(fake_db_path)
+            mock_db.assert_called_once_with(fake_db_path, config=fake_config)
 
 
 def test_junie_entry_uses_adapter() -> None:
@@ -260,10 +260,10 @@ def test_junie_entry_open_db_uses_config_path(tmp_path) -> None:
     fake_config.db_path = fake_db_path
 
     with patch.object(entry.TGsConfig, "from_yaml", return_value=fake_config):
-        with patch.object(entry, "Database", wraps=None) as mock_db:
+        with patch.object(entry, "open_database", wraps=None) as mock_db:
             mock_db.return_value = MagicMock()
             entry._open_db()
-            mock_db.assert_called_once_with(fake_db_path)
+            mock_db.assert_called_once_with(fake_db_path, config=fake_config)
 
 
 def test_opencode_entry_uses_adapter() -> None:
@@ -306,10 +306,10 @@ def test_opencode_entry_open_db_uses_config_path(tmp_path) -> None:
     fake_config.db_path = fake_db_path
 
     with patch.object(entry.TGsConfig, "from_yaml", return_value=fake_config):
-        with patch.object(entry, "Database", wraps=None) as mock_db:
+        with patch.object(entry, "open_database", wraps=None) as mock_db:
             mock_db.return_value = MagicMock()
             entry._open_db()
-            mock_db.assert_called_once_with(fake_db_path)
+            mock_db.assert_called_once_with(fake_db_path, config=fake_config)
 
 
 def test_resolve_provider_no_warning_on_registry_failure(caplog) -> None:

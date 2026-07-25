@@ -717,18 +717,51 @@ def _build_review_outcome(
         findings_high = int(review_meta.get("findings_high") or 0)
     except (TypeError, ValueError):
         return None
+    # Optional per-category (sub-dimension) breakdown for the granular quality
+    # ledger. The host may report review_meta["categories"] as
+    # {slug: {findings_total, findings_high, kept}}; absent → top-level dim only.
+    categories: dict[str, dict[str, Any]] = {}
+    raw_categories = review_meta.get("categories")
+    if isinstance(raw_categories, Mapping):
+        for slug, cat in raw_categories.items():
+            if not isinstance(cat, Mapping):
+                continue
+            key = str(slug or "").strip().lower()
+            if not key:
+                continue
+            try:
+                categories[key] = {
+                    "findings_total": int(cat.get("findings_total") or 0),
+                    "findings_high": int(cat.get("findings_high") or 0),
+                    "kept": bool(cat.get("kept", True)),
+                }
+            except (TypeError, ValueError):
+                continue
     return {
         "target_file": target_file,
         "dimension": dim,
         "tier": tier,
+        "model": str(agent_spec.get("model") or ""),
+        "effort": (str(agent_spec.get("effort")).strip() or None) if agent_spec.get("effort") else None,
         "findings_total": findings_total,
         "findings_high": findings_high,
         "kept_by_synthesis": bool(review_meta.get("kept_by_synthesis", True)),
+        "categories": categories,
     }
 
 
-def _record_review_outcome(db: Database, outcome: Mapping[str, Any]) -> None:
-    """Resolve the profile key and EMA-update review_tier_bias. Best-effort."""
+def _record_review_outcome(
+    db: Database,
+    outcome: Mapping[str, Any],
+    config: TGsConfig | None = None,
+) -> None:
+    """EMA-update review_tier_bias AND record the granular quality ledger.
+
+    The tier-bias EMA is unchanged. Additionally — when the model-quality ledger
+    is enabled — one findings-based ledger event per reviewed dimension (and one
+    per reported sub-dimension/category) attributes review precision to the model
+    that ran. Both are best-effort and never raise into finalize.
+    """
     try:
         from .review_fanout import estimate_review_profile, profile_key_for
         from .review_learning import record_review_tier_outcome
@@ -746,6 +779,53 @@ def _record_review_outcome(db: Database, outcome: Mapping[str, Any]) -> None:
         )
     except Exception:  # pragma: no cover - best-effort learning
         log.debug("review-tier outcome capture failed", exc_info=True)
+
+    # Granular model-quality ledger (source='findings'). Gated + best-effort.
+    mq_cfg = getattr(config, "model_quality", None) if config is not None else None
+    if mq_cfg is None or not (
+        getattr(mq_cfg, "enabled", True) and getattr(mq_cfg, "findings_enabled", True)
+    ):
+        return
+    try:
+        from . import model_quality
+
+        dimension = str(outcome["dimension"])
+        model = outcome.get("model")
+        effort = outcome.get("effort")
+        task_hash = outcome.get("task_hash")
+        run_id = outcome.get("run_id")
+        # Top-level dimension score.
+        model_quality.record_findings_score(
+            db,
+            model=model,
+            effort=effort,
+            dimension=dimension,
+            findings_high=int(outcome["findings_high"]),
+            findings_total=int(outcome["findings_total"]),
+            kept_by_synthesis=bool(outcome["kept_by_synthesis"]),
+            task_hash=task_hash,
+            run_id=run_id,
+        )
+        # Per-category sub-dimension scores (e.g. security -> sql-injection).
+        categories = outcome.get("categories")
+        if isinstance(categories, Mapping):
+            for slug, cat in categories.items():
+                if not isinstance(cat, Mapping):
+                    continue
+                model_quality.record_findings_score(
+                    db,
+                    model=model,
+                    effort=effort,
+                    dimension=dimension,
+                    sub_dimension=str(slug),
+                    findings_high=int(cat.get("findings_high") or 0),
+                    findings_total=int(cat.get("findings_total") or 0),
+                    kept_by_synthesis=bool(cat.get("kept", True)),
+                    task_hash=task_hash,
+                    run_id=run_id,
+                )
+    except Exception:  # pragma: no cover - best-effort learning
+        log.debug("model-quality findings capture failed", exc_info=True)
 
 
 def build_host_agent_record(
@@ -810,6 +890,9 @@ def build_host_agent_record(
     resolved_project = project_id or _HOST_RUN_META.get(run_id, {}).get("project_id") or "default-project"
 
     review_outcome = _build_review_outcome(agent_spec, result, tier)
+    if review_outcome is not None:
+        review_outcome["run_id"] = run_id
+        review_outcome["task_hash"] = ph
 
     return {
         "task_id": task_id,
@@ -1004,7 +1087,7 @@ def ingest_host_wave(
         telemetry_buffer.append(rec["telemetry_payload"])
         # Profile-keyed review-tier learning (read-only review agents). Best-effort.
         if rec.get("review_outcome"):
-            _record_review_outcome(db, rec["review_outcome"])
+            _record_review_outcome(db, rec["review_outcome"], config)
         draft_projects_by_hash.setdefault(rec["pattern_hash"], rec["resolved_project"])
         processed_agents += 1
         recorded = {

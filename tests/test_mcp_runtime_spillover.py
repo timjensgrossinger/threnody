@@ -221,6 +221,8 @@ def test_ensure_init_wires_runtime_registry_into_orchestrator(monkeypatch, tmp_p
     monkeypatch.setattr(mcp_server, "_schedule_model_catalog_refresh", lambda: None)
     monkeypatch.setattr(mcp_server.TGsConfig, "from_yaml", lambda: cfg)
     monkeypatch.setattr(mcp_server, "Database", lambda _path, **_kw: fake_db)
+    # _ensure_init now constructs the DB via open_database() (daemon-aware factory).
+    monkeypatch.setattr(mcp_server, "open_database", lambda _path, **_kw: fake_db)
     monkeypatch.setattr(mcp_server, "TaskRouter", lambda _config: fake_router)
     monkeypatch.setattr(
         mcp_server, "Planner", lambda _config, _backend, _db, **_kw: fake_planner

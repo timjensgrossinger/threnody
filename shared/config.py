@@ -508,6 +508,33 @@ class HostFastStartConfig:
     llm_refinement: bool = False
 
 
+@dataclass
+class ModelQualityConfig:
+    """Controls the granular per-(model x effort x dimension) quality ledger.
+
+    The ledger records a 0-10 score per scored agent output into
+    ``model_quality_events`` from two sources:
+
+    ``findings`` — free, derived from read-only ``REVIEW:`` agent findings at wave
+    finalize (a precision proxy over findings the synthesis kept). Never costs
+    tokens and never touches the spawn/hot path.
+
+    ``judge`` — an opt-out LLM judge that scores general (non-review) task output
+    0-10. It runs ONLY on the existing warm-path executor (``eval.py``), so it adds
+    zero latency to tasks or swarms and inherits that executor's failure backoff.
+
+    All flags are read off the hot path. ``enabled`` gates the whole ledger;
+    ``findings_enabled`` and ``judge_enabled`` gate each source independently so the
+    judge (the only token-spending part) can be disabled while keeping free
+    findings scoring.
+    """
+
+    enabled: bool = True
+    findings_enabled: bool = True
+    judge_enabled: bool = True
+    judge_model: str = "gpt-5-mini"
+
+
 def normalize_parallelism_limit(
     value: Any,
     *,
@@ -1322,6 +1349,29 @@ class ResilienceConfig:
     db_lock_max_delay_s: float = 2.0
 
 
+@dataclass
+class DbDaemonConfig:
+    """Single-writer DB daemon settings. Opt-in; off by default.
+
+    When enabled, one daemon process owns cache.db and all sessions access it
+    over a local Unix socket — eliminating the multi-process WAL -shm mmap that
+    can SIGBUS under heavy concurrency. Disabled → each process opens the DB
+    directly (legacy behavior).
+
+    Caveat: ``fallback_to_direct`` (default True) means a process that cannot reach
+    the daemon silently opens a DIRECT connection. If some processes reach the
+    daemon while others fall back, the multi-process -shm mmap this feature exists
+    to remove is reintroduced for the duration. For a strict single-writer
+    guarantee under high concurrency, set ``fallback_to_direct: false`` (processes
+    then fail loudly instead of degrading).
+    """
+    enabled: bool = False
+    socket_path: str = ""          # empty → derived as <db_path>.sock
+    idle_timeout_s: float = 900.0  # daemon self-exits after this idle; 0 = never
+    connect_timeout_s: float = 5.0
+    fallback_to_direct: bool = True
+
+
 def _dedupe_patterns(*groups: list[str] | tuple[str, ...]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -1373,6 +1423,7 @@ class TGsConfig:
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
     host_native: HostNativeConfig = field(default_factory=HostNativeConfig)
     host_fast_start: HostFastStartConfig = field(default_factory=HostFastStartConfig)
+    model_quality: ModelQualityConfig = field(default_factory=ModelQualityConfig)
     budgets: BudgetConfig = field(default_factory=BudgetConfig)
 
     # Cache
@@ -1525,6 +1576,7 @@ class TGsConfig:
 
     # Resilience: circuit breaker, retry, auth probe settings
     resilience: ResilienceConfig = field(default_factory=ResilienceConfig)
+    db_daemon: DbDaemonConfig = field(default_factory=DbDaemonConfig)
 
     # Improvement 1: immediate escalation retry when token ceiling exceeded
     escalation_retry_enabled: bool = True
@@ -2369,6 +2421,27 @@ class TGsConfig:
                 field_name="orchestrator.host_fast_start.llm_refinement",
             )
 
+        model_quality_raw = raw.get("model_quality", {})
+        if isinstance(model_quality_raw, Mapping):
+            cfg.model_quality.enabled = _coerce_config_bool(
+                model_quality_raw.get("enabled"),
+                default=cfg.model_quality.enabled,
+                field_name="model_quality.enabled",
+            )
+            cfg.model_quality.findings_enabled = _coerce_config_bool(
+                model_quality_raw.get("findings_enabled"),
+                default=cfg.model_quality.findings_enabled,
+                field_name="model_quality.findings_enabled",
+            )
+            cfg.model_quality.judge_enabled = _coerce_config_bool(
+                model_quality_raw.get("judge_enabled"),
+                default=cfg.model_quality.judge_enabled,
+                field_name="model_quality.judge_enabled",
+            )
+            judge_model = model_quality_raw.get("judge_model")
+            if isinstance(judge_model, str) and judge_model.strip():
+                cfg.model_quality.judge_model = judge_model.strip()
+
         raw_planner_host_mode = orchestrator_raw.get("planner_host_execution_mode", "host_native")
         if isinstance(raw_planner_host_mode, str) and raw_planner_host_mode.strip().lower() in {
             "host_native",
@@ -2493,6 +2566,19 @@ class TGsConfig:
                 db_lock_base_delay_s=max(0.0, float(db_raw.get("lock_base_delay_s", 0.1))),
                 db_lock_max_delay_s=max(0.01, float(db_raw.get("lock_max_delay_s", 2.0))),
             )
+
+        # Single-writer DB daemon (opt-in). Loaded from db.daemon.*
+        db_cfg_raw = raw.get("db", {})
+        if isinstance(db_cfg_raw, Mapping):
+            daemon_raw = db_cfg_raw.get("daemon", {}) or {}
+            if isinstance(daemon_raw, Mapping):
+                cfg.db_daemon = DbDaemonConfig(
+                    enabled=bool(daemon_raw.get("enabled", False)),
+                    socket_path=str(daemon_raw.get("socket_path", "") or ""),
+                    idle_timeout_s=max(0.0, float(daemon_raw.get("idle_timeout_s", 900.0))),
+                    connect_timeout_s=max(0.1, float(daemon_raw.get("connect_timeout_s", 5.0))),
+                    fallback_to_direct=bool(daemon_raw.get("fallback_to_direct", True)),
+                )
 
         # Background daemon cadence (health-probe + warm-path loops).
         # Legacy resilience.health_probe_interval_s is honored as a fallback

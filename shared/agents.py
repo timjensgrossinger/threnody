@@ -593,7 +593,8 @@ def register_agent_definition(
 def _get_agent_db() -> Database:
     global _DEFAULT_DB
     if _DEFAULT_DB is None:
-        _DEFAULT_DB = Database()
+        from .db_client import open_database
+        _DEFAULT_DB = open_database()
     return _DEFAULT_DB
 
 

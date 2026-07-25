@@ -275,6 +275,7 @@ class AgentResult:
     success: bool = True
     used_fallback: bool = False
     used_speculation: bool = False
+    effort: str | None = None  # applied reasoning effort (low|medium|high), if resolved
     gate_verdict: str | None = None  # pass | warn | block | rejected (plan 04)
     gate_signals: dict | None = None  # per-signal results
     convergence_rounds_data: list | None = None  # plan 14: [{round, score, idem_key}]
@@ -895,6 +896,7 @@ class Orchestrator:
         used_fallback: bool = False,
         used_speculation: bool = False,
         reason: str = "subtask_result",
+        effort: str | None = None,
     ) -> None:
         if self._db is None:
             return
@@ -911,6 +913,7 @@ class Orchestrator:
             used_fallback=used_fallback,
             used_speculation=used_speculation,
             reason=reason,
+            effort=effort,
             version="orchestrator",
         )
 
@@ -969,6 +972,8 @@ class Orchestrator:
         task_id: str,
         result: AgentResult,
         budget_state: TaskBudgetState | None,
+        *,
+        task_hash: str | None = None,
     ) -> None:
         self._log_agent_event(
             task_id,
@@ -981,7 +986,24 @@ class Orchestrator:
             escalated=result.escalated,
             used_fallback=result.used_fallback,
             used_speculation=result.used_speculation,
+            effort=getattr(result, "effort", None),
         )
+        # Opt-out, off-hot-path quality judge (source='judge'). Non-blocking:
+        # submits to the warm-path executor and returns immediately, so it never
+        # adds latency to tasks or swarms. Gating lives in spawn_judge.
+        try:
+            if self._evaluator is not None and getattr(result, "output", None):
+                self._evaluator.spawn_judge(
+                    output=result.output,
+                    model=result.model,
+                    effort=getattr(result, "effort", None),
+                    # Use the same pattern_hash key the findings/escalation ledgers
+                    # use so judge + findings scores for one task join; None (not the
+                    # unrelated task_id) when no per-subtask description is in scope.
+                    task_hash=task_hash,
+                )
+        except Exception:
+            log.debug("judge spawn failed", exc_info=True)
         self._record_cost_telemetry_for_result(task_id, result)
         if getattr(result, "convergence_rounds_data", None) is not None and self._db is not None:
             import json as _json
@@ -1151,6 +1173,65 @@ class Orchestrator:
 
         return None
 
+    def _effort_for_subtask(self, subtask: Subtask, tier: str) -> str | None:
+        """Best-effort resolve the effort string applied for this subtask+tier.
+
+        Uses the operator-configured per-provider x tier default (the value the
+        subprocess execution path actually applies as ``--effort``). Returns
+        ``None`` when unconfigured or the provider id is unknown — we never guess
+        from a class-name fallback, since that is not a valid effort-config key.
+        """
+        provider_id = getattr(subtask, "provider_id", None)
+        if not provider_id:
+            return None
+        try:
+            return self._config.get_default_effort(str(provider_id), tier)
+        except Exception:  # pragma: no cover - best-effort
+            log.debug("effort resolve failed", exc_info=True)
+            return None
+
+    def _log_escalation_event(
+        self,
+        subtask: Subtask,
+        *,
+        from_tier: str,
+        to_tier: str,
+        token_count: int,
+        ceiling: int,
+        reason: str,
+        from_model: str,
+        provider_override: "Provider | None",
+    ) -> None:
+        """Record one escalation row for BOTH triggers (token-ceiling + quality).
+
+        Resolves the target model and the applied effort so the model-quality
+        ledger can attribute each escalation to the specific model+effort that was
+        escalated away from, and stamps a real task hash (not the empty string the
+        old call sites used). Best-effort — never raises into ``execute_subtask``.
+        """
+        if self._db is None:
+            return
+        to_model = ""
+        try:
+            to_model = (provider_override or self._provider).resolve_model(to_tier)
+        except Exception:  # pragma: no cover - best-effort
+            log.debug("escalation to_model resolve failed", exc_info=True)
+        try:
+            self._db.log_escalation(
+                task_hash=pattern_hash(subtask.description),
+                agent_id=subtask.id,
+                from_tier=from_tier,
+                to_tier=to_tier,
+                token_count=token_count,
+                ceiling=ceiling,
+                from_model=from_model or None,
+                to_model=to_model or None,
+                effort=self._effort_for_subtask(subtask, from_tier),
+                reason=reason,
+            )
+        except Exception:  # pragma: no cover - best-effort
+            log.debug("log_escalation failed", exc_info=True)
+
     @staticmethod
     def _is_valid_coordinator_output(output: str) -> bool:
         payload = _extract_json(output)
@@ -1226,15 +1307,16 @@ class Orchestrator:
                         spec_result.tier_used,
                     )
                     next_tier = _NEXT_TIER.get(spec_result.tier_used, "high")
-                    if self._db:
-                        self._db.log_escalation(
-                            task_hash="",
-                            agent_id=subtask.id,
-                            from_tier=spec_result.tier_used,
-                            to_tier=next_tier,
-                            token_count=spec_result.token_estimate,
-                            ceiling=ceiling,
-                        )
+                    self._log_escalation_event(
+                        subtask,
+                        from_tier=spec_result.tier_used,
+                        to_tier=next_tier,
+                        token_count=spec_result.token_estimate,
+                        ceiling=ceiling,
+                        reason="token_ceiling",
+                        from_model=spec_result.model_used,
+                        provider_override=provider_override,
+                    )
                     # Improvement 1: immediate escalation retry on speculative path
                     if (
                         self._config.escalation_retry_enabled
@@ -1288,6 +1370,7 @@ class Orchestrator:
                     escalated=escalated,
                     success=success_actual,
                     used_speculation=True,
+                    effort=self._effort_for_subtask(subtask, spec_tier),
                 )
 
         # Normal execution path
@@ -1322,15 +1405,16 @@ class Orchestrator:
             escalated = True
 
             next_tier = _NEXT_TIER.get(subtask.tier, "high")
-            if self._db:
-                self._db.log_escalation(
-                    task_hash="",
-                    agent_id=subtask.id,
-                    from_tier=subtask.tier,
-                    to_tier=next_tier,
-                    token_count=token_count,
-                    ceiling=ceiling,
-                )
+            self._log_escalation_event(
+                subtask,
+                from_tier=subtask.tier,
+                to_tier=next_tier,
+                token_count=token_count,
+                ceiling=ceiling,
+                reason="token_ceiling",
+                from_model=model,
+                provider_override=provider_override,
+            )
 
             if (
                 self._config.escalation_retry_enabled
@@ -1369,6 +1453,18 @@ class Orchestrator:
             ):
                 quality_fail = self._check_output_quality_for_retry(output)
             if quality_fail is not None:
+                # Log the quality-triggered escalation too (the old code only
+                # logged token-ceiling escalations, silently dropping these).
+                self._log_escalation_event(
+                    subtask,
+                    from_tier=current_tier,
+                    to_tier=_NEXT_TIER.get(current_tier, "high"),
+                    token_count=token_count,
+                    ceiling=ceiling,
+                    reason=quality_fail,
+                    from_model=model,
+                    provider_override=provider_override,
+                )
                 try:
                     retry_out, current_tier, model = self._retry_at_next_tier(
                         subtask,
@@ -1418,6 +1514,7 @@ class Orchestrator:
             provider_name=provider_name,
             escalated=escalated,
             success=success_actual,
+            effort=self._effort_for_subtask(subtask, current_tier),
         )
 
     def _execute_subtask_with_prefetch(
@@ -2064,7 +2161,9 @@ class Orchestrator:
                 )
                 raise
             result.used_fallback = result.used_fallback or used_fallback
-            self._record_result(task_id, result, budget_state)
+            self._record_result(
+                task_id, result, budget_state, task_hash=pattern_hash(st.description)
+            )
             results.append(result)
             files_touched.update(_extract_file_paths(result.output))
 
@@ -2330,7 +2429,9 @@ class Orchestrator:
                             )
                             raise
                         result.used_fallback = result.used_fallback or wave_fallback
-                        self._record_result(task_id, result, budget_state)
+                        self._record_result(
+                            task_id, result, budget_state, task_hash=pattern_hash(st.description)
+                        )
                         results.append(result)
                         files_touched.update(_extract_file_paths(result.output))
                 except CircuitBreakerError:
@@ -5693,7 +5794,11 @@ def seed_resume_from_checkpoint(
     """
     if not isinstance(checkpoint, Mapping):
         raise TypeError("checkpoint must be a mapping")
-    active_db = db if db is not None else Database()
+    if db is not None:
+        active_db = db
+    else:
+        from .db_client import open_database
+        active_db = open_database()
     parent_swarm_id = str(checkpoint.get("swarm_id") or "").strip()
     if not parent_swarm_id:
         raise ValueError("checkpoint must contain a non-empty swarm_id")

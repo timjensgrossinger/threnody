@@ -1362,6 +1362,12 @@ PY
                     ;;
             esac
             ;;
+        quality)
+            local pybin=""
+            pybin=$(_tgs_python) || return 1
+            (cd "$_ROUTER_DIR" && "$pybin" -m shared.model_quality_report "$@")
+            return $?
+            ;;
         ""|-h|--help)
             _tgs_usage
             ;;

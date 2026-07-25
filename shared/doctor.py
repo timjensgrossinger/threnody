@@ -88,6 +88,30 @@ def _suggest_fix(provider_name: str, category: str | None) -> str:
     return "—"
 
 
+def _daemon_health_check(db) -> None:
+    """Report single-writer daemon status when the operator has opted in."""
+    try:
+        from .config import TGsConfig
+        cfg = TGsConfig.from_yaml()
+    except Exception:
+        return
+    daemon_cfg = getattr(cfg, "db_daemon", None)
+    if not daemon_cfg or not getattr(daemon_cfg, "enabled", False):
+        return
+    db_path = getattr(db, "_db_path", None) or getattr(cfg, "db_path", "")
+    sock = getattr(daemon_cfg, "socket_path", "") or (str(db_path) + ".sock")
+    import socket as _socket
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(sock)
+        s.close()
+        print(f"DB daemon: ENABLED and reachable ({sock})")
+    except OSError:
+        print(f"DB daemon: ENABLED but NOT reachable ({sock}) — will spawn on next use; "
+              "sessions fall back to direct DB if spawn fails")
+
+
 def diagnose(db, repair: bool = False, dry_run: bool = False) -> int:
     """Run diagnostics. Returns 0 if all healthy, 1 if any QUARANTINED."""
     providers = _load_providers()
@@ -193,6 +217,9 @@ def diagnose(db, repair: bool = False, dry_run: bool = False) -> int:
             print(f"  → {_DB_SUGGEST['db_corrupt']}")
         if rep.get("lock_present"):
             print("DB: recovery lock file present (normal during concurrent init)")
+
+    # Single-writer daemon health (only when opted in)
+    _daemon_health_check(db)
 
     if providers_stale:
         import datetime

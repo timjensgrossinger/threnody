@@ -75,6 +75,7 @@ from shared.db import (
     ROUTING_GUARD_MODE_ROUTED_PLAN,
     ROUTING_GUARD_TTL_SECONDS,
 )
+from shared.db_client import open_database
 from shared.eval import set_background_loop, run_warm_path_background_tasks
 from shared.resilience import (
     ErrorCategory,
@@ -624,11 +625,9 @@ def _ensure_init() -> tuple[TGsConfig, Database, TaskRouter, Planner, Orchestrat
         if needs_full_init:
             try:
                 config = TGsConfig.from_yaml()
-                db = Database(
-                    config.db_path,
-                    backup_keep=config.db_backup_keep,
-                    resilience=config.resilience,
-                )
+                # Routes to the single-writer daemon when db.daemon.enabled, else a
+                # direct Database (identical to the prior construction). Ships dark.
+                db = open_database(config.db_path, config=config)
                 router = TaskRouter(config)
                 _planner_registry = None
                 try:
@@ -1757,6 +1756,23 @@ TOOLS = [
         "description": (
             "Return aggregated spend and savings telemetry from delegated subtasks "
             "(est_cost_usd vs counterfactual) and persisted cost receipts for a time window."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "since": {
+                    "type": "string",
+                    "description": "Time window (7d, 30d, 24h, all). Default: 7d",
+                },
+            },
+        },
+    },
+    {
+        "name": "inspect_quality",
+        "description": (
+            "Return the granular model quality ledger: per-(model x effort x dimension x "
+            "sub_dimension) average score (0-10), sample count, findings/judge breakdown, and "
+            "approximate escalation rate for a time window. e.g. opus | high | security/sql-injection."
         ),
         "inputSchema": {
             "type": "object",
@@ -9018,6 +9034,17 @@ def handle_inspect_spend(args: dict) -> dict:
     return inspect_spend(str(args.get("since") or "7d"))
 
 
+def inspect_quality(since: str = "7d") -> dict:
+    config, db, *_ = _ensure_init()
+    from shared.model_quality import build_quality_snapshot
+
+    return build_quality_snapshot(db, since=str(since or "7d"), config=config)
+
+
+def handle_inspect_quality(args: dict) -> dict:
+    return inspect_quality(str(args.get("since") or "7d"))
+
+
 def handle_inspect_run_receipt(args: dict) -> dict:
     _, db, *_ = _ensure_init()
     run_id = args.get("run_id") or args.get("swarm_id")
@@ -11826,6 +11853,7 @@ HANDLERS = {
     "resume_swarm_inspect": handle_resume_swarm_inspect,
     "resume_swarm_confirm": handle_resume_swarm_confirm,
     "inspect_spend": handle_inspect_spend,
+    "inspect_quality": handle_inspect_quality,
     "inspect_run_receipt": handle_inspect_run_receipt,
     "list_task_packs": handle_list_task_packs,
     "plan_task_pack": handle_plan_task_pack,

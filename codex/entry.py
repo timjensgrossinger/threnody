@@ -32,6 +32,7 @@ from shared.router import TaskRouter
 from shared.planner import Planner, ProviderAgnosticBackend
 from shared.orchestrator import Orchestrator
 from shared.db import Database
+from shared.db_client import open_database
 from shared.discovery import get_registry
 from codex.providers import CODEX_TIER_MAP, CodexProvider
 from codex.providers_legacy import adapter_from_legacy
@@ -66,7 +67,7 @@ def _resolve_provider():
 def _init() -> tuple[TGsConfig, Database, TaskRouter, Planner, Orchestrator]:
     """Bootstrap all components."""
     config = TGsConfig.from_yaml()
-    db = Database(config.db_path)
+    db = open_database(config.db_path, config=config)
     router = TaskRouter(config)
     registry = get_registry()
     planner = Planner(
@@ -130,7 +131,7 @@ def _open_db() -> Database:
     returns a JSON error with a nonzero exit code.
     """
     config = TGsConfig.from_yaml()
-    return Database(config.db_path)
+    return open_database(config.db_path, config=config)
 
 
 def cmd_cache_get(task: str) -> None:

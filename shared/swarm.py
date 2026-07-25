@@ -10,7 +10,10 @@ from .db import Database
 
 
 def _get_db(db: Database | None) -> Database:
-    return db if db is not None else Database()
+    if db is not None:
+        return db
+    from .db_client import open_database
+    return open_database()
 
 
 @dataclass

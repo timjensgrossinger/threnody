@@ -29,6 +29,7 @@ from shared.router import TaskRouter
 from shared.planner import Planner, ClaudeCodeBackend, GhCopilotBackend
 from shared.orchestrator import Orchestrator
 from shared.db import Database
+from shared.db_client import open_database
 from shared.discovery import get_registry
 
 from shared.claude_compat import load_claude_module
@@ -57,7 +58,7 @@ def _resolve_provider() -> ClaudeCodeProvider:
 def _init() -> tuple[TGsConfig, Database, TaskRouter, Planner, Orchestrator]:
     """Bootstrap all components with Claude Code backend."""
     config = TGsConfig.from_yaml()
-    db = Database(config.db_path)
+    db = open_database(config.db_path, config=config)
     router = TaskRouter(config)
     # Prefer Claude backend for planning, fall back to Copilot if unavailable
     backend = ClaudeCodeBackend()

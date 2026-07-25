@@ -30,6 +30,7 @@ from shared.router import TaskRouter
 from shared.planner import Planner, GhCopilotBackend, ProviderAgnosticBackend
 from shared.orchestrator import Orchestrator
 from shared.db import Database
+from shared.db_client import open_database
 from shared.discovery import get_registry
 from copilot.providers import CopilotProvider
 from copilot.providers_legacy import adapter_from_legacy
@@ -55,7 +56,7 @@ def _resolve_provider() -> CopilotProvider:
 def _init() -> tuple[TGsConfig, Database, TaskRouter, Planner, Orchestrator]:
     """Bootstrap all components."""
     config = TGsConfig.from_yaml()
-    db = Database(config.db_path)
+    db = open_database(config.db_path, config=config)
     router = TaskRouter(config)
     try:
         backend: GhCopilotBackend | ProviderAgnosticBackend = ProviderAgnosticBackend(get_registry())

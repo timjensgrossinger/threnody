@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .config import DB_PATH, TGsConfig
 from .db import Database
+from .db_client import open_database
 
 log = logging.getLogger(__name__)
 
@@ -311,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=DB_PATH)
     args = parser.parse_args(argv)
 
-    db = Database(args.db)
+    db = open_database(args.db)
     try:
         scope = "user" if args.global_scope else "project"
         project_path = args.project or str(Path.cwd())

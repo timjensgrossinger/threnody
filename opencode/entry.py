@@ -23,6 +23,7 @@ from opencode.providers_legacy import adapter_from_legacy
 from shared.adapters import ProviderCapability
 from shared.config import TGsConfig
 from shared.db import Database
+from shared.db_client import open_database
 from shared.discovery import get_registry
 from shared.orchestrator import Orchestrator
 from shared.planner import Planner
@@ -56,7 +57,7 @@ def _resolve_provider():
 def _init() -> tuple[TGsConfig, Database, TaskRouter, Planner, Orchestrator]:
     """Bootstrap all components."""
     config = TGsConfig.from_yaml()
-    db = Database(config.db_path)
+    db = open_database(config.db_path, config=config)
     router = TaskRouter(config)
     planner = Planner(config, db)
     provider = _resolve_provider()
@@ -99,7 +100,7 @@ def cmd_route(task: str) -> None:
 def _open_db() -> Database:
     """Load config and return a Database at the configured path."""
     config = TGsConfig.from_yaml()
-    return Database(config.db_path)
+    return open_database(config.db_path, config=config)
 
 
 def cmd_cache_get(task: str) -> None:

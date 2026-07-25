@@ -524,6 +524,49 @@ class EvalResult:
     model: str
 
 
+def build_judge_prompt(output: str) -> str:
+    """Build a compact 0-10 quality-judge prompt for a general agent output."""
+    excerpt = (output or "")[:4000]
+    return (
+        "You are a strict senior engineer grading an AI coding agent's output.\n"
+        "Score its quality from 0 to 10 (10 = correct, complete, production-ready; "
+        "0 = wrong, empty, or non-functional).\n"
+        'Respond with ONLY a JSON object: {"score": <number 0-10>, "reason": "<brief>"}.\n\n'
+        f"Agent output:\n{excerpt}\n"
+    )
+
+
+def _parse_judge_score(raw: str | None) -> tuple[float, str] | None:
+    """Parse ``{"score": <0-10>, "reason": ...}`` from an LLM reply. None on failure."""
+    if not raw:
+        return None
+    import json
+
+    parsed = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                parsed = json.loads(line)
+                break
+            except (json.JSONDecodeError, ValueError):
+                continue
+    if parsed is None:
+        match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+    if not isinstance(parsed, dict) or "score" not in parsed:
+        return None
+    try:
+        score = float(parsed.get("score"))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(10.0, score)), str(parsed.get("reason", ""))
+
+
 class BackgroundEvaluator:
     """Spawns non-blocking background eval agents using the lowest free model.
 
@@ -735,6 +778,95 @@ class BackgroundEvaluator:
         future.add_done_callback(self._log_warm_path_result)
 
         log.info("Warm path scheduled: %d eval(s)", len(rework_events))
+        return future
+
+    def _judge_model(self) -> str:
+        mq = getattr(self._config, "model_quality", None) if self._config else None
+        model = getattr(mq, "judge_model", None) if mq else None
+        return model or "gpt-5-mini"
+
+    def _judge_enabled(self) -> bool:
+        mq = getattr(self._config, "model_quality", None) if self._config else None
+        if mq is None:
+            return False
+        return bool(getattr(mq, "enabled", True) and getattr(mq, "judge_enabled", True))
+
+    def _judge_one(
+        self,
+        *,
+        output: str,
+        model: str | None,
+        effort: str | None,
+        task_hash: str | None = None,
+        run_id: str | None = None,
+    ) -> float | None:
+        """Score one agent output 0-10 via the judge model and write the ledger.
+
+        Runs inside the warm-path executor thread — never on the hot path. The
+        judge itself runs on ``model_quality.judge_model``; the ledger row is
+        attributed to *model* (the model that produced *output*). Best-effort.
+        """
+        if not self._cli_call or not (output or "").strip():
+            return None
+        try:
+            raw = self._cli_call(build_judge_prompt(output), self._judge_model(), 30)
+        except Exception:
+            log.warning("judge cli_call failed", exc_info=True)
+            return None
+        parsed = _parse_judge_score(raw)
+        if parsed is None:
+            return None
+        score, reason = parsed
+        if self._db is not None:
+            try:
+                from . import model_quality
+
+                model_quality.record_judge_score(
+                    self._db,
+                    model=model,
+                    effort=effort,
+                    score_0_10=score,
+                    reason=reason,
+                    task_hash=task_hash,
+                    run_id=run_id,
+                )
+            except Exception:
+                log.debug("judge score persist failed", exc_info=True)
+        return score
+
+    def spawn_judge(
+        self,
+        *,
+        output: str,
+        model: str | None,
+        effort: str | None,
+        task_hash: str | None = None,
+        run_id: str | None = None,
+    ) -> ConcurrentFuture | None:
+        """Schedule a non-blocking 0-10 judge on the shared warm-path executor.
+
+        Returns immediately (never blocks tasks/swarms). No-op when the judge is
+        disabled, no CLI backend is available, or the warm-path is in its
+        failure-backoff window. Gate is read here (off the hot path).
+        """
+        if not self._judge_enabled() or not self._cli_call:
+            return None
+        if self._warm_path_disabled_until is not None:
+            if time.time() < self._warm_path_disabled_until:
+                return None
+            self._warm_path_disabled_until = None
+            self._warm_path_failures = 0
+        workers = _warm_path_worker_count(self._config)
+        executor = _get_warm_path_executor(workers)
+        future = executor.submit(
+            self._judge_one,
+            output=output,
+            model=model,
+            effort=effort,
+            task_hash=task_hash,
+            run_id=run_id,
+        )
+        future.add_done_callback(self._log_warm_path_result)
         return future
 
     async def run_warm_path(

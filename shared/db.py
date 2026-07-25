@@ -497,6 +497,7 @@ class Database:
                 rework_count INTEGER DEFAULT 0,
                 parse_diagnostics TEXT,
                 reason      TEXT,
+                effort      TEXT,
                 version     TEXT,
                 ts          REAL NOT NULL
             );
@@ -650,8 +651,33 @@ class Database:
                 to_tier     TEXT,
                 token_count INTEGER,
                 ceiling     INTEGER,
+                from_model  TEXT,
+                to_model    TEXT,
+                effort      TEXT,
+                reason      TEXT,
                 ts          REAL NOT NULL
             );
+
+            -- Granular model quality ledger (raw events; aggregated at read time).
+            -- One row per scored agent output. source='findings' comes free from
+            -- read-only REVIEW: agents (precision proxy over kept findings);
+            -- source='judge' is the opt-out warm-path LLM judge (0-10). model may
+            -- be the literal 'host-native' bucket when the host did not resolve one.
+            CREATE TABLE IF NOT EXISTS model_quality_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                model         TEXT NOT NULL,
+                effort        TEXT,
+                dimension     TEXT NOT NULL,
+                sub_dimension TEXT,
+                score_0_10    REAL NOT NULL,
+                source        TEXT NOT NULL CHECK (source IN ('findings', 'judge')),
+                sample_meta   TEXT,
+                task_hash     TEXT,
+                run_id        TEXT,
+                ts            REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_model_quality_events_key
+                ON model_quality_events (model, effort, dimension, ts);
 
             CREATE TABLE IF NOT EXISTS preview_records (
                 preview_token TEXT PRIMARY KEY,
@@ -711,6 +737,8 @@ class Database:
         """)
         self._ensure_parent_scoped_schema(conn)
         self._ensure_telemetry_columns(conn)
+        self._ensure_escalations_columns(conn)
+        self._ensure_model_quality_schema(conn)
         self._ensure_phase3_columns(conn)
         self._ensure_phase10_columns(conn)
         self._ensure_phase11_columns(conn)
@@ -779,6 +807,7 @@ class Database:
                 "ALTER TABLE telemetry ADD COLUMN parse_diagnostics TEXT"
             ),
             "reason": "ALTER TABLE telemetry ADD COLUMN reason TEXT",
+            "effort": "ALTER TABLE telemetry ADD COLUMN effort TEXT",
             # Phase 15 core explainability fields (additive)
             "urgency_score": (
                 "ALTER TABLE telemetry ADD COLUMN urgency_score REAL"
@@ -808,6 +837,56 @@ class Database:
         for column, statement in migrations.items():
             if column not in existing:
                 conn.execute(statement)
+
+    @staticmethod
+    def _ensure_escalations_columns(conn: sqlite3.Connection) -> None:
+        """Add model/effort/reason columns to older `escalations` tables.
+
+        Additive and nullable so pre-existing rows and readers survive. Backs the
+        enriched escalation logging (which model was escalated away from, at what
+        effort, and why).
+        """
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(escalations)").fetchall()
+        }
+        migrations = {
+            "from_model": "ALTER TABLE escalations ADD COLUMN from_model TEXT",
+            "to_model": "ALTER TABLE escalations ADD COLUMN to_model TEXT",
+            "effort": "ALTER TABLE escalations ADD COLUMN effort TEXT",
+            "reason": "ALTER TABLE escalations ADD COLUMN reason TEXT",
+        }
+        for column, statement in migrations.items():
+            if column not in existing:
+                conn.execute(statement)
+
+    @staticmethod
+    def _ensure_model_quality_schema(conn: sqlite3.Connection) -> None:
+        """Create the model quality ledger table on older databases.
+
+        Idempotent — the same DDL as the `_init_schema` base CREATE, kept here so
+        databases that predate the ledger pick it up on next open.
+        """
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_quality_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                model         TEXT NOT NULL,
+                effort        TEXT,
+                dimension     TEXT NOT NULL,
+                sub_dimension TEXT,
+                score_0_10    REAL NOT NULL,
+                source        TEXT NOT NULL CHECK (source IN ('findings', 'judge')),
+                sample_meta   TEXT,
+                task_hash     TEXT,
+                run_id        TEXT,
+                ts            REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_quality_events_key "
+            "ON model_quality_events (model, effort, dimension, ts)"
+        )
 
     @staticmethod
     def _ensure_phase3_columns(conn: sqlite3.Connection) -> None:
@@ -3992,6 +4071,7 @@ class Database:
         rework_count: int = 0,
         parse_diagnostics: str | None = None,
         reason: str | None = None,
+        effort: str | None = None,
         version: str = "copilot",
         # Phase 15 explainability fields (additive, optional)
         urgency_score: float | None = None,
@@ -4033,6 +4113,7 @@ class Database:
             rework_count=rework_count,
             parse_diagnostics=parse_diagnostics,
             reason=reason,
+            effort=effort,
             version=version,
             urgency_score=urgency_score,
             selected_topology=selected_topology,
@@ -4074,6 +4155,7 @@ class Database:
         rework_count: int = 0,
         parse_diagnostics: str | None = None,
         reason: str | None = None,
+        effort: str | None = None,
         version: str = "copilot",
         urgency_score: float | None = None,
         selected_topology: str | None = None,
@@ -4113,6 +4195,7 @@ class Database:
             "rework_count",
             "parse_diagnostics",
             "reason",
+            "effort",
             "version",
             "urgency_score",
             "selected_topology",
@@ -4147,6 +4230,7 @@ class Database:
             rework_count,
             parse_diagnostics,
             reason,
+            effort,
             version,
             urgency_score,
             selected_topology,
@@ -4302,12 +4386,17 @@ class Database:
         to_tier: str,
         token_count: int,
         ceiling: int,
+        from_model: str | None = None,
+        to_model: str | None = None,
+        effort: str | None = None,
+        reason: str | None = None,
     ) -> None:
         with self.conn() as conn:
             conn.execute(
                 "INSERT INTO escalations "
-                "(task_hash, agent_id, from_tier, to_tier, token_count, ceiling, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(task_hash, agent_id, from_tier, to_tier, token_count, ceiling, "
+                "from_model, to_model, effort, reason, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_hash,
                     agent_id,
@@ -4315,6 +4404,10 @@ class Database:
                     to_tier,
                     token_count,
                     ceiling,
+                    from_model,
+                    to_model,
+                    effort,
+                    reason,
                     time.time(),
                 ),
             )

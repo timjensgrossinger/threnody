@@ -76,6 +76,7 @@ def build_status_snapshot(
     }
 
     spend_snapshot = _load_spend_summary(db, config)
+    quality_summary = _load_quality_summary(db, config)
     usage_state = build_usage_state(db, config)
     plan_cache_summary = build_plan_cache_summary(db)
 
@@ -99,6 +100,7 @@ def build_status_snapshot(
         "rework_summary": _load_rework_summary(db),
         "provider_health": _load_provider_health(db),
         "spend_summary": spend_snapshot,
+        "quality_summary": quality_summary,
         "usage_state": usage_state,
         "plan_cache_summary": plan_cache_summary,
         "db_health": {
@@ -236,6 +238,39 @@ def _load_spend_summary(db: Database, config: "TGsConfig") -> dict:
             "savings_usd": 0.0,
             "free_subtask_pct": 0.0,
         }
+
+
+def _load_quality_summary(db: Database, config: "TGsConfig") -> dict:
+    """Return a compact model-quality ledger summary for status surfaces."""
+    try:
+        from shared.model_quality import build_quality_snapshot
+
+        snapshot = build_quality_snapshot(db, since="7d", config=config)
+        rows = snapshot.get("rows") or []
+        top = sorted(rows, key=lambda r: r.get("n", 0), reverse=True)[:5]
+        return {
+            "window": snapshot.get("window", "7d"),
+            "event_count": int(snapshot.get("event_count") or 0),
+            "tracked_keys": len(rows),
+            "top": [
+                {
+                    "model": r.get("model"),
+                    "effort": r.get("effort"),
+                    "dimension": (
+                        f"{r.get('dimension')}/{r.get('sub_dimension')}"
+                        if r.get("sub_dimension")
+                        else r.get("dimension")
+                    ),
+                    "avg_score": r.get("avg_score"),
+                    "n": r.get("n"),
+                }
+                for r in top
+            ],
+            "cli_hint": snapshot.get("cli_hint"),
+        }
+    except Exception:
+        log.debug("quality summary load failed", exc_info=True)
+        return {"window": "7d", "event_count": 0, "tracked_keys": 0, "top": []}
 
 
 def _load_rework_summary(db: Database) -> dict:
