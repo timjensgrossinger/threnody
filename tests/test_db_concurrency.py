@@ -134,6 +134,140 @@ def test_corruption_quarantined_not_deleted() -> None:
         db2.close()
 
 
+def _crashed_writer(db_path: str, rows: int) -> None:
+    """Subprocess entry: fill the WAL, then die without checkpointing it."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cache("
+        "key TEXT PRIMARY KEY, task TEXT, result TEXT, model TEXT, ts REAL)"
+    )
+    for i in range(rows):
+        conn.execute(
+            "INSERT OR REPLACE INTO cache VALUES (?,?,?,?,?)",
+            (f"wal{i}", "t", "x" * 200, "m", 1.0),
+        )
+    conn.commit()
+    os._exit(9)  # crash: the -wal survives uncheckpointed
+
+
+def _leave_hot_wal(db_path: Path, rows: int = 3000) -> int:
+    """Leave a genuine uncheckpointed WAL next to ``db_path``. Returns its size."""
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(target=_crashed_writer, args=(str(db_path), rows))
+    proc.start()
+    proc.join(timeout=60)
+    wal = db_path.with_name(db_path.name + "-wal")
+    assert wal.exists() and wal.stat().st_size > 0, "expected a hot WAL on disk"
+    return wal.stat().st_size
+
+
+def test_quarantine_discards_wal_so_fresh_db_is_clean() -> None:
+    """Quarantine must take the sidecars with it.
+
+    Characterization + hygiene: SQLite happens to reset (not replay) a WAL whose
+    main file is empty, so the recreated DB was already safe here. The assertion
+    pins that behaviour and checks the sidecars follow the DB they belong to.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        db_path = Path(d) / "cache.db"
+        Database(db_path).close()
+        _leave_hot_wal(db_path)
+
+        # Quarantine the main file only, exactly as the old recovery path did.
+        os.replace(db_path, db_path.with_name(db_path.name + ".corrupt.1"))
+
+        db = Database(db_path)  # previously: replayed the foreign WAL
+        with db.conn() as conn:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            # The orphaned WAL's rows must NOT resurface in the fresh DB.
+            assert conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0] == 0
+        db.close()
+        # Sidecars moved next to the quarantined DB, not left on the live name.
+        assert Path(str(db_path) + ".corrupt.1-wal").exists() or not Path(
+            str(db_path) + "-wal"
+        ).exists()
+
+
+def test_recovery_restores_backup_and_keeps_it() -> None:
+    """Restore must survive a hot WAL and must not consume the backup."""
+    with tempfile.TemporaryDirectory() as d:
+        db_path = Path(d) / "cache.db"
+        db = Database(db_path)
+        with db.conn() as conn:
+            conn.execute(
+                "INSERT INTO cache(key, task, result, model, ts) VALUES (?,?,?,?,?)",
+                ("good", "t", "r", "m", 1.0),
+            )
+        backup = db.backup_db()
+        assert backup is not None
+        db.close()
+
+        _leave_hot_wal(db_path)  # 3000 rows sitting in an uncheckpointed WAL
+
+        Database(db_path)._recover_db()
+
+        # Copied, not moved: a consumed backup leaves nothing to retry with.
+        assert Path(backup).exists()
+
+        db2 = Database(db_path)
+        with db2.conn() as conn:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            rows = conn.execute("SELECT key FROM cache").fetchall()
+        db2.close()
+        # Exactly the backup's contents — not the WAL's 3000 rows.
+        assert rows == [("good",)], rows
+
+
+def test_recovery_declines_while_another_process_holds_db() -> None:
+    """Recovery must not mutate the DB file while a peer connection is attached.
+
+    The process lock only serializes processes that take it; a peer merely holding
+    a connection does not. Replacing the file or deleting its WAL underneath that
+    reader invalidates its shm mapping (``disk I/O error``).
+    """
+    with tempfile.TemporaryDirectory() as d:
+        db_path = Path(d) / "cache.db"
+        db = Database(db_path)
+        with db.conn() as conn:
+            conn.execute(
+                "INSERT INTO cache(key, task, result, model, ts) VALUES (?,?,?,?,?)",
+                ("k", "t", "r", "m", 1.0),
+            )
+        assert db.backup_db() is not None
+        db.close()
+
+        holder = sqlite3.connect(str(db_path))
+        holder.execute("BEGIN EXCLUSIVE")
+        try:
+            before = db_path.stat().st_mtime_ns
+            Database(db_path)._recover_db()
+            assert db_path.stat().st_mtime_ns == before, "recovery mutated a shared DB"
+            assert glob.glob(str(db_path) + ".corrupt.*") == []
+        finally:
+            holder.rollback()
+            holder.close()
+
+
+def test_orphaned_wal_discarded_when_main_db_missing() -> None:
+    """A WAL beside a missing/empty main DB cannot belong to it → discard it."""
+    with tempfile.TemporaryDirectory() as d:
+        db_path = Path(d) / "cache.db"
+        Database(db_path).close()
+        _leave_hot_wal(db_path)
+        db_path.unlink()  # DB gone out of band; sidecars stranded
+
+        db = Database(db_path)
+        wal = db_path.with_name(db_path.name + "-wal")
+        # The stranded frames were dropped rather than replayed into the new DB.
+        with db.conn() as conn:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0] == 0
+        db.close()
+        assert not wal.exists() or wal.stat().st_size == 0
+
+
 def test_drop_thread_local_conn_forces_reopen() -> None:
     """_drop_thread_local_conn (auto-reconnect) clears the cached conn; next op reopens."""
     with tempfile.TemporaryDirectory() as d:

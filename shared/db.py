@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import secrets
+import shutil
 import sqlite3
 import stat
 import threading
@@ -2101,8 +2102,38 @@ class Database:
             log.debug("integrity probe inconclusive (%s)", category, exc_info=True)
             return None
 
+    def _discard_orphaned_sidecars(self) -> None:
+        """Drop a ``-wal``/``-shm`` pair that cannot belong to the main DB file.
+
+        A WAL-mode database always has at least a one-page (4 KiB) main file, so a
+        missing or empty ``cache.db`` beside a non-empty ``cache.db-wal`` means the
+        DB it journalled for is gone (quarantined, or removed out of band).
+
+        Hygiene, not a correctness fix: SQLite resets rather than replays a WAL when
+        the main file is empty, so the stale frames are already inert. Dropping them
+        keeps a multi-MB sidecar from lingering indefinitely and stops it becoming
+        live again the moment something repopulates the main file.
+        MUST hold ``_process_lock``.
+        """
+        wal, _shm = self._sidecar_paths()
+        try:
+            if not wal.exists() or wal.stat().st_size == 0:
+                return
+            main_size = self._db_path.stat().st_size if self._db_path.exists() else 0
+        except OSError:
+            log.debug("could not stat DB/sidecars", exc_info=True)
+            return
+        if main_size == 0:
+            log.warning(
+                "Discarding orphaned WAL %s (main DB is missing or empty) — "
+                "its frames belong to a database that no longer exists",
+                wal,
+            )
+            self._discard_wal_sidecars()
+
     def _check_integrity_and_recover(self) -> None:
         with self._process_lock():
+            self._discard_orphaned_sidecars()
             result = self._integrity_probe(str(self._db_path))
             self._last_integrity_ok = result if result is not None else True
             if result is None:
@@ -2121,9 +2152,108 @@ class Database:
         with self._process_lock():
             self._recover_db_locked()
 
+    def _sidecar_paths(self) -> tuple[Path, Path]:
+        """The ``-wal`` / ``-shm`` sidecars belonging to the main DB file."""
+        return (
+            self._db_path.with_name(f"{self._db_path.name}-wal"),
+            self._db_path.with_name(f"{self._db_path.name}-shm"),
+        )
+
+    def _discard_wal_sidecars(self, move_to: Path | None = None) -> None:
+        """Detach the ``-wal``/``-shm`` sidecars from the main DB file name.
+
+        SQLite identifies a WAL purely by filename, not by content: a ``-wal`` left
+        next to a *replaced*, non-empty ``cache.db`` is treated as that file's hot
+        journal and its frames are replayed into it. The restored database is then
+        silently overwritten by pages from the old one — the restore becomes a no-op,
+        and where the two files disagree on page geometry the next open fails with
+        ``file is not a database``. So any swap of the main DB file MUST discard the
+        sidecars in the same critical section.
+
+        (An *empty* or missing main file is the benign case: SQLite resets the WAL
+        rather than replaying it. Only a populated replacement is at risk.)
+
+        With ``move_to`` the sidecars are renamed alongside a quarantined DB (kept
+        for forensics); otherwise they are unlinked. Best-effort per file — a
+        missing sidecar is the normal case after a clean checkpoint.
+        """
+        for sidecar in self._sidecar_paths():
+            suffix = sidecar.name[len(self._db_path.name):]  # "-wal" / "-shm"
+            try:
+                if move_to is not None:
+                    os.replace(sidecar, move_to.with_name(move_to.name + suffix))
+                else:
+                    os.unlink(sidecar)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                log.debug("Could not discard sidecar %s", sidecar, exc_info=True)
+
+    def _close_all_connections(self) -> None:
+        """Drop every cached handle in this process before swapping the DB file.
+
+        Connections opened against the old inode keep their own WAL alive; if one
+        checkpoints after the swap it writes old-DB pages back under the new file's
+        name. Callers reopen lazily via ``_get_connection`` / ``_legacy_conn``.
+        """
+        with self._legacy_conn_lock:
+            for conn in list(self._legacy_conns.values()):
+                try:
+                    conn.close()
+                except Exception:
+                    log.debug("closing legacy conn failed", exc_info=True)
+            self._legacy_conns.clear()
+        self._drop_thread_local_conn()
+        self._schema_ready = False
+
+    def _can_take_exclusive(self) -> bool:
+        """True when no other connection (in any process) holds the DB.
+
+        ``_process_lock`` only serializes processes that *take* it — a peer MCP
+        server merely holding an open connection never does. Replacing the file or
+        deleting its WAL underneath such a reader invalidates its shm mapping and
+        surfaces as ``disk I/O error``. SQLite's own EXCLUSIVE lock is the reliable
+        probe: if we cannot get it, someone is attached and recovery must decline
+        rather than mutate shared state.
+        """
+        if not self._db_path.exists():
+            return True
+        try:
+            probe = sqlite3.connect(str(self._db_path), timeout=1.0)
+            try:
+                probe.execute("PRAGMA locking_mode = EXCLUSIVE")
+                # Only an actual write attempt acquires the exclusive lock.
+                probe.execute("BEGIN EXCLUSIVE")
+                probe.execute("ROLLBACK")
+                return True
+            finally:
+                probe.close()
+        except sqlite3.DatabaseError as exc:
+            # A corrupt DB cannot be read but is not shared — recovery is its point.
+            if classify_sqlite_error(exc) == ErrorCategory.DB_CORRUPT:
+                return True
+            log.debug("exclusive probe failed (%s)", exc, exc_info=True)
+            return False
+        except Exception:
+            log.debug("exclusive probe errored", exc_info=True)
+            return False
+
     def _recover_db_locked(self) -> None:
         """Recovery body. MUST be called while holding ``_process_lock``."""
         import glob as _glob
+        # Release our own handles first: they pin the old inode and its WAL.
+        self._close_all_connections()
+        if not self._can_take_exclusive():
+            # Another process is attached. Mutating the file now would corrupt its
+            # view; leave the DB alone and let a later run (or `threnody doctor
+            # --repair` on a quiet system) recover it.
+            log.warning(
+                "Skipping DB recovery at %s — another process holds the database. "
+                "Retry when idle (threnody doctor --repair).",
+                self._db_path,
+            )
+            self._last_integrity_ok = None
+            return
         pattern = str(self._db_path) + ".bak.*"
         candidates = sorted(
             _glob.glob(pattern),
@@ -2139,7 +2269,19 @@ class Database:
                 finally:
                     conn.close()
                 if valid:
-                    os.replace(candidate, self._db_path)
+                    # Copy, don't move: a consumed backup leaves nothing to retry
+                    # with if the restored file turns out bad. And discard the old
+                    # sidecars BEFORE the swap so no foreign WAL is replayed into it.
+                    self._discard_wal_sidecars()
+                    shutil.copyfile(candidate, self._db_path)
+                    self._ensure_private_db_file(self._db_path)
+                    if self._integrity_probe(str(self._db_path)) is False:
+                        log.warning(
+                            "Restored backup %s did not verify in place — discarding",
+                            candidate,
+                        )
+                        os.unlink(candidate)
+                        continue
                     self._last_integrity_ok = True
                     log.warning("DB recovered from backup %s", candidate)
                     return
@@ -2150,11 +2292,16 @@ class Database:
                 log.debug("Recovery candidate %s failed", candidate, exc_info=True)
         # No valid backup: QUARANTINE the corrupt DB (rename, don't delete) so it is
         # preserved for forensics and durable rows aren't silently destroyed.
+        quarantined = False
         try:
             quarantine = self._db_path.with_name(
                 self._db_path.name + f".corrupt.{int(time.time())}"
             )
             os.replace(self._db_path, quarantine)
+            quarantined = True
+            # Sidecars follow the DB they belong to, so the quarantine stays
+            # self-contained for forensics and nothing stale is left on the live name.
+            self._discard_wal_sidecars(move_to=quarantine)
             log.warning(
                 "No valid backup found — quarantined corrupt DB to %s, will recreate on next connect",
                 quarantine,
@@ -2163,7 +2310,13 @@ class Database:
             log.debug("Corrupt DB already gone before quarantine")
         except Exception:
             log.debug("Could not quarantine corrupt DB", exc_info=True)
-        self._last_integrity_ok = None
+        if not quarantined:
+            # DB file gone but sidecars may remain — they must not outlive it.
+            self._discard_wal_sidecars()
+        # The corrupt file is off the main path; the next connect recreates a clean
+        # DB. Report ok so callers don't immediately re-run recovery on the fresh
+        # file (which would quarantine an empty database).
+        self._last_integrity_ok = True
 
     def backup_db(self) -> Path | None:
         backup_path = self._db_path.with_name(
