@@ -172,7 +172,7 @@ class TestSecuritySmells:
         )
 
     def test_hardcoded_secret_detected(self):
-        got = rule_ids(scan_src('API_KEY = "sk-live-9f8a7b6c5d4e3f2a"\n'))
+        got = rule_ids(scan_src('API_KEY = "sk-live-9f8a7b6c5d4e3f2a"\n'))  # gitleaks:allow
         assert "hardcoded_secret" in got
 
     @pytest.mark.parametrize("line", [
@@ -270,7 +270,7 @@ class TestRegexRules:
         src = (
             "export function h(a) {\n"
             "  try { go() } catch (e) {}\n"
-            '  const apiKey = "abcd1234efgh5678";\n'
+            '  const apiKey = "abcd1234efgh5678";\n'  # gitleaks:allow
             '  const q = "SELECT * FROM users WHERE id = " + a;\n'
             "  const v = data as any;\n"
             "  return eval(a);\n"
@@ -287,7 +287,7 @@ class TestRegexRules:
 
     def test_secret_with_identifier_tail(self):
         assert "hardcoded_secret" in rule_ids(
-            ci.scan("c.go", content='secret_key = "A1b2C3d4E5f6"\n')
+            ci.scan("c.go", content='secret_key = "A1b2C3d4E5f6"\n')  # gitleaks:allow
         )
 
     def test_type_ignore_comment_on_python(self):
@@ -301,7 +301,7 @@ class TestRegexRules:
         assert [s.rule_id for s in intel.smells].count("eval_exec") == 1
 
     def test_python_syntax_error_still_gets_regex_rules(self):
-        intel = ci.scan("broken.py", content='def f(:\n    pass\nsecret_key = "A1b2C3d4E5f6"\n')
+        intel = ci.scan("broken.py", content='def f(:\n    pass\nsecret_key = "A1b2C3d4E5f6"\n')  # gitleaks:allow
         assert intel.parsed is False
         assert "hardcoded_secret" in rule_ids(intel)
 
