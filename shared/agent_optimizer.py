@@ -53,9 +53,16 @@ def choose_agent_count(task: str, *, requested: int | None = None, hard_cap: int
             strategy = "two_agent_pair"
             rationale = "Small review/security work benefits from a checker plus synthesis."
     elif file_count >= 4 or complexity.get("complex"):
-        recommended = _cap(max(2, min(file_count, 4)))
-        strategy = "bounded_swarm"
-        rationale = "Multi-file or coupled task; bounded fanout preserves parallelism without a large swarm."
+        # One writer per named file. The previous ``min(file_count, 4)`` ceiling
+        # was a *recommendation* that the planner applied as a hard file cap, so
+        # a 9-file task silently lost 5 files. Only swarm.max_agents may bound
+        # write fanout, and when it does the planner reports the shortfall.
+        recommended = _cap(max(2, file_count))
+        strategy = "file_fanout"
+        rationale = (
+            "Multi-file or coupled task; one writer per named file, bounded by "
+            "swarm.max_agents only when a cap is configured."
+        )
     else:
         recommended = _cap(2)
         strategy = "two_agent_pair"

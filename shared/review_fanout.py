@@ -8,7 +8,11 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+if TYPE_CHECKING:
+    from shared.code_intel import CodeIntel, Smell
+    from shared.db import Database
 
 log = logging.getLogger(__name__)
 
@@ -237,18 +241,30 @@ def _max_nesting_depth(content: str) -> int:
     return max(max_indent_units, max_brace)
 
 
-def _structural_density(content: str) -> float:
+def _structural_density(content: str, intel: "CodeIntel | None" = None) -> float:
     """Blend nesting, branch density, and definition surface into a 0.0–1.0 score.
 
-    Pure-Python over already-read content — no disk I/O, no AST, no LLM. Lets a
-    dense, deeply-nested mid-sized file out-rank a flat large one for tiering.
+    Pure-Python over already-read content — no disk I/O, no LLM. Lets a dense,
+    deeply-nested mid-sized file out-rank a flat large one for tiering.
+
+    When ``intel`` carries a successful AST parse, the same three quantities come
+    from the parse instead of the keyword regexes — the formula, normalizers, and
+    0.0–1.0 scale are identical, so ``_density_bucket`` names and therefore
+    ``profile_key_for`` learning keys are unchanged. The AST simply measures
+    accurately what the regexes approximate (which count keywords inside strings
+    and comments), so a previously mis-bucketed file may now bucket correctly.
     """
     eloc = _effective_loc(content)
     if eloc <= 0:
         return 0.0
-    defs = len(_DEF_SIGNALS.findall(content))
-    branches = len(_BRANCH_SIGNALS.findall(content))
-    depth = _max_nesting_depth(content)
+    if intel is not None and intel.parsed:
+        defs = intel.def_count
+        branches = intel.branch_count
+        depth = intel.max_depth
+    else:
+        defs = len(_DEF_SIGNALS.findall(content))
+        branches = len(_BRANCH_SIGNALS.findall(content))
+        depth = _max_nesting_depth(content)
     depth_n = min(depth / 8.0, 1.0)
     branch_n = min((branches / eloc) / 0.4, 1.0)
     def_n = min((defs / eloc) / 0.25, 1.0)
@@ -313,15 +329,20 @@ class ReviewProfile(NamedTuple):
     loc: int
     density_score: float = 0.0  # structural density (0.0–1.0); default keeps 3-arg back-compat
     concrete_high_risk: bool = False
+    intel: "CodeIntel | None" = None  # entity/smell scan; None when unavailable
 
 
-def estimate_review_profile(path: str) -> ReviewProfile:
-    """Return (band, has_risk, loc, density_score) for path.
+def estimate_review_profile(path: str, *, db: "Database | None" = None) -> ReviewProfile:
+    """Return (band, has_risk, loc, density_score, ...) for path.
 
     Additive companion to estimate_complexity: exposes raw LOC plus a structural
     density score for per-agent tier selection while preserving the risk-bumped
     band for dimension choice. Reuses the mtime+size-keyed cached read in
     _read_file_safe, so this adds no extra disk I/O on top of estimate_complexity.
+
+    ``db`` is optional and only enables the cross-process ``code_intel`` cache;
+    without it the scan still runs against an in-process cache, so this module
+    stays usable (and testable) with no database.
     """
     content = _read_file_safe(path)
     if content is None:
@@ -329,9 +350,21 @@ def estimate_review_profile(path: str) -> ReviewProfile:
         return ReviewProfile("moderate", False, _LOC_COMPLEX)
     loc = _count_loc(content)
     band, has_risk = estimate_complexity(path)
-    density = _structural_density(content)
+    intel = _scan_intel(path, content, db)
+    density = _structural_density(content, intel)
     concrete_high_risk = _has_concrete_high_risk_signals(content)
-    return ReviewProfile(band, has_risk, loc, density, concrete_high_risk)
+    return ReviewProfile(band, has_risk, loc, density, concrete_high_risk, intel)
+
+
+def _scan_intel(path: str, content: str, db: "Database | None") -> "CodeIntel | None":
+    """Best-effort code_intel scan — a failure degrades to the regex heuristics."""
+    try:
+        from .code_intel import scan
+
+        return scan(path, content=content, db=db)
+    except Exception:  # pragma: no cover - best-effort
+        log.debug("review_fanout: code_intel scan failed for %s", path, exc_info=True)
+        return None
 
 
 def estimate_complexity(path: str) -> tuple[Complexity, bool]:
@@ -366,22 +399,200 @@ def estimate_complexity(path: str) -> tuple[Complexity, bool]:
     return band, risk
 
 
+# Dimensions the static scanner has real detection coverage for. A clean scan is
+# weak evidence for these, so a trivial file may skip them. `logic` is excluded on
+# purpose: no static rule detects an off-by-one or an inverted condition, so "no
+# smells" says nothing about logic and must never justify dropping that reviewer.
+_STATIC_COVERAGE = frozenset({"security", "edge", "types", "performance"})
+
+
+def _smells_for_profile(prof: ReviewProfile) -> "dict[str, list[Smell]]":
+    """Static smells grouped by dimension, or ``{}`` when no scan is available.
+
+    Returns ``{}`` (not None) for an unscanned profile so callers can treat the
+    lookup uniformly; ``dimensions_for`` distinguishes the two cases by receiving
+    None explicitly when ``prof.intel`` is absent.
+    """
+    if prof.intel is None:
+        return {}
+    from .code_intel import smells_by_dimension
+
+    return smells_by_dimension(prof.intel.smells)
+
+
+def _smell_tier_bias(dim_smells: "list[Smell]") -> int:
+    """+1 when this dimension carries a high-severity static hit, else 0."""
+    from .code_intel import SEVERITY_HIGH
+
+    return 1 if any(s.severity == SEVERITY_HIGH for s in dim_smells) else 0
+
+
+def _format_leads(dim_smells: "list[Smell]") -> str:
+    if not dim_smells:
+        return ""
+    from .code_intel import format_smell_leads
+
+    return format_smell_leads(dim_smells)
+
+
+def _expected_rule_ids(dim_smells: "list[Smell]") -> list[str]:
+    """High-severity rule ids for this cell — the recall ledger's expected set."""
+    from .code_intel import SEVERITY_HIGH
+
+    return sorted({s.rule_id for s in dim_smells if s.severity == SEVERITY_HIGH})
+
+
+def _cell_tier(
+    path: str,
+    dim: _Dim,
+    prof: ReviewProfile,
+    *,
+    task_force_high: bool,
+    tier_bias: dict[tuple[str, str], int] | None,
+) -> tuple[str, "list[Smell]"]:
+    """Resolve one cell's tier and its dimension smells.
+
+    Extracted so the review-memory skip check and the subtask builder agree on the
+    planned tier — a skip decision compared against a different tier than the one
+    that would actually run would be unsound.
+    """
+    bias = 0
+    if tier_bias:
+        bias = int(tier_bias.get((profile_key_for(prof, path), dim.key), 0))
+    dim_smells = _smells_for_profile(prof).get(dim.key, []) if prof.intel else []
+    # A confirmed-shape static hit is concrete evidence this cell has real work to
+    # do, so give it one extra step of reasoning headroom.
+    bias += _smell_tier_bias(dim_smells)
+    tier = tier_for(
+        dim,
+        prof.band,
+        prof.has_risk,
+        loc=prof.loc,
+        force_high=task_force_high,
+        density_score=prof.density_score,
+        concrete_high_risk=prof.concrete_high_risk,
+        bias=bias,
+    )
+    return tier, dim_smells
+
+
+def _format_resolved(db: "Database | None", path: str, dimension: str) -> str:
+    """Prompt block suppressing findings already reported here and since fixed."""
+    if db is None:
+        return ""
+    try:
+        from .review_memory import format_resolved_block, load_resolved_findings
+
+        return format_resolved_block(load_resolved_findings(db, path, dimension))
+    except Exception:  # pragma: no cover - best-effort
+        log.debug("review_fanout: resolved-findings read failed", exc_info=True)
+        return ""
+
+
+def _format_replay(replayed: "list[Any]") -> str:
+    """Synthesis block carrying findings from cells served out of memory."""
+    if not replayed:
+        return ""
+    try:
+        from .review_memory import format_replay_block
+
+        return format_replay_block(replayed)
+    except Exception:  # pragma: no cover - best-effort
+        log.debug("review_fanout: replay block render failed", exc_info=True)
+        return ""
+
+
+def _review_memory_enabled() -> bool:
+    """Config gate for prior-review memory. Fail-safe → enabled."""
+    try:
+        from .config import TGsConfig
+
+        return bool(getattr(TGsConfig.from_yaml(), "review_memory_enabled", True))
+    except Exception:  # pragma: no cover - config read is best-effort
+        return True
+
+
+def _apply_review_memory(
+    all_cells: list[tuple[str, _Dim, ReviewProfile]],
+    db: "Database | None",
+    *,
+    task_force_high: bool,
+    tier_bias: dict[tuple[str, str], int] | None,
+) -> tuple[list[tuple[str, _Dim, ReviewProfile]], list[Any]]:
+    """Split cells into (to-run, replayed-from-memory).
+
+    A cell is only skipped when the stored scan covers the *same* content digest
+    AND ran at an equal-or-stronger tier, so cheap prior coverage never satisfies a
+    plan that has since escalated. Without a DB, without a scan digest, or with the
+    feature disabled, every cell runs — identical to pre-Phase-2 behavior.
+    """
+    if db is None or not all_cells or not _review_memory_enabled():
+        return all_cells, []
+    try:
+        from .review_memory import load_cached_scan, tier_covers
+    except Exception:  # pragma: no cover - defensive import
+        return all_cells, []
+
+    keep: list[tuple[str, _Dim, ReviewProfile]] = []
+    replayed: list[Any] = []
+    for path, dim, prof in all_cells:
+        sha = prof.intel.content_sha if prof.intel else ""
+        if not sha:
+            keep.append((path, dim, prof))
+            continue
+        planned_tier, _ = _cell_tier(
+            path, dim, prof, task_force_high=task_force_high, tier_bias=tier_bias
+        )
+        cached = load_cached_scan(db, path, sha, dim.key)
+        if cached is not None and tier_covers(cached.tier, planned_tier):
+            replayed.append(cached)
+        else:
+            keep.append((path, dim, prof))
+    if replayed:
+        log.info(
+            "review_fanout: %d cell(s) served from prior-review memory (unchanged revision)",
+            len(replayed),
+        )
+    # Never return an empty plan: if literally everything was cached, keep the
+    # synthesis agent so the replayed findings are still reported to the user.
+    return keep, replayed
+
+
 def dimensions_for(
     band: Complexity,
     has_risk: bool,
     requested: list[str] | None = None,
+    smells: "dict[str, list[Smell]] | None" = None,
 ) -> list[_Dim]:
     """Dimensions to run for a given complexity band + risk flag.
 
     When ``requested`` names explicit dimensions, run *only* those; security is
     appended (never evicting a named dim) only when the file carries real risk
     signals. With no explicit request, fall back to band-derived selection.
+
+    ``smells`` is the static pre-scan grouped by dimension. It refines the band
+    choice in two directions: a dimension holding a high-severity smell is added
+    even when the band would not have selected it, and a ``trivial`` file with a
+    clean scan may skip the dimensions the scanner actually covers
+    (:data:`_STATIC_COVERAGE`). Explicit ``requested`` dimensions are never
+    dropped, and security survives whenever ``has_risk``.
     """
+    from .code_intel import SEVERITY_HIGH
+
+    def _has_high(key: str) -> bool:
+        return any(s.severity == SEVERITY_HIGH for s in (smells or {}).get(key, ()))
+
     if requested:
         keys = [k for k in requested if k in _DIM_BY_KEY]
         if has_risk and "security" not in keys:
             keys.append("security")
         if keys:
+            # Static high-severity evidence outside the requested set still earns a
+            # reviewer — a confirmed exploit primitive should not go unreviewed
+            # because the operator named a different dimension.
+            for key in _DIM_KEYS:
+                if key not in keys and _has_high(key):
+                    keys.append(key)
             return [_DIM_BY_KEY[k] for k in keys]
         # requested held only unknown keys → fall through to band logic
 
@@ -394,6 +605,19 @@ def dimensions_for(
 
     if has_risk and "security" not in keys:
         keys = ["security"] + keys
+
+    if smells is not None:
+        for key in _DIM_KEYS:
+            if key not in keys and _has_high(key):
+                keys.append(key)
+        if band == "trivial":
+            keys = [
+                k
+                for k in keys
+                if k not in _STATIC_COVERAGE
+                or smells.get(k)
+                or (k == "security" and has_risk)
+            ]
 
     return [_DIM_BY_KEY[k] for k in keys]
 
@@ -530,6 +754,7 @@ def build_review_subtasks(
     *,
     max_agents: int | None = None,
     tier_bias: dict[tuple[str, str], int] | None = None,
+    db: "Database | None" = None,
 ) -> dict:
     """Build a DAG plan dict with per-(file, dimension) subtasks + synthesis.
 
@@ -539,6 +764,7 @@ def build_review_subtasks(
     tier_bias: optional learned {(profile_key, dimension): step} map. Looked up
         per cell (microsecond dict hit) and applied as a clamped tier shift. An
         empty/None map is a no-op — fresh repos keep the pure heuristic.
+    db: optional Database, used only for the cross-process code_intel scan cache.
     """
     if not entries:
         return {
@@ -565,8 +791,13 @@ def build_review_subtasks(
     # Compute per-file (dims, profile) — profile carries raw LOC for tiering
     file_dims: list[tuple[str, list[_Dim], ReviewProfile]] = []
     for path, _ in entries:
-        prof = estimate_review_profile(path)
-        dims = dimensions_for(prof.band, prof.has_risk, requested=requested)
+        prof = estimate_review_profile(path, db=db)
+        dims = dimensions_for(
+            prof.band,
+            prof.has_risk,
+            requested=requested,
+            smells=_smells_for_profile(prof),
+        )
         # Only force-add security on an explicit high-tier signal, not merely
         # because the user named some other dimension.
         if task_force_high and not any(dim.key == "security" for dim in dims):
@@ -580,6 +811,13 @@ def build_review_subtasks(
             dims, key=lambda d: _effective_drop_priority(d, requested_keys, prof.has_risk)
         ):
             all_cells.append((path, dim, prof))
+
+    # Prior-review memory: drop cells whose exact file revision was already
+    # reviewed at an equal-or-stronger tier, and replay their stored findings into
+    # synthesis instead of re-spawning the agent.
+    all_cells, replayed = _apply_review_memory(
+        all_cells, db, task_force_high=task_force_high, tier_bias=tier_bias
+    )
 
     # Cap: drop highest effective-priority cells first; reserve 1 slot for synthesis
     if max_agents is not None and max_agents > 0:
@@ -612,39 +850,41 @@ def build_review_subtasks(
     )
 
     for idx, (path, dim, prof) in enumerate(all_cells, start=1):
-        bias = 0
-        if tier_bias:
-            bias = int(tier_bias.get((profile_key_for(prof, path), dim.key), 0))
-        t = tier_for(
-            dim,
-            prof.band,
-            prof.has_risk,
-            loc=prof.loc,
-            force_high=task_force_high,
-            density_score=prof.density_score,
-            concrete_high_risk=prof.concrete_high_risk,
-            bias=bias,
+        t, dim_smells = _cell_tier(
+            path, dim, prof, task_force_high=task_force_high, tier_bias=tier_bias
         )
         subtasks.append({
             "id": idx,
-            "description": dim.prompt_template.format(path=path),
+            "description": (
+                dim.prompt_template.format(path=path)
+                + _format_leads(dim_smells)
+                + _format_resolved(db, path, dim.key)
+            ),
             "tier": t,
             "target_file": path,
             "subagent_type": dim.subagent_type,
             "read_only": True,
             "depends_on": [],
             "single_file_insertion": False,
+            # Consumed by host_learning to score static recall for this cell.
+            # Absent/empty means "no static expectation" — never a zero score.
+            "review_dimension": dim.key,
+            "expected_rules": _expected_rule_ids(dim_smells),
+            "content_sha": prof.intel.content_sha if prof.intel else "",
         })
         review_ids.append(idx)
 
     synth_id = len(all_cells) + 1
-    reviewed_files = sorted({path for path, _, _ in all_cells})
+    reviewed_files = sorted(
+        {path for path, _, _ in all_cells} | {scan.path for scan in replayed}
+    )
     has_high_risk_files = any(prof.concrete_high_risk for _, _, prof in all_cells)
     subtasks.append({
         "id": synth_id,
         "description": (
             _SYNTHESIS_PROMPT
             + f"\n\nFiles reviewed: {', '.join(reviewed_files)}"
+            + _format_replay(replayed)
         ),
         "tier": synthesis_tier(review_requires_high, len(all_cells), has_high_risk_files),
         "depends_on": review_ids,
@@ -654,14 +894,20 @@ def build_review_subtasks(
 
     n_files = len(entries)
     n_dims = len(all_cells)
+    cached_note = (
+        f" {len(replayed)} cell(s) served from prior-review memory (unchanged revision)."
+        if replayed
+        else ""
+    )
     return {
         "analysis": (
-            f"Review fanout: {n_files} file(s), {n_dims} dimension agent(s) + 1 synthesis. "
-            "Host-native DAG. No external planner LLM was called."
+            f"Review fanout: {n_files} file(s), {n_dims} dimension agent(s) + 1 synthesis."
+            f"{cached_note} Host-native DAG. No external planner LLM was called."
         ),
         "subtasks": subtasks,
         "strategy": "dag",
         "topology": "dag",
+        "cached_cell_count": len(replayed),
     }
 
 

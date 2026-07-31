@@ -143,11 +143,14 @@ def test_coupled_group_single_strategy_collapses_to_one_subtask() -> None:
     payload = build_heuristic_plan_payload(
         COUPLED_TASK, default_tier="medium", coupled_strategy="single"
     )
-    subtasks = payload["subtasks"]
-    assert len(subtasks) == 1
+    # The coupled group escalates to high, which the hybrid split then fronts with
+    # a read-only diagnosis. The invariant under test is about the *implementers*:
+    # all coupled files stay owned by exactly one writing agent.
+    writers = [st for st in payload["subtasks"] if not st.get("read_only")]
+    assert len(writers) == 1
     # Coupled source group escalates above the flat "low".
-    assert subtasks[0]["tier"] in {"medium", "high"}
-    assert len(subtasks[0].get("target_files", [])) == 4
+    assert writers[0]["tier"] in {"medium", "high"}
+    assert len(writers[0].get("target_files", [])) == 4
 
 
 def test_coupled_group_contract_strategy_builds_dag() -> None:
@@ -265,5 +268,61 @@ def test_same_dir_source_files_couple_without_keyword() -> None:
     payload = build_heuristic_plan_payload(
         task, default_tier="medium", coupled_strategy="single"
     )
-    assert len(payload["subtasks"]) == 1
-    assert len(payload["subtasks"][0]["target_files"]) == 3
+    # One writing agent owns all three; a read-only hybrid diagnosis may front it.
+    writers = [st for st in payload["subtasks"] if not st.get("read_only")]
+    assert len(writers) == 1
+    assert len(writers[0]["target_files"]) == 3
+
+
+UNDER_BUDGET_TASK = (
+    "Build a tool: (1) api/routes.py with endpoints, (2) api/schema.py with models, "
+    "(3) cli/main.py entrypoint, (4) store/db.py persistence, (5) worker/queue.py jobs"
+)
+
+
+def test_packing_is_reported_in_coverage_and_analysis() -> None:
+    """An agent budget below the file count is surfaced, not just logged."""
+    payload = build_heuristic_plan_payload(
+        UNDER_BUDGET_TASK, default_tier="medium", max_agents=2
+    )
+    writers = [st for st in payload["subtasks"] if not st.get("read_only")]
+    assert len(writers) <= 2
+    coverage = payload["coverage"]
+    assert coverage["deferred"] == []
+    packed = coverage["packed"]
+    assert packed["cap"] == 2
+    assert packed["trigger"] == "max_agents"
+    assert packed["agents_after"] <= 2
+    assert packed["subtasks_before"] > packed["agents_after"]
+    assert "Agent budget 2" in payload["analysis"]
+    # The transient build-time key never reaches the plan payload.
+    assert "packing" not in payload
+
+
+def test_uncapped_plan_reports_no_packing() -> None:
+    payload = build_heuristic_plan_payload(UNDER_BUDGET_TASK, default_tier="medium")
+    coverage = payload["coverage"]
+    assert coverage["deferred"] == []
+    assert "packed" not in coverage
+    assert "Agent budget" not in payload["analysis"]
+
+
+def test_unlimited_sentinel_is_not_a_cap_of_one() -> None:
+    """config.swarm_max_agents uses -1 for unlimited; it must not pack to 1 agent."""
+    unlimited = build_heuristic_plan_payload(
+        UNDER_BUDGET_TASK, default_tier="medium", max_agents=-1
+    )
+    baseline = build_heuristic_plan_payload(UNDER_BUDGET_TASK, default_tier="medium")
+    assert len(unlimited["subtasks"]) == len(baseline["subtasks"])
+    assert "packed" not in unlimited["coverage"]
+
+
+def test_fullstack_plan_accounts_for_template_files() -> None:
+    """Intent-template fanout gets the same file accounting as a listed fanout."""
+    task = "Build a fullstack webapp with a React frontend, FastAPI backend, and REST API"
+    payload = build_heuristic_plan_payload(task, default_tier="medium", max_agents=2)
+    coverage = payload["coverage"]
+    assert coverage["files_total"] >= coverage["files_assigned"] > 0
+    assert coverage["deferred"] == []
+    assert coverage["packed"]["cap"] == 2
+    assert "Agent budget 2" in payload["analysis"]

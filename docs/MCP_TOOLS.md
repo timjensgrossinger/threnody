@@ -33,7 +33,7 @@ Host execution reporting is part of the coordination contract:
 |---|---|---|
 | `report_host_wave` | `wave`, `agents` | Record one completed host wave; supports terminal and plan-expansion metadata |
 | `report_workflow_result` | `workflow_name`, `agents` | Record a Claude Code Dynamic Workflow result and optional consensus |
-| `expand_host_plan` | `discovered_files` | Add discovered files to an active host plan |
+| `expand_host_plan` | `discovered_files` | Add discovered files to an active host plan; paths outside the workspace root come back as `deferred_files`, and a wide discovery packs into the agent cap (`packing`) rather than one agent per file |
 | `report_host_swarm_complete` | `wave`, `agents`, `outcome` | Finalize host-native swarm learning and receipts |
 | `inspect_swarm` | `swarm_id` | Inspect an active or completed host-native swarm |
 

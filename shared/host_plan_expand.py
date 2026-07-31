@@ -6,9 +6,14 @@ from typing import Any
 
 from .config import TGsConfig
 from .db import Database
-from .heuristic_plan import file_entries_from_paths, _is_integration_file, _tier_for_subtask
+from .heuristic_plan import (
+    file_entries_from_paths,
+    _is_integration_file,
+    _pack_subtasks_to_cap,
+    _tier_for_subtask,
+)
 from .host_learning import _HOST_RUN_META, _ensure_host_run_meta, register_host_run_handoff
-from .host_spawn import build_host_spawn_waves
+from .host_spawn import build_host_spawn_waves, sanitize_plan_for_host
 from .planner import build_waves, Subtask
 
 log = logging.getLogger(__name__)
@@ -76,6 +81,12 @@ def expand_host_plan(
     if workspace_root:
         meta["workspace_root"] = workspace_root
     resolved_workspace = str(meta.get("workspace_root") or workspace_root or "")
+    if not resolved_workspace:
+        log.warning(
+            "expansion of %s has no workspace root (neither argument nor run meta); "
+            "discovered target paths cannot be containment-checked",
+            normalized_run_id,
+        )
     snapshots = db.get_handoff_agent_snapshots(normalized_run_id)
     assigned = _assigned_files(meta, snapshots)
 
@@ -135,11 +146,62 @@ def expand_host_plan(
             if int(subtask["id"]) in integration_ids:
                 subtask["depends_on"] = sorted(foundation_set)
 
+    # Bound one expansion the same way the initial plan is bounded — a host that
+    # reports 60 discovered files must not turn into a 60-agent wave. Packing
+    # merges instead of dropping, so every discovered file keeps an owner.
+    plan_dict: dict[str, object] = {"subtasks": subtasks}
+    cap = getattr(config, "swarm_max_agents", None)
+    _pack_subtasks_to_cap(plan_dict, cap)
+    packing = plan_dict.pop("packing", None)
+    subtasks = list(plan_dict.get("subtasks") or [])
+    if isinstance(packing, dict):
+        # Packing renumbers from 1 and clears edges; re-offset onto this run's id
+        # space so the appended subtasks never collide with the ones already run.
+        for offset, st in enumerate(subtasks):
+            st["id"] = start_id + offset
+            st["depends_on"] = []
+        log.info(
+            "host plan expansion for %s packed %d file(s) into %d agent(s) (cap=%s)",
+            normalized_run_id, len(entries), len(subtasks), cap,
+        )
+
+    # Same containment gate as the initial handoff: discovered paths come from a
+    # model, so strip targets that escape the workspace root before they reach a
+    # spawn manifest. Read-only expansion agents may still look outside it.
+    sanitization = sanitize_plan_for_host(
+        plan_dict,
+        workspace_root=resolved_workspace or None,
+        task=task_hint,
+        default_tier=default_tier,
+        # An expansion has nothing to collapse to: one agent over the original
+        # task hint would re-do the run, so report no_safe_files instead.
+        collapse_unsafe_to_single=False,
+    )
+    # Every expansion subtask exists to own a discovered file. One whose targets
+    # were all stripped has nothing left to do, so drop it rather than spawn an
+    # agent with no write scope.
+    subtasks = [
+        st
+        for st in (plan_dict.get("subtasks") or [])
+        if isinstance(st, dict) and _owned_paths([st])
+    ]
+    plan_dict["subtasks"] = subtasks
+    if not subtasks:
+        return {
+            "expanded": False,
+            "run_id": normalized_run_id,
+            "reason": "no_safe_files",
+            "discovered_files": new_paths,
+            "deferred_files": new_paths,
+            "sanitization": sanitization,
+            "host_spawn_waves": [],
+        }
+
     subtask_objs = [
         Subtask(
             id=int(st["id"]),
             description=str(st["description"]),
-            tier=str(st["tier"]),
+            tier=str(st.get("tier") or default_tier),
             model="",
             depends_on=list(st.get("depends_on") or []),
             target_file=str(st.get("target_file") or "") or None,
@@ -147,11 +209,8 @@ def expand_host_plan(
         for st in subtasks
     ]
     wave_ids = build_waves(subtask_objs)
-    plan_dict: dict[str, object] = {
-        "subtasks": subtasks,
-        "waves": wave_ids,
-        "topology": str(meta.get("topology") or "dag"),
-    }
+    plan_dict["waves"] = wave_ids
+    plan_dict["topology"] = str(meta.get("topology") or "dag")
     host_waves = build_host_spawn_waves(
         plan_dict,
         config=config,
@@ -183,7 +242,11 @@ def expand_host_plan(
 
     meta["plan_revision"] = revision_number
     meta["next_subtask_id"] = start_id + len(subtasks)
-    for path in new_paths:
+    # Only the paths an agent actually owns count as assigned — a target the
+    # containment gate stripped must stay claimable by a later expansion.
+    owned_paths = _owned_paths(subtasks)
+    deferred_paths = [p for p in new_paths if p.lower() not in {o.lower() for o in owned_paths}]
+    for path in owned_paths:
         if path not in meta.get("assigned_files", []):
             assigned_list = list(meta.get("assigned_files") or [])
             assigned_list.append(path)
@@ -202,15 +265,44 @@ def expand_host_plan(
         task_hint=task_hint,
     )
 
-    return {
+    result: dict[str, Any] = {
         "expanded": True,
         "run_id": normalized_run_id,
-        "new_files": new_paths,
+        "new_files": owned_paths,
+        "discovered_files": new_paths,
         "host_spawn_waves": host_waves,
         "start_wave": int(meta.get("host_waves_completed") or 0) + 1,
         "plan_revision": revision_number,
         "execution_contract": "spawn_subagents",
     }
+    if deferred_paths:
+        result["deferred_files"] = deferred_paths
+    if isinstance(packing, dict):
+        result["packing"] = packing
+    if any(sanitization.get(key) for key in ("dropped_targets", "dropped_subtasks", "dedup")):
+        result["sanitization"] = sanitization
+    return result
+
+
+def _owned_paths(subtasks: list[dict[str, Any]]) -> list[str]:
+    """Write targets that survived packing and containment, order-preserving."""
+    paths: list[str] = []
+    seen: set[str] = set()
+    for st in subtasks:
+        candidates: list[object] = []
+        raw_multi = st.get("target_files")
+        if isinstance(raw_multi, list):
+            candidates.extend(raw_multi)
+        candidates.append(st.get("target_file"))
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            path = candidate.strip().replace("\\", "/")
+            if path.lower() in seen:
+                continue
+            seen.add(path.lower())
+            paths.append(path)
+    return paths
 
 
 __all__ = ["expand_host_plan"]

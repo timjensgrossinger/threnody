@@ -120,11 +120,12 @@ drop-protected under the agent cap; `security` is still *added* (never evicting 
 named dimension) when a file has real risk signals. With no `[dims=...]`, the
 band-based default set runs.
 
-**Response is a compact spawn manifest.** For review runs the response carries
+**Response is a compact spawn manifest.** Every host-native run carries
 `host_spawn_waves` (the lean per-agent spawn list) plus a small `plan_summary` —
-the heavy duplicate `plan` and any `workflow_script` are omitted so the host
-reads it in one chunk and hits the <20s first-spawn target. Full plan fidelity is
-still recorded server-side (`inspect_run_receipt`). Spawn directly from
+the heavy duplicate `plan` is omitted so the host reads it in one chunk and hits
+the <20s first-spawn target; for review runs any `workflow_script` is dropped too.
+`plan_summary.coverage` keeps the file accounting (`deferred`, `packed`). Full plan
+fidelity is still recorded server-side (`inspect_run_receipt`). Spawn directly from
 `host_spawn_waves`; do not expect a full `plan` object.
 
 ### 4. Execute host_spawn_waves

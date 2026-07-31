@@ -3262,6 +3262,7 @@ def _register_host_handoff_if_ready(
         project_id=workspace_root,
         topology=topology or str(payload.get("topology") or "linear"),
         task_hint=task_hint,
+        hybrid_split=payload.get("hybrid_split"),
     )
     payload["host_run_id"] = run_id
 
@@ -3523,6 +3524,11 @@ def _execute_swarm_host_native_response(
         max_agents = int(max_agents_raw) if max_agents_raw is not None else None
     except (TypeError, ValueError):
         max_agents = None
+    # Resolve once, up front: the same root gates plan sanitization, the routing
+    # guard, and the learning contract, and the host is told which source won.
+    resolved_workspace, workspace_root_source = resolve_workspace_root(
+        request_meta.get("workspace_root")
+    )
     plan_started = time.monotonic()
     try:
         plan, used_heuristic = _planner_plan_for_caller(
@@ -3553,7 +3559,7 @@ def _execute_swarm_host_native_response(
         task=task_text,
         db=db,
         run_id=swarm_id,
-        workspace_root=str(request_meta.get("workspace_root") or _active_workspace_root()),
+        workspace_root=resolved_workspace,
         topology=str(request_meta.get("topology") or plan.topology or "linear"),
     )
     latency_ms["attach_host_spawn"] = int((time.monotonic() - attach_started) * 1000)
@@ -3641,9 +3647,6 @@ def _execute_swarm_host_native_response(
         "host_native_handoff",
         {"wave_count": len(host_waves), "task_chars": len(task_text)},
     )
-    resolved_workspace = str(
-        request_meta.get("workspace_root") or _active_workspace_root()
-    )
     guard = _issue_host_handoff_routing_guard(
         db,
         caller=caller,
@@ -3688,6 +3691,7 @@ def _execute_swarm_host_native_response(
         "awaiting_host_execution": True,
         "host_spawn_waves": host_waves,
         "workspace_root": resolved_workspace,
+        "workspace_root_source": workspace_root_source,
         "learning_report_contract": learning_contract,
         "latency_ms": latency_ms,
         "fast_start_target_ms": fast_start_target_ms,
@@ -3770,22 +3774,29 @@ def _execute_swarm_host_native_response(
     threading.Thread(
         target=_bg_receipt_persist, daemon=True, name=f"receipt-persist-{swarm_id}"
     ).start()
+    # Compact wire payload for every run, not just review runs: the receipt above
+    # already captured full plan fidelity (inspect_run_receipt) and the handoff
+    # snapshots were registered from host_spawn_waves, so the duplicate `plan`
+    # (whose subtask descriptions repeat the wave prompts verbatim) is dead weight
+    # on the critical path. The summary keeps what the host cannot rebuild from
+    # the manifest: the file accounting (`coverage`, incl. any `deferred` files
+    # and the packing record) and the inline bucket.
+    p = swarm_result.pop("plan", {}) or {}
+    if isinstance(p, dict):
+        plan_summary: dict[str, object] = {
+            "swarm_id": swarm_id,
+            "topology": p.get("topology"),
+            "strategy": p.get("strategy"),
+            "subtask_count": len(p.get("subtasks") or []),
+            "wave_count": len(host_waves),
+            "analysis": p.get("analysis"),
+        }
+        for _key in ("coverage", "inline_files", "sanitization", "hybrid_split"):
+            if p.get(_key):
+                plan_summary[_key] = p.get(_key)
+        swarm_result["plan_summary"] = plan_summary
     if review_run:
-        # Compact wire payload: the receipt above already captured full plan
-        # fidelity (inspect_run_receipt), and handoff snapshots were registered
-        # from host_spawn_waves — so the host only needs the lean spawn manifest.
-        # Drop the heavy duplicate `plan` (its subtask descriptions duplicate the
-        # wave prompts) and any workflow_script, which review never executes.
-        p = swarm_result.pop("plan", {}) or {}
-        if isinstance(p, dict):
-            swarm_result["plan_summary"] = {
-                "swarm_id": swarm_id,
-                "topology": p.get("topology"),
-                "strategy": p.get("strategy"),
-                "subtask_count": len(p.get("subtasks") or []),
-                "wave_count": len(host_waves),
-                "analysis": p.get("analysis"),
-            }
+        # Review never executes a workflow script, so drop that whole family too.
         for _k in (
             "workflow_emit",
             "workflow_execution_contract",
@@ -3795,6 +3806,11 @@ def _execute_swarm_host_native_response(
             "consensus_in_workflow",
         ):
             swarm_result.pop(_k, None)
+    if workspace_root_source == "cwd_fallback":
+        swarm_result["workspace_root_warning"] = (
+            "workspace_root was not supplied; target paths were checked against the "
+            f"server cwd {resolved_workspace}. Pass workspace_root to make this explicit."
+        )
     return {
         "result": swarm_result,
         "started": False,
@@ -4941,7 +4957,12 @@ def prepare_swarm_execution_request(
 ) -> dict[str, object]:
     """Normalize a future execute_swarm request without changing current MCP surfaces."""
     explicit_max_agents = args.get("max_agents") is not None
-    task_text_for_optimizer = _stringify_execute_swarm_task(args.get("task"))
+    # Resolve the task the same way the handler does. Reading args["task"]
+    # directly missed the task_spec/task_text shapes — and _normalize_mcp_tool_
+    # arguments *moves* an object-valued task to task_spec — so the optimizer saw
+    # "null", counted zero files, and recommended a single agent.
+    raw_task_input = _coerce_execute_swarm_task_input(args)
+    task_text_for_optimizer = _normalize_execute_swarm_task_text(raw_task_input)
     optimizer = choose_agent_count(
         task_text_for_optimizer,
         requested=args.get("max_agents") if explicit_max_agents else None,
@@ -4970,8 +4991,8 @@ def prepare_swarm_execution_request(
     urgency_score = 0.0
     effective_topology = requested_topology
     if requested_topology == "auto":
-        task_payload = args.get("task")
-        task_text = _stringify_execute_swarm_task(task_payload)
+        task_payload = raw_task_input
+        task_text = task_text_for_optimizer
         urgency_hint = args.get("urgency_hint")
         urgency_score = _compute_execute_swarm_urgency_score(
             task_text,
@@ -7501,6 +7522,40 @@ def _active_workspace_root() -> Path:
             candidate,
         )
     return Path.cwd().resolve()
+
+
+def resolve_workspace_root(raw_workspace_root: object | None = None) -> tuple[str, str]:
+    """Resolve the host workspace root and say where it came from.
+
+    Returns ``(path, source)`` with source one of ``argument``, ``env_override``,
+    or ``cwd_fallback``. Every planned ``target_file`` is containment-checked
+    against this root, so a silent fall back to the *server's* cwd can strip a
+    host agent's targets for pointing outside a directory the host never named —
+    hence the warning.
+    """
+    value = _normalize_fs_text(raw_workspace_root)
+    if value:
+        try:
+            return str(Path(value).expanduser().resolve(strict=False)), "argument"
+        except (OSError, RuntimeError, ValueError):
+            log.warning(
+                "Unusable workspace_root %r; resolving from the environment instead",
+                raw_workspace_root,
+            )
+    active = _active_workspace_root()
+    try:
+        server_cwd = Path.cwd().resolve()
+    except OSError:
+        server_cwd = active
+    if active != server_cwd:
+        return str(active), "env_override"
+    log.warning(
+        "No workspace_root supplied for host-native handoff; falling back to the "
+        "server cwd %s. Pass workspace_root so target paths are checked against "
+        "the host's project root.",
+        active,
+    )
+    return str(active), "cwd_fallback"
 
 
 def validate_target_path(

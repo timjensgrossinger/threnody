@@ -89,6 +89,18 @@ def plan_task_pack(pack: str, task: str, *, max_agents: int | None = None) -> di
         max_agents=max_agents,
     )
     subtasks = payload.get("subtasks")
+    # Per-file prompts are built from the clause that names the file, so the pack
+    # preamble no longer leaks in from the task text — inject it per subtask, or
+    # the agents lose the pack's instruction entirely.
+    prefix = str(meta.get("prefix") or "").strip()
+    if prefix and isinstance(subtasks, list):
+        for st in subtasks:
+            if not isinstance(st, dict):
+                continue
+            desc = str(st.get("description") or "").strip()
+            if desc.startswith(prefix):
+                continue
+            st["description"] = f"{prefix}\n\n{desc}" if desc else prefix
     if isinstance(subtasks, list) and "waves" not in payload:
         payload["waves"] = _build_waves([st for st in subtasks if isinstance(st, dict)])
     payload["task_pack"] = {"name": name, **deepcopy(meta)}

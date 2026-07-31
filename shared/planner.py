@@ -93,6 +93,11 @@ class Subtask:
     produces: list[str] = field(default_factory=list)
     is_coordinator: bool = False
     target_file: str | None = None
+    # Full owned-file set. A coupled group owns several files; ``target_file``
+    # stays the primary/interface file for callers that need a single path.
+    # Kept in sync with the prompt's ownership sentence by
+    # ``heuristic_plan._finalize_subtasks`` — never let the two diverge.
+    target_files: list[str] = field(default_factory=list)
     workspace_root: str | None = None
     single_file_insertion: bool = False
     edit_mode: str = "write"   # write | rewrite | blocks | patch — execute_subtask (subprocess utility delegation) ONLY; unused by the host-native swarm path, where host agents own their edit strategy via native Edit/Write tools
@@ -101,6 +106,15 @@ class Subtask:
     convergence_target: ConvergenceTarget | None = None  # plan 14: quality convergence loop
     subagent_type: str | None = None  # override host subagent type (e.g. "review-security")
     read_only: bool = False  # skip direct_edit; force host_task method
+    # Plan-shape metadata produced by the heuristic/review builders. Carried
+    # through the ExecutionPlan round-trip so the host-native path and the
+    # learning ingest see what the builder decided.
+    wave_kind: str | None = None            # diagnose | implement | consensus | verify_fix
+    review_dimension: str | None = None     # review fanout dimension key
+    expected_rules: list[str] = field(default_factory=list)  # code_intel rule ids
+    content_sha: str | None = None          # reviewed revision digest
+    hybrid_profile_key: str | None = None   # hybrid_tier_bias learning key
+    hybrid_delta: int | None = None         # applied implement-tier delta
     _consumes_explicit: bool = False
     _produces_explicit: bool = False
     _is_coordinator_explicit: bool = False
@@ -137,6 +151,13 @@ class ExecutionPlan:
     cache_hit: bool = False
     planner_mode: str | None = None
     for_each_nodes: list["ForEachNode"] = field(default_factory=list)
+    # Files named by the task that are handled inline by the orchestrating
+    # session instead of a spawned agent (direct-edit exempt: .md/.mdc, …).
+    # Surfaced so exempt work is visibly assigned rather than silently dropped.
+    inline_files: list[str] = field(default_factory=list)
+    # File-coverage accounting from the plan builder:
+    # {files_total, files_assigned, deferred: [...]}. Empty when not computed.
+    coverage: dict[str, object] = field(default_factory=dict)
     _topology_explicit: bool = False
     _max_rounds_explicit: bool = False
 
@@ -1395,6 +1416,9 @@ class Planner:
 
             raw_target_file = self._coerce_optional_text(st_data.get("target_file"))
             target_file: str | None = raw_target_file.strip() if raw_target_file else None
+            target_files = self._coerce_target_files(
+                st_data.get("target_files"), primary=target_file
+            )
             single_file_insertion = bool(st_data.get("single_file_insertion", False))
 
             raw_subagent_type = self._coerce_optional_text(st_data.get("subagent_type"))
@@ -1421,6 +1445,18 @@ class Planner:
             # as the internal dependency authority.
             stable_id = raw_stable_id or f"{stable_id_prefix}-task{i + 1:02d}"
 
+            expected_rules = [
+                str(rule).strip()
+                for rule in (st_data.get("expected_rules") or [])
+                if str(rule).strip()
+            ] if isinstance(st_data.get("expected_rules"), (list, tuple)) else []
+            raw_hybrid_delta = st_data.get("hybrid_delta")
+            try:
+                hybrid_delta = int(raw_hybrid_delta) if raw_hybrid_delta is not None else None
+            except (TypeError, ValueError):
+                log.debug("ignoring invalid hybrid_delta %r", raw_hybrid_delta)
+                hybrid_delta = None
+
             subtasks.append(Subtask(
                 id=st_id,
                 stable_id=stable_id,
@@ -1435,9 +1471,18 @@ class Planner:
                 produces=produces,
                 is_coordinator=is_coordinator,
                 target_file=target_file,
+                target_files=target_files,
                 single_file_insertion=single_file_insertion,
                 subagent_type=subagent_type,
                 read_only=read_only,
+                wave_kind=self._coerce_optional_text(st_data.get("wave_kind")),
+                review_dimension=self._coerce_optional_text(st_data.get("review_dimension")),
+                expected_rules=expected_rules,
+                content_sha=self._coerce_optional_text(st_data.get("content_sha")),
+                hybrid_profile_key=self._coerce_optional_text(
+                    st_data.get("hybrid_profile_key")
+                ),
+                hybrid_delta=hybrid_delta,
                 _consumes_explicit=consumes_explicit,
                 _produces_explicit=produces_explicit,
                 _is_coordinator_explicit=is_coordinator_explicit,
@@ -1463,10 +1508,21 @@ class Planner:
                 log.warning("Ignoring invalid token_budget value: %r", token_budget)
                 token_budget = None
 
+        raw_inline = parsed.get("inline_files")
+        inline_files = [
+            str(path).strip()
+            for path in raw_inline
+            if str(path).strip()
+        ] if isinstance(raw_inline, (list, tuple)) else []
+        raw_coverage = parsed.get("coverage")
+        coverage = dict(raw_coverage) if isinstance(raw_coverage, dict) else {}
+
         plan = ExecutionPlan(
             analysis=parsed.get("analysis", "Planner decomposition"),
             subtasks=self._auto_assign_agents(subtasks),
             waves=waves,
+            inline_files=inline_files,
+            coverage=coverage,
             total_agents=len(subtasks),
             strategy=strategy,
             topology=topology,
@@ -1645,6 +1701,32 @@ class Planner:
         return normalized or None
 
     @staticmethod
+    def _coerce_target_files(value: object, *, primary: str | None) -> list[str]:
+        """Normalise a plural ``target_files`` list, order-preserving and deduped.
+
+        ``primary`` (the scalar ``target_file``) is appended when the plural list
+        omits it, so the owned set is always a superset of the primary target.
+        """
+        result: list[str] = []
+        seen: set[str] = set()
+
+        def _add(candidate: object) -> None:
+            if not isinstance(candidate, str):
+                return
+            cleaned = candidate.strip()
+            if not cleaned or cleaned.lower() in seen:
+                return
+            seen.add(cleaned.lower())
+            result.append(cleaned)
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                _add(item)
+        _add(primary)
+        # A lone primary target adds nothing over the scalar field.
+        return result if len(result) > 1 else []
+
+    @staticmethod
     def _sequence_number(
         value: object,
         *,
@@ -1760,9 +1842,27 @@ class Planner:
                 subtask_payload["single_file_insertion"] = True
             if st.target_file is not None:
                 subtask_payload["target_file"] = st.target_file
+            if st.target_files:
+                subtask_payload["target_files"] = list(st.target_files)
             if st.subagent_type is not None:
                 subtask_payload["subagent_type"] = st.subagent_type
             if st.read_only:
                 subtask_payload["read_only"] = True
+            if st.wave_kind is not None:
+                subtask_payload["wave_kind"] = st.wave_kind
+            if st.review_dimension is not None:
+                subtask_payload["review_dimension"] = st.review_dimension
+            if st.expected_rules:
+                subtask_payload["expected_rules"] = list(st.expected_rules)
+            if st.content_sha is not None:
+                subtask_payload["content_sha"] = st.content_sha
+            if st.hybrid_profile_key is not None:
+                subtask_payload["hybrid_profile_key"] = st.hybrid_profile_key
+            if st.hybrid_delta is not None:
+                subtask_payload["hybrid_delta"] = st.hybrid_delta
             payload.setdefault("subtasks", []).append(subtask_payload)
+        if plan.inline_files:
+            payload["inline_files"] = list(plan.inline_files)
+        if plan.coverage:
+            payload["coverage"] = dict(plan.coverage)
         return payload

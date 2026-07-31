@@ -702,6 +702,133 @@ def test_expand_host_plan_skips_already_assigned_files(tmp_path: Path) -> None:
         database.close()
 
 
+def _expandable_run(db: Database, run_id: str) -> None:
+    register_host_run_handoff(
+        db,
+        run_id=run_id,
+        host_spawn_waves=[
+            {
+                "wave": 1,
+                "agents": [
+                    {
+                        "id": "1",
+                        "tier": "low",
+                        "model": "test",
+                        "prompt": "scaffold contract",
+                        "target_files": ["openapi.yaml"],
+                    },
+                ],
+            }
+        ],
+        planned_subtasks=1,
+        workspace_root="/tmp/project",
+        topology="dag",
+        task_hint="build todo app",
+    )
+    db.persist_swarm_run(
+        {"swarm_id": run_id, "status": "running", "resume_status": "running"}
+    )
+
+
+def test_expand_host_plan_packs_to_agent_cap_without_losing_files(tmp_path: Path) -> None:
+    """A wide discovery is bounded by swarm_max_agents, but keeps every file."""
+    database = Database(tmp_path / "host-plan-expand-cap.db")
+    database._init_schema(database._get_connection())
+    try:
+        run_id = "swarm-expand-cap"
+        _expandable_run(database, run_id)
+        config = TGsConfig()
+        config.parallelism.swarm_max_agents = 2
+        discovered = [
+            "app.py",
+            "templates/index.html",
+            "static/js/app.js",
+            "store/db.py",
+            "worker/queue.py",
+        ]
+        result = expand_host_plan(
+            database,
+            run_id=run_id,
+            discovered_files=discovered,
+            workspace_root="/tmp/project",
+            config=config,
+            caller="cursor",
+        )
+        assert result["expanded"] is True
+        agents = [
+            agent
+            for wave in result["host_spawn_waves"]
+            for agent in wave.get("agents", [])
+        ]
+        assert len(agents) <= 2
+        assert result["packing"]["cap"] == 2
+        owned = {path for agent in agents for path in agent.get("target_files", [])}
+        assert owned == set(discovered)
+        assert result.get("deferred_files") is None
+        # Appended ids must not collide with the subtask the run already spawned.
+        assert all(int(agent["id"]) > 1 for agent in agents)
+    finally:
+        database.close()
+
+
+def test_expand_host_plan_drops_targets_outside_workspace(tmp_path: Path) -> None:
+    """Discovered paths are model output — containment applies to expansions too."""
+    database = Database(tmp_path / "host-plan-expand-escape.db")
+    database._init_schema(database._get_connection())
+    try:
+        run_id = "swarm-expand-escape"
+        _expandable_run(database, run_id)
+        result = expand_host_plan(
+            database,
+            run_id=run_id,
+            discovered_files=["app.py", "/etc/passwd", "../../secrets.env"],
+            workspace_root="/tmp/project",
+            config=TGsConfig(),
+        )
+        assert result["expanded"] is True
+        assert result["new_files"] == ["app.py"]
+        assert set(result["deferred_files"]) == {"/etc/passwd", "../../secrets.env"}
+        assert result["sanitization"]["reasons"]
+        owned = {
+            path
+            for wave in result["host_spawn_waves"]
+            for agent in wave.get("agents", [])
+            for path in agent.get("target_files", [])
+        }
+        assert owned == {"app.py"}
+        # A dropped path stays claimable by a later expansion.
+        snapshots = database.get_handoff_agent_snapshots(run_id)
+        assigned = {
+            path
+            for snap in snapshots
+            for path in (snap.get("target_files") or [])
+        }
+        assert "/etc/passwd" not in assigned
+    finally:
+        database.close()
+
+
+def test_expand_host_plan_rejects_all_unsafe_discovery(tmp_path: Path) -> None:
+    database = Database(tmp_path / "host-plan-expand-unsafe.db")
+    database._init_schema(database._get_connection())
+    try:
+        run_id = "swarm-expand-unsafe"
+        _expandable_run(database, run_id)
+        result = expand_host_plan(
+            database,
+            run_id=run_id,
+            discovered_files=["/etc/passwd", "../../secrets.env"],
+            workspace_root="/tmp/project",
+            config=TGsConfig(),
+        )
+        assert result["expanded"] is False
+        assert result["reason"] == "no_safe_files"
+        assert result["host_spawn_waves"] == []
+        assert set(result["deferred_files"]) == {"/etc/passwd", "../../secrets.env"}
+    finally:
+        database.close()
+
+
 def _occ_and_telemetry(db: Database, run_id: str) -> tuple[int, int]:
     with db.conn() as conn:
         occ = conn.execute(

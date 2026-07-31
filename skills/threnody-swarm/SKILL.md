@@ -40,9 +40,17 @@ high-tier synthesis for explicit deep-risk work.
 
 0. If not already planned, follow **`threnody-plan`** (plan-only swarm preview stops before spawn).
 1. Optionally `route_task` for tier context.
-2. **`execute_swarm(task, topology?, max_agents?, budget_limit?)`**
+2. **`execute_swarm(task, topology?, max_agents?, budget_limit?, workspace_root)`** —
+   always pass `workspace_root`. Target paths are containment-checked against it;
+   omit it and the server falls back to its own cwd and answers with
+   `workspace_root_source: "cwd_fallback"` plus a `workspace_root_warning`.
 3. Handle response:
    - **`awaiting_host_execution` + `host_spawn_waves`** — execute waves via host agents.
+     The response carries `plan_summary`, not a full `plan` object (all runs, not
+     just review runs). Spawn from `host_spawn_waves`; read `plan_summary.coverage`
+     for file accounting — a non-empty `coverage.deferred` means a named file has
+     no owner, and `coverage.packed` means the agent budget merged files into
+     fewer agents. Full plan fidelity stays server-side (`inspect_run_receipt`).
    - **`preview: true` + `preview_token`** — cost over budget; confirm then re-call with token.
    - **`started: true`** (delegate mode only) — Threnody subprocess orchestrator running.
    - Check `learning_report_contract.report_mode` (`batch` default, or `inline`).

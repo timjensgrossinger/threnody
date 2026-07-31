@@ -844,3 +844,127 @@ class TestPlannerSubtaskRoundtrip:
         st0 = d["subtasks"][0]
         assert "subagent_type" not in st0
         assert "read_only" not in st0
+
+
+# ---------------------------------------------------------------------------
+# code_intel wiring: static smells refine dimensions, tier, and prompts
+# ---------------------------------------------------------------------------
+
+class TestStaticSmellWiring:
+    """Phase 1 wiring — shared/code_intel.py feeding review fanout."""
+
+    @staticmethod
+    def _write(tmp_path, name: str, body: str) -> str:
+        f = tmp_path / name
+        f.write_text(body, encoding="utf-8")
+        return str(f)
+
+    def test_density_uses_ast_when_parse_succeeds(self):
+        from shared.code_intel import scan
+        from shared.review_fanout import _structural_density
+
+        # `if` and `for` appear only inside a string and a comment: the keyword
+        # regexes count them, the AST does not.
+        content = (
+            "def f(x):\n"
+            '    msg = "if for while case switch and && || ?"\n'
+            "    # if for while else elif case\n"
+            "    return msg\n"
+        ) * 20
+        intel = scan("fake_dense.py", content=content)
+        assert intel.parsed is True
+        assert _structural_density(content, intel) < _structural_density(content)
+
+    def test_density_falls_back_when_parse_fails(self):
+        from shared.code_intel import scan
+        from shared.review_fanout import _structural_density
+
+        content = "def broken(:\n    if x:\n        return 1\n" * 10
+        intel = scan("fake_broken.py", content=content)
+        assert intel.parsed is False
+        # Unparsed intel must not zero the score — the regex path still applies.
+        assert _structural_density(content, intel) == _structural_density(content)
+
+    def test_high_severity_smell_adds_missing_dimension(self):
+        from shared.code_intel import DIM_PERFORMANCE, SEVERITY_HIGH, Smell
+        from shared.review_fanout import dimensions_for
+
+        smells = {DIM_PERFORMANCE: [
+            Smell("blocking_call_in_async", DIM_PERFORMANCE, SEVERITY_HIGH, 3, "m")
+        ]}
+        keys = [d.key for d in dimensions_for("moderate", False, smells=smells)]
+        assert "performance" in keys  # moderate band would not include it
+
+    def test_high_severity_smell_survives_explicit_dims(self):
+        from shared.code_intel import DIM_SECURITY, SEVERITY_HIGH, Smell
+        from shared.review_fanout import dimensions_for
+
+        smells = {DIM_SECURITY: [Smell("eval_exec", DIM_SECURITY, SEVERITY_HIGH, 1, "m")]}
+        keys = [d.key for d in dimensions_for("moderate", False, ["types"], smells=smells)]
+        assert keys[0] == "types"  # requested dim stays first / protected
+        assert "security" in keys
+
+    def test_trivial_clean_file_drops_covered_dimensions(self):
+        from shared.review_fanout import dimensions_for
+
+        keys = [d.key for d in dimensions_for("trivial", False, smells={})]
+        # edge has real static coverage and was clean -> dropped.
+        assert "edge" not in keys
+        # logic has no static coverage -> a clean scan is no evidence, keep it.
+        assert "logic" in keys
+
+    def test_trivial_file_keeps_security_when_risky(self):
+        from shared.review_fanout import dimensions_for
+
+        keys = [d.key for d in dimensions_for("trivial", True, smells={})]
+        assert "security" in keys
+
+    def test_no_scan_preserves_legacy_dimensions(self):
+        from shared.review_fanout import dimensions_for
+
+        # smells=None (no scan) must reproduce the pre-Phase-1 band selection.
+        assert [d.key for d in dimensions_for("trivial", False)] == ["logic", "edge"]
+        assert [d.key for d in dimensions_for("trivial", False, smells=None)] == [
+            "logic", "edge"
+        ]
+
+    def test_smell_bumps_tier_and_injects_leads(self, tmp_path: Path):
+        from shared.review_fanout import build_review_subtasks
+
+        # Small file: security would normally tier low/medium. A concrete exploit
+        # primitive is present, so it must escalate and carry the lead.
+        path = self._write(
+            tmp_path,
+            "vuln.py",
+            "import os\ndef run(cmd):\n    os.system('rm -rf ' + cmd)\n",
+        )
+        plan = build_review_subtasks([(path, "")], f"REVIEW: {path}")
+        cell = next(
+            st for st in plan["subtasks"] if st.get("review_dimension") == "security"
+        )
+        assert cell["tier"] == "high"
+        assert "os_system" in cell["description"]
+        assert "NOT confirmed findings" in cell["description"]
+        assert "os_system" in cell["expected_rules"]
+        assert cell["content_sha"]
+
+    def test_clean_file_has_no_leads_and_no_expectation(self, tmp_path: Path):
+        from shared.review_fanout import build_review_subtasks
+
+        path = self._write(
+            tmp_path, "clean.py", "def add(a: int, b: int) -> int:\n    return a + b\n"
+        )
+        plan = build_review_subtasks([(path, "")], f"REVIEW: {path}")
+        cells = [st for st in plan["subtasks"] if st.get("review_dimension")]
+        assert cells, "a clean file still gets reviewed"
+        for cell in cells:
+            assert cell["expected_rules"] == []
+            assert "Static pre-scan leads" not in cell["description"]
+
+    def test_unreadable_file_still_plans(self):
+        from shared.review_fanout import build_review_subtasks
+
+        plan = build_review_subtasks(
+            [("/nonexistent/zz.py", "")], "REVIEW: /nonexistent/zz.py"
+        )
+        assert len(plan["subtasks"]) >= 2  # >=1 review cell + synthesis

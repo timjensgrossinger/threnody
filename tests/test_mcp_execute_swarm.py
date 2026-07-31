@@ -383,6 +383,149 @@ def test_execute_swarm_honors_workspace_root_arg(monkeypatch, tmp_path: Path) ->
     assert guard.get("cwd") == ws
     # file_hints resolve the relative target under the supplied workspace root.
     assert any(ws in str(hint) for hint in (guard.get("file_hints") or []))
+    assert payload["workspace_root_source"] == "argument"
+    assert "workspace_root_warning" not in payload
+
+
+def _fake_single_file_planner():
+    class FakePlan:
+        total_agents = 1
+        topology = "linear"
+
+    class FakePlanner:
+        def plan(self, _t: str, **_k) -> FakePlan:
+            return FakePlan()
+
+        def plan_heuristic(self, _t: str, **_k) -> FakePlan:
+            return FakePlan()
+
+        def plan_to_dict(self, _p: FakePlan) -> dict[str, object]:
+            return {
+                "subtasks": [
+                    {
+                        "id": "st-1",
+                        "description": "build the calculator ops module",
+                        "tier": "low",
+                        "depends_on": [],
+                        "target_file": "ops.py",
+                    }
+                ],
+                "waves": [["st-1"]],
+                "topology": "linear",
+                "analysis": "one file",
+                "coverage": {
+                    "files_total": 2,
+                    "files_assigned": 1,
+                    "files_inline": 0,
+                    "deferred": ["notes.py"],
+                    "packed": {"cap": 1, "trigger": "max_agents", "agents_after": 1},
+                },
+                "inline_files": ["README.md"],
+            }
+
+    return FakePlanner()
+
+
+def test_missing_workspace_root_is_reported_not_silent(monkeypatch, tmp_path: Path) -> None:
+    """A cwd fallback is visible to the host — target containment depends on it."""
+    db = _stub_init(monkeypatch, tmp_path)
+    mcp_server._execute_swarm_rate_limit.clear()
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+    monkeypatch.setattr(
+        mcp_server, "_spawn_execute_swarm_runtime_handoff", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (
+            TGsConfig(db_path=tmp_path / "ws-missing.db"),
+            db,
+            None,
+            _fake_single_file_planner(),
+            None,
+        ),
+    )
+    monkeypatch.setattr(mcp_server, "_active_workspace_root", lambda: Path.cwd().resolve())
+
+    payload = mcp_server.handle_execute_swarm(
+        {"task": "build calculator ops", "max_agents": 1}
+    )["result"]
+
+    assert payload["workspace_root_source"] == "cwd_fallback"
+    assert str(Path.cwd().resolve()) in payload["workspace_root_warning"]
+
+
+def test_env_override_workspace_root_is_not_flagged(monkeypatch, tmp_path: Path) -> None:
+    db = _stub_init(monkeypatch, tmp_path)
+    mcp_server._execute_swarm_rate_limit.clear()
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+    monkeypatch.setattr(
+        mcp_server, "_spawn_execute_swarm_runtime_handoff", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (
+            TGsConfig(db_path=tmp_path / "ws-env.db"),
+            db,
+            None,
+            _fake_single_file_planner(),
+            None,
+        ),
+    )
+    override = tmp_path / "env-proj"
+    override.mkdir()
+    monkeypatch.setattr(mcp_server, "_active_workspace_root", lambda: override.resolve())
+
+    payload = mcp_server.handle_execute_swarm(
+        {"task": "build calculator ops", "max_agents": 1}
+    )["result"]
+
+    assert payload["workspace_root_source"] == "env_override"
+    assert "workspace_root_warning" not in payload
+    assert payload["workspace_root"] == str(override.resolve())
+
+
+def test_non_review_response_is_compacted_but_keeps_file_accounting(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The duplicate `plan` is dropped for every run; coverage survives in the summary."""
+    db = _stub_init(monkeypatch, tmp_path)
+    mcp_server._execute_swarm_rate_limit.clear()
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+    monkeypatch.setattr(
+        mcp_server, "_spawn_execute_swarm_runtime_handoff", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_ensure_init",
+        lambda: (
+            TGsConfig(db_path=tmp_path / "compact.db"),
+            db,
+            None,
+            _fake_single_file_planner(),
+            None,
+        ),
+    )
+
+    payload = mcp_server.handle_execute_swarm(
+        {
+            "task": "build calculator ops",
+            "max_agents": 1,
+            "workspace_root": str(tmp_path),
+        }
+    )["result"]
+
+    assert "plan" not in payload
+    summary = payload["plan_summary"]
+    assert summary["subtask_count"] == 1
+    assert summary["wave_count"] == len(payload["host_spawn_waves"])
+    assert summary["analysis"] == "one file"
+    assert summary["coverage"]["deferred"] == ["notes.py"]
+    assert summary["coverage"]["packed"]["cap"] == 1
+    assert summary["inline_files"] == ["README.md"]
+    # The manifest the host actually spawns from is untouched by the compaction.
+    assert payload["host_spawn_waves"][0]["agents"][0]["target_files"] == ["ops.py"]
 
 
 # ---------------------------------------------------------------------------
