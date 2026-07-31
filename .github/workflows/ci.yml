@@ -27,7 +27,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install --upgrade pip pyyaml pytest tomli
+      # `build` backs tests/test_clean_install.py; without it the wheel/sdist smoke
+      # test skipped silently on dev machines and failed the fixture here.
+      - run: python -m pip install --upgrade pip pyyaml pytest tomli build
       - name: Hermetic test suite
         env:
           THRENODY_TEST_MODE: "1"

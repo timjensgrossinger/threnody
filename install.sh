@@ -369,6 +369,7 @@ if [[ "$HAS_CLAUDE" -eq 1 ]]; then
 
     if [[ -f "$CLAUDE_CONFIG" ]]; then
         # Add or refresh the managed entry using Python for safe JSON manipulation.
+        # shellcheck disable=SC2015  # info/warn never fail, so && || is if-then-else here
         python3 -c "
 import json, sys
 with open('$CLAUDE_CONFIG') as f:
@@ -411,6 +412,7 @@ COPILOT_MCP_CONFIG="$HOME/.copilot/mcp-config.json"
 mkdir -p "$HOME/.copilot"
 
 if [[ -f "$COPILOT_MCP_CONFIG" ]]; then
+    # shellcheck disable=SC2015  # info/warn never fail, so && || is if-then-else here
     python3 -c "
 import json
 with open('$COPILOT_MCP_CONFIG') as f:
@@ -510,6 +512,7 @@ if [[ "$HAS_CURSOR" -eq 1 ]]; then
     mkdir -p "$HOME/.cursor"
 
     if [[ -f "$CURSOR_MCP_CONFIG" ]]; then
+        # shellcheck disable=SC2015  # info/warn never fail, so && || is if-then-else here
         python3 -c "
 import json
 with open('$CURSOR_MCP_CONFIG') as f:
@@ -543,6 +546,7 @@ if [[ "$HAS_JUNIE" -eq 1 ]]; then
     mkdir -p "$HOME/.junie/mcp"
 
     if [[ -f "$JUNIE_MCP_CONFIG" ]]; then
+        # shellcheck disable=SC2015  # info/warn never fail, so && || is if-then-else here
         python3 -c "
 import json
 with open('$JUNIE_MCP_CONFIG') as f:
@@ -1188,6 +1192,7 @@ if not hooks:
 path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 PY
     then
+        # shellcheck disable=SC2015  # both branches are info; the test is the only fallible part
         [[ "$MULTI_LEARN_ACTION" == "install" ]] \
             && info "Installed Codex PostToolUse learning hook in ~/.codex/hooks.json" \
             || info "Removed managed Codex learning hook from ~/.codex/hooks.json"
@@ -1228,6 +1233,7 @@ if not hooks.get("afterFileEdit"):
 path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 PY
     then
+        # shellcheck disable=SC2015  # both branches are info; the test is the only fallible part
         [[ "$MULTI_LEARN_ACTION" == "install" ]] \
             && info "Installed Cursor afterFileEdit learning hook in ~/.cursor/hooks.json" \
             || info "Removed managed Cursor learning hook from ~/.cursor/hooks.json"
@@ -1255,6 +1261,7 @@ path.write_text(json.dumps({
 PY
         info "Installed Copilot postToolUse learning hook in $COPILOT_HOOK_FILE"
     else
+        # shellcheck disable=SC2015  # the trailing || true is the intended catch-all
         rm -f "$COPILOT_HOOK_FILE" 2>/dev/null \
             && info "Removed managed Copilot learning hook" || true
     fi

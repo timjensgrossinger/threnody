@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -48,23 +49,41 @@ if sys.version_info < (3, 10) or sys.version_info >= (3, 14):
         allow_module_level=True,
     )
 
+if importlib.util.find_spec("build") is None:
+    # A missing build frontend is a missing tool, not a broken package: skip with a
+    # reason instead of failing the fixture with a bare CalledProcessError (which is
+    # how this read as a mystery CI failure on runners that lacked `build`).
+    pytest.skip(
+        "clean-install smoke needs the `build` frontend: pip install build",
+        allow_module_level=True,
+    )
+
 
 def _run(
     command: list[str],
     *,
     cwd: Path,
     env: dict[str, str] | None = None,
+    timeout: int = 120,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command with captured text output and a useful failure message."""
-    return subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=120,
-    )
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.CalledProcessError as exc:
+        # check=True + capture_output hides the reason entirely; without this the
+        # failure reaches CI as an exit status and nothing else.
+        raise AssertionError(
+            f"command failed ({exc.returncode}): {' '.join(command)}\n"
+            f"--- stdout ---\n{exc.stdout}\n--- stderr ---\n{exc.stderr}"
+        ) from exc
 
 
 def _venv_python(venv_dir: Path) -> Path:
@@ -122,6 +141,9 @@ def _build_distributions(output_dir: Path) -> tuple[Path, Path]:
             str(output_dir),
         ],
         cwd=ROOT,
+        # Two isolated builds, each provisioning hatchling from the network on a
+        # cold pip cache — 120s is not enough on a fresh runner.
+        timeout=600,
     )
     wheels = list(output_dir.glob("*.whl"))
     sdists = list(output_dir.glob("*.tar.gz"))

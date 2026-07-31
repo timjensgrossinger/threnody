@@ -1583,6 +1583,10 @@ alias ghcw="ghc --stats"
 # ? — natural language shorthand
 # ---------------------------------------------------------------------------
 if [[ -n "${ZSH_VERSION:-}" ]]; then
+    # zsh-only: `functions` is zsh's function table, and the body must stay
+    # single-quoted so it is expanded when `?` runs, not now. shellcheck reads this
+    # as bash, where it looks like an unused array and a missing expansion.
+    # shellcheck disable=SC2034,SC2016
     functions[?]='
         if [[ $# -eq 0 ]]; then
             echo "Usage: ? <natural language prompt>" >&2
