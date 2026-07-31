@@ -12,7 +12,7 @@
   <a href="https://github.com/timjensgrossinger/threnody/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/timjensgrossinger/threnody/ci.yml?branch=main" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%20%E2%80%93%203.13-blue" alt="Python">
   <img src="https://img.shields.io/badge/MCP-stdio-green" alt="MCP">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.3.0--alpha.2-orange" alt="Release"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-v0.3.0--alpha.3-orange" alt="Release"></a>
 </p>
 
 <p align="center">
@@ -126,6 +126,12 @@ Host shell (Claude / Copilot / Codex / Cursor / …)
 | ⚡ | **Dynamic Workflows** | Opt-in (claude-code): fan-out plans emit a tier-aware [Workflow](https://code.claude.com/docs/en/workflows) script; recurring shapes export to permanent `/workflow` commands |
 | 🧾 | **Receipts and run cards** | `cost_receipt` + `inspect_run_receipt(format=json\|markdown\|html)` record plan, waves, model rationale, skipped calls, policy decisions, outcomes |
 | 🧩 | **Task packs and blueprints** | Curated packs (`security-review`, `test-gap`, `release-check`); successful runs export to replayable workflow blueprints |
+| 🔬 | **Static pre-scan** | Deterministic AST + pattern scan (zero tokens) sharpens review tiering, injects verified-or-refuted leads, and grades reviewers against ground truth |
+| ♻️ | **Prior-review memory** | An unchanged `(file revision × dimension)` already covered at an equal-or-stronger tier is skipped and replayed; findings since fixed are suppressed |
+| 🪄 | **Hybrid diagnose→implement** | One read-only high-tier diagnosis produces a change-spec, cheaper implementers execute it. Emits tiers only; the discount is learned per work profile, never hardcoded |
+| ✅ | **Baseline-diff verify gate** | Lint/type/test graded against the merge base, so pre-existing red never blocks and only real regressions get a fix pass (in-process, zero tokens on the host path) |
+| 📚 | **Repo beliefs** | Each run leaves a free `pattern`/`constraint` lesson; later runs get the most relevant ones injected, ranked by SQLite FTS × recency × recurrence (no embeddings) |
+| 🪜 | **Graded task ladder** | `threnody ladder run` executes L0–L6 benchmark cases with deterministic graders, deriving the **minimum passing tier per model** instead of a hand-maintained mapping |
 | 💾 | **Cross-session memory** | `memory_*` MCP tools backed by local SQLite, shared across all MCP hosts |
 | 🔌 | **MCP-native** | 53 published tools over stdio JSON-RPC; works with any MCP-compatible host |
 | 📈 | **Adaptive thresholds** | EMA threshold learning from `record_outcome` (per-project, opt-in) |
@@ -203,6 +209,8 @@ execute_subtask(provider_id="codex")                             → HostDelegat
 ghc agent "implement JWT auth for the user service"   # multi-agent waves
 ghcs "how to list files recursively in python"        # quick routed call
 threnody inspect status --project . --details         # provider readiness
+threnody quality --since 7d                           # model quality ledger
+threnody ladder run --tier low,medium,high            # graded ground truth (spends tokens)
 threnody-watch                                        # live TUI monitor
 ```
 
@@ -231,7 +239,7 @@ Full reference: [docs/CLI.md](docs/CLI.md)
 
 ## Beta status
 
-Public alpha **v0.3.0-alpha.2** — MCP tool schemas may change between releases; pin a git tag for stability. macOS and Linux (`zsh`/`bash`); Windows not supported by the installer. See [CHANGELOG.md](CHANGELOG.md).
+Public alpha **v0.3.0-alpha.3** — MCP tool schemas may change between releases; pin a git tag for stability. macOS and Linux (`zsh`/`bash`); Windows not supported by the installer. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Running tests
 

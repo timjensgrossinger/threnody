@@ -3,7 +3,7 @@
   "name": "io.github.timjensgrossinger/threnody",
   "title": "Threnody",
   "description": "Local-first MCP meta-harness: routes, plans, and swarms multi-agent coding work — emitting tier-aware Dynamic Workflows on Claude Code — while the host shell executes via Agent/Task subagents.",
-  "version": "0.3.0-alpha.2",
+  "version": "0.3.0-alpha.3",
   "websiteUrl": "https://github.com/timjensgrossinger/threnody",
   "repository": {
     "url": "https://github.com/timjensgrossinger/threnody",
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "threnody-mcp",
-      "version": "0.3.0a2",
+      "version": "0.3.0a3",
       "transport": {
         "type": "stdio"
       },

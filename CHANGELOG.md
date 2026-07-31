@@ -7,6 +7,84 @@ Versioning for public releases.
 
 ## [Unreleased]
 
+## [0.3.0-alpha.3] - 2026-07-31
+
+Host-native spawn manifests now account for every file they were given, and the
+learning loop gains four zero-token ground-truth sources. No MCP tool was
+removed; one response shape changed (see Changed).
+
+### Added
+
+- **`shared/verify.py`** — lint/type/test verify gate graded against the **merge
+  base**: failures already red on the branch are reported as
+  `preexisting_failures` and never blamed on the run; only `new_failures` can
+  warn/reject. Runs in-process at host-native finalize (zero model tokens) and
+  yields at most one low-tier `verify_followup`. Off by default (`verify_gate`).
+- **`shared/code_intel.py`** — deterministic, LLM-free entity/smell scan (stdlib
+  `ast` for Python, regex elsewhere). Backs review structural-density scoring and
+  the objective static-recall grade; cached by `(path, content_sha)`.
+- **`shared/review_memory.py`** — a `(file revision × dimension)` cell already
+  reviewed at an equal-or-stronger tier is skipped and its findings replayed into
+  synthesis; findings since fixed are injected as "already fixed". A skip needs an
+  exact digest match **and** tier coverage, so depth is never traded for cost.
+- **`shared/beliefs.py`** — one free repo-scoped lesson per run at finalize
+  (pattern on a clean run, constraint on a failed/reworked one), stored in the
+  existing `project` memory scope, injected under a hard cap.
+- **`shared/ladder.py`** + `tests/ladder/L0..L6` — graded task ladder: the
+  ground-truth complement to the classification-only routing eval. Operator-
+  invoked (`threnody ladder run`), feeds `model_quality_events` and the
+  minimum-passing-tier table.
+- **`shared/hybrid_learning.py`** — the diagnose→implement tier discount is
+  learned per work profile (`hybrid_tier_bias`) instead of fixed.
+- **Objective quality sources** — `record_static_recall_score` (reviewer graded
+  against the static pre-scan) and `record_verify_gate_score` (did the write leave
+  new failures) join the free findings proxy; `threnody quality` reports
+  `objective_n`/`objective_avg` so ground truth is distinguishable from inference.
+- **Router duration axis** — `expected_duration_bucket` (short/medium/long) from
+  structural signals, with `tests/eval/duration/` fixtures.
+
+### Fixed
+
+- **Files could vanish from a spawn manifest.** `choose_agent_count`'s
+  `min(file_count, 4)` recommendation was applied as a hard file cap, so a 9-file
+  task silently planned 4. Fanout is now one writer per named file, bounded only by
+  `swarm.max_agents`, and an over-budget plan **packs** files into fewer multi-file
+  owners rather than dropping them.
+- **The squeeze is now reported.** `coverage.deferred` (a named file with no owner
+  — a plan defect) and `coverage.packed` (budget forced merging) ride the plan
+  payload and `plan_summary`; intent-template fullstack plans get the same
+  accounting instead of packing silently.
+- **`swarm_max_agents: -1` meant "unlimited" everywhere except the packer**, which
+  read it as a cap of one agent. Any caller passing the config value collapsed a
+  whole fanout into a single agent.
+- **`target_files` was dropped by the planner**, so a multi-file owner reached the
+  host with one target and the ownership dedupe could not fire. `Subtask` now
+  carries the plural list through `plan_to_dict`, alongside `inline_files`.
+- **Per-file prompt hints leaked across paths.** Clause windows now anchor on the
+  full path and terminate at the next path, coupled subtasks group per directory
+  instead of collapsing globally, and the ownership sentence no longer splices
+  onto an unterminated clause.
+- **`expand_host_plan` bypassed the containment gate and every cap.** It now runs
+  `sanitize_plan_for_host` (escaped paths return as `deferred_files` and stay
+  claimable) and packs to the agent cap, re-offsetting ids so appended agents
+  cannot collide with already-spawned ones.
+- **`workspace_root` resolved silently to the server's cwd.** Resolution happens
+  once per handoff and is echoed as `workspace_root_source`
+  (`argument` | `env_override` | `cwd_fallback`), with a `workspace_root_warning`
+  on the fallback — target containment is checked against that root.
+- **Task packs lost their preamble** once hint windows were tightened; the pack
+  prefix is injected per subtask again.
+- Review fanout tiering is LOC + structural-density based (dense mid-size
+  reasoning-heavy → high, flat large → medium) rather than keyword-driven, and
+  `[dims=...]` intent is honored with drop protection.
+
+### Changed
+
+- **Host-native `execute_swarm` responses are compact for every run**, not only
+  `REVIEW:` runs: the duplicate `plan` is replaced by `plan_summary` (which keeps
+  `coverage`, `inline_files`, `sanitization`). Spawn from `host_spawn_waves`; full
+  plan fidelity remains in the run receipt (`inspect_run_receipt`).
+
 ## [0.3.0-alpha.2] - 2026-06-16
 
 Local resource-usage hardening for many concurrent host-native subagents.
@@ -210,7 +288,8 @@ hardening (older internal tags such as `v3.2.0-alpha.1` remain in git history).
 
 - Last internal milestone before the public release hardening cycle.
 
-[Unreleased]: https://github.com/timjensgrossinger/threnody/compare/v0.3.0-alpha.2...HEAD
+[Unreleased]: https://github.com/timjensgrossinger/threnody/compare/v0.3.0-alpha.3...HEAD
+[0.3.0-alpha.3]: https://github.com/timjensgrossinger/threnody/compare/v0.3.0-alpha.2...v0.3.0-alpha.3
 [0.3.0-alpha.2]: https://github.com/timjensgrossinger/threnody/compare/v0.3.0-alpha.1...v0.3.0-alpha.2
 [0.3.0-alpha.1]: https://github.com/timjensgrossinger/threnody/compare/v0.2.0-alpha.1...v0.3.0-alpha.1
 [0.2.0-alpha.1]: https://github.com/timjensgrossinger/threnody/releases/tag/v0.2.0-alpha.1
