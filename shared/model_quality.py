@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +32,24 @@ log = logging.getLogger(__name__)
 
 SOURCE_FINDINGS = "findings"
 SOURCE_JUDGE = "judge"
+# Objective sources — graded against something deterministic rather than against
+# another model's judgement. `static_recall` compares a reviewer's reported
+# findings to the high-severity static pre-scan set; `verify_gate` records whether
+# a write-path run left new test/type/lint failures; `ladder` records a graded
+# benchmark pass/fail. Kept distinct from the two proxy sources so operators can
+# tell ground truth from inference.
+SOURCE_STATIC_RECALL = "static_recall"
+SOURCE_VERIFY_GATE = "verify_gate"
+SOURCE_LADDER = "ladder"
+
+VALID_SOURCES = frozenset({
+    SOURCE_FINDINGS,
+    SOURCE_JUDGE,
+    SOURCE_STATIC_RECALL,
+    SOURCE_VERIFY_GATE,
+    SOURCE_LADDER,
+})
+OBJECTIVE_SOURCES = frozenset({SOURCE_STATIC_RECALL, SOURCE_VERIFY_GATE, SOURCE_LADDER})
 # Bucket used when the host did not resolve a concrete model for an agent (e.g.
 # host-native review agents whose tier -> model resolution was unavailable). Kept
 # explicit so a real model is never falsely credited/blamed.
@@ -100,7 +119,7 @@ def _write_event(
     run_id: str | None = None,
 ) -> None:
     """Insert one ledger event. Best-effort — never raises into caller paths."""
-    if source not in (SOURCE_FINDINGS, SOURCE_JUDGE):
+    if source not in VALID_SOURCES:
         log.debug("model_quality: refusing unknown source %r", source)
         return
     try:
@@ -178,6 +197,232 @@ def record_findings_score(
         task_hash=task_hash,
         run_id=run_id,
     )
+
+
+def static_recall_to_score(
+    *,
+    expected_rules: "list[str] | tuple[str, ...]",
+    reported_categories: "list[str] | tuple[str, ...]",
+    findings_total: int,
+) -> tuple[float, dict[str, Any]] | None:
+    """Map reviewer output against the static pre-scan set to a 0-10 score.
+
+    Unlike :func:`findings_to_score` this is measured against something objective:
+    the high-severity smells :mod:`shared.code_intel` found deterministically in
+    the same file. Recall is the share of those the reviewer reported; the
+    remainder of the score penalises unexplained extra findings only mildly,
+    because a reviewer legitimately finds real defects no static rule covers.
+
+    Returns ``None`` when there is no expectation to measure against (empty
+    ``expected_rules``) so a clean file never dilutes the ledger.
+    """
+    from .code_intel import rule_aliases
+
+    expected = {str(r) for r in expected_rules if r}
+    if not expected:
+        return None
+    # Reviewers report `dimension/category` kebab-case slugs; rule ids are
+    # snake_case and often use different words for the same defect. Match through
+    # code_intel.rule_aliases, comparing both whole slugs and individual tokens.
+    reported_slugs: set[str] = set()
+    reported_tokens: set[str] = set()
+    for raw in reported_categories:
+        if not raw:
+            continue
+        cat = str(raw).strip().lower()
+        reported_slugs.add(cat)
+        reported_slugs.add(cat.rsplit("/", 1)[-1])
+        for part in re.split(r"[/_\-\s]+", cat):
+            if len(part) > 2:
+                reported_tokens.add(part)
+    hits = 0
+    missed: list[str] = []
+    for rule in sorted(expected):
+        aliases = rule_aliases(rule)
+        matched = any(
+            alias in reported_slugs
+            or any(alias in slug for slug in reported_slugs)
+            or alias in reported_tokens
+            for alias in aliases
+        )
+        if matched:
+            hits += 1
+        else:
+            missed.append(rule)
+    recall = hits / len(expected)
+    extras = max(0, int(findings_total) - hits)
+    # Recall carries the score; unmatched extra findings shave at most 2 points.
+    noise_penalty = min(2.0, 0.25 * extras)
+    score = max(0.0, min(10.0, round(10.0 * recall - noise_penalty, 2)))
+    meta = {
+        "expected": sorted(expected),
+        "matched": hits,
+        "missed": missed,
+        "recall": round(recall, 3),
+        "extra_findings": extras,
+    }
+    return score, meta
+
+
+def record_static_recall_score(
+    db: Database,
+    *,
+    model: str | None,
+    effort: str | None,
+    dimension: str,
+    expected_rules: "list[str] | tuple[str, ...]",
+    reported_categories: "list[str] | tuple[str, ...]",
+    findings_total: int,
+    sub_dimension: str | None = None,
+    task_hash: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    """Score a reviewer against the static pre-scan (source='static_recall').
+
+    No-op when the file carried no high-severity static expectation.
+    """
+    scored = static_recall_to_score(
+        expected_rules=expected_rules,
+        reported_categories=reported_categories,
+        findings_total=findings_total,
+    )
+    if scored is None:
+        return
+    score, meta = scored
+    _write_event(
+        db,
+        model=model,
+        effort=effort,
+        dimension=dimension,
+        sub_dimension=sub_dimension,
+        score_0_10=score,
+        source=SOURCE_STATIC_RECALL,
+        sample_meta=meta,
+        task_hash=task_hash,
+        run_id=run_id,
+    )
+
+
+def record_verify_gate_score(
+    db: Database,
+    *,
+    model: str | None,
+    effort: str | None,
+    score_0_10: float,
+    new_failure_count: int = 0,
+    preexisting_count: int = 0,
+    task_hash: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    """Record a verify-gate outcome (source='verify_gate').
+
+    Objective: the written code either passed lint/types/tests or introduced new
+    failures relative to the merge base. ``preexisting_count`` is stored for
+    context only and never affects the score.
+    """
+    _write_event(
+        db,
+        model=model,
+        effort=effort,
+        dimension=DIMENSION_GENERAL,
+        sub_dimension="verify",
+        score_0_10=score_0_10,
+        source=SOURCE_VERIFY_GATE,
+        sample_meta={
+            "new_failures": int(new_failure_count),
+            "preexisting_failures": int(preexisting_count),
+        },
+        task_hash=task_hash,
+        run_id=run_id,
+    )
+
+
+def record_ladder_score(
+    db: Database,
+    *,
+    model: str | None,
+    effort: str | None,
+    level_label: str,
+    passed: bool,
+    tier: str | None = None,
+    case_id: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    """Record one graded ladder verdict (source='ladder').
+
+    Pass/fail only — a benchmark that partially credits broken code is not ground
+    truth. ``sub_dimension`` is the level label (``L0``..``L6``) so
+    ``build_quality_snapshot`` groups a model's results per difficulty rung.
+    """
+    _write_event(
+        db,
+        model=model,
+        effort=effort,
+        dimension=DIMENSION_GENERAL,
+        sub_dimension=str(level_label or "L?"),
+        score_0_10=10.0 if passed else 0.0,
+        source=SOURCE_LADDER,
+        sample_meta={
+            "passed": bool(passed),
+            "tier": (tier or None),
+            "case_id": (case_id or None),
+        },
+        run_id=run_id,
+    )
+
+
+def build_min_passing_tier_map(
+    db: Database, *, since: str = "all"
+) -> dict[str, dict[str, str]]:
+    """Return ``{model: {level_label: cheapest_passing_tier}}`` from ladder events.
+
+    This is the auto-detected "which model is good at what" — derived from graded
+    outcomes rather than a hand-maintained table, and intended to inform
+    ``preferred_routing``. A level appears for a model only when that tier passed
+    *every* case attempted at that level, so one lucky pass is not evidence.
+    """
+    since_ts, _ = parse_quality_window(since)
+    attempted: dict[tuple[str, str, str], set[str]] = {}
+    passed: dict[tuple[str, str, str], set[str]] = {}
+    try:
+        with db.conn() as conn:
+            rows = conn.execute(
+                "SELECT model, sub_dimension, sample_meta, score_0_10 "
+                "FROM model_quality_events "
+                "WHERE source = ? AND ts >= ? AND sub_dimension IS NOT NULL",
+                (SOURCE_LADDER, since_ts),
+            ).fetchall()
+    except Exception:  # pragma: no cover - best-effort read
+        log.debug("model_quality: ladder query failed", exc_info=True)
+        return {}
+    for model, level, meta_json, score in rows:
+        try:
+            meta = json.loads(meta_json) if meta_json else {}
+        except (TypeError, ValueError):
+            meta = {}
+        tier = str(meta.get("tier") or "")
+        case_id = str(meta.get("case_id") or "")
+        if not tier or not case_id:
+            continue
+        key = (str(model), str(level), tier)
+        attempted.setdefault(key, set()).add(case_id)
+        if float(score or 0.0) >= 10.0:
+            passed.setdefault(key, set()).add(case_id)
+
+    out: dict[str, dict[str, str]] = {}
+    tier_order = ("low", "medium", "high")
+    models = {m for m, _, _ in attempted}
+    levels = {lvl for _, lvl, _ in attempted}
+    for model in sorted(models):
+        for level in sorted(levels):
+            for tier in tier_order:
+                key = (model, level, tier)
+                if key not in attempted:
+                    continue
+                if passed.get(key, set()) == attempted[key]:
+                    out.setdefault(model, {})[level] = tier
+                    break
+    return out
 
 
 def record_judge_score(
@@ -268,7 +513,11 @@ def build_quality_snapshot(
                 "SELECT model, effort, dimension, sub_dimension, "
                 "COUNT(*), AVG(score_0_10), MIN(score_0_10), MAX(score_0_10), "
                 "SUM(CASE WHEN source='findings' THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN source='judge' THEN 1 ELSE 0 END) "
+                "SUM(CASE WHEN source='judge' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN source IN ('static_recall', 'verify_gate', 'ladder') "
+                "THEN 1 ELSE 0 END), "
+                "AVG(CASE WHEN source IN ('static_recall', 'verify_gate', 'ladder') "
+                "THEN score_0_10 END) "
                 "FROM model_quality_events WHERE ts >= ? "
                 "GROUP BY model, effort, dimension, sub_dimension "
                 "ORDER BY model, dimension, sub_dimension",
@@ -290,6 +539,8 @@ def build_quality_snapshot(
         max_score,
         findings_n,
         judge_n,
+        objective_n,
+        objective_avg,
     ) in grouped:
         n = int(n or 0)
         total_events += n
@@ -306,6 +557,12 @@ def build_quality_snapshot(
             "max_score": round(float(max_score or 0.0), 2),
             "findings_n": int(findings_n or 0),
             "judge_n": int(judge_n or 0),
+            # Ground-truth subset: scored against static analysis, a verify gate,
+            # or a graded ladder rather than another model's judgement.
+            "objective_n": int(objective_n or 0),
+            "objective_avg": (
+                round(float(objective_avg), 2) if objective_avg is not None else None
+            ),
             "escalation_rate": esc_rates.get((str(model), effort), 0.0),
         })
 
@@ -318,8 +575,11 @@ def build_quality_snapshot(
         "rows": rows_out,
         "disclaimer": (
             "score_0_10 blends free review-findings precision (source='findings') "
-            "and an opt-out LLM judge (source='judge'); it is a relative learning "
-            "signal, not an absolute model benchmark. escalation_rate is approximate."
+            "and an opt-out LLM judge (source='judge'); those two are relative "
+            "learning signals, not an absolute model benchmark. objective_avg covers "
+            "only the ground-truth sources (static_recall, verify_gate, ladder) and "
+            "is the column to trust when objective_n is non-zero. escalation_rate is "
+            "approximate."
         ),
         "cli_hint": f"threnody quality --since {window_label}",
     }
@@ -328,11 +588,21 @@ def build_quality_snapshot(
 __all__ = [
     "SOURCE_FINDINGS",
     "SOURCE_JUDGE",
+    "SOURCE_STATIC_RECALL",
+    "SOURCE_VERIFY_GATE",
+    "SOURCE_LADDER",
+    "VALID_SOURCES",
+    "OBJECTIVE_SOURCES",
     "MODEL_UNRESOLVED",
     "DIMENSION_GENERAL",
     "parse_quality_window",
     "findings_to_score",
+    "static_recall_to_score",
     "record_findings_score",
+    "record_static_recall_score",
+    "record_verify_gate_score",
+    "record_ladder_score",
+    "build_min_passing_tier_map",
     "record_judge_score",
     "build_quality_snapshot",
 ]

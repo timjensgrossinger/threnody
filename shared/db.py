@@ -660,10 +660,14 @@ class Database:
             );
 
             -- Granular model quality ledger (raw events; aggregated at read time).
-            -- One row per scored agent output. source='findings' comes free from
-            -- read-only REVIEW: agents (precision proxy over kept findings);
-            -- source='judge' is the opt-out warm-path LLM judge (0-10). model may
-            -- be the literal 'host-native' bucket when the host did not resolve one.
+            -- One row per scored agent output. Proxy sources: 'findings' comes free
+            -- from read-only REVIEW: agents (precision over kept findings) and
+            -- 'judge' is the opt-out warm-path LLM judge. Ground-truth sources:
+            -- 'static_recall' grades a reviewer against the deterministic
+            -- code_intel pre-scan, 'verify_gate' records whether a write left new
+            -- lint/type/test failures vs the merge base, and 'ladder' records a
+            -- graded benchmark pass/fail. model may be the literal 'host-native'
+            -- bucket when the host did not resolve one.
             CREATE TABLE IF NOT EXISTS model_quality_events (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 model         TEXT NOT NULL,
@@ -671,7 +675,9 @@ class Database:
                 dimension     TEXT NOT NULL,
                 sub_dimension TEXT,
                 score_0_10    REAL NOT NULL,
-                source        TEXT NOT NULL CHECK (source IN ('findings', 'judge')),
+                source        TEXT NOT NULL CHECK (source IN (
+                                  'findings', 'judge',
+                                  'static_recall', 'verify_gate', 'ladder')),
                 sample_meta   TEXT,
                 task_hash     TEXT,
                 run_id        TEXT,
@@ -679,6 +685,77 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_model_quality_events_key
                 ON model_quality_events (model, effort, dimension, ts);
+
+            -- Deterministic code intelligence cache (shared/code_intel.py). Keyed by
+            -- content digest, so an unchanged file is one indexed read instead of a
+            -- re-parse. entities/smells are JSON arrays of the module's NamedTuples;
+            -- parsed=0 means the regex fallback produced the row (depth/branch
+            -- totals are then 0 and callers fall back to the keyword heuristic).
+            CREATE TABLE IF NOT EXISTS code_intel (
+                path         TEXT NOT NULL,
+                content_sha  TEXT NOT NULL,
+                entities     TEXT NOT NULL,
+                smells       TEXT NOT NULL,
+                max_depth    INTEGER NOT NULL DEFAULT 0,
+                branch_count INTEGER NOT NULL DEFAULT 0,
+                def_count    INTEGER NOT NULL DEFAULT 0,
+                parsed       INTEGER NOT NULL DEFAULT 0,
+                ts           REAL NOT NULL,
+                PRIMARY KEY (path, content_sha)
+            );
+            CREATE INDEX IF NOT EXISTS idx_code_intel_ts ON code_intel (ts);
+
+            -- Prior-review memory (shared/review_memory.py). review_scans records
+            -- that a given file REVISION x dimension was actually reviewed, and at
+            -- which tier, so an unchanged revision can be skipped and replayed
+            -- instead of re-spawning the agent.
+            CREATE TABLE IF NOT EXISTS review_scans (
+                path           TEXT NOT NULL,
+                content_sha    TEXT NOT NULL,
+                dimension      TEXT NOT NULL,
+                tier           TEXT,
+                findings_total INTEGER NOT NULL DEFAULT 0,
+                findings_high  INTEGER NOT NULL DEFAULT 0,
+                model          TEXT,
+                ts             REAL NOT NULL,
+                PRIMARY KEY (path, content_sha, dimension)
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_scans_path ON review_scans (path, dimension);
+
+            -- Per-finding lifecycle, keyed by a line-independent fingerprint so a
+            -- finding's status survives unrelated edits. status='resolved' rows are
+            -- replayed into later prompts as "already fixed, do not re-report".
+            CREATE TABLE IF NOT EXISTS review_findings (
+                path           TEXT NOT NULL,
+                dimension      TEXT NOT NULL,
+                fingerprint    TEXT NOT NULL,
+                category       TEXT,
+                severity       TEXT,
+                line           INTEGER NOT NULL DEFAULT 0,
+                summary        TEXT,
+                status         TEXT NOT NULL DEFAULT 'open',
+                first_seen_sha TEXT,
+                last_seen_sha  TEXT,
+                resolved_sha   TEXT,
+                first_seen_ts  REAL NOT NULL,
+                last_seen_ts   REAL NOT NULL,
+                PRIMARY KEY (path, dimension, fingerprint)
+            );
+            CREATE INDEX IF NOT EXISTS idx_review_findings_status
+                ON review_findings (path, dimension, status);
+
+            -- Learned adjustment for the hybrid diagnose->implement tier discount
+            -- (shared/hybrid_learning.py). Keyed by work profile AND the delta that
+            -- ran, so outcomes at different discounts stay separable.
+            CREATE TABLE IF NOT EXISTS hybrid_tier_bias (
+                profile_key  TEXT NOT NULL,
+                delta        INTEGER NOT NULL,
+                rework_ema   REAL DEFAULT 0,
+                clean_ema    REAL DEFAULT 0,
+                sample_count INTEGER DEFAULT 0,
+                updated_at   REAL NOT NULL,
+                PRIMARY KEY (profile_key, delta)
+            );
 
             CREATE TABLE IF NOT EXISTS preview_records (
                 preview_token TEXT PRIMARY KEY,
@@ -740,6 +817,8 @@ class Database:
         self._ensure_telemetry_columns(conn)
         self._ensure_escalations_columns(conn)
         self._ensure_model_quality_schema(conn)
+        self._ensure_code_intel_schema(conn)
+        self._ensure_review_memory_schema(conn)
         self._ensure_phase3_columns(conn)
         self._ensure_phase10_columns(conn)
         self._ensure_phase11_columns(conn)
@@ -876,7 +955,9 @@ class Database:
                 dimension     TEXT NOT NULL,
                 sub_dimension TEXT,
                 score_0_10    REAL NOT NULL,
-                source        TEXT NOT NULL CHECK (source IN ('findings', 'judge')),
+                source        TEXT NOT NULL CHECK (source IN (
+                                  'findings', 'judge',
+                                  'static_recall', 'verify_gate', 'ladder')),
                 sample_meta   TEXT,
                 task_hash     TEXT,
                 run_id        TEXT,
@@ -887,6 +968,147 @@ class Database:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_model_quality_events_key "
             "ON model_quality_events (model, effort, dimension, ts)"
+        )
+        Database._ensure_model_quality_sources(conn)
+
+    @staticmethod
+    def _ensure_model_quality_sources(conn: sqlite3.Connection) -> None:
+        """Widen the ledger's ``source`` CHECK to admit the ground-truth sources.
+
+        SQLite cannot ALTER a CHECK constraint, so a database created before
+        static_recall/verify_gate/ladder existed needs the table rebuilt. Detected
+        by looking for the new source names in the stored DDL; rows are carried
+        over, so this is a one-time no-data-loss rewrite and a no-op afterwards.
+        """
+        try:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='model_quality_events'"
+            ).fetchone()
+        except sqlite3.Error:
+            log.debug("db: model_quality DDL probe failed", exc_info=True)
+            return
+        ddl = (row[0] if row else "") or ""
+        if not ddl or "static_recall" in ddl:
+            return
+        log.info("db: widening model_quality_events.source CHECK (one-time rebuild)")
+        # Individual execute() calls, NOT executescript(): executescript issues an
+        # implicit COMMIT first, which would take this rebuild outside the caller's
+        # schema transaction and could leave a half-migrated table behind if a
+        # statement failed. Run inside the existing transaction so the whole swap
+        # commits or rolls back as one unit — other processes holding a WAL read
+        # snapshot never observe an intermediate state.
+        conn.execute("DROP TABLE IF EXISTS model_quality_events_new")
+        conn.execute(
+            """
+            CREATE TABLE model_quality_events_new (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                model         TEXT NOT NULL,
+                effort        TEXT,
+                dimension     TEXT NOT NULL,
+                sub_dimension TEXT,
+                score_0_10    REAL NOT NULL,
+                source        TEXT NOT NULL CHECK (source IN (
+                                  'findings', 'judge',
+                                  'static_recall', 'verify_gate', 'ladder')),
+                sample_meta   TEXT,
+                task_hash     TEXT,
+                run_id        TEXT,
+                ts            REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO model_quality_events_new "
+            "(id, model, effort, dimension, sub_dimension, score_0_10, source, "
+            " sample_meta, task_hash, run_id, ts) "
+            "SELECT id, model, effort, dimension, sub_dimension, score_0_10, source, "
+            "       sample_meta, task_hash, run_id, ts FROM model_quality_events"
+        )
+        conn.execute("DROP TABLE model_quality_events")
+        conn.execute("ALTER TABLE model_quality_events_new RENAME TO model_quality_events")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_quality_events_key "
+            "ON model_quality_events (model, effort, dimension, ts)"
+        )
+
+    @staticmethod
+    def _ensure_code_intel_schema(conn: sqlite3.Connection) -> None:
+        """Create the code_intel scan cache on databases that predate it."""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS code_intel (
+                path         TEXT NOT NULL,
+                content_sha  TEXT NOT NULL,
+                entities     TEXT NOT NULL,
+                smells       TEXT NOT NULL,
+                max_depth    INTEGER NOT NULL DEFAULT 0,
+                branch_count INTEGER NOT NULL DEFAULT 0,
+                def_count    INTEGER NOT NULL DEFAULT 0,
+                parsed       INTEGER NOT NULL DEFAULT 0,
+                ts           REAL NOT NULL,
+                PRIMARY KEY (path, content_sha)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_code_intel_ts ON code_intel (ts)")
+
+    @staticmethod
+    def _ensure_review_memory_schema(conn: sqlite3.Connection) -> None:
+        """Create the prior-review memory tables on databases that predate them."""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS review_scans (
+                path           TEXT NOT NULL,
+                content_sha    TEXT NOT NULL,
+                dimension      TEXT NOT NULL,
+                tier           TEXT,
+                findings_total INTEGER NOT NULL DEFAULT 0,
+                findings_high  INTEGER NOT NULL DEFAULT 0,
+                model          TEXT,
+                ts             REAL NOT NULL,
+                PRIMARY KEY (path, content_sha, dimension)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_review_scans_path ON review_scans (path, dimension)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS review_findings (
+                path           TEXT NOT NULL,
+                dimension      TEXT NOT NULL,
+                fingerprint    TEXT NOT NULL,
+                category       TEXT,
+                severity       TEXT,
+                line           INTEGER NOT NULL DEFAULT 0,
+                summary        TEXT,
+                status         TEXT NOT NULL DEFAULT 'open',
+                first_seen_sha TEXT,
+                last_seen_sha  TEXT,
+                resolved_sha   TEXT,
+                first_seen_ts  REAL NOT NULL,
+                last_seen_ts   REAL NOT NULL,
+                PRIMARY KEY (path, dimension, fingerprint)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_review_findings_status "
+            "ON review_findings (path, dimension, status)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hybrid_tier_bias (
+                profile_key  TEXT NOT NULL,
+                delta        INTEGER NOT NULL,
+                rework_ema   REAL DEFAULT 0,
+                clean_ema    REAL DEFAULT 0,
+                sample_count INTEGER DEFAULT 0,
+                updated_at   REAL NOT NULL,
+                PRIMARY KEY (profile_key, delta)
+            )
+            """
         )
 
     @staticmethod

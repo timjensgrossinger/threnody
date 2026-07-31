@@ -1,0 +1,16 @@
+{
+  "id": "duration-medium-01",
+  "category": "duration",
+  "tags": [
+    "duration",
+    "stable"
+  ],
+  "prompt": "Update core/parser.py and core/lexer.py to share a token table",
+  "expected": {
+    "tier": "medium",
+    "score_min": 0.17,
+    "score_max": 0.65,
+    "duration_expected": "medium",
+    "file_count_expected": 2
+  }
+}

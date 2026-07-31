@@ -31,6 +31,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from shared.db import Database
+
+# The graded ladder (tests/ladder/) ships hidden grader tests named test_*.py that
+# are meant to run INSIDE a sandbox against a model-produced solution — never as
+# part of this suite. Collecting them would fail on the missing solution module and
+# would also litter the case directories with __pycache__.
+collect_ignore_glob = ["ladder/*"]
 from shared.discovery import CLIProvider, ProviderReadiness, DetectReason
 from shared.config import TGsConfig
 

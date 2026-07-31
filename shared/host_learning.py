@@ -362,8 +362,14 @@ def register_host_run_handoff(
     project_id: str | None = None,
     topology: str | None = None,
     task_hint: str | None = None,
+    hybrid_split: Mapping[str, Any] | None = None,
 ) -> None:
-    """Persist handoff metadata and per-agent telemetry stubs."""
+    """Persist handoff metadata and per-agent telemetry stubs.
+
+    ``hybrid_split`` is the diagnose->implement descriptor from
+    ``heuristic_plan.apply_hybrid_split``; carrying it here is what lets finalize
+    attribute the run's outcome back to the tier discount that was applied.
+    """
     handoff_caller: str | None = None
     for wave in host_spawn_waves:
         if not isinstance(wave, dict):
@@ -393,6 +399,10 @@ def register_host_run_handoff(
         "plan_revision": existing.get("plan_revision"),
         "next_subtask_id": existing.get("next_subtask_id"),
         "task_hint": task_hint or existing.get("task_hint"),
+        "hybrid_split": (
+            dict(hybrid_split) if isinstance(hybrid_split, Mapping)
+            else existing.get("hybrid_split")
+        ),
     }
     if int(planned_subtasks) > int(existing.get("planned_subtasks") or 0):
         meta["planned_subtasks"] = max(0, int(planned_subtasks))
@@ -747,7 +757,97 @@ def _build_review_outcome(
         "findings_high": findings_high,
         "kept_by_synthesis": bool(review_meta.get("kept_by_synthesis", True)),
         "categories": categories,
+        # Optional per-finding detail for prior-review memory. Absent → only counts
+        # are persisted, which still enables the unchanged-revision skip but leaves
+        # finding lifecycle state untouched (see review_memory.record_review_scan).
+        "findings": review_meta.get("findings"),
     }
+
+
+def _record_review_memory(
+    db: Database,
+    outcome: Mapping[str, Any],
+    prof: Any,
+) -> None:
+    """Persist that this (file revision x dimension) was reviewed, plus findings.
+
+    The content digest comes from the finalize-time scan, so a file edited between
+    plan and finalize is recorded against the revision that was actually reviewed.
+    Without a digest there is nothing safe to key a future skip on, so the write is
+    dropped rather than guessed.
+    """
+    intel = getattr(prof, "intel", None)
+    sha = getattr(intel, "content_sha", "") if intel is not None else ""
+    if not sha:
+        return
+    try:
+        from .review_memory import record_review_scan
+
+        record_review_scan(
+            db,
+            path=str(outcome["target_file"]),
+            content_sha=sha,
+            dimension=str(outcome["dimension"]),
+            tier=str(outcome["tier"]),
+            findings_total=int(outcome["findings_total"]),
+            findings_high=int(outcome["findings_high"]),
+            findings=outcome.get("findings"),
+            model=outcome.get("model"),
+        )
+    except Exception:  # pragma: no cover - best-effort persistence
+        log.debug("review-memory capture failed", exc_info=True)
+
+
+def _record_static_recall(
+    db: Database,
+    outcome: Mapping[str, Any],
+    prof: Any,
+) -> None:
+    """Score this reviewer against the deterministic static pre-scan.
+
+    The expectation is recomputed from the file at finalize time (``prof.intel``
+    already carries the scan), so it never depends on the host echoing plan
+    metadata back. Scoring is skipped unless the host reported a per-category
+    breakdown or reported nothing at all: with findings but no categories there is
+    no way to tell whether the static hits were among them, and guessing would
+    punish a correct reviewer.
+    """
+    intel = getattr(prof, "intel", None)
+    if intel is None:
+        return
+    try:
+        from . import model_quality
+        from .code_intel import expected_findings
+
+        dimension = str(outcome["dimension"])
+        expected = sorted({
+            s.rule_id for s in expected_findings(intel.smells, dimension)
+        })
+        if not expected:
+            return
+        categories = outcome.get("categories")
+        reported = list(categories) if isinstance(categories, Mapping) else []
+        findings_total = int(outcome["findings_total"])
+        if not reported and findings_total > 0:
+            log.debug(
+                "static-recall skipped for %s/%s: findings reported without categories",
+                outcome.get("target_file"),
+                dimension,
+            )
+            return
+        model_quality.record_static_recall_score(
+            db,
+            model=outcome.get("model"),
+            effort=outcome.get("effort"),
+            dimension=dimension,
+            expected_rules=expected,
+            reported_categories=reported,
+            findings_total=findings_total,
+            task_hash=outcome.get("task_hash"),
+            run_id=outcome.get("run_id"),
+        )
+    except Exception:  # pragma: no cover - best-effort learning
+        log.debug("model-quality static-recall capture failed", exc_info=True)
 
 
 def _record_review_outcome(
@@ -760,13 +860,16 @@ def _record_review_outcome(
     The tier-bias EMA is unchanged. Additionally — when the model-quality ledger
     is enabled — one findings-based ledger event per reviewed dimension (and one
     per reported sub-dimension/category) attributes review precision to the model
-    that ran. Both are best-effort and never raise into finalize.
+    that ran, plus one objective static-recall event graded against the
+    deterministic code_intel pre-scan. All are best-effort and never raise into
+    finalize.
     """
+    prof = None
     try:
         from .review_fanout import estimate_review_profile, profile_key_for
         from .review_learning import record_review_tier_outcome
 
-        prof = estimate_review_profile(outcome["target_file"])
+        prof = estimate_review_profile(outcome["target_file"], db=db)
         profile_key = profile_key_for(prof, outcome["target_file"])
         record_review_tier_outcome(
             db,
@@ -780,11 +883,16 @@ def _record_review_outcome(
     except Exception:  # pragma: no cover - best-effort learning
         log.debug("review-tier outcome capture failed", exc_info=True)
 
-    # Granular model-quality ledger (source='findings'). Gated + best-effort.
+    if config is None or getattr(config, "review_memory_enabled", True):
+        _record_review_memory(db, outcome, prof)
+
     mq_cfg = getattr(config, "model_quality", None) if config is not None else None
-    if mq_cfg is None or not (
-        getattr(mq_cfg, "enabled", True) and getattr(mq_cfg, "findings_enabled", True)
-    ):
+    ledger_on = mq_cfg is not None and getattr(mq_cfg, "enabled", True)
+    if ledger_on and getattr(mq_cfg, "static_recall_enabled", True):
+        _record_static_recall(db, outcome, prof)
+
+    # Granular model-quality ledger (source='findings'). Gated + best-effort.
+    if not (ledger_on and getattr(mq_cfg, "findings_enabled", True)):
         return
     try:
         from . import model_quality
@@ -1302,7 +1410,23 @@ def ingest_host_wave(
             workspace_root=effective_root,
             rework_events=rework_events,
         )
+        _promote_verify_keys(response)
     return response
+
+
+def _promote_verify_keys(response: dict[str, Any]) -> None:
+    """Lift verify_report / verify_followup out of ``finalize`` to the top level.
+
+    ``verify_followup`` is an instruction to the host to spawn one more agent, so
+    it has to be visible where the host looks for actions rather than buried in the
+    finalize sub-dict alongside bookkeeping.
+    """
+    finalize = response.get("finalize")
+    if not isinstance(finalize, Mapping):
+        return
+    for key in ("verify_report", "verify_followup"):
+        if key in finalize and key not in response:
+            response[key] = finalize[key]
 
 
 def import_run_log(
@@ -1357,6 +1481,7 @@ def import_run_log(
             router=router,
             workspace_root=workspace_root,
         )
+        _promote_verify_keys(result)
         run_log.mark_imported(run_id)
         return result
 
@@ -1377,6 +1502,7 @@ def import_run_log(
         if w == last:
             result["finalize"] = wave_result.get("finalize")
             result["rework_events"] = wave_result.get("rework_events", [])
+            _promote_verify_keys(result)
 
     run_log.mark_imported(run_id)
     try:
@@ -1385,6 +1511,222 @@ def import_run_log(
     except Exception:
         log.debug("run_log prune failed", exc_info=True)
     return result
+
+
+def _run_host_verify_gate(
+    run_id: str,
+    meta: Mapping[str, Any],
+    *,
+    config: TGsConfig | None,
+    workspace_root: str | None,
+    success: bool,
+) -> dict[str, Any] | None:
+    """Run the verify gate for a host-native run, in-process and token-free.
+
+    No agent is spawned on the happy path: lint/type/test commands are ordinary
+    subprocesses, and failures that were already present at the merge base are
+    discarded. Only when *new* failures survive that diff does the caller get back
+    a report carrying ``followup``, which the MCP layer turns into a single
+    low-tier fix agent — the same lazy shape as ``consensus_followup``.
+
+    Returns None when the gate is disabled, nothing was written, or the run
+    already failed (a failed run has its own error path; piling a gate rejection
+    on top adds no information).
+    """
+    gate_cfg = getattr(config, "verify_gate", None) if config is not None else None
+    if gate_cfg is None or not getattr(gate_cfg, "enabled", False):
+        return None
+    if not workspace_root or not success:
+        return None
+    assigned = meta.get("assigned_files")
+    if not assigned:
+        return None
+    try:
+        from .verify import run_verify_gate
+
+        report = run_verify_gate(
+            gate_cfg,
+            project_root=workspace_root,
+            run_id=run_id,
+        )
+    except Exception:  # pragma: no cover - gate is best-effort
+        log.debug("host verify gate failed for %s", run_id, exc_info=True)
+        return None
+    payload = report.to_dict()
+    if report.new_failures:
+        payload["followup"] = {
+            "tier": "low",
+            "read_only": False,
+            "wave_kind": "verify_fix",
+            "description": (
+                "The verify gate found failures introduced by this run. Fix ONLY "
+                "these, and do not touch anything unrelated:\n"
+                + "\n".join(f"- {f}" for f in report.new_failures[:25])
+                + "\n\nFailures that already existed on the merge base are excluded "
+                "and must be left alone."
+            ),
+        }
+        log.info(
+            "verify gate: %d new failure(s) in run %s (%d pre-existing ignored)",
+            len(report.new_failures),
+            run_id,
+            len(report.preexisting_failures),
+        )
+    return payload
+
+
+def _record_verify_quality(
+    db: Database,
+    run_id: str,
+    verify_report: Mapping[str, Any],
+    *,
+    config: TGsConfig | None,
+) -> None:
+    """Record the gate result as an objective quality event per model that wrote.
+
+    This is ground truth, not a proxy: the code either compiled, type-checked, and
+    passed its tests, or it did not. Score is 10 for a clean run and degrades with
+    the number of newly introduced failures. Attributed to each model that actually
+    wrote files in this run, read back from the run log.
+    """
+    mq_cfg = getattr(config, "model_quality", None) if config is not None else None
+    if mq_cfg is None or not getattr(mq_cfg, "enabled", True):
+        return
+    new_failures = list(verify_report.get("new_failures") or [])
+    # Without a baseline the pass/fail is not trustworthy enough to be called
+    # ground truth, so it is left out of the objective ledger entirely.
+    if not verify_report.get("baseline_used") and new_failures:
+        return
+    score = 10.0 if not new_failures else max(0.0, 10.0 - 2.5 * len(new_failures))
+    try:
+        from . import model_quality, run_log
+
+        writers: dict[str, str | None] = {}
+        for rec in run_log.read_run_log(run_id):
+            if not isinstance(rec, Mapping) or rec.get("read_only"):
+                continue
+            if not rec.get("files") and not rec.get("target_file"):
+                continue
+            model = str(rec.get("model") or "").strip()
+            if model:
+                writers[model] = (str(rec.get("effort")).strip() or None) if rec.get("effort") else None
+        if not writers:
+            writers = {model_quality.MODEL_UNRESOLVED: None}
+        for model, effort in writers.items():
+            model_quality.record_verify_gate_score(
+                db,
+                model=model,
+                effort=effort,
+                score_0_10=score,
+                new_failure_count=len(new_failures),
+                preexisting_count=len(verify_report.get("preexisting_failures") or []),
+                run_id=run_id,
+            )
+    except Exception:  # pragma: no cover - best-effort learning
+        log.debug("verify-gate quality capture failed", exc_info=True)
+
+
+def _record_run_belief(
+    db: Database,
+    meta: Mapping[str, Any],
+    *,
+    project_id: str,
+    success: bool,
+    rework_events: list[dict[str, Any]] | None,
+    verify_report: Mapping[str, Any] | None,
+    config: TGsConfig | None,
+) -> None:
+    """Derive one repo-scoped belief from how this run went. Free, no LLM.
+
+    A clean run records a ``pattern``; a failed, reworked, or verify-dirty run
+    records a ``constraint``. The summary is built from the run's own task hint and
+    touched files — deliberately not model-generated, so this costs nothing and
+    cannot hallucinate a lesson that did not happen.
+    """
+    cfg = getattr(config, "beliefs", None) if config is not None else None
+    if cfg is not None and not (
+        getattr(cfg, "enabled", True) and getattr(cfg, "capture_enabled", True)
+    ):
+        return
+    task_hint = " ".join(str(meta.get("task_hint") or "").split())
+    if not task_hint or not project_id:
+        return
+    # finalize_host_swarm falls back to "default-project" when no workspace root was
+    # resolved. Writing beliefs there would pool lessons from unrelated repos into
+    # one bucket and then inject them everywhere, so skip rather than cross-contaminate.
+    if project_id == "default-project":
+        log.debug("belief capture skipped: no resolved project for run")
+        return
+    files = [str(p) for p in (meta.get("assigned_files") or [])][:5]
+    file_note = f" (files: {', '.join(files)})" if files else ""
+
+    new_failures = []
+    if isinstance(verify_report, Mapping):
+        new_failures = list(verify_report.get("new_failures") or [])
+    reworked = bool(rework_events)
+
+    if success and not reworked and not new_failures:
+        kind = "pattern"
+        summary = f"{task_hint}{file_note} — completed cleanly on the first pass."
+    else:
+        kind = "constraint"
+        if new_failures:
+            reason = f"left {len(new_failures)} new verify failure(s)"
+        elif reworked:
+            reason = f"needed {len(rework_events or [])} rework pass(es)"
+        else:
+            reason = "did not complete successfully"
+        summary = f"{task_hint}{file_note} — {reason}; plan for more care here."
+    try:
+        from .beliefs import record_belief
+
+        record_belief(
+            kind=kind, summary=summary, project_id=project_id, paths=files, db=db
+        )
+    except Exception:  # pragma: no cover - best-effort learning
+        log.debug("belief capture failed", exc_info=True)
+
+
+def _record_hybrid_split_outcome(
+    db: Database,
+    meta: Mapping[str, Any],
+    *,
+    success: bool,
+    rework_events: list[dict[str, Any]] | None,
+    config: TGsConfig | None,
+) -> None:
+    """Feed one diagnose->implement run back into the learned tier discount.
+
+    A run counts as clean only when it succeeded AND produced no rework: those are
+    the two ways a too-aggressive discount shows up. ``verify_report`` is consulted
+    when present so a run that left new lint/type/test failures is never counted as
+    a success for the discount. No-op unless the plan actually applied a split.
+    """
+    split = meta.get("hybrid_split")
+    if not isinstance(split, Mapping):
+        return
+    hybrid_cfg = getattr(config, "hybrid", None) if config is not None else None
+    if hybrid_cfg is not None and not getattr(hybrid_cfg, "learning_enabled", True):
+        return
+    profile_key = str(split.get("profile_key") or "")
+    if not profile_key:
+        return
+    verify = meta.get("verify_report")
+    verify_clean = True
+    if isinstance(verify, Mapping):
+        verify_clean = not verify.get("new_failures")
+    clean = bool(success) and not rework_events and verify_clean
+    try:
+        from .hybrid_learning import record_hybrid_outcome
+
+        record_hybrid_outcome(
+            db,
+            profile_key=profile_key,
+            delta=int(split.get("delta") or -1),
+            clean=clean,
+        )
+    except Exception:  # pragma: no cover - learning is best-effort
+        log.debug("hybrid split outcome capture failed", exc_info=True)
 
 
 def finalize_host_swarm(
@@ -1515,6 +1857,28 @@ def finalize_host_swarm(
         except Exception:
             log.debug("decomposition prefs record failed", exc_info=True)
 
+    # Verify gate runs locally in Python — no agent, no tokens. Must precede the
+    # hybrid outcome record so the discount is judged against the gate result.
+    verify_report = _run_host_verify_gate(
+        run_id, meta, config=config, workspace_root=effective_root, success=success
+    )
+    if verify_report is not None:
+        meta["verify_report"] = verify_report
+        _record_verify_quality(db, run_id, verify_report, config=config)
+
+    _record_hybrid_split_outcome(
+        db, meta, success=success, rework_events=rework_events, config=config
+    )
+    _record_run_belief(
+        db,
+        meta,
+        project_id=project_id,
+        success=success,
+        rework_events=rework_events,
+        verify_report=verify_report,
+        config=config,
+    )
+
     if config is not None and rework_events:
         try:
             tracker = _HOST_WAVE_TRACKERS.get(run_id)
@@ -1542,6 +1906,13 @@ def finalize_host_swarm(
     }
     if swarm_outcome_error:
         result["swarm_outcome_error"] = swarm_outcome_error
+    if verify_report is not None:
+        result["verify_report"] = verify_report
+        followup = verify_report.get("followup")
+        if followup:
+            # Lazy single-agent fix round, mirroring consensus_followup: the host
+            # spawns it only because real new failures survived the baseline diff.
+            result["verify_followup"] = followup
     all_warnings = list(finalize_warnings)
     if routing_learning_warning:
         all_warnings.append(routing_learning_warning)

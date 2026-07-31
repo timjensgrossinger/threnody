@@ -926,17 +926,61 @@ def enrich_subtask(
     else:
         log.debug("context: no file references in subtask %d", subtask.id)
 
-    if not artifact_block and not block:
+    belief_block = build_belief_block(project_root, query=subtask.description, db=db)
+
+    if not artifact_block and not block and not belief_block:
         if subtask.agent_context:
             return dataclasses.replace(subtask, description=description)
         return subtask
 
-    enriched_description = description + artifact_block + block
+    enriched_description = description + belief_block + artifact_block + block
     log.info(
-        "context: enriched subtask %d (+%d chars, %d file ref(s), %d artifact(s))",
+        "context: enriched subtask %d (+%d chars, %d file ref(s), %d artifact(s), "
+        "%d belief chars)",
         subtask.id,
-        len(artifact_block) + len(block),
+        len(artifact_block) + len(block) + len(belief_block),
         len(refs),
         artifact_count,
+        len(belief_block),
     )
     return dataclasses.replace(subtask, description=enriched_description)
+
+
+def build_belief_block(
+    project_root: str | None,
+    *,
+    query: str = "",
+    db: object | None = None,
+) -> str:
+    """Render this repo's learned beliefs as a bounded prompt block.
+
+    Returns ``""`` on a fresh repo, when disabled, or on any failure — belief
+    injection is supporting context and must never be able to break enrichment.
+    """
+    if not project_root:
+        return ""
+    try:
+        from .config import TGsConfig
+
+        cfg = getattr(TGsConfig.from_yaml(), "beliefs", None)
+        if cfg is not None and not (
+            getattr(cfg, "enabled", True) and getattr(cfg, "inject_enabled", True)
+        ):
+            return ""
+        limit = int(getattr(cfg, "max_injected", 5)) if cfg is not None else 5
+        max_chars = int(getattr(cfg, "max_chars", 1200)) if cfg is not None else 1200
+    except Exception:  # pragma: no cover - config read is best-effort
+        limit, max_chars = 5, 1200
+    try:
+        from .beliefs import build_belief_context
+
+        return build_belief_context(
+            str(project_root),
+            query=query or "",
+            limit=limit,
+            max_chars=max_chars,
+            db=db,  # type: ignore[arg-type]
+        )
+    except Exception:  # pragma: no cover - best-effort
+        log.debug("context: belief injection failed", exc_info=True)
+        return ""

@@ -46,6 +46,13 @@ class RoutingDecision:
     # Phase 14 additions: explainable urgency surface
     urgency_score: float = 0.0
     matched_urgency_signals: list[str] = field(default_factory=list)
+    # Expected duration of the work: short | medium | long. Derived from signals
+    # already computed (complexity score + how many files the task names), NOT from
+    # a new keyword vocabulary. It deliberately does NOT influence tier or model
+    # choice — it only sets reasoning effort / token budget and gates whether the
+    # hybrid diagnose->implement hop is worth its extra latency.
+    expected_duration_bucket: str = "medium"
+    expected_file_count: int = 0
 
 
 # Score nudge applied when a low-tier override keyword dominates a single-concern
@@ -55,6 +62,61 @@ _LOW_OVERRIDE_DELTA: float = -0.20
 
 # Ordinal rank for tier-floor comparisons.
 _TIER_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+
+DURATION_SHORT = "short"
+DURATION_MEDIUM = "medium"
+DURATION_LONG = "long"
+VALID_DURATION_BUCKETS = (DURATION_SHORT, DURATION_MEDIUM, DURATION_LONG)
+
+# File-count boundaries for the duration axis. Structural, not vocabulary: a task
+# naming several files takes longer than one naming none, regardless of wording.
+_DURATION_LONG_FILES = 4
+
+# Work-file extensions for the duration proxy. An explicit allowlist rather than a
+# generic `.<letters>` pattern on purpose: the loose form matches prose like "e.g."
+# and attribute access like "foo.bar", which would silently inflate the file count
+# and push short work into the `long` bucket. Mirrors heuristic_plan._FILE_EXT_GROUP
+# minus the documentation formats, which are not work targets here.
+_WORK_EXT_GROUP = (
+    r"py|pyi|ts|tsx|js|jsx|mjs|cjs|html|htm|css|scss|vue|svelte|go|rs|java|kt|rb|cs"
+    r"|lua|c|h|cpp|hpp|cc|sh|bash|zsh|swift|ex|exs|tf|sql|proto|yaml|yml|json|toml"
+    r"|ini|cfg"
+)
+_FILE_TOKEN = re.compile(
+    rf"(?<![\w/.])((?:[\w.-]+/)*[\w.-]+\.(?:{_WORK_EXT_GROUP}))\b",
+    re.IGNORECASE,
+)
+
+
+def count_task_files(task: str) -> int:
+    """Count distinct work-file tokens named in a task string.
+
+    A cheap structural proxy for scope, not a path resolver: documentation formats
+    are excluded so "update the README" does not read as multi-file work, and only
+    recognised source/config extensions count so prose cannot inflate the number.
+    """
+    if not isinstance(task, str) or not task:
+        return 0
+    return len({m.group(1).strip().lower() for m in _FILE_TOKEN.finditer(task)})
+
+
+def duration_bucket_for(
+    score: float,
+    *,
+    file_count: int,
+    thresholds: "ThresholdConfig",
+) -> str:
+    """Classify expected duration from the already-computed score and file count.
+
+    ``long`` when the work is genuinely complex or spans several files; ``short``
+    only when a low score AND at most one named file agree that it is a quick edit.
+    Everything ambiguous is ``medium`` — the neutral bucket that changes nothing.
+    """
+    if file_count >= _DURATION_LONG_FILES or score > thresholds.medium_max:
+        return DURATION_LONG
+    if score <= thresholds.low_max and file_count <= 1:
+        return DURATION_SHORT
+    return DURATION_MEDIUM
 
 
 def _compile_risk_floor_re(patterns: list[str]) -> "re.Pattern[str] | None":
@@ -186,12 +248,20 @@ class TaskRouter:
         """Check high-tier overrides — always win, using word-boundary matching."""
         for kw in self._overrides.get("high", []):
             if re.search(rf"\b{re.escape(kw)}\b", task_lower):
+                file_count = count_task_files(task_lower)
                 return RoutingDecision(
                     tier="high",
                     score=0.90,
                     reason=f"keyword override → high: '{kw}'",
                     agents=1,
                     override=True,
+                    # A hard high override is complex by definition, so it is never
+                    # 'short' — the duration axis must stay populated on this early
+                    # return or downstream gating would silently see the default.
+                    expected_duration_bucket=(
+                        DURATION_LONG if file_count >= _DURATION_LONG_FILES else DURATION_MEDIUM
+                    ),
+                    expected_file_count=file_count,
                 )
         return None
 
@@ -679,6 +749,14 @@ class TaskRouter:
         else:
             reason = f"score={final_score} [{reason_parts}] → {tier}"
 
+        # 9. Duration axis — advisory only: never touches tier or model.
+        file_count = count_task_files(task)
+        duration_bucket = duration_bucket_for(
+            final_score,
+            file_count=file_count,
+            thresholds=self._get_thresholds(score=final_score, project_path=project_path),
+        )
+
         agents = 2 if tier != "high" else 1
         decision = RoutingDecision(
             tier=tier,
@@ -689,6 +767,8 @@ class TaskRouter:
             intent_modifier=intent_mod,
             urgency_score=urgency_score,
             matched_urgency_signals=urgency_matched,
+            expected_duration_bucket=duration_bucket,
+            expected_file_count=file_count,
         )
         self._shadow_bandit_log(task, decision, project_path=project_path)
         return decision

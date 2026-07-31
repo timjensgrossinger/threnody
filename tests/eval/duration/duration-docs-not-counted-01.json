@@ -1,0 +1,16 @@
+{
+  "id": "duration-docs-not-counted-01",
+  "category": "duration",
+  "tags": [
+    "duration",
+    "stable"
+  ],
+  "prompt": "Fix a typo in README.md",
+  "expected": {
+    "tier": "low",
+    "score_min": 0.0,
+    "score_max": 0.16,
+    "duration_expected": "short",
+    "file_count_expected": 0
+  }
+}

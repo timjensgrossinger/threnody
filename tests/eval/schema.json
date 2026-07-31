@@ -4,7 +4,13 @@
   "title": "RoutingEvalFixture",
   "description": "Schema for Threnody routing correctness evaluation fixtures.",
   "type": "object",
-  "required": ["id", "category", "tags", "prompt", "expected"],
+  "required": [
+    "id",
+    "category",
+    "tags",
+    "prompt",
+    "expected"
+  ],
   "additionalProperties": false,
   "properties": {
     "id": {
@@ -15,12 +21,21 @@
     "category": {
       "type": "string",
       "description": "Fixture category, matches the subdirectory name.",
-      "enum": ["low_tier", "medium_tier", "high_tier", "urgency", "fanout"]
+      "enum": [
+        "low_tier",
+        "medium_tier",
+        "high_tier",
+        "urgency",
+        "fanout",
+        "duration"
+      ]
     },
     "tags": {
       "type": "array",
       "description": "Free-form classification tags for filtering and reporting.",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "minItems": 1
     },
     "prompt": {
@@ -31,12 +46,20 @@
     "expected": {
       "type": "object",
       "description": "Expected routing outcome.",
-      "required": ["tier", "score_min", "score_max"],
+      "required": [
+        "tier",
+        "score_min",
+        "score_max"
+      ],
       "additionalProperties": false,
       "properties": {
         "tier": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
           "description": "Expected RoutingDecision.tier value."
         },
         "score_min": {
@@ -58,9 +81,26 @@
         },
         "fanout_expected": {
           "type": "string",
-          "enum": ["none", "favor_parallel"],
+          "enum": [
+            "none",
+            "favor_parallel"
+          ],
           "description": "Expected fanout hint derived from RoutingDecision.agents.",
           "default": "none"
+        },
+        "duration_expected": {
+          "type": "string",
+          "enum": [
+            "short",
+            "medium",
+            "long"
+          ],
+          "description": "Expected RoutingDecision.expected_duration_bucket value."
+        },
+        "file_count_expected": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Expected RoutingDecision.expected_file_count value."
         }
       }
     }

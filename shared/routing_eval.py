@@ -20,7 +20,8 @@ SWARM_FIXTURE_GLOB = "fixtures_swarm_*.json"
 VALID_TIERS = ("low", "medium", "high")
 # "favor_linear" not produced by _agents_to_fanout; omitted until a mapping is defined
 VALID_FANOUT = ("none", "favor_parallel")
-VALID_CATEGORIES = ("low_tier", "medium_tier", "high_tier", "urgency", "fanout")
+VALID_CATEGORIES = ("low_tier", "medium_tier", "high_tier", "urgency", "fanout", "duration")
+VALID_DURATION = ("short", "medium", "long")
 
 # Module-level injectable router symbol. Tests can monkeypatch
 # shared.routing_eval._TaskRouter before calling run_eval().
@@ -103,6 +104,17 @@ def _validate_fixture(fixture: dict[str, Any]) -> list[str]:
     if "urgency_expected" in expected and not isinstance(expected["urgency_expected"], bool):
         errors.append("'expected.urgency_expected' must be a boolean")
 
+    if "duration_expected" in expected and expected["duration_expected"] not in VALID_DURATION:
+        errors.append(
+            f"'expected.duration_expected' must be one of {VALID_DURATION}, "
+            f"got {expected['duration_expected']!r}"
+        )
+
+    if "file_count_expected" in expected:
+        fc = expected["file_count_expected"]
+        if not isinstance(fc, int) or isinstance(fc, bool) or fc < 0:
+            errors.append("'expected.file_count_expected' must be a non-negative integer")
+
     if "fanout_expected" in expected and expected["fanout_expected"] not in VALID_FANOUT:
         errors.append(
             f"'expected.fanout_expected' must be one of {VALID_FANOUT}, got {expected['fanout_expected']!r}"
@@ -120,7 +132,8 @@ def _validate_fixture(fixture: dict[str, Any]) -> list[str]:
         errors.append(f"unexpected top-level fields: {sorted(extra_keys)}")
 
     extra_expected = set(expected.keys()) - {
-        "tier", "score_min", "score_max", "urgency_expected", "fanout_expected"
+        "tier", "score_min", "score_max", "urgency_expected", "fanout_expected",
+        "duration_expected", "file_count_expected",
     }
     if extra_expected:
         errors.append(f"unexpected 'expected' fields: {sorted(extra_expected)}")
@@ -234,6 +247,20 @@ def _compare_fixture(fixture: dict[str, Any], decision: Any) -> tuple[bool, str]
         if actual_fanout != expected["fanout_expected"]:
             return False, (
                 f"fanout={actual_fanout} expected={expected['fanout_expected']}"
+            )
+
+    if "duration_expected" in expected:
+        actual_duration = getattr(decision, "expected_duration_bucket", "medium")
+        if actual_duration != expected["duration_expected"]:
+            return False, (
+                f"duration={actual_duration} expected={expected['duration_expected']}"
+            )
+
+    if "file_count_expected" in expected:
+        actual_files = int(getattr(decision, "expected_file_count", 0))
+        if actual_files != expected["file_count_expected"]:
+            return False, (
+                f"file_count={actual_files} expected={expected['file_count_expected']}"
             )
 
     return True, ""
@@ -594,6 +621,8 @@ _FILTER_ALIASES: dict[str, str] = {
     "high": "high_tier",
     "urgency": "urgency",
     "fanout": "fanout",
+    "duration": "duration",
+    "dur": "duration",
 }
 
 

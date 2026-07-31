@@ -90,7 +90,11 @@ PLANNER_ALLOW_TOPOLOGY_FALLBACK = False
 # ---------------------------------------------------------------------------
 PLAN_CACHE_TTL_HOURS = 168  # 7 days
 RESULT_CACHE_TTL_HOURS = 168
-CURRENT_PLAN_SCHEMA_VERSION = 1
+# Bumped to 2: plans now carry plural `target_files` ownership, `inline_files`
+# and `coverage`. Cached v1 plans predate the ownership fix (a coupled group was
+# stored owning a single file while its prompt claimed several) and must not be
+# replayed.
+CURRENT_PLAN_SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # Intent modifier keywords and weights
@@ -523,14 +527,21 @@ class ModelQualityConfig:
     0-10. It runs ONLY on the existing warm-path executor (``eval.py``), so it adds
     zero latency to tasks or swarms and inherits that executor's failure backoff.
 
+    ``static_recall`` — free and objective, derived at wave finalize by comparing a
+    reviewer's reported categories against the high-severity smells
+    ``shared/code_intel.py`` found deterministically in the same file. Unlike the
+    two sources above this is graded against ground truth rather than another
+    model's judgement, so operators should weight it higher.
+
     All flags are read off the hot path. ``enabled`` gates the whole ledger;
-    ``findings_enabled`` and ``judge_enabled`` gate each source independently so the
-    judge (the only token-spending part) can be disabled while keeping free
-    findings scoring.
+    ``findings_enabled``, ``static_recall_enabled`` and ``judge_enabled`` gate each
+    source independently so the judge (the only token-spending part) can be
+    disabled while keeping the two free sources.
     """
 
     enabled: bool = True
     findings_enabled: bool = True
+    static_recall_enabled: bool = True
     judge_enabled: bool = True
     judge_model: str = "gpt-5-mini"
 
@@ -843,6 +854,57 @@ class VerifyGateConfig:
         "types": VerifyGateSignalConfig(command="auto", required=True),
         "tests": VerifyGateSignalConfig(command="auto", required=True),
     })
+
+
+@dataclass
+class BeliefsConfig:
+    """Repo-scoped belief capture and prompt injection (shared/beliefs.py).
+
+    Beliefs are derived for free at swarm finalize — a clean run records a
+    ``pattern``, a failed/reworked one records a ``constraint`` — and stored in the
+    existing project memory scope. Retrieval blends FTS relevance, recency, and
+    recurrence, then hard-caps the injected text.
+
+    ``max_injected`` / ``max_chars`` exist to keep this supporting context rather
+    than letting repo history crowd out the actual task.
+    """
+
+    enabled: bool = True
+    capture_enabled: bool = True
+    inject_enabled: bool = True
+    max_injected: int = 5
+    max_chars: int = 1200
+
+
+@dataclass
+class HybridConfig:
+    """Hybrid diagnose->implement split for expensive write-path subtasks.
+
+    When a planned subtask lands on ``min_tier``, the plan is rewritten into two
+    waves: one read-only diagnosis agent at that tier that produces a structured
+    change-spec, then the implementers at ``min_tier + implement_tier_delta``
+    working from it. The expensive model does the reasoning once and the cheap
+    models do the typing.
+
+    Only *tiers* are emitted — model resolution stays with
+    ``host_spawn.host_native_model_for_tier`` / ``preferred_routing``, so there is
+    no role->model mapping to maintain here.
+
+    ``implement_tier_delta`` is a starting point, not a constant: outcomes feed
+    ``shared/hybrid_learning.py`` and the delta is adjusted per work profile as
+    evidence accumulates. The split is suppressed for urgent work (the extra hop
+    costs latency) and for single trivial edits (nothing to diagnose).
+    """
+
+    enabled: bool = True
+    min_tier: str = "high"
+    implement_tier_delta: int = -1
+    # Above this many write targets one diagnosis cannot stay coherent, so the
+    # split is skipped rather than producing a vague spec for a dozen files.
+    max_files: int = 8
+    # Urgency at or above this suppresses the split (latency beats cost).
+    urgency_suppress_at: float = 0.6
+    learning_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -1458,6 +1520,13 @@ class TGsConfig:
     # Default-safe: a no-op until enough samples accumulate; fresh repos unaffected.
     review_learning_enabled: bool = True
 
+    # Prior-review memory. When enabled, a (file revision x dimension) cell already
+    # reviewed at an equal-or-stronger tier is skipped and its stored findings are
+    # replayed into synthesis, and findings previously fixed are suppressed in later
+    # prompts. Skips require an exact content-digest match, so this never trades
+    # coverage for cost. Disable to always re-review from scratch.
+    review_memory_enabled: bool = True
+
     # Risk-aware tier floor. Security-sensitive tasks (routing) and files (host
     # fanout) whose text/filename matches risk_filename_patterns are floored to at
     # least risk_floor_tier, so credential/auth/crypto work is never routed to the
@@ -1555,6 +1624,8 @@ class TGsConfig:
 
     # Janitor-style verify gate (plan 04).
     verify_gate: VerifyGateConfig = field(default_factory=VerifyGateConfig)
+    hybrid: HybridConfig = field(default_factory=HybridConfig)
+    beliefs: BeliefsConfig = field(default_factory=BeliefsConfig)
 
     # Worktree isolation for execute_subtask (plan 06).
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1735,6 +1806,69 @@ class TGsConfig:
         cfg.output_quality_retry_enabled = raw.get("output_quality_retry_enabled", True) is True
         cfg.quality_check_incomplete_output = raw.get("quality_check_incomplete_output", False) is True
         cfg.reasoning_scoring_enabled = raw.get("reasoning_scoring_enabled", True) is True
+
+        beliefs_raw = raw.get("beliefs", {})
+        if isinstance(beliefs_raw, Mapping):
+            for flag in ("enabled", "capture_enabled", "inject_enabled"):
+                setattr(
+                    cfg.beliefs,
+                    flag,
+                    _coerce_config_bool(
+                        beliefs_raw.get(flag),
+                        default=getattr(cfg.beliefs, flag),
+                        field_name=f"beliefs.{flag}",
+                    ),
+                )
+            for numeric, lo, hi in (("max_injected", 1, 25), ("max_chars", 100, 8000)):
+                value = beliefs_raw.get(numeric)
+                if value is not None:
+                    try:
+                        setattr(cfg.beliefs, numeric, max(lo, min(hi, int(value))))
+                    except (TypeError, ValueError):
+                        log.warning("beliefs.%s must be an int; keeping default", numeric)
+
+        hybrid_raw = raw.get("hybrid", {})
+        if isinstance(hybrid_raw, Mapping):
+            cfg.hybrid.enabled = _coerce_config_bool(
+                hybrid_raw.get("enabled"),
+                default=cfg.hybrid.enabled,
+                field_name="hybrid.enabled",
+            )
+            cfg.hybrid.learning_enabled = _coerce_config_bool(
+                hybrid_raw.get("learning_enabled"),
+                default=cfg.hybrid.learning_enabled,
+                field_name="hybrid.learning_enabled",
+            )
+            raw_min_tier = hybrid_raw.get("min_tier")
+            if isinstance(raw_min_tier, str) and raw_min_tier.strip().lower() in {
+                "low", "medium", "high",
+            }:
+                cfg.hybrid.min_tier = raw_min_tier.strip().lower()
+            elif raw_min_tier is not None:
+                log.warning("hybrid.min_tier must be low/medium/high; keeping %s", cfg.hybrid.min_tier)
+            raw_delta = hybrid_raw.get("implement_tier_delta")
+            if raw_delta is not None:
+                try:
+                    # Clamp: a non-negative delta would make the split pure overhead,
+                    # and below -2 there is nothing left to step down to.
+                    cfg.hybrid.implement_tier_delta = max(-2, min(-1, int(raw_delta)))
+                except (TypeError, ValueError):
+                    log.warning("hybrid.implement_tier_delta must be an int; keeping default")
+            raw_max_files = hybrid_raw.get("max_files")
+            if raw_max_files is not None:
+                try:
+                    cfg.hybrid.max_files = max(1, int(raw_max_files))
+                except (TypeError, ValueError):
+                    log.warning("hybrid.max_files must be an int; keeping default")
+            raw_urgency = hybrid_raw.get("urgency_suppress_at")
+            if raw_urgency is not None:
+                try:
+                    cfg.hybrid.urgency_suppress_at = max(0.0, min(1.0, float(raw_urgency)))
+                except (TypeError, ValueError):
+                    log.warning("hybrid.urgency_suppress_at must be a float; keeping default")
+
+        cfg.review_learning_enabled = raw.get("review_learning_enabled", True) is True
+        cfg.review_memory_enabled = raw.get("review_memory_enabled", True) is True
 
         cfg.risk_floor_enabled = raw.get("risk_floor_enabled", True) is True
         raw_risk_floor_tier = raw.get("risk_floor_tier", "medium")
@@ -2432,6 +2566,11 @@ class TGsConfig:
                 model_quality_raw.get("findings_enabled"),
                 default=cfg.model_quality.findings_enabled,
                 field_name="model_quality.findings_enabled",
+            )
+            cfg.model_quality.static_recall_enabled = _coerce_config_bool(
+                model_quality_raw.get("static_recall_enabled"),
+                default=cfg.model_quality.static_recall_enabled,
+                field_name="model_quality.static_recall_enabled",
             )
             cfg.model_quality.judge_enabled = _coerce_config_bool(
                 model_quality_raw.get("judge_enabled"),

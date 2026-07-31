@@ -15,7 +15,7 @@ from typing import Any
 
 from shared.config import TGsConfig
 from shared.db import Database
-from shared.model_quality import build_quality_snapshot
+from shared.model_quality import build_min_passing_tier_map, build_quality_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DOC_PATH = REPO_ROOT / "docs" / "MODEL_QUALITY.md"
@@ -47,26 +47,41 @@ def render_quality_markdown(snapshot: dict[str, Any]) -> str:
     if not rows:
         header.append("_No quality events recorded in this window yet._")
         header.append("")
+        header.append(
+            "Review and task runs populate the free signals automatically. To seed the "
+            "ground-truth signal (and the minimum-passing-tier table), run the graded "
+            "ladder — it spends real tokens."
+        )
+        header.append("")
         header.append("## How to refresh")
         header.append("")
         header.append("```bash")
         header.append("threnody quality --since 7d")
+        header.append("threnody ladder run --tier low,medium,high")
         header.append("python3 -m shared.model_quality_report --write-docs")
         header.append("```")
         return "\n".join(header) + "\n"
 
     table = [
-        "| Model | Effort | Dimension | Score | n | Findings | Judge | Esc.rate |",
-        "|---|---|---|---:|---:|---:|---:|---:|",
+        "| Model | Effort | Dimension | Score | n | Objective | Obj.score | Findings | "
+        "Judge | Esc.rate |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         table.append(
-            "| {model} | {effort} | {dim} | {score:.2f} | {n} | {fn} | {jn} | {esc:.2f} |".format(
+            "| {model} | {effort} | {dim} | {score:.2f} | {n} | {on} | {oscore} | "
+            "{fn} | {jn} | {esc:.2f} |".format(
                 model=row.get("model", "?"),
                 effort=_fmt_effort(row.get("effort")),
                 dim=_fmt_dim(str(row.get("dimension", "?")), row.get("sub_dimension")),
                 score=float(row.get("avg_score") or 0.0),
                 n=int(row.get("n") or 0),
+                on=int(row.get("objective_n") or 0),
+                oscore=(
+                    f"{float(row['objective_avg']):.2f}"
+                    if row.get("objective_avg") is not None
+                    else "—"
+                ),
                 fn=int(row.get("findings_n") or 0),
                 jn=int(row.get("judge_n") or 0),
                 esc=float(row.get("escalation_rate") or 0.0),
@@ -76,14 +91,50 @@ def render_quality_markdown(snapshot: dict[str, Any]) -> str:
         "",
         f"> {snapshot.get('disclaimer', '')}",
         "",
+    ]
+    footer.extend(render_min_passing_tier_section(snapshot.get("min_passing_tier") or {}))
+    footer.extend([
         "## How to refresh",
         "",
         "```bash",
         "threnody quality --since 7d",
+        "threnody ladder run --tier low,medium,high   # refresh the graded ground truth",
         "python3 -m shared.model_quality_report --write-docs",
         "```",
-    ]
+    ])
     return "\n".join(header + table + footer) + "\n"
+
+
+def render_min_passing_tier_section(min_map: dict[str, dict[str, str]]) -> list[str]:
+    """Render the graded ladder's minimum-passing-tier table.
+
+    This is the auto-detected "which model is good at what": for each model, the
+    cheapest tier observed to pass every case at a difficulty level. Empty until
+    `threnody ladder run` has been executed.
+    """
+    if not min_map:
+        return [
+            "## Minimum passing tier (graded ladder)",
+            "",
+            "_No graded ladder results yet — run `threnody ladder run` to populate "
+            "the ground-truth signal._",
+            "",
+        ]
+    levels = sorted({lvl for per_model in min_map.values() for lvl in per_model})
+    lines = [
+        "## Minimum passing tier (graded ladder)",
+        "",
+        "Cheapest tier observed to pass **every** case at each level. Derived from "
+        "graded outcomes, not hand-maintained — use it to inform `preferred_routing`.",
+        "",
+        "| Model | " + " | ".join(levels) + " |",
+        "|---" * (len(levels) + 1) + "|",
+    ]
+    for model in sorted(min_map):
+        cells = [min_map[model].get(level, "—") for level in levels]
+        lines.append(f"| {model} | " + " | ".join(cells) + " |")
+    lines.append("")
+    return lines
 
 
 def _open_db(db_path: Path | None, config: TGsConfig | None = None) -> Database:
@@ -102,7 +153,9 @@ def write_quality_doc(
     db_path: Path | None = None,
     config: TGsConfig | None = None,
 ) -> dict[str, Any]:
-    snapshot = build_quality_snapshot(_open_db(db_path, config), since=since, config=config)
+    db = _open_db(db_path, config)
+    snapshot = build_quality_snapshot(db, since=since, config=config)
+    snapshot["min_passing_tier"] = build_min_passing_tier_map(db, since=since)
     target = path or DEFAULT_DOC_PATH
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(render_quality_markdown(snapshot), encoding="utf-8")
@@ -134,7 +187,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"wrote {snapshot['written_to']}")
         return 0
 
-    snapshot = build_quality_snapshot(_open_db(args.db, config), since=args.since, config=config)
+    db = _open_db(args.db, config)
+    snapshot = build_quality_snapshot(db, since=args.since, config=config)
+    snapshot["min_passing_tier"] = build_min_passing_tier_map(db, since=args.since)
     if args.json:
         print(json.dumps(snapshot, indent=2, sort_keys=True))
     else:

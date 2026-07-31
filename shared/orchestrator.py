@@ -1816,8 +1816,14 @@ class Orchestrator:
     def _run_verify_gate(self, subtask: "Subtask", result: AgentResult) -> AgentResult:
         """Run verify gate signals after a file-writing subtask.
 
-        Returns a new AgentResult with gate_verdict and gate_signals set.
-        If mode=block and a required signal fails, sets success=False and gate_verdict='rejected'.
+        Returns the AgentResult with gate_verdict and gate_signals set. If
+        mode=block and a required signal fails, sets success=False and
+        gate_verdict='rejected'.
+
+        Delegates to :mod:`shared.verify` so this path and the host-native path
+        share one implementation. Signals that fail identically at the merge base
+        are reported as pre-existing and no longer reject the run — an agent is
+        only blamed for failures it actually introduced.
         """
         try:
             gate_cfg = self._config.verify_gate
@@ -1828,97 +1834,26 @@ class Orchestrator:
         if not subtask.target_file and result.gate_verdict is None:
             return result
 
-        project_root = self._project_root or ""
-        signal_results: dict[str, dict] = {}
-        any_required_failed = False
+        from .verify import run_verify_gate
 
-        for sig_name, sig_cfg in gate_cfg.signals.items():
-            cmd = sig_cfg.command
-            if cmd == "auto":
-                cmd = self._detect_gate_command(sig_name, project_root)
-            if not cmd:
-                if sig_cfg.required:
-                    signal_results[sig_name] = {
-                        "passed": False,
-                        "unavailable": True,
-                        "error": "required verification command is unavailable",
-                    }
-                    any_required_failed = True
-                else:
-                    signal_results[sig_name] = {
-                        "skipped": True,
-                        "unavailable": True,
-                    }
-                continue
-            try:
-                command_args = shlex.split(cmd)
-                if not command_args:
-                    raise ValueError("verification command is empty")
-                proc = subprocess.run(
-                    command_args,
-                    capture_output=True,
-                    text=True,
-                    cwd=project_root or None,
-                    timeout=sig_cfg.timeout_seconds,
-                )
-                passed = proc.returncode == 0
-                signal_results[sig_name] = {
-                    "passed": passed,
-                    "returncode": proc.returncode,
-                    "command": command_args,
-                    "stderr": proc.stderr[:500] if not passed else "",
-                }
-                if not passed and sig_cfg.required:
-                    any_required_failed = True
-            except subprocess.TimeoutExpired:
-                signal_results[sig_name] = {
-                    "passed": False,
-                    "timed_out": True,
-                    "timeout_seconds": sig_cfg.timeout_seconds,
-                }
-                if sig_cfg.required:
-                    any_required_failed = True
-            except Exception as exc:
-                signal_results[sig_name] = {
-                    "passed": False,
-                    "error": str(exc),
-                }
-                if sig_cfg.required:
-                    any_required_failed = True
-
-        if any_required_failed and gate_cfg.mode == "block":
-            verdict = "rejected"
-        elif any_required_failed:
-            verdict = "warn"
-        else:
-            verdict = "pass"
-
-        result.gate_verdict = verdict
-        result.gate_signals = signal_results
-        if verdict == "rejected":
+        report = run_verify_gate(
+            gate_cfg,
+            project_root=self._project_root or "",
+            run_id=getattr(self, "_session_id", None),
+            command_resolver=self._detect_gate_command,
+        )
+        result.gate_verdict = report.verdict
+        result.gate_signals = report.signals
+        if report.verdict == "rejected":
             result.success = False
         return result
 
     @staticmethod
     def _detect_gate_command(signal: str, project_root: str) -> str:
         """Auto-detect the gate command for a signal type based on project files."""
-        if signal == "lint":
-            if shutil.which("ruff") is not None:
-                return "ruff check ."
-            if shutil.which("flake8") is not None:
-                return "flake8 ."
-            return ""
-        if signal == "types":
-            if shutil.which("mypy") is not None:
-                return "mypy ."
-            if shutil.which("pyright") is not None:
-                return "pyright ."
-            return ""
-        if signal == "tests":
-            if shutil.which("pytest") is not None:
-                return "python3 -m pytest --tb=no -q"
-            return ""
-        return ""
+        from .verify import detect_gate_command
+
+        return detect_gate_command(signal, project_root)
 
     @staticmethod
     def _gate_score_from_result(result: AgentResult) -> float:

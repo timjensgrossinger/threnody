@@ -235,3 +235,137 @@ def test_spawn_judge_no_backend_is_noop(db: Database) -> None:
     cfg = TGsConfig.defaults()
     ev = BackgroundEvaluator(db=db, config=cfg, cli_call=None)
     assert ev.spawn_judge(output="x", model="m", effort=None) is None
+
+
+# ---------------------------------------------------------------------------
+# static_recall — graded against the deterministic code_intel pre-scan
+# ---------------------------------------------------------------------------
+
+class TestStaticRecall:
+    def test_no_expectation_yields_no_signal(self):
+        from shared.model_quality import static_recall_to_score
+
+        assert static_recall_to_score(
+            expected_rules=[], reported_categories=["security/xss"], findings_total=1
+        ) is None
+
+    def test_full_recall_scores_ten(self):
+        from shared.model_quality import static_recall_to_score
+
+        score, meta = static_recall_to_score(
+            expected_rules=["sql_interpolation"],
+            reported_categories=["security/sql-injection"],
+            findings_total=1,
+        )
+        assert score == 10.0
+        assert meta["matched"] == 1
+        assert meta["missed"] == []
+        assert meta["recall"] == 1.0
+
+    def test_missed_expectation_scores_zero(self):
+        from shared.model_quality import static_recall_to_score
+
+        score, meta = static_recall_to_score(
+            expected_rules=["eval_exec"], reported_categories=[], findings_total=0
+        )
+        assert score == 0.0
+        assert meta["missed"] == ["eval_exec"]
+
+    def test_partial_recall_is_proportional(self):
+        from shared.model_quality import static_recall_to_score
+
+        score, meta = static_recall_to_score(
+            expected_rules=["eval_exec", "os_system"],
+            reported_categories=["security/eval-injection"],
+            findings_total=1,
+        )
+        assert meta["recall"] == 0.5
+        assert score == 5.0
+
+    def test_extra_findings_penalty_is_bounded(self):
+        from shared.model_quality import static_recall_to_score
+
+        score, meta = static_recall_to_score(
+            expected_rules=["eval_exec"],
+            reported_categories=["security/eval-injection"],
+            findings_total=40,
+        )
+        assert meta["extra_findings"] == 39
+        # Recall stays perfect; noise shaves at most 2 points, never inverts it.
+        assert score == 8.0
+
+    def test_score_never_negative(self):
+        from shared.model_quality import static_recall_to_score
+
+        score, _ = static_recall_to_score(
+            expected_rules=["eval_exec"], reported_categories=[], findings_total=30
+        )
+        assert score == 0.0
+
+    def test_record_writes_event_with_new_source(self, tmp_path):
+        from shared.db import Database
+        from shared.model_quality import SOURCE_STATIC_RECALL, record_static_recall_score
+
+        db = Database(db_path=tmp_path / "cache.db")
+        record_static_recall_score(
+            db,
+            model="haiku",
+            effort="low",
+            dimension="security",
+            expected_rules=["os_system"],
+            reported_categories=["security/command-injection"],
+            findings_total=1,
+            run_id="run-1",
+        )
+        with db.conn() as conn:
+            rows = conn.execute(
+                "SELECT model, dimension, source, score_0_10 FROM model_quality_events"
+            ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][2] == SOURCE_STATIC_RECALL
+        assert rows[0][0] == "haiku"
+
+    def test_record_is_noop_without_expectation(self, tmp_path):
+        from shared.db import Database
+        from shared.model_quality import record_static_recall_score
+
+        db = Database(db_path=tmp_path / "cache.db")
+        record_static_recall_score(
+            db,
+            model="haiku",
+            effort=None,
+            dimension="logic",
+            expected_rules=[],
+            reported_categories=["logic/off-by-one"],
+            findings_total=1,
+        )
+        with db.conn() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM model_quality_events").fetchone()[0]
+        assert n == 0
+
+    def test_snapshot_separates_objective_sources(self, tmp_path):
+        from shared.db import Database
+        from shared.model_quality import (
+            build_quality_snapshot,
+            record_judge_score,
+            record_static_recall_score,
+        )
+
+        db = Database(db_path=tmp_path / "cache.db")
+        record_static_recall_score(
+            db,
+            model="haiku",
+            effort=None,
+            dimension="security",
+            expected_rules=["os_system"],
+            reported_categories=["security/command-injection"],
+            findings_total=1,
+        )
+        record_judge_score(db, model="haiku", effort=None, score_0_10=4.0)
+        snap = build_quality_snapshot(db, since="all")
+        by_dim = {r["dimension"]: r for r in snap["rows"]}
+        assert by_dim["security"]["objective_n"] == 1
+        assert by_dim["security"]["objective_avg"] == 10.0
+        # The judge row is a proxy source and must not enter the objective column.
+        assert by_dim["general"]["objective_n"] == 0
+        assert by_dim["general"]["objective_avg"] is None

@@ -438,6 +438,9 @@ Usage:
   threnody db repair [--db PATH]
   threnody db backup [--db PATH]
   threnody db prune [--db PATH] [--keep N]
+  threnody quality [--since 7d] [--json] [--write-docs]
+  threnody ladder list [--level 0,1]
+  threnody ladder run [--tier low,medium,high] [--level N] [--case ID] [--json]
 
 Examples:
   threnody inspect status --project .
@@ -1366,6 +1369,12 @@ PY
             local pybin=""
             pybin=$(_tgs_python) || return 1
             (cd "$_ROUTER_DIR" && "$pybin" -m shared.model_quality_report "$@")
+            return $?
+            ;;
+        ladder)
+            local pybin=""
+            pybin=$(_tgs_python) || return 1
+            (cd "$_ROUTER_DIR" && "$pybin" -m shared.ladder "$@")
             return $?
             ;;
         ""|-h|--help)

@@ -1,0 +1,16 @@
+{
+  "id": "duration-long-02",
+  "category": "duration",
+  "tags": [
+    "duration",
+    "stable"
+  ],
+  "prompt": "Design a distributed rate limiter with sharded counters",
+  "expected": {
+    "tier": "high",
+    "score_min": 0.66,
+    "score_max": 1.0,
+    "duration_expected": "medium",
+    "file_count_expected": 0
+  }
+}

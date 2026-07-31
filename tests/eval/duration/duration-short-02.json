@@ -1,0 +1,16 @@
+{
+  "id": "duration-short-02",
+  "category": "duration",
+  "tags": [
+    "duration",
+    "stable"
+  ],
+  "prompt": "Rename the helper in tools/fmt.py",
+  "expected": {
+    "tier": "low",
+    "score_min": 0.0,
+    "score_max": 0.16,
+    "duration_expected": "short",
+    "file_count_expected": 1
+  }
+}

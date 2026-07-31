@@ -1,0 +1,9 @@
+{
+  "id": "l0-fix-off-by-one",
+  "level": 0,
+  "prompt": "The function `last_index` should return the index of the final element of a list, or -1 for an empty list. It is off by one. Fix it.",
+  "target_file": "solution.py",
+  "grader": "python3 -m pytest -q --tb=short",
+  "timeout_seconds": 300,
+  "grader_timeout_seconds": 120
+}

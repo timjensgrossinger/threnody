@@ -1,0 +1,9 @@
+{
+  "id": "l0-return-constant",
+  "level": 0,
+  "prompt": "Create a Python module with a function `answer()` that returns the integer 42.",
+  "target_file": "solution.py",
+  "grader": "python3 -m pytest -q --tb=short",
+  "timeout_seconds": 300,
+  "grader_timeout_seconds": 120
+}
