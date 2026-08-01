@@ -353,6 +353,18 @@ ROUTING_POLICY_HOOK_CAPABLE_SHELLS = frozenset({"claude-code"})
 LEARNING_HOOK_CAPABLE_SHELLS = frozenset(
     {"claude-code", "codex", "cursor", "github-copilot-cli"}
 )
+# Shells whose native agent/skill directory `agent_export` can write to, so a
+# pre-registered definition carries the static instruction text and the per-agent
+# prompt only needs the variable part. Junie has no such directory, so it keeps
+# the full inline prompt. Kept in sync with `agent_export._BUILTIN_TARGETS`.
+NAMED_SUBAGENT_TYPE_SHELLS = frozenset(
+    {"claude-code", "github-copilot-cli", "codex", "cursor", "opencode"}
+)
+# Shells whose definition format Threnody can express a read-only tool list in.
+# Deliberately narrower than NAMED_SUBAGENT_TYPE_SHELLS: a shell can resolve a named
+# definition without Threnody knowing how to restrict its tools, and claiming a
+# restriction that is not actually emitted would be worse than claiming none.
+TOOL_RESTRICTION_CAPABLE_SHELLS = frozenset({"claude-code"})
 ROUTING_POLICY_SHELL_BOOTSTRAP_IDS = {
     "claude-code": "claude-code",
     "github-copilot-cli": "github-copilot",
@@ -501,6 +513,12 @@ class HostNativeConfig:
     learning_capture: str = "hook"
     draft_ready_mode: str = "deferred"
     runs_keep: int = 20
+    # Resolve `depends_on` to actual upstream *results*: upstream agents write their
+    # output to the run dir and dependents are handed the path. Without this the
+    # spawn payload only names the dependency, so a dependent agent either
+    # re-derives the analysis (defeating the hybrid tier discount) or the host
+    # re-pastes it into every dependent prompt.
+    forward_upstream_results: bool = True
 
 
 @dataclass
@@ -544,6 +562,11 @@ class ModelQualityConfig:
     static_recall_enabled: bool = True
     judge_enabled: bool = True
     judge_model: str = "gpt-5-mini"
+    # Feed the ledger back into tier selection (shared/quality_bias.py). Reads
+    # only the OBJECTIVE sources (verify_gate / static_recall / ladder) once at
+    # plan build. Opt-in: it changes which tier runs, so it should not switch on
+    # silently under an existing install.
+    routing_bias_enabled: bool = False
 
 
 def normalize_parallelism_limit(
@@ -681,6 +704,17 @@ class ShellRoutingProfile:
     # workflow script instead of running queens as separate host agents (hybrid default).
     # claude-code only.
     consensus_in_workflow: bool = False
+    # --- Host capabilities (prompt economy) ---------------------------------
+    # True when this shell resolves `subagent_type` against a pre-registered
+    # definition, so static instruction text can live there instead of being
+    # repeated in every spawn prompt. False → the full inline prompt is emitted,
+    # which is byte-identical to pre-capability behavior.
+    named_subagent_types: bool = False
+    # True when the shell honors a per-spawn allowed-tool list.
+    tool_restriction: bool = False
+    # Per-agent prompt cap in characters. 0 → no per-shell cap; the global
+    # `prompt_economy.prompt_char_budget` applies instead.
+    prompt_char_budget: int = 0
     tier_model_mapping: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROUTING_TIER_MODELS))
 
     def to_dict(self) -> dict[str, Any]:
@@ -691,6 +725,9 @@ class ShellRoutingProfile:
             "direct_edit_hooks": self.direct_edit_hooks,
             "workflow_emit": self.workflow_emit,
             "consensus_in_workflow": self.consensus_in_workflow,
+            "named_subagent_types": self.named_subagent_types,
+            "tool_restriction": self.tool_restriction,
+            "prompt_char_budget": self.prompt_char_budget,
             "tier_model_mapping": dict(sorted(self.tier_model_mapping.items())),
         }
 
@@ -723,6 +760,13 @@ class RoutingPolicyConfig:
             direct_edit_hooks=direct_edit_hooks,
             workflow_emit=override.workflow_emit,
             consensus_in_workflow=override.consensus_in_workflow,
+            named_subagent_types=(
+                override.named_subagent_types and canonical in NAMED_SUBAGENT_TYPE_SHELLS
+            ),
+            tool_restriction=(
+                override.tool_restriction and canonical in TOOL_RESTRICTION_CAPABLE_SHELLS
+            ),
+            prompt_char_budget=override.prompt_char_budget,
             tier_model_mapping=merged_models,
         )
 
@@ -738,6 +782,11 @@ class RoutingPolicyConfig:
 
 def _mode_shell_profile(shell_id: str, mode: str) -> ShellRoutingProfile:
     tier_models = _shell_tier_model_defaults(shell_id)
+    # Capabilities describe what the host *can* do, not what policy asks for —
+    # so they follow the shell, not the routing mode. Whether Threnody acts on
+    # them is gated separately by `prompt_economy`.
+    named_subagent_types = shell_id in NAMED_SUBAGENT_TYPE_SHELLS
+    tool_restriction = shell_id in TOOL_RESTRICTION_CAPABLE_SHELLS
     if mode == "guarded":
         return ShellRoutingProfile(
             shell_id=shell_id,
@@ -745,9 +794,16 @@ def _mode_shell_profile(shell_id: str, mode: str) -> ShellRoutingProfile:
             low_tier_execute_subtask=False,
             agent_transparency_required=True,
             direct_edit_hooks=shell_id in ROUTING_POLICY_HOOK_CAPABLE_SHELLS,
+            named_subagent_types=named_subagent_types,
+            tool_restriction=tool_restriction,
             tier_model_mapping=tier_models,
         )
-    return ShellRoutingProfile(shell_id=shell_id, tier_model_mapping=tier_models)
+    return ShellRoutingProfile(
+        shell_id=shell_id,
+        named_subagent_types=named_subagent_types,
+        tool_restriction=tool_restriction,
+        tier_model_mapping=tier_models,
+    )
 
 
 def _recommended_shell_profile(shell_id: str) -> ShellRoutingProfile:
@@ -874,6 +930,42 @@ class BeliefsConfig:
     inject_enabled: bool = True
     max_injected: int = 5
     max_chars: int = 1200
+
+
+@dataclass
+class PromptEconomyConfig:
+    """Per-agent prompt cost controls for host-native waves (shared/prompt_budget.py).
+
+    Everything here is paid *once per agent*, so a fan-out past ~4 agents multiplies
+    it. All three levers are independent:
+
+    ``externalize_boilerplate``: emit only the variable part of an agent prompt when
+    the shell has ``named_subagent_types`` — the static instruction text is already
+    in the exported definition, so repeating it per agent is pure waste. Falls back
+    to the full inline prompt on shells without that capability, so no host loses
+    instructions.
+
+    ``inject_beliefs_on_host``: give host-native *write-path* agents the repo's
+    learned beliefs and style profile, which previously reached only the subprocess
+    path (``context.enrich_subtask``). Costs a bounded block per prompt and saves the
+    unbounded rediscovery it replaces. Review agents are never injected — a primed
+    reviewer would contaminate the findings signal ``review_learning`` consumes.
+
+    ``prompt_char_budget``: global per-agent prompt cap. 0 disables. Overflow is
+    compressed via ``context.ContextCompressor`` rather than truncated.
+
+    ``instruction_tax_warning`` / ``instruction_tax_warn_bytes``: warn when the
+    workspace's own instruction files (CLAUDE.md, AGENTS.md, ...) times the agent
+    count crosses a threshold. Threnody cannot trim those — only the operator can —
+    so the honest move is to surface the number.
+    """
+
+    externalize_boilerplate: bool = True
+    inject_beliefs_on_host: bool = True
+    prompt_char_budget: int = 0
+    instruction_tax_warning: bool = True
+    # Bytes of instruction text x agent count above which the warning fires.
+    instruction_tax_warn_bytes: int = 200_000
 
 
 @dataclass
@@ -1165,6 +1257,30 @@ def _parse_shell_routing_profile(
         )
         direct_edit_hooks = False
 
+    named_subagent_types = _coerce_config_bool(
+        raw_profile.get("named_subagent_types"),
+        default=base.named_subagent_types,
+        field_name=f"routing_policy.shells.{canonical}.named_subagent_types",
+    )
+    if named_subagent_types and canonical not in NAMED_SUBAGENT_TYPE_SHELLS:
+        log.warning(
+            "routing_policy.shells.%s.named_subagent_types is unsupported for this shell; disabling",
+            canonical,
+        )
+        named_subagent_types = False
+
+    tool_restriction = _coerce_config_bool(
+        raw_profile.get("tool_restriction"),
+        default=base.tool_restriction,
+        field_name=f"routing_policy.shells.{canonical}.tool_restriction",
+    )
+    if tool_restriction and canonical not in TOOL_RESTRICTION_CAPABLE_SHELLS:
+        log.warning(
+            "routing_policy.shells.%s.tool_restriction is unsupported for this shell; disabling",
+            canonical,
+        )
+        tool_restriction = False
+
     return ShellRoutingProfile(
         shell_id=canonical,
         route_task_mandatory=_coerce_config_bool(
@@ -1192,6 +1308,16 @@ def _parse_shell_routing_profile(
             raw_profile.get("consensus_in_workflow"),
             default=base.consensus_in_workflow,
             field_name=f"routing_policy.shells.{canonical}.consensus_in_workflow",
+        ),
+        named_subagent_types=named_subagent_types,
+        tool_restriction=tool_restriction,
+        prompt_char_budget=max(
+            0,
+            _coerce_config_int(
+                raw_profile.get("prompt_char_budget"),
+                default=base.prompt_char_budget,
+                field_name=f"routing_policy.shells.{canonical}.prompt_char_budget",
+            ),
         ),
         tier_model_mapping=_parse_tier_model_mapping(
             raw_profile.get("tier_model_mapping"),
@@ -1491,6 +1617,10 @@ class TGsConfig:
     # Cache
     db_path: Path = field(default_factory=lambda: DB_PATH)
     db_backup_keep: int = 3
+    # Hours between automatic rotating DB backups (0 disables). Without a backup
+    # candidate, one corruption quarantines the DB and every learning table
+    # resets to empty — see Database._maybe_auto_backup.
+    db_backup_interval_hours: int = 6
     plan_cache_ttl_hours: int = PLAN_CACHE_TTL_HOURS
     result_cache_ttl_hours: int = RESULT_CACHE_TTL_HOURS
 
@@ -1519,6 +1649,13 @@ class TGsConfig:
     # per-(profile, dimension) tier selection at plan-build (cold path, no LLM).
     # Default-safe: a no-op until enough samples accumulate; fresh repos unaffected.
     review_learning_enabled: bool = True
+    # Whether per-project routing learning is on for a project that has never been
+    # explicitly configured. A stored project_routing row always wins, so an
+    # operator opt-out is never overridden; this only decides the never-seen case.
+    # Defaults False to preserve the documented opt-in gate (see
+    # tests/test_router.py::test_project_local_optin_gate) — set it true to have
+    # router.learn_project_routing accumulate without a per-project opt-in.
+    project_learning_default: bool = False
 
     # Prior-review memory. When enabled, a (file revision x dimension) cell already
     # reviewed at an equal-or-stronger tier is skipped and its stored findings are
@@ -1526,6 +1663,32 @@ class TGsConfig:
     # prompts. Skips require an exact content-digest match, so this never trades
     # coverage for cost. Disable to always re-review from scratch.
     review_memory_enabled: bool = True
+
+    # How the per-dimension review findings are merged into the final report.
+    #   llm    — spawn the synthesis agent (pre-existing behaviour)
+    #   python — merge/dedup/rank in-process from the findings files; no agent
+    #   auto   — python for a narrow run (few cells, few files), where there is
+    #            nothing to correlate across dimensions and the merge is pure
+    #            bookkeeping; llm for a broad run, which also preserves the
+    #            `kept_by_synthesis` false-positive-drop signal that feeds
+    #            model_quality.record_findings_score
+    review_synthesis_mode: str = "auto"
+    review_synthesis_python_max_cells: int = 6
+    review_synthesis_python_max_files: int = 2
+
+    # Review scope when the target is a directory/glob rather than an explicit file
+    # list. `changed` intersects with the files touched since the merge base and
+    # still reads each survivor WHOLE, so content_sha, LOC buckets and static-recall
+    # grading are unchanged; skipped files are reported under coverage.deferred.
+    # Falls back to `full` with no baseline (fresh repo) or on a full-sweep/audit ask.
+    review_scope: str = "changed"
+
+    # Skip a dimension whose class of bug the file structurally cannot hold (no type
+    # annotations at all -> types; no loops and no I/O -> performance). Uses
+    # structural facts from code_intel.scan_entities, deliberately NOT scan_smells —
+    # that is the static-recall grading signal, and gating on it would make objective
+    # recall trivially satisfiable. Never gates security or a requested dimension.
+    review_structural_dim_gating: bool = True
 
     # Risk-aware tier floor. Security-sensitive tasks (routing) and files (host
     # fanout) whose text/filename matches risk_filename_patterns are floored to at
@@ -1626,6 +1789,9 @@ class TGsConfig:
     verify_gate: VerifyGateConfig = field(default_factory=VerifyGateConfig)
     hybrid: HybridConfig = field(default_factory=HybridConfig)
     beliefs: BeliefsConfig = field(default_factory=BeliefsConfig)
+
+    # Per-agent prompt cost controls for host-native waves.
+    prompt_economy: PromptEconomyConfig = field(default_factory=PromptEconomyConfig)
 
     # Worktree isolation for execute_subtask (plan 06).
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1786,6 +1952,12 @@ class TGsConfig:
             ),
             plan_cache_ttl_hours=cache_raw.get("ttl_hours", PLAN_CACHE_TTL_HOURS),
             db_backup_keep=_coerce_config_int(cache_raw.get("backup_keep", 3), default=3, field_name="cache.backup_keep", minimum=1),
+            db_backup_interval_hours=_coerce_config_int(
+                cache_raw.get("backup_interval_hours", 6),
+                default=6,
+                field_name="cache.backup_interval_hours",
+                minimum=0,
+            ),
         )
         cfg.code_review = raw.get("code_review", False) is True
         raw_review_tier = raw.get("code_review_tier", "all")
@@ -1826,6 +1998,45 @@ class TGsConfig:
                         setattr(cfg.beliefs, numeric, max(lo, min(hi, int(value))))
                     except (TypeError, ValueError):
                         log.warning("beliefs.%s must be an int; keeping default", numeric)
+
+        economy_raw = raw.get("prompt_economy", {})
+        if isinstance(economy_raw, Mapping):
+            for flag in (
+                "externalize_boilerplate",
+                "inject_beliefs_on_host",
+                "instruction_tax_warning",
+            ):
+                setattr(
+                    cfg.prompt_economy,
+                    flag,
+                    _coerce_config_bool(
+                        economy_raw.get(flag),
+                        default=getattr(cfg.prompt_economy, flag),
+                        field_name=f"prompt_economy.{flag}",
+                    ),
+                )
+            for numeric, lo, hi in (
+                # 0 disables the cap; the low end of the enabled range is deliberately
+                # generous — a cap that truncates real instructions is worse than none.
+                ("prompt_char_budget", 0, 200_000),
+                ("instruction_tax_warn_bytes", 10_000, 100_000_000),
+            ):
+                value = economy_raw.get(numeric)
+                if value is None:
+                    continue
+                try:
+                    coerced = int(value)
+                except (TypeError, ValueError):
+                    log.warning("prompt_economy.%s must be an int; keeping default", numeric)
+                    continue
+                if numeric == "prompt_char_budget" and coerced != 0 and coerced < 2_000:
+                    log.warning(
+                        "prompt_economy.prompt_char_budget=%d is too small to hold a real "
+                        "prompt; treating as disabled",
+                        coerced,
+                    )
+                    coerced = 0
+                setattr(cfg.prompt_economy, numeric, max(lo, min(hi, coerced)))
 
         hybrid_raw = raw.get("hybrid", {})
         if isinstance(hybrid_raw, Mapping):
@@ -1868,7 +2079,43 @@ class TGsConfig:
                     log.warning("hybrid.urgency_suppress_at must be a float; keeping default")
 
         cfg.review_learning_enabled = raw.get("review_learning_enabled", True) is True
+        cfg.project_learning_default = _coerce_config_bool(
+            raw.get("project_learning_default"),
+            default=cfg.project_learning_default,
+            field_name="project_learning_default",
+        )
         cfg.review_memory_enabled = raw.get("review_memory_enabled", True) is True
+        cfg.review_structural_dim_gating = (
+            raw.get("review_structural_dim_gating", True) is True
+        )
+        raw_synthesis_mode = raw.get("review_synthesis_mode")
+        if isinstance(raw_synthesis_mode, str) and raw_synthesis_mode.strip().lower() in {
+            "auto", "python", "llm",
+        }:
+            cfg.review_synthesis_mode = raw_synthesis_mode.strip().lower()
+        elif raw_synthesis_mode is not None:
+            log.warning(
+                "review_synthesis_mode must be auto/python/llm; keeping %s",
+                cfg.review_synthesis_mode,
+            )
+        for _key in (
+            "review_synthesis_python_max_cells",
+            "review_synthesis_python_max_files",
+        ):
+            raw_synthesis_max = raw.get(_key)
+            if raw_synthesis_max is None:
+                continue
+            try:
+                setattr(cfg, _key, max(1, int(raw_synthesis_max)))
+            except (TypeError, ValueError):
+                log.warning("%s must be an int; keeping default", _key)
+        raw_review_scope = raw.get("review_scope")
+        if isinstance(raw_review_scope, str) and raw_review_scope.strip().lower() in {
+            "changed", "full",
+        }:
+            cfg.review_scope = raw_review_scope.strip().lower()
+        elif raw_review_scope is not None:
+            log.warning("review_scope must be changed/full; keeping %s", cfg.review_scope)
 
         cfg.risk_floor_enabled = raw.get("risk_floor_enabled", True) is True
         raw_risk_floor_tier = raw.get("risk_floor_tier", "medium")
@@ -2577,6 +2824,11 @@ class TGsConfig:
                 default=cfg.model_quality.judge_enabled,
                 field_name="model_quality.judge_enabled",
             )
+            cfg.model_quality.routing_bias_enabled = _coerce_config_bool(
+                model_quality_raw.get("routing_bias_enabled"),
+                default=cfg.model_quality.routing_bias_enabled,
+                field_name="model_quality.routing_bias_enabled",
+            )
             judge_model = model_quality_raw.get("judge_model")
             if isinstance(judge_model, str) and judge_model.strip():
                 cfg.model_quality.judge_model = judge_model.strip()
@@ -2761,6 +3013,11 @@ class TGsConfig:
                     hn_raw.get("runs_keep", 20),
                     default=20,
                     field_name="host_native.runs_keep",
+                ),
+                forward_upstream_results=_coerce_config_bool(
+                    hn_raw.get("forward_upstream_results"),
+                    default=True,
+                    field_name="host_native.forward_upstream_results",
                 ),
             )
 
@@ -3003,7 +3260,18 @@ class TGsConfig:
                 "learning_capture": self.host_native.learning_capture,
                 "draft_ready_mode": self.host_native.draft_ready_mode,
                 "runs_keep": self.host_native.runs_keep,
+                "forward_upstream_results": self.host_native.forward_upstream_results,
             },
+            "prompt_economy": {
+                "externalize_boilerplate": self.prompt_economy.externalize_boilerplate,
+                "inject_beliefs_on_host": self.prompt_economy.inject_beliefs_on_host,
+                "prompt_char_budget": self.prompt_economy.prompt_char_budget,
+                "instruction_tax_warning": self.prompt_economy.instruction_tax_warning,
+                "instruction_tax_warn_bytes": self.prompt_economy.instruction_tax_warn_bytes,
+            },
+            "review_synthesis_mode": self.review_synthesis_mode,
+            "review_scope": self.review_scope,
+            "review_structural_dim_gating": self.review_structural_dim_gating,
             "swarm": {
                 "max_agents": self.swarm_max_agents,
                 "host_execution_mode": self.swarm_host_execution_mode,

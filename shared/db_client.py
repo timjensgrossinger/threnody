@@ -350,7 +350,17 @@ def open_database(db_path: str | Path | None = None, *, config=None):
             log.warning("db daemon unavailable (%s) — using direct DB", exc)
 
     backup_keep = int(getattr(config, "db_backup_keep", 3) or 3)
+    backup_interval_hours = int(getattr(config, "db_backup_interval_hours", 6) or 0)
     resilience = getattr(config, "resilience", None)
     if resolved_path:
-        return Database(Path(resolved_path), backup_keep=backup_keep, resilience=resilience)
-    return Database(backup_keep=backup_keep, resilience=resilience)
+        return Database(
+            Path(resolved_path),
+            backup_keep=backup_keep,
+            backup_interval_hours=backup_interval_hours,
+            resilience=resilience,
+        )
+    return Database(
+        backup_keep=backup_keep,
+        backup_interval_hours=backup_interval_hours,
+        resilience=resilience,
+    )

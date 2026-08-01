@@ -770,6 +770,110 @@ def test_flush_empty_is_noop() -> None:
         assert _count(db, "telemetry") == 0
 
 
+# --- automatic backup (guards learning data against corruption) ---
+
+
+def _backups(db_path: Path) -> list[str]:
+    import glob
+
+    return glob.glob(str(db_path) + ".bak.*")
+
+
+def _seed_row(db: Database) -> None:
+    with db.conn() as conn:
+        conn.execute(
+            "INSERT INTO telemetry (session_id, ts) VALUES ('seed', ?)", (time.time(),)
+        )
+
+
+def test_auto_backup_skips_empty_database() -> None:
+    """An empty DB must never become the newest restore candidate."""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path, backup_interval_hours=6)
+        db.close()
+        assert _backups(path) == []
+
+
+def test_auto_backup_writes_once_then_throttles() -> None:
+    """A populated DB is backed up on open, then held off until the interval."""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path, backup_interval_hours=6)
+        _seed_row(db)
+        db.close()
+
+        db = Database(path, backup_interval_hours=6)
+        db.close()
+        assert len(_backups(path)) == 1
+
+        db = Database(path, backup_interval_hours=6)
+        db.close()
+        assert len(_backups(path)) == 1  # throttled, not a second copy
+
+
+def test_auto_backup_disabled_by_zero_interval() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path, backup_interval_hours=0)
+        _seed_row(db)
+        db.close()
+
+        db = Database(path, backup_interval_hours=0)
+        db.close()
+        assert _backups(path) == []
+
+
+def test_corruption_recovers_from_auto_backup_instead_of_quarantine() -> None:
+    """The whole point: a corrupt DB restores rather than resetting to empty."""
+    import glob
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path, backup_interval_hours=6)
+        _seed_row(db)
+        db.close()
+        db = Database(path, backup_interval_hours=6)  # takes the backup
+        db.close()
+        assert len(_backups(path)) == 1
+
+        with open(path, "r+b") as handle:
+            handle.seek(4096)
+            handle.write(b"\x00" * 8192)
+        for sidecar in ("-wal", "-shm"):
+            stale = Path(str(path) + sidecar)
+            if stale.exists():
+                stale.unlink()
+
+        db = Database(path, backup_interval_hours=6)
+        assert _count(db, "telemetry") == 1
+        db.close()
+        assert glob.glob(str(path) + ".corrupt.*") == []
+
+
+def test_auto_backup_skipped_after_recovery() -> None:
+    """A DB this process just recreated must not evict the good backup."""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path, backup_interval_hours=6)
+        _seed_row(db)
+        db.close()
+
+        with open(path, "r+b") as handle:
+            handle.seek(4096)
+            handle.write(b"\x00" * 8192)
+        for sidecar in ("-wal", "-shm"):
+            stale = Path(str(path) + sidecar)
+            if stale.exists():
+                stale.unlink()
+
+        # No backup existed, so this quarantines and recreates — and must not
+        # then back up the fresh empty file it just made.
+        db = Database(path, backup_interval_hours=6)
+        db.close()
+        assert _backups(path) == []
+
+
 if __name__ == "__main__":
     tests = [
         test_cache_put_and_get,

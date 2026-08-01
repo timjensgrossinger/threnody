@@ -70,6 +70,11 @@ budgets:
 cache:
   ttl_hours: 24
   backup_keep: 3
+  # Hours between automatic rotating backups (0 disables). Without a backup on
+  # disk, a corrupt cache.db is quarantined and recreated empty — silently
+  # resetting every accumulated learning table. Taken at startup only, skipped
+  # when the DB is empty or was just recovered.
+  backup_interval_hours: 6
 
 providers:
   # Router-only host (claude-code) coordinates in the MCP host shell by default.

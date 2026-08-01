@@ -3,21 +3,24 @@ name: threnody-plan
 description: >-
   Threnody planning mode for normal orchestration and swarms. Use when user
   asks to plan, decompose, show waves, dry run, preview swarm, or before
-  multi-file work. Supports plan-only (stop for approval) or plan-then-execute.
+  multi-file work. Always confirms the wave plan before spawning any agent.
 ---
 
 # Threnody planning mode
 
 Unified **planning entry point** for normal orchestration (`plan_task`) and
-swarms (`execute_swarm`). Detect plan-only vs plan-then-execute from user wording.
+swarms (`execute_swarm`). Every path ends at the same confirmation gate (§4) —
+the difference between plan-only and plan-then-execute is only what the
+recommended option is, not whether the user gets asked.
 
 ## Trigger phrases
 
 **Plan-only:** "plan only", "dry run", "show waves", "preview the swarm",
-"don't execute yet", "what agents would you spawn"
+"don't execute yet", "what agents would you spawn" — recommend **Cancel** at the
+gate and stop there unless the user picks a run option.
 
 **Plan-then-execute:** default when user asks to build/implement/refactor without
-plan-only qualifiers
+plan-only qualifiers — recommend the matching run option at the gate.
 
 **Always plan first:** multi-file, multi-concern, or parallel agent work
 
@@ -80,22 +83,43 @@ Use this template:
 
 Include `consumes` / `produces` / `depends_on` when the plan exposes them.
 
-### 4. Branch on plan-only
+### 4. Confirm before spawning — always
 
-**Plan-only** (user said dry run / plan only / don't execute):
+After the wave table, **always** call **`AskUserQuestion`** — in both the
+plan-only and the plan-then-execute branch. Never spawn straight off a plan.
 
-- Stop after the wave table.
-- Do **not** spawn host Task/Agent or call `execute_subtask`.
-- Ask: "Approve this wave plan?"
-- On approval → hand off to `threnody-task` or `threnody-swarm` for execution.
+Show first: the wave table, `cost_estimate` when present, and
+`plan_summary.coverage.deferred` when any file ended up with no owner.
 
-**Plan-then-execute** (default):
+Then one question, header `Execute`, four options:
 
-- Show a **brief** wave summary (can be shorter than full table).
-- Immediately spawn `host_spawn_waves` via `threnody-task` or `threnody-swarm` — the orchestrator does **not** implement subtasks with direct edits.
+| Option | Meaning |
+|--------|---------|
+| **Run as swarm** | hand off `host_spawn_waves` via `threnody-swarm` (`swarm_id`, budget, resume) |
+| **Run as task** | wave execution via `threnody-task`, no swarm persistence |
+| **Adjust scope** | user describes the change in free text |
+| **Cancel** | stop — spawn nothing |
+
+Order the options so the tool that actually produced the plan comes **first** and
+is labelled `(Recommended)`: `execute_swarm` → *Run as swarm* first;
+`decompose_task` / `plan_task` → *Run as task* first.
+
+On **Adjust scope**: re-call the same planning tool with the amended task, render
+the new wave table, and ask again. Never spawn during this loop.
+
+On **Cancel**: stop. Do not call `report_host_swarm_complete` — nothing ran.
+
+After the user picks a run option:
+
+- Spawn `host_spawn_waves` via `threnody-task` or `threnody-swarm` — the orchestrator does **not** implement subtasks with direct edits.
 - For every wave, start every same-wave agent first, then wait for that wave's
   results before advancing to dependent waves.
 - **Reporting:** in `batch` mode (default, see `learning_report_contract.report_mode`) report once at terminal via `report_host_swarm_complete` — no per-worker-wave round-trip. In `inline` mode call `report_host_wave` after each wave. Use `inspect_swarm` to confirm status transitions.
+
+**Timing tradeoff (intentional):** the question sits between handoff and first
+spawn. The <5s handoff target still holds; the <30s first-spawn target now
+includes human response time by design. Keep the pre-question rendering cheap —
+do not fetch receipts or run extra tools just to draw the table.
 
 ## Full-stack prompt boilerplate
 

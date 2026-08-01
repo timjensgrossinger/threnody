@@ -295,3 +295,175 @@ def test_subtask_target_files_reads_plural_list() -> None:
     from shared.host_spawn import _subtask_target_files
     st = {"target_file": "a.py", "target_files": ["a.py", "b.py", "c.py"]}
     assert _subtask_target_files(st) == ["a.py", "b.py", "c.py"]
+
+
+# ---------------------------------------------------------------------------
+# Prompt economy: capability gating, findings protocol, upstream forwarding
+# ---------------------------------------------------------------------------
+
+def _review_plan() -> dict:
+    return {
+        "subtasks": [
+            {
+                "id": 1,
+                "description": "Security review of shared/db.py",
+                "tier": "medium",
+                "read_only": True,
+                "review_dimension": "security",
+                "subagent_type": "review-security",
+                "target_file": "shared/db.py",
+                "depends_on": [],
+            }
+        ],
+        "waves": [[1]],
+    }
+
+
+def test_named_subagent_type_requires_the_capability() -> None:
+    """A shell with no exported definition must fall back to the tier-derived type,
+    or its spawn names an agent that does not exist."""
+    from shared.host_spawn import named_subagent_types_supported
+
+    config = TGsConfig()
+    assert named_subagent_types_supported(config, "claude-code") is True
+    assert named_subagent_types_supported(config, "junie") is False
+    # An unknown shell must not inherit the capability via the advisory fallback.
+    assert named_subagent_types_supported(config, "not-a-real-shell") is False
+    assert named_subagent_types_supported(config, None) is False
+
+
+def test_unknown_shell_spawn_matches_tier_derived_type() -> None:
+    config = TGsConfig()
+    spec = build_host_spawn(
+        config=config,
+        caller="not-a-real-shell",
+        tier="medium",
+        prompt="p",
+        subagent_type="review-security",
+        read_only=True,
+    )
+    assert spec.subagent_type == "threnody-medium"
+
+
+def test_findings_protocol_only_under_python_synthesis() -> None:
+    config = TGsConfig()
+    plan = _review_plan()
+    plan["synthesis_mode"] = "python"
+    waves = build_host_spawn_waves(
+        plan, config=config, caller="claude-code", run_id="swarm-fp-test"
+    )
+    prompt = waves[0]["agents"][0]["prompt"]
+    assert "Write your findings to" in prompt
+    assert "dim=security" in prompt
+
+
+def test_findings_protocol_absent_under_llm_synthesis() -> None:
+    """With a synthesis agent reading the replies, redirecting them to disk would
+    starve it."""
+    config = TGsConfig()
+    plan = _review_plan()
+    plan["synthesis_mode"] = "llm"
+    waves = build_host_spawn_waves(
+        plan, config=config, caller="claude-code", run_id="swarm-fp-test"
+    )
+    assert "Write your findings to" not in waves[0]["agents"][0]["prompt"]
+
+
+def test_findings_protocol_absent_without_run_id() -> None:
+    """The run id names the file; without it there is nothing to write to."""
+    config = TGsConfig()
+    plan = _review_plan()
+    plan["synthesis_mode"] = "python"
+    waves = build_host_spawn_waves(plan, config=config, caller="claude-code")
+    assert "Write your findings to" not in waves[0]["agents"][0]["prompt"]
+
+
+def _dag_plan() -> dict:
+    return {
+        "subtasks": [
+            {"id": 1, "description": "Diagnose the flow.", "tier": "high",
+             "read_only": True, "depends_on": []},
+            {"id": 2, "description": "Implement a.py", "tier": "medium",
+             "target_file": "a.py", "depends_on": [1]},
+            {"id": 3, "description": "Implement b.py", "tier": "medium",
+             "target_file": "b.py", "depends_on": [1]},
+        ],
+        "waves": [[1], [2, 3]],
+    }
+
+
+def test_upstream_artifact_forwarding() -> None:
+    config = TGsConfig()
+    waves = build_host_spawn_waves(
+        _dag_plan(), config=config, caller="claude-code", run_id="swarm-up-test"
+    )
+    producer = waves[0]["agents"][0]
+    consumers = waves[1]["agents"]
+    # The depended-upon agent is told where to leave its output...
+    assert producer["artifact_path"]
+    assert "depend on your output" in producer["prompt"]
+    # ...and both dependents are pointed at that one file, rather than the host
+    # re-pasting the diagnosis into each prompt.
+    for agent in consumers:
+        assert [u["id"] for u in agent["upstream"]] == ["1"]
+        assert agent["upstream"][0]["artifact_path"] == producer["artifact_path"]
+        assert "Read these upstream results" in agent["prompt"]
+    assert "artifact_path" not in consumers[0]
+
+
+def test_upstream_forwarding_off_by_config() -> None:
+    config = TGsConfig()
+    config.host_native.forward_upstream_results = False
+    waves = build_host_spawn_waves(
+        _dag_plan(), config=config, caller="claude-code", run_id="swarm-up-test"
+    )
+    assert "artifact_path" not in waves[0]["agents"][0]
+    assert "upstream" not in waves[1]["agents"][0]
+
+
+def test_upstream_forwarding_absent_without_dependencies() -> None:
+    config = TGsConfig()
+    plan = {
+        "subtasks": [
+            {"id": 1, "description": "Edit a.py", "tier": "low", "target_file": "a.py",
+             "depends_on": []},
+        ],
+        "waves": [[1]],
+    }
+    waves = build_host_spawn_waves(
+        plan, config=config, caller="claude-code", run_id="swarm-up-test"
+    )
+    agent = waves[0]["agents"][0]
+    assert "artifact_path" not in agent and "upstream" not in agent
+
+
+def test_pattern_hash_is_carried_into_the_spawn_payload() -> None:
+    """Learning keys on the kind of work, not the rendered prompt."""
+    config = TGsConfig()
+    plan = _review_plan()
+    plan["subtasks"][0]["pattern_hash"] = "abc123def456"
+    waves = build_host_spawn_waves(plan, config=config, caller="claude-code")
+    assert waves[0]["agents"][0]["pattern_hash"] == "abc123def456"
+
+
+def test_instruction_tax_report_is_per_host_and_thresholded(tmp_path) -> None:
+    config = TGsConfig()
+    from shared.host_spawn import instruction_tax_report
+
+    (tmp_path / "CLAUDE.md").write_text("x" * 40_000, encoding="utf-8")
+    big = instruction_tax_report(
+        config, workspace_root=str(tmp_path), agent_count=15, caller="claude-code"
+    )
+    assert big is not None and big["per_agent_bytes"] == 40_000
+    assert big["total_bytes"] == 600_000
+    # Codex does not read CLAUDE.md, so it must not be billed for it.
+    assert instruction_tax_report(
+        config, workspace_root=str(tmp_path), agent_count=15, caller="codex"
+    ) is None
+    # Under the threshold, and unknown hosts, stay quiet.
+    assert instruction_tax_report(
+        config, workspace_root=str(tmp_path), agent_count=1, caller="claude-code"
+    ) is None
+    assert instruction_tax_report(
+        config, workspace_root=str(tmp_path), agent_count=15, caller="mystery-shell"
+    ) is None

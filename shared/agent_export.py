@@ -220,6 +220,187 @@ def export_agent_skill(
     return {"written": written, "skipped": skipped, "errors": errors}
 
 
+# ---------------------------------------------------------------------------
+# Review dimension definitions (prompt economy)
+# ---------------------------------------------------------------------------
+
+# Read-only: review agents report findings, they never edit. Emitted only for
+# providers in TOOL_RESTRICTION_CAPABLE_SHELLS, whose frontmatter format is known.
+_REVIEW_TOOLS = "Read, Grep, Glob"
+
+# A named `subagent_type` resolves from the host's *agent* registry, which is not
+# always the same place learned skills go. Claude Code is the case that differs:
+# `_BUILTIN_TARGETS` points at `.claude/skills` for learned agents, but a spawn's
+# subagent_type is looked up in `.claude/agents`.
+_REVIEW_TARGET_OVERRIDES: dict[str, ExportTarget] = {
+    "claude-code": ExportTarget(
+        provider_id="claude-code",
+        project_subdir=".claude/agents",
+        global_dir=Path.home() / ".claude" / "agents",
+        layout="flat_md",
+    ),
+}
+
+# Filenames that already define a reviewer under a given name. Users commonly ship
+# their own tuned reviewers (`review-security.agent.md`); those are exactly the
+# definitions this feature wants the host to load, so they must never be overwritten.
+_REVIEW_DEFINITION_SUFFIXES = (".md", ".agent.md")
+
+
+def _review_definition_exists(directory: Path, slug: str, layout: str) -> Path | None:
+    """Return an existing definition path for *slug*, or None."""
+    if layout == "skill_dir":
+        candidate = directory / slug / "SKILL.md"
+        return candidate if candidate.exists() else None
+    for suffix in _REVIEW_DEFINITION_SUFFIXES:
+        candidate = directory / f"{slug}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _build_review_definition(dim: "Any", provider_id: str) -> str:
+    """Render one review dimension as a provider-native definition file.
+
+    The body is ``dim.stable_block`` — the same instruction text the inline prompt
+    would carry. Exporting it here is what lets the per-agent prompt shrink to just
+    the target path: with N cells the text is loaded once per agent by the host
+    instead of being paid for N times in prompt tokens.
+    """
+    from .config import TOOL_RESTRICTION_CAPABLE_SHELLS
+
+    description = (
+        f"{dim.title} agent for Threnody review fanout. Read-only: reports findings, "
+        "never edits."
+    )
+    lines = ["---", f"name: {dim.subagent_type}", f"description: {description}"]
+    if provider_id in TOOL_RESTRICTION_CAPABLE_SHELLS:
+        lines.append(f"tools: {_REVIEW_TOOLS}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {dim.title}")
+    lines.append("")
+    lines.append(dim.stable_block)
+    lines.append("")
+    lines.append(
+        "The spawn prompt names the file to review and may add static pre-scan leads "
+        "to confirm or refute. Review only the named file."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def export_review_definitions(
+    *,
+    providers: list[str] | None = None,
+    scope: str = "user",
+    project_path: str | None = None,
+    dry_run: bool = False,
+    overwrite: bool = False,
+) -> dict:
+    """Write the review-dimension definitions into each host's native directory.
+
+    Unlike :func:`export_agent_skill` these are not learned agents — there is no DB
+    row and no approval gate, because the content is Threnody's own static review
+    instructions taken straight from ``review_fanout.REVIEW_DIMENSIONS``. One source
+    of truth: the exported file and the inline fallback prompt render from the same
+    dimension record, so they cannot drift.
+
+    An existing definition of the same name is left alone unless *overwrite* is set:
+    a user's own tuned reviewer is precisely the definition this is trying to put in
+    place, so clobbering it would destroy the better version of the same thing.
+
+    Returns ``{"written": [...], "skipped": [...], "errors": [...]}``.
+    """
+    from .review_fanout import REVIEW_DIMENSIONS
+
+    provider_ids = providers or [t.provider_id for t in _BUILTIN_TARGETS]
+    written: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+
+    for pid in provider_ids:
+        target = _REVIEW_TARGET_OVERRIDES.get(pid) or _TARGET_BY_PROVIDER.get(pid)
+        if target is None:
+            skipped.append({"provider": pid, "reason": "unknown provider"})
+            continue
+        for dim in REVIEW_DIMENSIONS:
+            slug = dim.subagent_type
+            try:
+                content = _build_review_definition(dim, pid)
+                if scope == "user":
+                    if target.layout == "skill_dir":
+                        out_path = target.global_dir.joinpath(slug, "SKILL.md")
+                    else:
+                        out_path = target.global_dir.joinpath(f"{slug}.md")
+                    existing = _review_definition_exists(
+                        target.global_dir, slug, target.layout
+                    )
+                    if existing is not None and not overwrite:
+                        skipped.append(
+                            {
+                                "provider": pid,
+                                "dimension": dim.key,
+                                "reason": "definition already present",
+                                "path": str(existing),
+                            }
+                        )
+                        continue
+                else:
+                    if not project_path:
+                        skipped.append(
+                            {
+                                "provider": pid,
+                                "reason": "project_path required for scope=project",
+                            }
+                        )
+                        break
+                    root = Path(project_path).expanduser().resolve(strict=False)
+                    if not root.is_dir():
+                        errors.append(
+                            {"provider": pid, "reason": f"project_path not a directory: {root}"}
+                        )
+                        break
+                    out_path = _resolve_export_path(
+                        root, target.project_subdir, slug, target.layout
+                    )
+                    existing = _review_definition_exists(
+                        out_path.parent if target.layout == "flat_md" else root / target.project_subdir,
+                        slug,
+                        target.layout,
+                    )
+                    if existing is not None and not overwrite:
+                        skipped.append(
+                            {
+                                "provider": pid,
+                                "dimension": dim.key,
+                                "reason": "definition already present",
+                                "path": str(existing),
+                            }
+                        )
+                        continue
+                if not dry_run:
+                    _safe_write(out_path, content)
+                written.append(
+                    {
+                        "provider": pid,
+                        "dimension": dim.key,
+                        "path": str(out_path),
+                        "dry_run": dry_run,
+                    }
+                )
+            except Exception as exc:
+                log.debug(
+                    "review definition export failed for %s/%s: %s",
+                    pid,
+                    dim.key,
+                    exc,
+                    exc_info=True,
+                )
+                errors.append({"provider": pid, "dimension": dim.key, "reason": str(exc)})
+
+    return {"written": written, "skipped": skipped, "errors": errors}
+
+
 def export_all_active(
     db: Database,
     *,

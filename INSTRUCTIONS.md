@@ -109,6 +109,10 @@ of a marked block.
 - **Host hooks:** Claude guarded mode installs `shell/threnody-routing-hook.sh` (see [docs/HOOKS.md](docs/HOOKS.md)).
 - **Routing trust:** run `python3 -m shared.routing_report --write-docs` for fixture accuracy stats.
 - **Learned agents:** approval-gated drafts may land in the **cost_lane** when low-tier patterns recur with strong quality — prefer free/low execution metadata in drafts. Approved agents inject context during **planning** (`plan_task` / `decompose_task`); they do not auto-select host subagent personas at `route_task` time.
+- **Prompt economy (`prompt_economy` in config.yaml):** everything a subagent prompt carries is paid once *per agent*, so a fan-out past ~4 agents multiplies it. `install.sh` writes the static review-dimension instructions into each host's own definition directory (never overwriting one you already have), after which review prompts carry only the target path. Hosts without a definition directory keep the instructions inline, front-loaded so repeated agents share a cacheable prefix. See `shared/prompt_budget.py`.
+- **Instruction-file tax:** a host reloads *your* instruction files (`CLAUDE.md`, `AGENTS.md`, …) into every subagent, so their size is multiplied by the agent count before any work happens. A wide fan-out returns `instruction_tax_warning` with the per-host number — Threnody cannot trim those files, only you can.
+- **Review report:** `review_synthesis_mode` decides whether per-dimension findings are merged by an agent (`llm`) or in-process (`python`, via `shared/findings_merge.py` — no agent, and the findings stop accumulating in the parent conversation). `auto` picks per run based on how broad the review is.
+- **Upstream results:** with `host_native.forward_upstream_results` (default on), a depended-upon agent writes its output to the run's `artifacts/` dir and its dependents are handed the path. Pass `artifact_path` / `upstream[]` through as-is; do not re-paste an upstream agent's output into dependent prompts.
 
 ## Cross-session memory (cross-CLI)
 

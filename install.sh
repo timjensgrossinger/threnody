@@ -851,6 +851,30 @@ install_threnody_flat_agents() {
     info "Installed Threnody agent guides to $target_dir"
 }
 
+install_review_definitions() {
+    # Prompt economy: put the static review-dimension instructions in each host's
+    # own definition directory so a review fan-out does not repeat them in every
+    # agent prompt. Never overwrites a definition the user already has — their own
+    # tuned reviewer is the better version of the same file.
+    (cd "$INSTALL_DIR" && python3 - <<'PY'
+import logging
+logging.basicConfig(level=logging.ERROR)
+try:
+    from shared.agent_export import export_review_definitions
+except Exception as exc:  # pragma: no cover - install-time guard
+    print(f"  ⚠️  review definitions unavailable: {exc}")
+    raise SystemExit(0)
+result = export_review_definitions(scope="user")
+written = len(result.get("written") or [])
+kept = len(result.get("skipped") or [])
+errors = result.get("errors") or []
+print(f"  ✅ Review definitions: {written} written, {kept} left as-is")
+for err in errors[:3]:
+    print(f"  ⚠️  {err.get('provider')}/{err.get('dimension')}: {err.get('reason')}")
+PY
+    ) || warn "Review definition export failed (review prompts fall back to inline instructions)"
+}
+
 install_provider_skill_targets() {
     install_threnody_skills "$HOME/.claude/skills"
     install_threnody_skills "$HOME/.cursor/skills"
@@ -865,6 +889,7 @@ install_provider_skill_targets() {
     # as markdown agents rather than directory-style SKILL.md packages.
     install_threnody_flat_agents "$HOME/.copilot/agents"
     install_threnody_flat_agents "$HOME/.config/opencode/agent"
+    install_review_definitions
     SYNCED_THRENODY_SKILLS=1
 }
 

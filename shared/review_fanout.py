@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
-    from shared.code_intel import CodeIntel, Smell
+    from shared.code_intel import CodeIntel, Smell, StructuralTraits
     from shared.db import Database
 
 log = logging.getLogger(__name__)
@@ -63,21 +63,60 @@ _HIGH_REVIEW_TASK_SIGNALS = re.compile(
 
 
 class _Dim(NamedTuple):
+    """One review dimension, stored as parts rather than one prompt string.
+
+    The instruction text (``title`` + ``focus`` + ``report``) is identical for every
+    file in a run, while only the path varies. Keeping them separate lets the same
+    dimension render two ways:
+
+    * ``prompt_template`` — the full inline prompt, path first. Byte-for-byte the
+      wording used before this split, for hosts that cannot resolve a named subagent
+      definition and therefore need the instructions in the prompt itself.
+    * ``stable_block`` + ``variable_line`` — instructions front-loaded and path last,
+      so N agents share a cacheable prefix; and when the host *does* resolve a named
+      definition, the stable half is dropped entirely because the definition already
+      carries it.
+    """
+
     key: str
     subagent_type: str
-    prompt_template: str
+    title: str   # e.g. "Security review"
+    focus: str   # what to look for; one sentence ending in a period
+    report: str  # how to report findings, incl. the category vocabulary
     drop_priority: int  # higher = drop first; 0 = never drop
     reasoning_heavy: bool = False  # escalates to high tier on large files
+
+    @property
+    def prompt_template(self) -> str:
+        """Full inline prompt with a ``{path}`` placeholder."""
+        return f"{self.title} of {{path}}: {self.focus} {self.report}"
+
+    @property
+    def stable_block(self) -> str:
+        """Path-free instruction text — constant across every cell in the run.
+
+        ``focus`` is stored lowercase because the inline form reads
+        ``"... of {path}: check for ..."``; standing alone it starts a sentence.
+        """
+        focus = f"{self.focus[:1].upper()}{self.focus[1:]}" if self.focus else ""
+        return f"{self.title}. {focus} {self.report}"
+
+    def variable_line(self, path: str) -> str:
+        """The only per-agent-varying part of a review prompt."""
+        return f"Review this file: {path}"
 
 
 REVIEW_DIMENSIONS: list[_Dim] = [
     _Dim(
         key="security",
         subagent_type="review-security",
-        prompt_template=(
-            "Security review of {path}: check for injection (SQL, command, XSS), "
+        title="Security review",
+        focus=(
+            "check for injection (SQL, command, XSS), "
             "auth bypass, hardcoded secrets, SSRF, path traversal, weak crypto, "
-            "CSRF, IDOR, insecure deserialization, and input validation gaps. "
+            "CSRF, IDOR, insecure deserialization, and input validation gaps."
+        ),
+        report=(
             "Report each finding as: ⚠️ [SEVERITY] security/<category> — file:line — description (CWE-XXX), "
             "where <category> is a kebab-case vulnerability class "
             "(e.g. sql-injection, xss, path-traversal, hardcoded-secret, ssrf, weak-crypto). "
@@ -89,9 +128,12 @@ REVIEW_DIMENSIONS: list[_Dim] = [
     _Dim(
         key="logic",
         subagent_type="review-logic",
-        prompt_template=(
-            "Logic review of {path}: check for off-by-one errors, wrong conditions, "
-            "unreachable code, swapped arguments, missing returns, and state invariant violations. "
+        title="Logic review",
+        focus=(
+            "check for off-by-one errors, wrong conditions, "
+            "unreachable code, swapped arguments, missing returns, and state invariant violations."
+        ),
+        report=(
             "Report each finding as: ⚠️ [SEVERITY] logic/<category> — file:line — description, "
             "where <category> is a kebab-case slug (e.g. off-by-one, wrong-condition, missing-return). "
             "Output nothing if no issues found."
@@ -102,10 +144,13 @@ REVIEW_DIMENSIONS: list[_Dim] = [
     _Dim(
         key="edge",
         subagent_type="review-edge-cases",
-        prompt_template=(
-            "Edge and null case review of {path}: check for null/None dereferences, "
+        title="Edge and null case review",
+        focus=(
+            "check for null/None dereferences, "
             "empty collection access, division by zero, missing error handling, "
-            "missing defaults, boundary conditions, and missing I/O error handling. "
+            "missing defaults, boundary conditions, and missing I/O error handling."
+        ),
+        report=(
             "Report each finding as: ⚠️ [SEVERITY] edge/<category> — file:line — description, "
             "where <category> is a kebab-case slug (e.g. null-deref, empty-collection, div-by-zero). "
             "Output nothing if no issues found."
@@ -115,9 +160,12 @@ REVIEW_DIMENSIONS: list[_Dim] = [
     _Dim(
         key="types",
         subagent_type="review-types",
-        prompt_template=(
-            "Type safety review of {path}: check for type mismatches, unsafe casts, "
-            "generic violations, incompatible return types, and serialization/deserialization drift. "
+        title="Type safety review",
+        focus=(
+            "check for type mismatches, unsafe casts, "
+            "generic violations, incompatible return types, and serialization/deserialization drift."
+        ),
+        report=(
             "Report each finding as: ⚠️ [SEVERITY] types/<category> — file:line — description, "
             "where <category> is a kebab-case slug (e.g. type-mismatch, unsafe-cast, serde-drift). "
             "Output nothing if no issues found."
@@ -127,10 +175,13 @@ REVIEW_DIMENSIONS: list[_Dim] = [
     _Dim(
         key="performance",
         subagent_type="review-performance",
-        prompt_template=(
-            "Performance review of {path}: check for O(n²) algorithms, N+1 queries, "
+        title="Performance review",
+        focus=(
+            "check for O(n²) algorithms, N+1 queries, "
             "memory leaks, blocking I/O in async contexts, unbounded growth, missing pagination, "
-            "and redundant calls. "
+            "and redundant calls."
+        ),
+        report=(
             "Report each finding as: ⚠️ [SEVERITY] performance/<category> — file:line — description, "
             "where <category> is a kebab-case slug (e.g. quadratic, n-plus-1, memory-leak, blocking-io). "
             "Output nothing if no issues found."
@@ -330,6 +381,9 @@ class ReviewProfile(NamedTuple):
     density_score: float = 0.0  # structural density (0.0–1.0); default keeps 3-arg back-compat
     concrete_high_risk: bool = False
     intel: "CodeIntel | None" = None  # entity/smell scan; None when unavailable
+    # Coarse shape facts (annotations / loops / I/O) used to skip a dimension the file
+    # cannot hold defects for. None when unavailable → nothing is skipped.
+    traits: "StructuralTraits | None" = None
 
 
 def estimate_review_profile(path: str, *, db: "Database | None" = None) -> ReviewProfile:
@@ -353,7 +407,20 @@ def estimate_review_profile(path: str, *, db: "Database | None" = None) -> Revie
     intel = _scan_intel(path, content, db)
     density = _structural_density(content, intel)
     concrete_high_risk = _has_concrete_high_risk_signals(content)
-    return ReviewProfile(band, has_risk, loc, density, concrete_high_risk, intel)
+    return ReviewProfile(
+        band, has_risk, loc, density, concrete_high_risk, intel, _scan_traits(path, content)
+    )
+
+
+def _scan_traits(path: str, content: str) -> "StructuralTraits | None":
+    """Best-effort structural traits — a failure degrades to running every dimension."""
+    try:
+        from .code_intel import structural_traits
+
+        return structural_traits(path, content)
+    except Exception:  # pragma: no cover - best-effort
+        log.debug("review_fanout: structural traits failed for %s", path, exc_info=True)
+        return None
 
 
 def _scan_intel(path: str, content: str, db: "Database | None") -> "CodeIntel | None":
@@ -442,6 +509,12 @@ def _expected_rule_ids(dim_smells: "list[Smell]") -> list[str]:
     return sorted({s.rule_id for s in dim_smells if s.severity == SEVERITY_HIGH})
 
 
+# Wildcard profile key: a tier_bias entry that applies to every file profile.
+# Used by the objective model-quality loop, whose signal is per-(model, dimension)
+# and therefore not tied to any one file shape.
+GLOBAL_PROFILE_KEY = "*"
+
+
 def _cell_tier(
     path: str,
     dim: _Dim,
@@ -458,7 +531,14 @@ def _cell_tier(
     """
     bias = 0
     if tier_bias:
-        bias = int(tier_bias.get((profile_key_for(prof, path), dim.key), 0))
+        # Two learned sources share this map: a per-profile step keyed on the
+        # file's profile_key, and a model-wide step from the objective quality
+        # ledger keyed on the GLOBAL_PROFILE_KEY wildcard. Their sum is clamped to
+        # a single step so two independent learners cannot compound into a
+        # two-tier jump; the evidence-based smell bias below is separate.
+        learned = int(tier_bias.get((profile_key_for(prof, path), dim.key), 0))
+        learned += int(tier_bias.get((GLOBAL_PROFILE_KEY, dim.key), 0))
+        bias = max(-1, min(1, learned))
     dim_smells = _smells_for_profile(prof).get(dim.key, []) if prof.intel else []
     # A confirmed-shape static hit is concrete evidence this cell has real work to
     # do, so give it one extra step of reasoning headroom.
@@ -476,6 +556,243 @@ def _cell_tier(
     return tier, dim_smells
 
 
+_DIRECTORY_TOKEN = re.compile(r"(?<![\w./-])((?:[\w.-]+/)+|\.)(?![\w.-]*\.[A-Za-z])")
+
+
+def directory_targets(task: str) -> list[str]:
+    """Directory-shaped targets named in a ``REVIEW:`` task.
+
+    A trailing-slash token (``shared/``) or a bare ``.``. Deliberately not a glob
+    engine: this exists so ``REVIEW: shared/`` has a defined meaning, nothing more.
+    """
+    if not isinstance(task, str) or not task.strip():
+        return []
+    body = strip_dims_token(task)
+    if body.strip().lower().startswith(_REVIEW_SENTINEL):
+        body = body.strip()[len(_REVIEW_SENTINEL):]
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _DIRECTORY_TOKEN.finditer(body):
+        token = match.group(1).strip()
+        if not token:
+            continue
+        normalized = token.rstrip("/") or "."
+        if normalized.lower() in seen:
+            continue
+        seen.add(normalized.lower())
+        out.append(normalized)
+    return out
+
+
+def changed_files_under(
+    workspace_root: str, directories: list[str]
+) -> tuple[list[str], str | None]:
+    """Files changed since the merge base, restricted to *directories*.
+
+    Returns ``(paths, baseline_ref)``. An empty ref means no baseline could be
+    resolved (fresh repo, root commit, not a git repo) — the caller must then not
+    claim to have scoped anything.
+
+    Each returned file is reviewed *whole*, so ``content_sha``, the LOC bucket in
+    ``profile_key_for`` and static-recall grading are all identical to an unscoped
+    run. This narrows *which* files are reviewed, never how much of one is read.
+    """
+    if not workspace_root or not directories:
+        return [], None
+    try:
+        from pathlib import Path
+
+        from .verify import _git, resolve_baseline_ref
+
+        ref = resolve_baseline_ref(workspace_root)
+        if not ref:
+            return [], None
+        args = ["diff", "--name-only", ref, "--", *directories]
+        proc = _git(args, workspace_root)
+        if proc is None or proc.returncode != 0:
+            return [], None
+        root = Path(workspace_root)
+        paths: list[str] = []
+        seen: set[str] = set()
+        for line in (proc.stdout or "").splitlines():
+            rel = line.strip()
+            if not rel or rel.lower() in seen:
+                continue
+            candidate = root / rel
+            # Deleted files show up in the diff but cannot be reviewed.
+            if not candidate.is_file():
+                continue
+            seen.add(rel.lower())
+            paths.append(str(candidate))
+        return paths, ref
+    except Exception:
+        log.debug("review_fanout: changed-file scoping failed", exc_info=True)
+        return [], None
+
+
+def _review_pattern_hash(dim_key: str) -> str:
+    """Prompt-independent pattern key for a review dimension.
+
+    Deliberately hashes a canonical token rather than the prompt: review prompts
+    change wording as the boilerplate mode changes, and the learning tables must not
+    see that as a new kind of work.
+    """
+    try:
+        from .agents import pattern_hash
+
+        return pattern_hash(f"review:{dim_key}")
+    except Exception:
+        log.debug("review_fanout: pattern_hash unavailable", exc_info=True)
+        return ""
+
+
+def _load_config(config: "Any | None" = None) -> "Any | None":
+    """Return *config* or a freshly loaded one. ``None`` on any failure.
+
+    ``TGsConfig.from_yaml()`` re-reads and re-parses config.yaml on every call, so a
+    fan-out resolves it once here and threads the result.
+    """
+    if config is not None:
+        return config
+    try:
+        from .config import TGsConfig
+
+        return TGsConfig.from_yaml()
+    except Exception:
+        log.debug("review_fanout: config load failed", exc_info=True)
+        return None
+
+
+def _prompt_economy(
+    caller: str | None, config: "Any | None" = None
+) -> tuple[str, int]:
+    """Resolve (boilerplate_mode, prompt_char_budget) for this run.
+
+    Best-effort: any failure falls back to the legacy prompt with no budget, because
+    a config read must never be what stops a review from being planned.
+    """
+    from .prompt_budget import BOILERPLATE_LEGACY
+
+    if caller is None or config is None:
+        return BOILERPLATE_LEGACY, 0
+    try:
+        from .prompt_budget import boilerplate_mode, effective_budget
+
+        return boilerplate_mode(config, caller), effective_budget(config, caller)
+    except Exception:
+        log.debug("review_fanout: prompt economy resolution failed", exc_info=True)
+        return BOILERPLATE_LEGACY, 0
+
+
+def resolve_synthesis_mode(
+    config: "Any | None",
+    *,
+    cells: int,
+    files: int,
+) -> str:
+    """Decide whether findings are merged in Python or by a synthesis agent.
+
+    What the LLM synthesis agent adds over a mechanical dedup-and-sort is
+    *correlation*: noticing that findings from different dimensions or different files
+    describe one root cause. That value scales with the breadth of the merge, so
+    breadth is what ``auto`` measures — the number of (file × dimension) cells and the
+    number of files. A narrow run has nothing to correlate and the merge is pure
+    bookkeeping; a broad one is where the judgment earns its cost.
+
+    Deliberately not keyed on the static pre-scan's expected-finding count: that
+    number is almost always small, so it would resolve to ``python`` nearly always
+    and make ``auto`` a misleading name for "python".
+    """
+    if config is None:
+        return "llm"
+    mode = str(getattr(config, "review_synthesis_mode", "auto") or "auto").lower()
+    if mode in {"python", "llm"}:
+        return mode
+    max_cells = int(getattr(config, "review_synthesis_python_max_cells", 6) or 6)
+    max_files = int(getattr(config, "review_synthesis_python_max_files", 2) or 2)
+    if cells <= max_cells and files <= max_files:
+        return "python"
+    return "llm"
+
+
+# Dimensions a file can be proven not to need, and the trait that proves it.
+# Only these two: a file with no annotations genuinely has no type contract to check,
+# and one with no loops and no I/O has no hot path. There is no equivalent proof for
+# logic, edge cases, or security — any file can hold those.
+_TRAIT_GATED_DIMENSIONS = ("types", "performance")
+
+
+def _gate_dimensions_structurally(
+    dims: list[_Dim], traits: "StructuralTraits | None", requested_keys: set[str]
+) -> list[_Dim]:
+    """Drop dimensions whose class of defect the file structurally cannot hold.
+
+    Skips nothing unless the traits came from a real AST parse (``parsed``): on the
+    regex fallback the answers are guesses, and a guess must never remove a reviewer.
+    Never drops an explicitly requested dimension, and never touches ``security`` —
+    which is not trait-gated at all.
+    """
+    if traits is None or not traits.parsed:
+        return dims
+    dropped: list[str] = []
+    kept: list[_Dim] = []
+    for dim in dims:
+        if dim.key in requested_keys or dim.key not in _TRAIT_GATED_DIMENSIONS:
+            kept.append(dim)
+            continue
+        if dim.key == "types" and not traits.has_annotations:
+            dropped.append(dim.key)
+            continue
+        if dim.key == "performance" and not (traits.has_loops or traits.has_io):
+            dropped.append(dim.key)
+            continue
+        kept.append(dim)
+    if dropped:
+        log.debug("review_fanout: structural gating dropped %s", ", ".join(dropped))
+    # Never return an empty dimension set — that would silently drop the file.
+    return kept or dims
+
+
+def _cell_description(
+    path: str,
+    dim: _Dim,
+    dim_smells: "list[Smell]",
+    db: "Database | None",
+    *,
+    mode: str,
+    budget: int,
+) -> str:
+    """Render one review cell's prompt under the resolved boilerplate *mode*.
+
+    ``legacy`` reproduces the pre-split string exactly — same wording, same
+    concatenation, no separator changes — so opting out is a true no-op.
+    """
+    from .prompt_budget import (
+        BOILERPLATE_DEFINITION,
+        BOILERPLATE_LEGACY,
+        render,
+    )
+
+    leads = _format_leads(dim_smells)
+    resolved = _format_resolved(db, path, dim.key)
+
+    if mode == BOILERPLATE_LEGACY and budget <= 0:
+        return dim.prompt_template.format(path=path) + leads + resolved
+
+    if mode == BOILERPLATE_DEFINITION:
+        # The exported subagent definition already carries title/focus/report.
+        stable: list[str] = []
+        variable = [dim.variable_line(path), leads, resolved]
+    elif mode == BOILERPLATE_LEGACY:
+        # Budget-only pass: keep the legacy wording, cap the appended blocks.
+        stable = [dim.prompt_template.format(path=path)]
+        variable = [leads, resolved]
+    else:
+        stable = [dim.stable_block]
+        variable = [dim.variable_line(path), leads, resolved]
+    return render(stable=stable, variable=variable, budget=budget).text
+
+
 def _format_resolved(db: "Database | None", path: str, dimension: str) -> str:
     """Prompt block suppressing findings already reported here and since fixed."""
     if db is None:
@@ -487,6 +804,37 @@ def _format_resolved(db: "Database | None", path: str, dimension: str) -> str:
     except Exception:  # pragma: no cover - best-effort
         log.debug("review_fanout: resolved-findings read failed", exc_info=True)
         return ""
+
+
+def _replayed_finding_records(replayed: "list[Any]") -> list[dict[str, Any]]:
+    """Flatten prior-review scans into plain finding records.
+
+    Structured rather than pre-rendered so the consumer owns the formatting, and so a
+    record with a missing field is skipped instead of producing a malformed line.
+    """
+    out: list[dict[str, Any]] = []
+    for scan in replayed or []:
+        path = str(getattr(scan, "path", "") or "").strip()
+        dimension = str(getattr(scan, "dimension", "") or "").strip()
+        if not path or not dimension:
+            continue
+        for finding in getattr(scan, "findings", ()) or ():
+            summary = str(getattr(finding, "summary", "") or "").strip()
+            if not summary:
+                continue
+            try:
+                line = int(getattr(finding, "line", 0) or 0)
+            except (TypeError, ValueError):
+                line = 0
+            out.append({
+                "dimension": dimension,
+                "category": str(getattr(finding, "category", "") or "").strip().lower(),
+                "severity": str(getattr(finding, "severity", "") or "").strip().lower(),
+                "path": path,
+                "line": line,
+                "summary": summary,
+            })
+    return out
 
 
 def _format_replay(replayed: "list[Any]") -> str:
@@ -755,6 +1103,8 @@ def build_review_subtasks(
     max_agents: int | None = None,
     tier_bias: dict[tuple[str, str], int] | None = None,
     db: "Database | None" = None,
+    caller: str | None = None,
+    config: "Any | None" = None,
 ) -> dict:
     """Build a DAG plan dict with per-(file, dimension) subtasks + synthesis.
 
@@ -765,6 +1115,10 @@ def build_review_subtasks(
         per cell (microsecond dict hit) and applied as a clamped tier shift. An
         empty/None map is a no-op — fresh repos keep the pure heuristic.
     db: optional Database, used only for the cross-process code_intel scan cache.
+    caller: host shell id, used to resolve prompt-economy capabilities. ``None``
+        keeps the pre-split prompt wording exactly.
+    config: optional pre-loaded TGsConfig, so a fan-out resolves prompt economy
+        once instead of re-reading config.yaml per cell.
     """
     if not entries:
         return {
@@ -787,6 +1141,13 @@ def build_review_subtasks(
     task_force_high = _task_requests_high_tier(task)
     requested = _requested_dimensions(task)
     requested_keys = set(requested)
+    # Prompt economy resolved once per run, not per cell — from_yaml() re-reads and
+    # re-parses config.yaml on every call.
+    cfg = _load_config(config)
+    boilerplate, prompt_char_budget = _prompt_economy(caller, cfg)
+    structural_gating = bool(
+        getattr(cfg, "review_structural_dim_gating", False) if cfg is not None else False
+    )
 
     # Compute per-file (dims, profile) — profile carries raw LOC for tiering
     file_dims: list[tuple[str, list[_Dim], ReviewProfile]] = []
@@ -798,6 +1159,8 @@ def build_review_subtasks(
             requested=requested,
             smells=_smells_for_profile(prof),
         )
+        if structural_gating:
+            dims = _gate_dimensions_structurally(dims, prof.traits, requested_keys)
         # Only force-add security on an explicit high-tier signal, not merely
         # because the user named some other dimension.
         if task_force_high and not any(dim.key == "security" for dim in dims):
@@ -819,9 +1182,28 @@ def build_review_subtasks(
         all_cells, db, task_force_high=task_force_high, tier_bias=tier_bias
     )
 
-    # Cap: drop highest effective-priority cells first; reserve 1 slot for synthesis
+    # Resolve the synthesis mode BEFORE the agent cap, from the review as requested.
+    # The cap and the mode are otherwise circular: the cap must know whether to reserve
+    # a slot for a synthesis agent, while `auto` keys on how many cells survive it.
+    # Deciding on pre-cap breadth breaks that, and is the more faithful reading anyway —
+    # how broad a review *is* should not change because a budget trimmed it.
+    synthesis_mode = resolve_synthesis_mode(
+        cfg,
+        cells=len(all_cells),
+        files=len({path for path, _, _ in all_cells} | {s.path for s in replayed}),
+    )
+
+    # A one-agent budget cannot hold both a reviewer and a synthesis agent: the cap
+    # floors at one cell and the synthesis agent was then appended regardless, so the
+    # plan overran the budget. Spend the slot on the review and merge in-process.
+    if max_agents is not None and 0 < max_agents <= 1 and all_cells:
+        synthesis_mode = "python"
+
+    # Cap: drop highest effective-priority cells first, reserving a slot for the
+    # synthesis agent only when one will actually be planned. Under python synthesis
+    # the merge is in-process, so reserving a slot would silently cost a review cell.
     if max_agents is not None and max_agents > 0:
-        review_cap = max(1, max_agents - 1)
+        review_cap = max_agents if synthesis_mode == "python" else max(1, max_agents - 1)
         if len(all_cells) > review_cap:
             by_priority = sorted(
                 range(len(all_cells)),
@@ -855,10 +1237,8 @@ def build_review_subtasks(
         )
         subtasks.append({
             "id": idx,
-            "description": (
-                dim.prompt_template.format(path=path)
-                + _format_leads(dim_smells)
-                + _format_resolved(db, path, dim.key)
+            "description": _cell_description(
+                path, dim, dim_smells, db, mode=boilerplate, budget=prompt_char_budget
             ),
             "tier": t,
             "target_file": path,
@@ -866,6 +1246,11 @@ def build_review_subtasks(
             "read_only": True,
             "depends_on": [],
             "single_file_insertion": False,
+            # Pin the learning key to the dimension, not the rendered prompt.
+            # `agents.normalize_pattern` strips paths but keeps prose, so without
+            # this a prompt-wording change would mint a new pattern_hash and orphan
+            # every accumulated `subtask_patterns` row for this dimension.
+            "pattern_hash": _review_pattern_hash(dim.key),
             # Consumed by host_learning to score static recall for this cell.
             # Absent/empty means "no static expectation" — never a zero score.
             "review_dimension": dim.key,
@@ -879,18 +1264,31 @@ def build_review_subtasks(
         {path for path, _, _ in all_cells} | {scan.path for scan in replayed}
     )
     has_high_risk_files = any(prof.concrete_high_risk for _, _, prof in all_cells)
-    subtasks.append({
-        "id": synth_id,
-        "description": (
-            _SYNTHESIS_PROMPT
-            + f"\n\nFiles reviewed: {', '.join(reviewed_files)}"
-            + _format_replay(replayed)
-        ),
-        "tier": synthesis_tier(review_requires_high, len(all_cells), has_high_risk_files),
-        "depends_on": review_ids,
-        "subagent_type": "",  # empty → resolved to threnody-high by tier in host_spawn
-        "read_only": True,
-    })
+    if not all_cells and replayed:
+        # Every cell came out of prior-review memory, so no agent will run. The
+        # in-process merge only happens at wave finalize, which nothing would reach
+        # with an empty plan — so the synthesis agent stays, as the one agent whose
+        # job is to surface the carried-over findings.
+        synthesis_mode = "llm"
+    # Cells served from prior-review memory have findings but no agent. Under `llm`
+    # they ride into the synthesis prompt via _format_replay; under `python` they must
+    # be handed to the in-process merge, or those findings would go unreported.
+    replayed_findings = (
+        _replayed_finding_records(replayed) if synthesis_mode == "python" else []
+    )
+    if synthesis_mode != "python":
+        subtasks.append({
+            "id": synth_id,
+            "description": (
+                _SYNTHESIS_PROMPT
+                + f"\n\nFiles reviewed: {', '.join(reviewed_files)}"
+                + _format_replay(replayed)
+            ),
+            "tier": synthesis_tier(review_requires_high, len(all_cells), has_high_risk_files),
+            "depends_on": review_ids,
+            "subagent_type": "",  # empty → resolved to threnody-high by tier in host_spawn
+            "read_only": True,
+        })
 
     n_files = len(entries)
     n_dims = len(all_cells)
@@ -899,15 +1297,24 @@ def build_review_subtasks(
         if replayed
         else ""
     )
+    synthesis_note = (
+        " Findings are merged in-process (no synthesis agent)."
+        if synthesis_mode == "python"
+        else " + 1 synthesis."
+    )
     return {
         "analysis": (
-            f"Review fanout: {n_files} file(s), {n_dims} dimension agent(s) + 1 synthesis."
+            f"Review fanout: {n_files} file(s), {n_dims} dimension agent(s)."
+            f"{synthesis_note}"
             f"{cached_note} Host-native DAG. No external planner LLM was called."
         ),
         "subtasks": subtasks,
         "strategy": "dag",
         "topology": "dag",
         "cached_cell_count": len(replayed),
+        "synthesis_mode": synthesis_mode,
+        "reviewed_files": reviewed_files,
+        "replayed_findings": replayed_findings,
     }
 
 

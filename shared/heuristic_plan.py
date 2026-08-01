@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from .config import (
     DEFAULT_RISK_FILENAME_PATTERNS,
@@ -1052,7 +1052,8 @@ Target files: {files}
 
 _IMPLEMENT_NOTE = (
     " Follow the change-spec from the diagnosis subtask exactly: it names the "
-    "edits, invariants, and risks for this file. If the spec is wrong or "
+    "edits, invariants, and risks for this file. The spawn payload's upstream "
+    "artifact list gives the file to read it from. If the spec is wrong or "
     "incomplete for what you find in the code, say so in your output rather than "
     "silently improvising."
 )
@@ -1450,6 +1451,88 @@ def _load_review_tier_bias() -> dict[tuple[str, str], int] | None:
         return None
 
 
+def _load_quality_tier_bias() -> dict[tuple[str, str], int]:
+    """Load the objective model-quality bias, keyed for the review tier map.
+
+    Returns ``{(GLOBAL_PROFILE_KEY, dimension): step}`` — the ledger's signal is
+    per-(model, dimension), so it applies to every file profile rather than one.
+    Opt-in via ``model_quality.routing_bias_enabled``; any failure or missing data
+    yields ``{}`` so the pure heuristic is unchanged on a fresh repo.
+    """
+    try:
+        from .config import TGsConfig
+
+        mq_cfg = getattr(TGsConfig.from_yaml(), "model_quality", None)
+        if mq_cfg is None or not getattr(mq_cfg, "enabled", True):
+            return {}
+        if not getattr(mq_cfg, "routing_bias_enabled", False):
+            return {}
+        from .agents import _get_agent_db
+        from .quality_bias import apply_quality_floor, load_model_quality_bias
+
+        db = _get_agent_db()
+        raw = apply_quality_floor(db, load_model_quality_bias(db))
+    except Exception:  # pragma: no cover - learning read is best-effort
+        return {}
+
+    # Collapse (model, dimension) -> dimension. Different models can disagree on
+    # the same dimension; only act when they agree, so one bad model never drags
+    # every reviewer's tier.
+    by_dimension: dict[str, set[int]] = {}
+    for (_model, dimension), step in raw.items():
+        by_dimension.setdefault(dimension, set()).add(step)
+    from .review_fanout import GLOBAL_PROFILE_KEY
+
+    return {
+        (GLOBAL_PROFILE_KEY, dimension): steps.pop()
+        for dimension, steps in by_dimension.items()
+        if len(steps) == 1
+    }
+
+
+_FULL_SWEEP_RE = re.compile(
+    r"\b(?:full(?:\s+(?:sweep|review|audit))?|audit|everything|entire|whole\s+repo)\b",
+    re.IGNORECASE,
+)
+
+
+def _changed_file_entries(task: str) -> list[tuple[str, str]]:
+    """Entries for a directory-target review, scoped to changed files.
+
+    Returns ``[]`` — leaving today's behaviour untouched — when the task names no
+    directory, when the operator asked for a full sweep, when ``review_scope`` is
+    ``full``, or when there is no merge base to diff against (fresh repo, root
+    commit, not a git checkout).
+    """
+    try:
+        from .review_fanout import changed_files_under, directory_targets
+
+        directories = directory_targets(task)
+        if not directories:
+            return []
+        if _FULL_SWEEP_RE.search(task or ""):
+            return []
+        from .config import TGsConfig
+
+        cfg = TGsConfig.from_yaml()
+        if str(getattr(cfg, "review_scope", "changed") or "changed").lower() != "changed":
+            return []
+        workspace_root = str(Path.cwd())
+        paths, ref = changed_files_under(workspace_root, directories)
+        if not paths or not ref:
+            return []
+        log.info(
+            "review_fanout: scoped %s to %d changed file(s) since %s",
+            ", ".join(directories),
+            len(paths),
+            ref[:12],
+        )
+        return [(path, "") for path in paths]
+    except Exception:  # pragma: no cover - best-effort
+        log.debug("heuristic_plan: changed-file review scoping failed", exc_info=True)
+        return []
+
+
 def _intel_db() -> object | None:
     """Shared DB handle for the code_intel scan cache. Fail-safe → None.
 
@@ -1525,6 +1608,7 @@ def build_heuristic_plan_payload(
     coupled_strategy: str = "single",
     urgency_score: float | None = None,
     duration_bucket: str | None = None,
+    caller: str | None = None,
 ) -> dict[str, object]:
     """Build planner JSON compatible with ``Planner._build_plan`` without an LLM.
 
@@ -1532,6 +1616,9 @@ def build_heuristic_plan_payload(
     split: urgent or short work skips the extra hop. Both are derived from the task
     text when not supplied, so callers that have a routing decision can pass it
     through and callers that do not still get the same gating.
+
+    ``caller`` is the host shell id; it selects the prompt-economy capabilities for
+    the emitted prompts. Omitting it keeps the pre-capability prompt wording exactly.
     """
     if urgency_score is None or duration_bucket is None:
         derived_urgency, derived_duration = _derive_routing_hints(task)
@@ -1548,13 +1635,23 @@ def build_heuristic_plan_payload(
         entries = extract_task_file_entries(
             strip_dims_token(task), intent_templates=False, allow_external=True
         )
+        if not entries:
+            # No explicit file named. A directory target ("REVIEW: shared/") otherwise
+            # degrades to a single agent over the whole task; scope it to the files
+            # actually changed since the merge base instead. Each survivor is still
+            # reviewed whole, so no learning key changes.
+            entries = _changed_file_entries(task)
         tier_bias = _load_review_tier_bias()
+        quality_bias = _load_quality_tier_bias()
+        if quality_bias:
+            tier_bias = {**(tier_bias or {}), **quality_bias}
         return build_review_subtasks(
             entries,
             task,
             max_agents=max_agents,
             tier_bias=tier_bias,
             db=_intel_db(),
+            caller=caller,
         )  # type: ignore[return-value]
 
     task_lower = task.lower() if isinstance(task, str) else ""

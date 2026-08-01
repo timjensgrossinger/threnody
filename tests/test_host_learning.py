@@ -941,6 +941,188 @@ def test_import_run_log_is_idempotent(tmp_path: Path, monkeypatch) -> None:
     db.close()
 
 
+def test_hook_record_is_attributed_to_planned_agent_by_target_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A PostToolUse-shaped record has no ids — the touched file must supply them.
+
+    Without this, tier/model stay null and every learning loop keyed on
+    (tier, model, dimension) is unfeedable in the default batch+hook mode.
+    """
+    from shared.host_learning import _enrich_agent_from_handoff, _index_handoff_snapshots
+
+    db = Database(tmp_path / "attrib.db")
+    db._init_schema(db._get_connection())
+    workspace = tmp_path / "project"
+    (workspace / "shared").mkdir(parents=True)
+    target = workspace / "shared" / "router.py"
+    target.write_text("x = 1\n")
+
+    register_host_run_handoff(
+        db,
+        run_id="swarm-attrib",
+        host_spawn_waves=[
+            {
+                "wave": 1,
+                "agents": [
+                    {
+                        "id": "1",
+                        "tier": "high",
+                        "model": "planned-model",
+                        "prompt": "refactor router",
+                        "target_files": ["shared/router.py"],
+                    }
+                ],
+            }
+        ],
+        planned_subtasks=1,
+        workspace_root=str(workspace),
+    )
+
+    snapshots = db.get_handoff_agent_snapshots("swarm-attrib")
+    by_task, by_spawn, by_wave, by_path = _index_handoff_snapshots(
+        snapshots, str(workspace)
+    )
+    assert by_path, "handoff snapshots must be indexed by target file"
+
+    hook_record = {
+        "wave": 0,
+        "spawn_id": "",
+        "task_id": "",
+        "tier": None,
+        "model": None,
+        "success": True,
+        "touched_files": [str(target)],
+        "source": "post_tool_use_hook",
+    }
+    enriched = _enrich_agent_from_handoff(
+        hook_record,
+        snapshots_by_task_id=by_task,
+        snapshots_by_spawn_id=by_spawn,
+        snapshots_by_wave_agent=by_wave,
+        wave_index=1,
+        agent_index=0,
+        snapshots_by_target_file=by_path,
+        workspace_root=str(workspace),
+    )
+    assert enriched["tier"] == "high"
+    assert enriched["model"] == "planned-model"
+    assert enriched["task_id"] == host_task_id("swarm-attrib", "1")
+    db.close()
+
+
+def test_unmatched_hook_record_stays_on_wave_one(tmp_path: Path, monkeypatch) -> None:
+    """A touched file nobody planned must not be attributed to a random agent."""
+    from shared import run_log
+    from shared.host_learning import import_run_log
+
+    monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", tmp_path / "runs" / "active.json")
+
+    db = Database(tmp_path / "unmatched.db")
+    db._init_schema(db._get_connection())
+    register_host_run_handoff(
+        db,
+        run_id="swarm-unmatched",
+        host_spawn_waves=[
+            {
+                "wave": 2,
+                "agents": [
+                    {
+                        "id": "1",
+                        "tier": "low",
+                        "model": "m",
+                        "prompt": "p",
+                        "target_files": ["planned.py"],
+                    }
+                ],
+            }
+        ],
+        planned_subtasks=1,
+        workspace_root=str(tmp_path),
+    )
+    run_log.append_agent_record(
+        "swarm-unmatched",
+        {
+            "wave": 0,
+            "spawn_id": "",
+            "task_id": "",
+            "tier": None,
+            "model": None,
+            "success": True,
+            "touched_files": [str(tmp_path / "never-planned.py")],
+            "source": "post_tool_use_hook",
+        },
+    )
+    result = import_run_log(
+        db,
+        "swarm-unmatched",
+        outcome="accepted",
+        config=TGsConfig(),
+        workspace_root=str(tmp_path),
+    )
+    assert result["imported_waves"] == 1
+    db.close()
+
+
+def test_hook_record_wave_recovered_from_plan(tmp_path: Path, monkeypatch) -> None:
+    """A wave-0 hook record lands on the wave that planned its file, not wave 1."""
+    from shared import run_log
+    from shared.host_learning import import_run_log
+
+    monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", tmp_path / "runs" / "active.json")
+
+    db = Database(tmp_path / "waves.db")
+    db._init_schema(db._get_connection())
+    register_host_run_handoff(
+        db,
+        run_id="swarm-waves",
+        host_spawn_waves=[
+            {
+                "wave": 1,
+                "agents": [
+                    {"id": "1", "tier": "low", "model": "m", "prompt": "p",
+                     "target_files": ["first.py"]},
+                ],
+            },
+            {
+                "wave": 2,
+                "agents": [
+                    {"id": "2", "tier": "high", "model": "m2", "prompt": "p2",
+                     "target_files": ["second.py"]},
+                ],
+            },
+        ],
+        planned_subtasks=2,
+        workspace_root=str(tmp_path),
+    )
+    for name in ("first.py", "second.py"):
+        run_log.append_agent_record(
+            "swarm-waves",
+            {
+                "wave": 0,
+                "spawn_id": "",
+                "task_id": "",
+                "tier": None,
+                "model": None,
+                "success": True,
+                "touched_files": [str(tmp_path / name)],
+                "source": "post_tool_use_hook",
+            },
+        )
+    result = import_run_log(
+        db,
+        "swarm-waves",
+        outcome="accepted",
+        config=TGsConfig(),
+        workspace_root=str(tmp_path),
+    )
+    # Two distinct planned waves, so two imported waves — not one flat wave 1.
+    assert result["imported_waves"] == 2
+    db.close()
+
+
 def test_effective_capture_falls_back_to_model_for_non_claude() -> None:
     from shared.config import HostNativeConfig
     from shared.host_learning import build_learning_report_contract, effective_learning_capture

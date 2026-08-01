@@ -97,6 +97,120 @@ class CodeIntel(NamedTuple):
 EMPTY_INTEL = CodeIntel("", "", (), (), 0, 0, 0, False)
 
 
+class StructuralTraits(NamedTuple):
+    """Coarse structural facts about a file, for deciding which reviewers to run.
+
+    Deliberately separate from :class:`CodeIntel` (which is persisted in the
+    ``code_intel`` table) so adding traits cannot break cached-row deserialization.
+
+    ``parsed`` is the load-bearing field: it is True only when a real AST produced
+    these answers. On a regex fallback the answers are guesses, and a guess must never
+    be used to *skip* a reviewer — so callers gate on ``parsed``.
+    """
+
+    has_annotations: bool
+    has_loops: bool
+    has_io: bool
+    parsed: bool
+
+
+UNKNOWN_TRAITS = StructuralTraits(False, False, False, False)
+
+# Call names that indicate I/O or an external round-trip. Used only to decide whether
+# a performance reviewer has anything to look at, so false positives are cheap (an
+# extra reviewer) and false negatives are not (a skipped reviewer) — hence broad.
+_IO_CALL_NAMES: frozenset[str] = frozenset({
+    "open", "read", "write", "readlines", "writelines", "load", "loads", "dump",
+    "dumps", "get", "post", "put", "delete", "patch", "request", "urlopen",
+    "connect", "execute", "executemany", "executescript", "fetchone", "fetchall",
+    "fetchmany", "commit", "cursor", "run", "call", "check_output", "check_call",
+    "Popen", "send", "recv", "sendall", "accept", "listen", "sleep", "fetch",
+    "query", "save", "create", "update", "insert", "select", "scan", "glob",
+    "iterdir", "walk", "copy", "copyfile", "move", "remove", "unlink", "rmtree",
+})
+
+_ANNOTATION_RE = re.compile(
+    r"(?m)(?:^\s*\w+\s*:\s*[A-Za-z_\[][\w\[\], .|\"']*\s*(?:=|$)"  # annotated assignment
+    r"|def\s+\w+\s*\([^)]*:\s*[A-Za-z_\[]"                          # annotated parameter
+    r"|\)\s*->\s*[A-Za-z_\[])"                                      # return annotation
+)
+_LOOP_RE = re.compile(r"(?m)\b(?:for|while|forEach|map\s*\(|\.map\b|\.filter\b)\b")
+
+
+def structural_traits(path: str, content: str | None) -> StructuralTraits:
+    """Answer three yes/no questions about a file, with zero tokens.
+
+    Used to skip a review dimension whose class of defect the file structurally
+    cannot hold: no annotations anywhere means nothing for a type reviewer to check;
+    no loops and no I/O means nothing for a performance reviewer to check.
+
+    Deliberately independent of :func:`scan_smells`. That scan is the yardstick
+    ``model_quality.record_static_recall_score`` grades reviewers against, so gating
+    reviewers on it would make objective recall trivially satisfiable and destroy the
+    signal. These traits are about a file's *shape*, not its suspected defects.
+    """
+    if not content or not content.strip():
+        return UNKNOWN_TRAITS
+    if len(content) > MAX_SCAN_BYTES:
+        content = content[:MAX_SCAN_BYTES]
+    if str(path).lower().endswith(".py"):
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError, RecursionError):
+            tree = None
+        if tree is not None:
+            has_annotations = False
+            has_loops = False
+            has_io = False
+            for node in ast.walk(tree):
+                if not has_annotations:
+                    if isinstance(node, ast.AnnAssign):
+                        has_annotations = True
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if node.returns is not None or any(
+                            arg.annotation is not None
+                            for arg in [
+                                *node.args.args,
+                                *node.args.kwonlyargs,
+                                *node.args.posonlyargs,
+                            ]
+                        ):
+                            has_annotations = True
+                if not has_loops and isinstance(
+                    node,
+                    (
+                        ast.For,
+                        ast.AsyncFor,
+                        ast.While,
+                        ast.ListComp,
+                        ast.SetComp,
+                        ast.DictComp,
+                        ast.GeneratorExp,
+                    ),
+                ):
+                    has_loops = True
+                if not has_io and isinstance(node, ast.Call):
+                    func = node.func
+                    name = (
+                        func.attr
+                        if isinstance(func, ast.Attribute)
+                        else (func.id if isinstance(func, ast.Name) else "")
+                    )
+                    if name in _IO_CALL_NAMES:
+                        has_io = True
+                if has_annotations and has_loops and has_io:
+                    break
+            return StructuralTraits(has_annotations, has_loops, has_io, True)
+    # Non-Python or unparseable: answer with the regex heuristic but mark it
+    # unparsed, so callers treat the answers as unusable for skipping.
+    return StructuralTraits(
+        has_annotations=bool(_ANNOTATION_RE.search(content)),
+        has_loops=bool(_LOOP_RE.search(content)),
+        has_io=any(name in content for name in ("open(", "fetch(", "request", "query")),
+        parsed=False,
+    )
+
+
 def content_sha(content: str) -> str:
     """Short stable digest of file content — the cache and findings revision key."""
     return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]

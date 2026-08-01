@@ -32,6 +32,10 @@ log = logging.getLogger(__name__)
 RUNS_ROOT = BASE_DIR / "runs"
 _LOG_NAME = "wave.jsonl"
 _META_NAME = "meta.json"
+# Where an agent leaves output that its dependents read. Without this, a plan can
+# only *name* a dependency, so the dependent agent either re-derives the upstream
+# analysis or the host re-pastes it into every dependent prompt.
+_ARTIFACTS_NAME = "artifacts"
 # Pointer to the run a PostToolUse learning hook should append to. The MCP
 # execute_swarm/plan response sets it; the terminal report clears it. The hook
 # stays dependency-light (run_log only) by reading this rather than the DB.
@@ -63,6 +67,22 @@ def run_log_dir(run_id: str, *, create: bool = False) -> Path:
 
 def run_log_path(run_id: str) -> Path:
     return run_log_dir(run_id) / _LOG_NAME
+
+
+def artifacts_dir(run_id: str, *, create: bool = False) -> Path:
+    """``<run_dir>/artifacts`` — where an agent leaves output for its dependents."""
+    d = run_log_dir(run_id, create=create) / _ARTIFACTS_NAME
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def artifact_path(run_id: str, spawn_id: str) -> Path:
+    """Per-agent artifact file. *spawn_id* is reduced to one safe path segment."""
+    safe = _SAFE_ID.sub("_", str(spawn_id or "agent").strip()) or "agent"
+    if safe in {".", ".."}:
+        safe = "agent"
+    return artifacts_dir(run_id) / f"{safe}.md"
 
 
 def run_meta_path(run_id: str) -> Path:

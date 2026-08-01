@@ -148,6 +148,8 @@ Host shell (Claude / Copilot / Codex / Cursor / …)
 
 Nine repo-local skills under [`skills/`](skills/) guide MCP workflows from any host. `install.sh` installs them into provider-native roots (directory-style for Claude Code / Cursor / Codex; flat markdown for Copilot CLI / OpenCode).
 
+`install.sh` also writes the five review-dimension agent definitions into each host's own definition directory, so a review fan-out does not repeat the same checklist in every agent prompt (`prompt_economy.externalize_boilerplate`). A definition you already have under the same name is **never** overwritten — your tuned reviewer is the better version of that file.
+
 | Skill | Use when |
 |---|---|
 | [threnody-plan](skills/threnody-plan/SKILL.md) | Plan-only or plan-then-execute; waves vs swarm |

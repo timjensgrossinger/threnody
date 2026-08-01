@@ -110,10 +110,42 @@ def build_status_snapshot(
                 else None
             ),
             "last_integrity_ok": getattr(db, 'last_integrity_ok', None),
+            **_load_backup_health(db),
         },
         "explainability_link": "threnody inspect status --details",
         "spend_link": "threnody inspect spend --since 7d",
     }
+
+
+def _load_backup_health(db: Database) -> dict:
+    """Report whether a restore candidate exists on disk, and how old it is.
+
+    ``last_backup_ts`` only reflects a backup *this process* took, so it reads
+    None on a healthy long-lived install. What actually decides whether a
+    corruption costs every learning table is whether a ``.bak.*`` file exists at
+    all — surface that, plus a warning when it does not.
+    """
+    result: dict[str, object] = {
+        "backups_present": None,
+        "newest_backup_age_hours": None,
+    }
+    age_fn = getattr(db, "_newest_backup_age_s", None)
+    if not callable(age_fn):
+        return result  # RemoteDatabase / stub — nothing to report.
+    try:
+        age_s = age_fn()
+    except Exception:
+        log.debug("backup health probe failed", exc_info=True)
+        return result
+    result["backups_present"] = age_s is not None
+    if age_s is None:
+        result["warning"] = (
+            "no DB backup on disk — a corruption would quarantine cache.db and "
+            "reset every learning table (run: threnody db backup)"
+        )
+    else:
+        result["newest_backup_age_hours"] = round(age_s / 3600.0, 2)
+    return result
 
 
 def _load_pending_approvals(project_id: str, db: Database) -> list[dict]:

@@ -150,6 +150,7 @@ from shared.host_spawn import (
     sanitize_plan_for_host,
     effective_planner_host_execution_mode,
     effective_swarm_host_execution_mode,
+    instruction_tax_report,
     validate_execute_subtask_delegation,
     workflow_emit_enabled,
     consensus_in_workflow_enabled,
@@ -2293,6 +2294,7 @@ def _planner_plan_for_caller(
             default_tier=default_tier,
             topology=topology,
             max_agents=max_agents,
+            caller=caller,
         ), True
     return planner.plan(
         task,
@@ -3406,6 +3408,9 @@ def _attach_host_spawn_metadata(
             config=config,
             caller=caller,
             registry=registry,
+            run_id=run_id,
+            workspace_root=resolved_root,
+            task=task,
         )
         if waves:
             payload["host_spawn_waves"] = waves
@@ -3708,6 +3713,10 @@ def _execute_swarm_host_native_response(
             "Use spawn_batch when present; otherwise use agents. "
             "Do not use direct Write/Edit on planned target_files. "
             "Do not call execute_subtask for same-host work. "
+            "When an agent spec carries artifact_path, that agent's prompt already "
+            "tells it to write its output there; when it carries upstream[], its "
+            "prompt already tells it to read those files. Pass both through as-is — "
+            "do not re-paste an upstream agent's output into the dependent prompts. "
             "After each wave completes, call report_host_wave(swarm_id, wave, workspace_root, agents[]) "
             "with per-agent task_id, spawn_id, success, touched_files, and output_excerpt "
             "(see learning_report_contract); "
@@ -3811,6 +3820,22 @@ def _execute_swarm_host_native_response(
             "workspace_root was not supplied; target paths were checked against the "
             f"server cwd {resolved_workspace}. Pass workspace_root to make this explicit."
         )
+    try:
+        _agent_total = sum(
+            len(wave.get("agents") or [])
+            for wave in host_waves
+            if isinstance(wave, dict)
+        )
+        instruction_tax = instruction_tax_report(
+            config,
+            workspace_root=resolved_workspace,
+            agent_count=_agent_total,
+            caller=caller,
+        )
+        if instruction_tax is not None:
+            swarm_result["instruction_tax_warning"] = instruction_tax
+    except Exception:
+        log.debug("instruction tax report failed", exc_info=True)
     return {
         "result": swarm_result,
         "started": False,

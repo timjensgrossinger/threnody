@@ -124,12 +124,14 @@ class Database:
         result_ttl_hours: int = RESULT_CACHE_TTL_HOURS,
         plan_ttl_hours: int = PLAN_CACHE_TTL_HOURS,
         backup_keep: int = 3,
+        backup_interval_hours: int = 6,
         resilience: object | None = None,
     ) -> None:
         self._db_path = (db_path or DB_PATH).expanduser() if db_path else DB_PATH
         self._result_ttl = result_ttl_hours * 3600
         self._plan_ttl = plan_ttl_hours * 3600
         self._backup_keep = backup_keep
+        self._backup_interval_s = max(0, int(backup_interval_hours)) * 3600
         # SQLite contention knobs (shared WAL across concurrent MCP servers). Falls
         # back to safe hard defaults when no ResilienceConfig is supplied.
         self._db_busy_timeout_ms = int(getattr(resilience, "db_busy_timeout_ms", 30000) or 30000)
@@ -146,6 +148,9 @@ class Database:
         self._preview_token_last_prune_ts = 0.0
         self._last_backup_ts: float | None = None
         self._last_integrity_ok: bool | None = None
+        # Set by _recover_db_locked so _maybe_auto_backup can tell a healthy DB
+        # apart from one this process just restored or recreated.
+        self._recovered_this_session = False
         # Per-thread connection storage for wave parallelism (FNDX-01)
         # Each thread gets its own SQLite connection to avoid ProgrammingError
         # when multiple threads access the shared database.
@@ -153,6 +158,7 @@ class Database:
         self._ensure_private_db_file(self._db_path)
         self._restrict_db_permissions()
         self._check_integrity_and_recover()
+        self._maybe_auto_backup()
 
     def _ensure_private_db_directory(self) -> None:
         if not hasattr(os, "O_NOFOLLOW"):
@@ -2463,6 +2469,10 @@ class Database:
     def _recover_db_locked(self) -> None:
         """Recovery body. MUST be called while holding ``_process_lock``."""
         import glob as _glob
+        # Whatever the outcome below, this DB is no longer the one we started
+        # with — _maybe_auto_backup must not turn a restored or recreated file
+        # into the newest backup candidate.
+        self._recovered_this_session = True
         # Release our own handles first: they pin the old inode and its WAL.
         self._close_all_connections()
         if not self._can_take_exclusive():
@@ -2539,6 +2549,94 @@ class Database:
         # DB. Report ok so callers don't immediately re-run recovery on the fresh
         # file (which would quarantine an empty database).
         self._last_integrity_ok = True
+
+    def _newest_backup_age_s(self) -> float | None:
+        """Age of the most recent ``.bak.*`` in seconds, or None when there is none."""
+        import glob as _glob
+        newest: float | None = None
+        for path in _glob.glob(str(self._db_path) + ".bak.*"):
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+        return None if newest is None else max(0.0, time.time() - newest)
+
+    def _has_backup_worthy_content(self) -> bool:
+        """True when the live DB already holds durable rows worth preserving.
+
+        Guards against the failure mode where a freshly created (schema-only or
+        schema-less) database becomes the newest restore candidate and evicts a
+        good backup. Read-only and cheap: EXISTS, not COUNT.
+        """
+        probe_tables = (
+            "telemetry",
+            "memory",
+            "swarm_runs",
+            "approval_queue",
+            "agent_definitions",
+            "model_quality_events",
+            "review_tier_bias",
+            "subtask_patterns",
+            "project_routing",
+        )
+        if not self._db_path.exists():
+            return False
+        try:
+            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=2.0)
+        except sqlite3.Error:
+            log.debug("backup content probe could not open DB", exc_info=True)
+            return False
+        try:
+            existing = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            for table in probe_tables:
+                if table not in existing:
+                    continue
+                # Table names are module constants, never caller input — SQLite
+                # cannot parameterize an identifier.
+                row = conn.execute(f"SELECT EXISTS(SELECT 1 FROM {table})").fetchone()
+                if row and row[0]:
+                    return True
+            return False
+        except sqlite3.Error:
+            log.debug("backup content probe failed", exc_info=True)
+            return False
+        finally:
+            conn.close()
+
+    def _maybe_auto_backup(self) -> None:
+        """Take a rotating backup when the live DB is healthy and one is due.
+
+        Without a scheduled backup, ``_recover_db_locked`` finds no ``.bak.*``
+        candidate and a single corruption quarantines the database — silently
+        resetting every accumulated learning table (review_tier_bias,
+        model_quality_events, project_routing, ...). Deliberately conservative:
+        never runs on a DB this process recovered or recreated, and never on an
+        empty one, so a worthless snapshot cannot rotate out a good one.
+        """
+        if self._backup_interval_s <= 0:
+            return
+        if self._last_integrity_ok is not True or self._recovered_this_session:
+            return
+        try:
+            age = self._newest_backup_age_s()
+            if age is not None and age < self._backup_interval_s:
+                return
+            if not self._has_backup_worthy_content():
+                return
+            with self._process_lock():
+                # Re-check under the lock: a peer MCP server sharing this WAL may
+                # have taken the due backup while we were probing.
+                age = self._newest_backup_age_s()
+                if age is not None and age < self._backup_interval_s:
+                    return
+                self.backup_db()
+        except Exception:
+            log.debug("auto-backup skipped", exc_info=True)
 
     def backup_db(self) -> Path | None:
         backup_path = self._db_path.with_name(

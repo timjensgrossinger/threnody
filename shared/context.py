@@ -946,6 +946,66 @@ def enrich_subtask(
     return dataclasses.replace(subtask, description=enriched_description)
 
 
+_STYLE_FIELD_LABELS: tuple[tuple[str, str], ...] = (
+    ("naming_convention", "naming"),
+    ("return_style", "control flow"),
+    ("type_hint_usage", "type hints"),
+    ("comment_verbosity", "comment density"),
+    ("import_style", "imports"),
+)
+
+
+def build_style_block(project_root: str | None, *, db: object | None = None) -> str:
+    """Render this project's learned style profile as a one-line prompt block.
+
+    Returns ``""`` until the profile has observations, so a fresh repo injects
+    nothing. Only fields that have actually been learned are named — stating
+    ``naming: unknown`` would spend tokens to say nothing.
+    """
+    # StyleLearner runs DDL in __init__, so it needs a real Database — there is no
+    # meaningful profile without one.
+    if not project_root or db is None:
+        return ""
+    try:
+        from .style import StyleLearner
+
+        learner = StyleLearner(db)  # type: ignore[arg-type]
+        profile = learner.get_profile(str(project_root))
+    except Exception:  # pragma: no cover - best-effort
+        log.debug("context: style profile read failed", exc_info=True)
+        return ""
+    if profile is None or int(getattr(profile, "sample_count", 0) or 0) <= 0:
+        return ""
+    parts: list[str] = []
+    for attr, label in _STYLE_FIELD_LABELS:
+        value = str(getattr(profile, attr, "") or "").strip().lower()
+        if value and value != "unknown":
+            parts.append(f"{label}: {value.replace('_', ' ')}")
+    if not parts:
+        return ""
+    return (
+        "\n\nThis repo's observed conventions — match them rather than rediscovering "
+        "them: " + "; ".join(parts) + "."
+    )
+
+
+def build_repo_context_block(
+    project_root: str | None,
+    *,
+    query: str = "",
+    db: object | None = None,
+) -> str:
+    """Beliefs + style as one bounded block for host-native write-path prompts.
+
+    Both halves already bound themselves (``BeliefsConfig.max_chars``, one line of
+    style) and both return ``""`` on a fresh repo. Combined here so callers inject a
+    single stable block whose text is identical for every agent in a run.
+    """
+    return build_belief_block(project_root, query=query, db=db) + build_style_block(
+        project_root, db=db
+    )
+
+
 def build_belief_block(
     project_root: str | None,
     *,

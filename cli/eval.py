@@ -123,7 +123,7 @@ def cmd_bandit(argv: list[str] | None = None) -> int:
             if bandit_wins + heuristic_wins > 0:
                 print(f"  On diverge — bandit wins     : {bandit_wins}")
                 print(f"  On diverge — heuristic wins  : {heuristic_wins}")
-        print(f"\n  Mode: {summary['mode']} (set config.routing.bandit_mode=live to promote)")
+        print(f"\n  Mode: {summary['mode']} (shadow only — live bandit routing is unimplemented)")
         print()
     return 0
 

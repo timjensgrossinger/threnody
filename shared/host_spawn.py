@@ -10,7 +10,12 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Mapping
 
-from .config import TGsConfig, normalize_caller_id, normalize_routing_policy_shell_id
+from .config import (
+    SUPPORTED_ROUTING_POLICY_SHELLS,
+    TGsConfig,
+    normalize_caller_id,
+    normalize_routing_policy_shell_id,
+)
 from .context import is_within_repo, normalize_target_path
 from .discovery import HOST_PROVIDER_NAMES, ROUTER_ONLY_PROVIDERS
 
@@ -42,6 +47,15 @@ class HostSpawnSpec:
     id: str | None = None
     task_id: str | None = None
     run_id: str | None = None
+    # Where this agent must leave output for its dependents (set only when something
+    # actually depends on it), and the artifacts it should read first.
+    artifact_path: str | None = None
+    upstream: list[dict[str, Any]] = field(default_factory=list)
+    # Prompt-independent learning key. Carried through the spawn payload so pattern
+    # tracking keys on the *kind* of work rather than the rendered prompt, which
+    # changes with prompt-economy settings. Absent → learning falls back to hashing
+    # the description, as it always did.
+    pattern_hash: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -65,6 +79,12 @@ class HostSpawnSpec:
             payload["task_id"] = self.task_id
         if self.run_id is not None:
             payload["run_id"] = self.run_id
+        if self.pattern_hash:
+            payload["pattern_hash"] = self.pattern_hash
+        if self.artifact_path:
+            payload["artifact_path"] = self.artifact_path
+        if self.upstream:
+            payload["upstream"] = [dict(item) for item in self.upstream]
         return payload
 
 
@@ -174,6 +194,31 @@ def subagent_type_for_tier(tier: str) -> str:
     return "generalPurpose"
 
 
+def named_subagent_types_supported(config: TGsConfig, caller: str | None) -> bool:
+    """True when *caller* resolves a named ``subagent_type`` to a real definition.
+
+    Capability-driven rather than hardcoded to claude-code: ``install.sh`` exports
+    reviewer definitions to every shell in ``NAMED_SUBAGENT_TYPE_SHELLS`` via
+    ``agent_export``, so those shells can honor a named type too. A shell without a
+    definition directory falls back to the tier-derived type, which is what every
+    shell did before capabilities existed.
+    """
+    if config is None:
+        return False
+    shell_id = normalize_routing_policy_shell_id(normalize_caller_id(caller))
+    # An unrecognized shell must not inherit a capability by way of
+    # effective_profile()'s advisory fallback — an unknown host has no exported
+    # definition to resolve the named type against.
+    if shell_id is None or shell_id not in SUPPORTED_ROUTING_POLICY_SHELLS:
+        return False
+    try:
+        profile = config.routing_policy.effective_profile(shell_id)
+    except Exception:
+        log.debug("named_subagent_types_supported: profile lookup failed", exc_info=True)
+        return False
+    return bool(getattr(profile, "named_subagent_types", False))
+
+
 def build_host_spawn(
     *,
     config: TGsConfig,
@@ -186,13 +231,16 @@ def build_host_spawn(
     model: str | None = None,
     subagent_type: str | None = None,
     read_only: bool = False,
+    pattern_hash: str | None = None,
+    artifact_path: str | None = None,
+    upstream: list[dict[str, Any]] | None = None,
 ) -> HostSpawnSpec:
-    # Review agents use named subagent types only on claude-code; other hosts fall back to tier.
+    # Review agents use named subagent types on shells that resolve them to an
+    # exported definition; every other host falls back to the tier-derived type.
     normalized_caller = normalize_caller_id(caller)
-    is_claude_code = normalized_caller == "claude-code"
     resolved_subagent_type = (
         subagent_type
-        if subagent_type and is_claude_code
+        if subagent_type and named_subagent_types_supported(config, caller)
         else subagent_type_for_tier(tier)
     )
     # read_only tasks must never use direct_edit — they read source context only.
@@ -208,6 +256,9 @@ def build_host_spawn(
         wave_id=wave_id,
         target_files=list(target_files or []),
         id=spawn_id,
+        pattern_hash=pattern_hash,
+        artifact_path=artifact_path,
+        upstream=list(upstream or []),
     )
 
 
@@ -519,12 +570,250 @@ def sanitize_plan_for_host(
     return report
 
 
+def _findings_protocol_block(run_id: str, spawn_id: str, dimension: str) -> str:
+    """Instruction to write findings to a file and return only counts.
+
+    Two costs disappear: the agent's findings stop being copied into the parent
+    conversation (where every later turn re-sends them), and the merge step can read
+    them directly instead of a synthesis agent being handed every prior agent's
+    excerpt as context.
+    """
+    from .findings_merge import findings_path
+
+    path = findings_path(run_id, spawn_id)
+    return (
+        f"Write your findings to {path} — one finding per line, in exactly the "
+        "format given above, creating parent directories if needed. Write the file "
+        "even when you find nothing (leave it empty).\n"
+        "Then reply with ONLY this one-line summary and nothing else:\n"
+        f"dim={dimension} total=<number of findings> high=<number of high or critical>\n"
+        "Do not repeat the findings in your reply — they are read from the file."
+    )
+
+
+# Instruction files each host actually loads into every subagent. Deliberately
+# per-host rather than the union of all known instruction files: reporting a total no
+# single run pays would overstate the tax and cost the number its credibility.
+# ``AGENTS.md`` is the cross-tool convention and is read by all of them.
+_HOST_INSTRUCTION_FILES: dict[str, tuple[str, ...]] = {
+    "claude-code": ("CLAUDE.md", "AGENTS.md"),
+    "github-copilot-cli": (
+        ".github/copilot-instructions.md",
+        "copilot-instructions.md",
+        "AGENTS.md",
+    ),
+    "codex": ("AGENTS.md",),
+    "cursor": (".cursorrules", "AGENTS.md"),
+    "opencode": ("AGENTS.md",),
+    "junie": ("AGENTS.md",),
+}
+
+
+def instruction_tax_report(
+    config: TGsConfig,
+    *,
+    workspace_root: str | None,
+    agent_count: int,
+    caller: str | None = None,
+) -> dict[str, Any] | None:
+    """Report the per-agent instruction-file tax when it dominates a fan-out.
+
+    Every host reloads the workspace's own instruction files (CLAUDE.md, AGENTS.md,
+    …) into *each* subagent, so their combined size is multiplied by the agent count
+    before any work happens. Threnody cannot trim them — they are the operator's
+    files, and shrinking them may be exactly wrong — so the honest move is to state
+    the number.
+
+    Returns ``None`` when disabled, when the caller's instruction files are unknown or
+    absent, or when the total is under the configured threshold.
+    """
+    if config is None or agent_count <= 0:
+        return None
+    economy = getattr(config, "prompt_economy", None)
+    if economy is None or not getattr(economy, "instruction_tax_warning", False):
+        return None
+    if not workspace_root:
+        return None
+    shell_id = normalize_routing_policy_shell_id(normalize_caller_id(caller))
+    candidates = _HOST_INSTRUCTION_FILES.get(shell_id or "")
+    if not candidates:
+        # Unknown host: which files it loads is a guess, and an inflated number is
+        # worse than no number.
+        return None
+    try:
+        from pathlib import Path
+
+        root = Path(workspace_root)
+        if not root.is_dir():
+            return None
+        files: list[dict[str, Any]] = []
+        per_agent_bytes = 0
+        for rel in candidates:
+            candidate = root / rel
+            try:
+                if not candidate.is_file():
+                    continue
+                size = candidate.stat().st_size
+            except OSError:
+                continue
+            if size <= 0:
+                continue
+            per_agent_bytes += size
+            files.append({"path": rel, "bytes": size})
+        if not files:
+            return None
+        threshold = int(getattr(economy, "instruction_tax_warn_bytes", 200_000) or 200_000)
+        total_bytes = per_agent_bytes * agent_count
+        if total_bytes < threshold:
+            return None
+        files.sort(key=lambda item: int(item["bytes"]), reverse=True)
+        return {
+            "shell": shell_id,
+            "per_agent_bytes": per_agent_bytes,
+            "agent_count": agent_count,
+            "total_bytes": total_bytes,
+            # ~4 bytes/token is the usual rough ratio for prose; stated as approximate
+            # because the real number depends on the host's tokenizer.
+            "approx_total_tokens": total_bytes // 4,
+            "files": files,
+            "details": (
+                f"This workspace's instruction files total {per_agent_bytes:,} bytes and are "
+                f"reloaded into each of {agent_count} agents (~{total_bytes // 4:,} tokens "
+                "per run before any work). Threnody cannot trim them; shortening the "
+                "largest file is the single biggest per-agent saving available."
+            ),
+        }
+    except Exception:
+        log.debug("instruction_tax_report failed", exc_info=True)
+        return None
+
+
+def repo_context_prefix(
+    config: TGsConfig, *, workspace_root: str | None, task: str | None
+) -> str:
+    """The repo's learned beliefs + style, as a prefix for write-path prompts.
+
+    Beliefs and the style profile already existed but only reached the subprocess path
+    via ``context.enrich_subtask``, so every host-native agent rediscovered the repo's
+    conventions from scratch — once per agent, every run. Bounded by
+    ``BeliefsConfig.max_chars`` plus one line of style; empty on a fresh repo.
+
+    Applied here rather than in the plan builder on purpose: plans are cached by task
+    text, and baking repo-specific context into a cached plan would leak it across
+    runs and workspaces.
+    """
+    if config is None or not workspace_root:
+        return ""
+    economy = getattr(config, "prompt_economy", None)
+    if economy is None or not getattr(economy, "inject_beliefs_on_host", False):
+        return ""
+    try:
+        from .agents import _get_agent_db
+        from .context import build_repo_context_block
+
+        try:
+            db = _get_agent_db()
+        except Exception:
+            db = None
+        return build_repo_context_block(
+            workspace_root, query=task or "", db=db
+        ).strip()
+    except Exception:
+        log.debug("host_spawn: repo context prefix failed", exc_info=True)
+        return ""
+
+
+def _spawn_id_for_subtask(subtask: Mapping[str, Any], fallback: Any) -> str:
+    if subtask.get("id") is not None:
+        return str(subtask["id"])
+    if subtask.get("stable_id") is not None:
+        return str(subtask["stable_id"])
+    return str(fallback)
+
+
+def _upstream_forwarding_enabled(config: TGsConfig) -> bool:
+    host_native = getattr(config, "host_native", None) if config is not None else None
+    return bool(getattr(host_native, "forward_upstream_results", False))
+
+
+def _artifact_write_block(path: str) -> str:
+    """Instruction for an agent whose output other agents depend on."""
+    return (
+        f"Other agents in this run depend on your output. Write it to {path} "
+        "(create parent directories if needed) as well as replying normally, so they "
+        "can read it directly instead of re-deriving your analysis."
+    )
+
+
+def _artifact_read_block(upstream: list[dict[str, Any]]) -> str:
+    """Instruction for an agent whose dependencies left artifacts."""
+    listed = "\n".join(
+        f"- {item.get('id')}: {item.get('artifact_path')}" for item in upstream
+    )
+    return (
+        "Read these upstream results before starting — they are the output of the "
+        "agents this task depends on, and following them is cheaper and more accurate "
+        "than re-deriving their conclusions:\n"
+        f"{listed}\n"
+        "If an artifact is missing or contradicts what you find in the code, say so "
+        "in your output rather than silently improvising."
+    )
+
+
+def _materialize_replayed_findings(run_id: str, raw: Any) -> None:
+    """Write prior-review findings into the run's findings dir.
+
+    Cells served from prior-review memory have findings but never spawn an agent. The
+    in-process merge reads only findings files, so without this a fully-cached review
+    run would produce an empty report while the stored findings sat unused.
+    """
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return
+    try:
+        from .findings_merge import REPLAY_SOURCE, Finding, write_findings
+
+        records = []
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            summary = str(item.get("summary") or "").strip()
+            path = str(item.get("path") or "").strip()
+            if not summary or not path:
+                continue
+            try:
+                line = int(item.get("line") or 0)
+            except (TypeError, ValueError):
+                line = 0
+            records.append(
+                Finding(
+                    dimension=str(item.get("dimension") or "").strip().lower(),
+                    category=str(item.get("category") or "").strip().lower(),
+                    severity=str(item.get("severity") or "").strip().lower() or "medium",
+                    path=path,
+                    line=line,
+                    description=summary,
+                    source=REPLAY_SOURCE,
+                )
+            )
+        if records:
+            write_findings(run_id, REPLAY_SOURCE, records)
+    except Exception:
+        log.debug(
+            "host_spawn: replayed findings materialization failed for %s",
+            run_id,
+            exc_info=True,
+        )
+
+
 def build_host_spawn_waves(
     plan_dict: Mapping[str, Any],
     *,
     config: TGsConfig,
     caller: str | None,
     registry: Any | None = None,
+    run_id: str | None = None,
+    workspace_root: str | None = None,
+    task: str | None = None,
 ) -> list[dict[str, Any]]:
     subtasks = plan_dict.get("subtasks")
     waves = plan_dict.get("waves")
@@ -536,6 +825,31 @@ def build_host_spawn_waves(
         raw_id = raw.get("id") if isinstance(raw, dict) else None
         if raw_id is not None:
             subtask_by_id[_subtask_id_key(raw_id)] = raw
+
+    # The plan already decided how findings are merged; the spawn layer only honors
+    # it. "llm" means a synthesis agent reads the replies, so the replies must stay
+    # in the conversation.
+    findings_protocol = (
+        str(plan_dict.get("synthesis_mode") or "").strip().lower() == "python"
+    )
+    if findings_protocol and run_id:
+        _materialize_replayed_findings(run_id, plan_dict.get("replayed_findings"))
+
+    # Dependency-result forwarding: work out which subtasks are depended upon (they
+    # must leave an artifact) and, per subtask, where its dependencies left theirs.
+    forward_upstream = bool(run_id) and _upstream_forwarding_enabled(config)
+    # Resolved once per run: the text is identical for every agent, which is both the
+    # point (shared cacheable prefix) and the reason not to rebuild it per subtask.
+    repo_prefix = repo_context_prefix(
+        config, workspace_root=workspace_root, task=task
+    )
+    depended_upon: set[tuple[str, str]] = set()
+    if forward_upstream:
+        for raw in subtasks:
+            if not isinstance(raw, dict):
+                continue
+            for dep in raw.get("depends_on") or []:
+                depended_upon.add(_subtask_id_key(dep))
 
     host_waves: list[dict[str, Any]] = []
     for wave_idx, wave_ids in enumerate(waves, start=1):
@@ -576,6 +890,66 @@ def build_host_spawn_waves(
                 else None
             )
             subtask_read_only = bool(subtask.get("read_only", False))
+            resolved_spawn_id = _spawn_id_for_subtask(subtask, sid)
+
+            # Read-only agents are deliberately excluded: a reviewer primed with the
+            # repo's prior beliefs is a biased reviewer, and its findings feed
+            # review_learning — so contaminating them corrupts the signal, not just
+            # the review.
+            if repo_prefix and not subtask_read_only:
+                prompt = f"{repo_prefix}\n\n{prompt}"
+
+            artifact_path_str: str | None = None
+            upstream_specs: list[dict[str, Any]] = []
+            if forward_upstream:
+                try:
+                    from .run_log import artifact_path as _artifact_path
+
+                    if _subtask_id_key(sid) in depended_upon:
+                        artifact_path_str = str(
+                            _artifact_path(run_id or "", resolved_spawn_id)
+                        )
+                        prompt = prompt + "\n\n" + _artifact_write_block(artifact_path_str)
+                    for dep in subtask.get("depends_on") or []:
+                        dep_subtask = subtask_by_id.get(_subtask_id_key(dep))
+                        if not isinstance(dep_subtask, dict):
+                            continue
+                        dep_spawn_id = _spawn_id_for_subtask(dep_subtask, dep)
+                        upstream_specs.append(
+                            {
+                                "id": dep_spawn_id,
+                                "artifact_path": str(
+                                    _artifact_path(run_id or "", dep_spawn_id)
+                                ),
+                            }
+                        )
+                    if upstream_specs:
+                        prompt = prompt + "\n\n" + _artifact_read_block(upstream_specs)
+                except Exception:
+                    log.debug(
+                        "host_spawn_waves: upstream forwarding failed for %r",
+                        sid,
+                        exc_info=True,
+                    )
+            # Findings-file protocol: only for review cells, only when a run id is
+            # known (it names the file), and only when the merge will actually read
+            # those files. With synthesis_mode=llm the synthesis agent reads the
+            # agents' replies, so redirecting them to disk would starve it.
+            review_dimension = str(subtask.get("review_dimension") or "").strip()
+            if review_dimension and run_id and findings_protocol:
+                try:
+                    prompt = (
+                        prompt
+                        + "\n\n"
+                        + _findings_protocol_block(
+                            run_id, resolved_spawn_id, review_dimension
+                        )
+                    )
+                except Exception:
+                    log.debug(
+                        "host_spawn_waves: findings protocol injection failed",
+                        exc_info=True,
+                    )
             agents.append(
                 build_host_spawn(
                     config=config,
@@ -584,18 +958,17 @@ def build_host_spawn_waves(
                     prompt=prompt,
                     wave_id=f"wave-{wave_idx}",
                     target_files=_subtask_target_files(subtask),
-                    spawn_id=str(
-                        subtask["id"]
-                        if subtask.get("id") is not None
-                        else (
-                            subtask["stable_id"]
-                            if subtask.get("stable_id") is not None
-                            else sid
-                        )
-                    ),
+                    spawn_id=resolved_spawn_id,
                     model=model,
                     subagent_type=subtask_subagent_type,
                     read_only=subtask_read_only,
+                    pattern_hash=(
+                        str(subtask.get("pattern_hash")).strip()
+                        if subtask.get("pattern_hash")
+                        else None
+                    ),
+                    artifact_path=artifact_path_str,
+                    upstream=upstream_specs,
                 ).to_dict()
             )
         if agents:

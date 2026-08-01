@@ -115,6 +115,11 @@ class Subtask:
     content_sha: str | None = None          # reviewed revision digest
     hybrid_profile_key: str | None = None   # hybrid_tier_bias learning key
     hybrid_delta: int | None = None         # applied implement-tier delta
+    # Prompt-independent learning key. Set by builders whose prompt wording varies
+    # with prompt-economy settings (review fanout), so `subtask_patterns` keys on the
+    # kind of work instead of the rendered text. None → learning hashes the
+    # description, which is the historical behaviour.
+    pattern_hash: str | None = None
     _consumes_explicit: bool = False
     _produces_explicit: bool = False
     _is_coordinator_explicit: bool = False
@@ -158,6 +163,16 @@ class ExecutionPlan:
     # File-coverage accounting from the plan builder:
     # {files_total, files_assigned, deferred: [...]}. Empty when not computed.
     coverage: dict[str, object] = field(default_factory=dict)
+    # How a review fan-out's findings are merged: "python" (in-process, no synthesis
+    # agent) or "llm". Set by review_fanout; read at spawn build to decide whether
+    # review agents write findings to a file instead of into their reply.
+    synthesis_mode: str = ""
+    # Files the review fan-out actually covers, so an in-process merge can name them
+    # without re-deriving the list from subtask targets.
+    reviewed_files: list[str] = field(default_factory=list)
+    # Findings carried over from prior-review memory (no agent runs for those cells).
+    # Materialized into the run's findings dir so an in-process merge includes them.
+    replayed_findings: list[dict[str, object]] = field(default_factory=list)
     _topology_explicit: bool = False
     _max_rounds_explicit: bool = False
 
@@ -1268,8 +1283,15 @@ class Planner:
         default_tier: str = "medium",
         topology: str | None = None,
         max_agents: int | None = None,
+        caller: str | None = None,
     ) -> ExecutionPlan:
-        """Decompose a task using local heuristics (no external planner LLM)."""
+        """Decompose a task using local heuristics (no external planner LLM).
+
+        ``caller`` selects the host's prompt-economy capabilities and is part of the
+        plan cache key: the emitted prompts differ per host (a host that resolves a
+        named subagent definition omits the instruction text that a host without one
+        must be given inline), so plans are not interchangeable between callers.
+        """
         constraints: list[str] = []
         normalized_topology = str(topology or "").strip().lower()
         if normalized_topology:
@@ -1282,6 +1304,8 @@ class Planner:
         if constraints:
             constraint_suffix = "\n\nEXECUTION CONSTRAINTS:\n" + "\n".join(constraints)
         cache_key = task + constraint_suffix
+        if caller:
+            cache_key += f"\n\nCALLER: {caller}"
 
         if not skip_cache and self._db:
             lookup = self._db.plan_lookup(cache_key)
@@ -1331,6 +1355,7 @@ class Planner:
             topology=topology,
             intent_templates=intent_templates,
             coupled_strategy=coupled_strategy,
+            caller=caller,
         )
         plan = self._build_plan(parsed, task)
         plan.planner_mode = "heuristic"
@@ -1483,6 +1508,7 @@ class Planner:
                     st_data.get("hybrid_profile_key")
                 ),
                 hybrid_delta=hybrid_delta,
+                pattern_hash=self._coerce_optional_text(st_data.get("pattern_hash")),
                 _consumes_explicit=consumes_explicit,
                 _produces_explicit=produces_explicit,
                 _is_coordinator_explicit=is_coordinator_explicit,
@@ -1516,6 +1542,23 @@ class Planner:
         ] if isinstance(raw_inline, (list, tuple)) else []
         raw_coverage = parsed.get("coverage")
         coverage = dict(raw_coverage) if isinstance(raw_coverage, dict) else {}
+        raw_synthesis_mode = parsed.get("synthesis_mode")
+        synthesis_mode = (
+            str(raw_synthesis_mode).strip().lower()
+            if isinstance(raw_synthesis_mode, str)
+            and str(raw_synthesis_mode).strip().lower() in {"python", "llm"}
+            else ""
+        )
+        raw_reviewed = parsed.get("reviewed_files")
+        reviewed_files = [
+            str(path).strip()
+            for path in raw_reviewed
+            if str(path).strip()
+        ] if isinstance(raw_reviewed, (list, tuple)) else []
+        raw_replayed = parsed.get("replayed_findings")
+        replayed_findings = [
+            dict(item) for item in raw_replayed if isinstance(item, dict)
+        ] if isinstance(raw_replayed, (list, tuple)) else []
 
         plan = ExecutionPlan(
             analysis=parsed.get("analysis", "Planner decomposition"),
@@ -1523,6 +1566,9 @@ class Planner:
             waves=waves,
             inline_files=inline_files,
             coverage=coverage,
+            synthesis_mode=synthesis_mode,
+            reviewed_files=reviewed_files,
+            replayed_findings=replayed_findings,
             total_agents=len(subtasks),
             strategy=strategy,
             topology=topology,
@@ -1860,9 +1906,17 @@ class Planner:
                 subtask_payload["hybrid_profile_key"] = st.hybrid_profile_key
             if st.hybrid_delta is not None:
                 subtask_payload["hybrid_delta"] = st.hybrid_delta
+            if st.pattern_hash:
+                subtask_payload["pattern_hash"] = st.pattern_hash
             payload.setdefault("subtasks", []).append(subtask_payload)
         if plan.inline_files:
             payload["inline_files"] = list(plan.inline_files)
         if plan.coverage:
             payload["coverage"] = dict(plan.coverage)
+        if plan.synthesis_mode:
+            payload["synthesis_mode"] = plan.synthesis_mode
+        if plan.reviewed_files:
+            payload["reviewed_files"] = list(plan.reviewed_files)
+        if plan.replayed_findings:
+            payload["replayed_findings"] = [dict(item) for item in plan.replayed_findings]
         return payload

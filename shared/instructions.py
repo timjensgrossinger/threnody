@@ -111,6 +111,22 @@ def _render_claude_pointer_block(
             "",
         ])
 
+    lines.extend([
+        "### Prompt economy",
+        "",
+        "Everything a subagent prompt carries is paid once **per agent**, so a fan-out past ~4 "
+        "agents multiplies it. Threnody handles this in the spawn payload — pass it through "
+        "rather than rewriting it:",
+        "- When an agent spec carries `artifact_path`, its prompt already tells it to write its "
+        "output there; when it carries `upstream[]`, its prompt already tells it to read those "
+        "files. Do not re-paste an upstream agent's output into dependent prompts.",
+        "- Review agents may be told to write findings to a file and reply with counts only. That "
+        "is deliberate: Threnody merges them in-process. Do not ask them to repeat the findings.",
+        "- A wide fan-out may return `instruction_tax_warning`, reporting how many tokens this "
+        "workspace's own instruction files cost across the run. Only the operator can shrink those.",
+        "",
+    ])
+
     if not profile.route_task_mandatory:
         lines.extend([
             "### Guarded mode",

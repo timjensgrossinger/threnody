@@ -445,7 +445,13 @@ class TaskRouter:
     # ------------------------------------------------------------------
 
     def is_learning_enabled(self, project_id: str) -> bool:
-        """Return whether project-local learning is enabled for this project."""
+        """Return whether project-local learning is enabled for this project.
+
+        A stored row always wins, so an operator who turned learning off stays
+        off. A project with NO row falls back to ``project_learning_default`` —
+        without that, a never-configured project could never accumulate routing
+        feedback, which is every project by default.
+        """
         if not self._db or not project_id:
             return False
         try:
@@ -454,7 +460,9 @@ class TaskRouter:
                     "SELECT learning_enabled FROM project_routing WHERE project_path = ?",
                     (project_id,),
                 ).fetchone()
-            return bool(row[0]) if row else False
+            if row is not None:
+                return bool(row[0])
+            return bool(getattr(self._config, "project_learning_default", True))
         except Exception:
             log.debug("Failed to read learning flag for %s", project_id, exc_info=True)
             return False

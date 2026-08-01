@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -15,8 +16,23 @@ from shared.review_fanout import (
     estimate_complexity,
     is_fast_review_intent,
     is_review_intent,
+    resolve_synthesis_mode,
     tier_for,
 )
+
+
+def _llm_synthesis_config() -> SimpleNamespace:
+    """Config stub pinning the LLM synthesis agent.
+
+    Tests that assert properties *of the synthesis agent* (its tier, its
+    depends_on) must pin the mode: under `python` synthesis there is no agent to
+    assert about, because the merge happens in-process (shared/findings_merge.py).
+    """
+    return SimpleNamespace(review_synthesis_mode="llm")
+
+
+def _python_synthesis_config() -> SimpleNamespace:
+    return SimpleNamespace(review_synthesis_mode="python")
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +301,50 @@ class TestTierFor:
         logic2 = [s for s in plan2["subtasks"] if s.get("subagent_type") == "review-logic"]
         assert logic2 and logic2[0]["tier"] == "medium"
 
+    def test_global_profile_key_bias_applies_to_every_profile(self, tmp_path: Path):
+        """The objective quality loop is per-(model, dimension), not per-file-shape."""
+        from shared.review_fanout import GLOBAL_PROFILE_KEY
+
+        f = tmp_path / "m.py"
+        f.write_text("\n".join(f"x{i} = {i}" for i in range(300)), encoding="utf-8")
+        plan = build_review_subtasks(
+            [(str(f), "")],
+            f"REVIEW: {f} [dims=logic]",
+            tier_bias={(GLOBAL_PROFILE_KEY, "logic"): 1},
+        )
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        assert logic and logic[0]["tier"] == "high"
+
+    def test_profile_and_global_bias_clamp_to_one_step(self, tmp_path: Path):
+        """Two independent learners must not compound into a two-tier jump."""
+        from shared.review_fanout import GLOBAL_PROFILE_KEY
+
+        f = tmp_path / "m.py"
+        f.write_text("\n".join(f"x{i} = {i}" for i in range(300)), encoding="utf-8")
+        pk = "%s|mid|flat" % ".py"
+        plan = build_review_subtasks(
+            [(str(f), "")],
+            f"REVIEW: {f} [dims=logic]",
+            tier_bias={(pk, "logic"): 1, (GLOBAL_PROFILE_KEY, "logic"): 1},
+        )
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        # medium + clamp(1+1) == medium + 1 == high, not beyond.
+        assert logic and logic[0]["tier"] == "high"
+
+    def test_opposing_biases_cancel(self, tmp_path: Path):
+        from shared.review_fanout import GLOBAL_PROFILE_KEY
+
+        f = tmp_path / "m.py"
+        f.write_text("\n".join(f"x{i} = {i}" for i in range(300)), encoding="utf-8")
+        pk = "%s|mid|flat" % ".py"
+        plan = build_review_subtasks(
+            [(str(f), "")],
+            f"REVIEW: {f} [dims=logic]",
+            tier_bias={(pk, "logic"): 1, (GLOBAL_PROFILE_KEY, "logic"): -1},
+        )
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        assert logic and logic[0]["tier"] == "medium"
+
     # --- density-aware tiering (density_score passed) ---
 
     def test_dense_midsize_reasoning_heavy_escalates_to_high(self):
@@ -480,7 +540,9 @@ class TestBuildReviewSubtasks:
         f = tmp_path / "tiny.md"
         f.write_text("\n".join(f"line {i}" for i in range(10)), encoding="utf-8")
         entries = [(str(f), "")]
-        result = build_review_subtasks(entries, f"REVIEW: {f}")
+        result = build_review_subtasks(
+            entries, f"REVIEW: {f}", config=_llm_synthesis_config()
+        )
 
         subtasks = result["subtasks"]
         review = [s for s in subtasks if not s.get("depends_on")]
@@ -490,10 +552,24 @@ class TestBuildReviewSubtasks:
         assert len(review) >= 1
         assert result["topology"] == "dag"
 
+    def test_python_synthesis_drops_the_agent(self, tmp_path: Path):
+        """python mode plans no synthesis agent — the merge is in-process."""
+        f = tmp_path / "tiny.md"
+        f.write_text("\n".join(f"line {i}" for i in range(10)), encoding="utf-8")
+        result = build_review_subtasks(
+            [(str(f), "")], f"REVIEW: {f}", config=_python_synthesis_config()
+        )
+        assert result["synthesis_mode"] == "python"
+        assert [s for s in result["subtasks"] if s.get("depends_on")] == []
+        # The reviewed-file list must survive so the in-process report can name them.
+        assert result["reviewed_files"] == [str(f)]
+
     def test_synthesis_depends_on_all_review_ids(self, tmp_path: Path):
         f = tmp_path / "file.md"
         f.write_text("\n".join(f"line {i}" for i in range(10)), encoding="utf-8")
-        result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
+        result = build_review_subtasks(
+            [(str(f), "")], f"REVIEW: {f}", config=_llm_synthesis_config()
+        )
         subtasks = result["subtasks"]
         review_ids = [s["id"] for s in subtasks if not s.get("depends_on")]
         synth = next(s for s in subtasks if s.get("depends_on"))
@@ -558,29 +634,39 @@ class TestBuildReviewSubtasks:
     def test_synthesis_defaults_to_medium(self, tmp_path: Path):
         f = tmp_path / "tiny.md"
         f.write_text("\n".join(f"line {i}" for i in range(10)), encoding="utf-8")
-        result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
+        result = build_review_subtasks(
+            [(str(f), "")], f"REVIEW: {f}", config=_llm_synthesis_config()
+        )
         synth = next(s for s in result["subtasks"] if s.get("depends_on"))
         assert synth["tier"] == "medium"
 
     def test_synthesis_stays_medium_on_ordinary_risk(self, tmp_path: Path):
         f = tmp_path / "secrets.md"
         f.write_text("token = 'abc'\n", encoding="utf-8")
-        result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
+        result = build_review_subtasks(
+            [(str(f), "")], f"REVIEW: {f}", config=_llm_synthesis_config()
+        )
         synth = next(s for s in result["subtasks"] if s.get("depends_on"))
         assert synth["tier"] == "medium"
 
     def test_synthesis_high_on_concrete_high_risk(self, tmp_path: Path):
         f = tmp_path / "runner.md"
         f.write_text("subprocess.run(cmd, shell=True)\n", encoding="utf-8")
-        result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
+        result = build_review_subtasks(
+            [(str(f), "")], f"REVIEW: {f}", config=_llm_synthesis_config()
+        )
         synth = next(s for s in result["subtasks"] if s.get("depends_on"))
         assert synth["tier"] == "high"
 
     def test_max_agents_drops_lowest_priority_first(self, tmp_path: Path):
-        # Complex file would have 5 dims → cap to 3 review + 1 synthesis = 4 total
+        # Complex file would have 5 dims → cap to 3 review + 1 synthesis = 4 total.
+        # Pinned to llm mode: that "+ 1 synthesis" is what reserves the fourth slot,
+        # and under python synthesis all 4 would correctly go to review cells.
         f = tmp_path / "big.md"
         f.write_text("\n".join(f"line {i}" for i in range(210)), encoding="utf-8")
-        result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}", max_agents=4)
+        result = build_review_subtasks(
+            [(str(f), "")], f"REVIEW: {f}", max_agents=4, config=_llm_synthesis_config()
+        )
         review = [s for s in result["subtasks"] if not s.get("depends_on")]
         assert len(review) <= 3
         # Performance (drop_priority=4) should be absent when capped
@@ -653,7 +739,11 @@ class TestBuildReviewSubtasks:
         # Both trivial → 2 dims each = 4 review + 1 synthesis
         f1.write_text("\n".join(f"l{i}" for i in range(5)), encoding="utf-8")
         f2.write_text("\n".join(f"l{i}" for i in range(5)), encoding="utf-8")
-        result = build_review_subtasks([(str(f1), ""), (str(f2), "")], "REVIEW: a.md b.md")
+        result = build_review_subtasks(
+            [(str(f1), ""), (str(f2), "")],
+            "REVIEW: a.md b.md",
+            config=_llm_synthesis_config(),
+        )
         review = [s for s in result["subtasks"] if not s.get("depends_on")]
         synthesis = [s for s in result["subtasks"] if s.get("depends_on")]
         assert len(synthesis) == 1
@@ -738,11 +828,16 @@ class TestHeuristicPlannerIntegration:
         result = build_heuristic_plan_payload(f"REVIEW: {f}")
         assert result["topology"] == "dag"
         subtasks = result["subtasks"]
-        # Must have at least one review subtask and one synthesis
         review = [s for s in subtasks if not s.get("depends_on")]
         synthesis = [s for s in subtasks if s.get("depends_on")]
         assert len(review) >= 1
-        assert len(synthesis) == 1
+        # A merge step must always exist, but its mechanism depends on the resolved
+        # synthesis mode: an agent for `llm`, in-process for `python`.
+        assert result["synthesis_mode"] in {"python", "llm"}
+        if result["synthesis_mode"] == "llm":
+            assert len(synthesis) == 1
+        else:
+            assert synthesis == []
 
     def test_non_review_task_unaffected(self):
         from shared.heuristic_plan import build_heuristic_plan_payload

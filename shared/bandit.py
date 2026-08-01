@@ -2,8 +2,11 @@
 Contextual bandit routing policy (plan 11).
 
 LinUCB / Thompson sampling over (tier, provider_id) arms.
-Runs in shadow mode by default — logs picks but executes heuristic choice.
-Promote to live via config.routing.bandit_mode = 'live'.
+Shadow-only today: arms are updated from recorded outcomes (currently consensus
+persona picks, see host_learning) and readable via ``arm_stats``, but nothing
+executes a bandit choice. There is no ``config.routing.bandit_mode`` knob — that
+config section does not exist; promoting this to live routing is unimplemented
+work, not a setting.
 """
 from __future__ import annotations
 

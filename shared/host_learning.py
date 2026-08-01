@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -292,12 +293,37 @@ def _ensure_host_run_meta(db: Database, run_id: str) -> dict[str, Any]:
     return _HOST_RUN_META.setdefault(run_id, {})
 
 
+def _normalize_path_key(path: object, base: str | None = None) -> str:
+    """Canonical key for matching a touched file to a planned target_file.
+
+    Handoff snapshots may hold workspace-relative paths while hook-captured
+    records hold absolute ones, so both sides are resolved against the run's
+    workspace root before comparison.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    try:
+        if base and not os.path.isabs(raw):
+            raw = os.path.join(base, raw)
+        return os.path.realpath(raw)
+    except Exception:  # pragma: no cover - defensive
+        return raw
+
+
 def _index_handoff_snapshots(
     snapshots: list[dict[str, object]],
-) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]], dict[tuple[int, int], dict[str, object]]]:
+    workspace_root: str | None = None,
+) -> tuple[
+    dict[str, dict[str, object]],
+    dict[str, dict[str, object]],
+    dict[tuple[int, int], dict[str, object]],
+    dict[str, dict[str, object]],
+]:
     by_task_id: dict[str, dict[str, object]] = {}
     by_spawn_id: dict[str, dict[str, object]] = {}
     by_wave_agent: dict[tuple[int, int], dict[str, object]] = {}
+    by_target_file: dict[str, dict[str, object]] = {}
     for snap in snapshots:
         task_id = snap.get("task_id")
         if isinstance(task_id, str) and task_id.strip():
@@ -306,15 +332,53 @@ def _index_handoff_snapshots(
         if isinstance(spawn_id, str) and spawn_id.strip():
             by_spawn_id[spawn_id.strip()] = snap
         wave_raw = snap.get("wave")
-        worker_raw = snap.get("worker_index")
+        # Prefer the per-wave agent_index: worker_index is a run-global counter,
+        # so on wave 2+ it never equals the caller's per-wave agent position.
+        worker_raw = snap.get("agent_index")
+        if worker_raw is None:
+            worker_raw = snap.get("worker_index")
         try:
             wave_num = int(wave_raw) if wave_raw is not None else 0
-            worker_num = int(worker_raw) if worker_raw is not None else int(snap.get("worker_index") or 0)
+            worker_num = int(worker_raw) if worker_raw is not None else 0
         except (TypeError, ValueError):
             continue
         if wave_num > 0:
             by_wave_agent[(wave_num, worker_num)] = snap
-    return by_task_id, by_spawn_id, by_wave_agent
+        # Path index: the only key a PostToolUse-captured edit can be matched on,
+        # since the hook has no spawn_id/task_id to report. On collision keep the
+        # earliest wave — the agent that wrote the file, not a later fixer.
+        targets = snap.get("target_files")
+        if isinstance(targets, list):
+            for target in targets:
+                key = _normalize_path_key(target, workspace_root)
+                if not key:
+                    continue
+                prior = by_target_file.get(key)
+                if prior is None:
+                    by_target_file[key] = snap
+                    continue
+                try:
+                    prior_wave = int(prior.get("wave") or 0)
+                except (TypeError, ValueError):
+                    prior_wave = 0
+                if 0 < wave_num < prior_wave or prior_wave == 0:
+                    by_target_file[key] = snap
+    return by_task_id, by_spawn_id, by_wave_agent, by_target_file
+
+
+def _agent_touched_files(agent: Mapping[str, Any]) -> list[str]:
+    """Files an agent reported writing, across report and hook payload shapes."""
+    out: list[str] = []
+    for key in ("touched_files", "target_files"):
+        raw = agent.get(key)
+        if isinstance(raw, list):
+            out.extend(str(p) for p in raw if str(p).strip())
+        elif isinstance(raw, str) and raw.strip():
+            out.append(raw.strip())
+    single = agent.get("target_file")
+    if isinstance(single, str) and single.strip():
+        out.append(single.strip())
+    return out
 
 
 def _enrich_agent_from_handoff(
@@ -325,6 +389,8 @@ def _enrich_agent_from_handoff(
     snapshots_by_wave_agent: Mapping[tuple[int, int], Mapping[str, object]],
     wave_index: int,
     agent_index: int,
+    snapshots_by_target_file: Mapping[str, Mapping[str, object]] | None = None,
+    workspace_root: str | None = None,
 ) -> dict[str, Any]:
     """Merge handoff snapshot fields into a wave report agent payload."""
     merged: dict[str, Any] = dict(agent)
@@ -336,11 +402,22 @@ def _enrich_agent_from_handoff(
         spawn_raw = agent.get("spawn_id") or agent.get("id")
         if isinstance(spawn_raw, str) and spawn_raw.strip():
             snap = snapshots_by_spawn_id.get(spawn_raw.strip())
+    if snap is None and snapshots_by_target_file:
+        # Path match comes BEFORE the positional fallback: a hook-captured record
+        # carries no spawn_id/task_id and lands on a synthetic wave/index, so
+        # (wave_index, agent_index) would match some unrelated planned agent.
+        for touched in _agent_touched_files(agent):
+            candidate = snapshots_by_target_file.get(
+                _normalize_path_key(touched, workspace_root)
+            )
+            if candidate is not None:
+                snap = candidate
+                break
     if snap is None:
         snap = snapshots_by_wave_agent.get((wave_index, agent_index))
     if snap is None:
         return merged
-    for key in ("prompt", "tier", "model", "task_id"):
+    for key in ("prompt", "tier", "model", "task_id", "spawn_id"):
         if not merged.get(key) and snap.get(key):
             merged[key] = snap[key]
     if not merged.get("description") and snap.get("prompt"):
@@ -764,6 +841,52 @@ def _build_review_outcome(
     }
 
 
+def _backfill_review_meta(
+    run_id: str,
+    spawn_id: str,
+    agent_spec: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Derive ``review_meta`` from this agent's findings file when the host omitted it.
+
+    Under the findings-file protocol a review agent replies with counts only, so the
+    host has nothing to build ``review_meta`` from — without this, every review
+    learning signal (``review_tier_bias``, prior-review memory, the quality ledger)
+    would silently stop. Parsing the file here also yields the per-category
+    breakdown, which is *more* than hosts usually report: the static-recall scorer
+    skips scoring entirely when categories are absent.
+
+    Returns *result* unchanged when the host already reported ``review_meta``, when
+    this is not a review agent, or when no findings file exists.
+    """
+    if isinstance(result.get("review_meta"), Mapping):
+        return result
+    if not run_id or not spawn_id:
+        return result
+    if not str(agent_spec.get("subagent_type") or "") in _REVIEW_SUBAGENT_TO_DIM:
+        return result
+    try:
+        from .findings_merge import findings_path, parse_findings_text, review_meta_for
+
+        path = findings_path(run_id, spawn_id)
+        if not path.is_file():
+            return result
+        findings = parse_findings_text(
+            path.read_text(encoding="utf-8", errors="replace"), source=spawn_id
+        )
+        merged = dict(result)
+        merged["review_meta"] = review_meta_for(findings)
+        return merged
+    except Exception:
+        log.debug(
+            "host_learning: review_meta backfill failed for %s/%s",
+            run_id,
+            spawn_id,
+            exc_info=True,
+        )
+        return result
+
+
 def _record_review_memory(
     db: Database,
     outcome: Mapping[str, Any],
@@ -994,9 +1117,14 @@ def build_host_agent_record(
         outcome_summary=outcome_summary,
         quality_score=eval_quality,
     )
-    ph = pattern_hash(description)
+    # Prefer the builder's prompt-independent key when the spawn carried one. Prompt
+    # wording varies with prompt-economy settings, and hashing it would mint a new
+    # pattern for the same kind of work, orphaning accumulated rows.
+    carried_hash = str(agent_spec.get("pattern_hash") or "").strip()
+    ph = carried_hash or pattern_hash(description)
     resolved_project = project_id or _HOST_RUN_META.get(run_id, {}).get("project_id") or "default-project"
 
+    result = _backfill_review_meta(run_id, spawn_id, agent_spec, result)
     review_outcome = _build_review_outcome(agent_spec, result, tier)
     if review_outcome is not None:
         review_outcome["run_id"] = run_id
@@ -1125,7 +1253,9 @@ def ingest_host_wave(
     )
 
     snapshots = db.get_handoff_agent_snapshots(run_id)
-    by_task_id, by_spawn_id, by_wave_agent = _index_handoff_snapshots(snapshots)
+    by_task_id, by_spawn_id, by_wave_agent, by_target_file = _index_handoff_snapshots(
+        snapshots, effective_root
+    )
 
     tracker = _wave_tracker(run_id)
     wave_files: set[str] = set()
@@ -1154,6 +1284,8 @@ def ingest_host_wave(
             snapshots_by_wave_agent=by_wave_agent,
             wave_index=wave_index,
             agent_index=agent_index,
+            snapshots_by_target_file=by_target_file,
+            workspace_root=effective_root,
         )
         spawn_id = str(enriched.get("spawn_id") or enriched.get("id") or "")
         spec = {
@@ -1457,15 +1589,43 @@ def import_run_log(
         return {"already_imported": True, "run_id": run_id}
 
     records = run_log.read_run_log(run_id)
-    waves: dict[int, list[dict[str, Any]]] = {}
-    for rec in records:
-        if not isinstance(rec, Mapping):
-            continue
+
+    # Hook-captured records carry no wave (the PostToolUse hook has no wave
+    # context), so recover it from the planned agent that owns the touched file.
+    # Without this every hook record collapses onto wave 1 and cross-wave rework
+    # detection sees a single flat wave.
+    by_target_file: dict[str, Mapping[str, object]] = {}
+    try:
+        _, _, _, by_target_file = _index_handoff_snapshots(
+            db.get_handoff_agent_snapshots(run_id), workspace_root
+        )
+    except Exception:
+        log.debug("handoff path index unavailable for %s", run_id, exc_info=True)
+
+    def _resolve_wave(rec: Mapping[str, Any]) -> int:
         try:
             w = int(rec.get("wave", 1))
         except (TypeError, ValueError):
             w = 1
-        waves.setdefault(max(1, w), []).append(dict(rec))
+        if w > 0:
+            return w
+        for touched in _agent_touched_files(rec):
+            snap = by_target_file.get(_normalize_path_key(touched, workspace_root))
+            if snap is None:
+                continue
+            try:
+                snap_wave = int(snap.get("wave") or 0)
+            except (TypeError, ValueError):
+                continue
+            if snap_wave > 0:
+                return snap_wave
+        return 1
+
+    waves: dict[int, list[dict[str, Any]]] = {}
+    for rec in records:
+        if not isinstance(rec, Mapping):
+            continue
+        waves.setdefault(_resolve_wave(rec), []).append(dict(rec))
 
     ordered = sorted(waves)
     result: dict[str, Any] = {"run_id": run_id, "imported_waves": len(ordered)}
@@ -1906,6 +2066,12 @@ def finalize_host_swarm(
     }
     if swarm_outcome_error:
         result["swarm_outcome_error"] = swarm_outcome_error
+    review_report = _build_python_review_report(run_id)
+    if review_report is not None:
+        # A review run that used the findings-file protocol has no synthesis agent;
+        # the ranked report is produced here instead, in the same shape the synthesis
+        # prompt specified so consumers cannot tell the difference except by cost.
+        result["review_report"] = review_report
     if verify_report is not None:
         result["verify_report"] = verify_report
         followup = verify_report.get("followup")
@@ -1919,6 +2085,38 @@ def finalize_host_swarm(
     if all_warnings:
         result["warnings"] = all_warnings
     return result
+
+
+def _build_python_review_report(run_id: str) -> dict[str, Any] | None:
+    """Merge this run's findings files into one ranked report, in-process.
+
+    Returns ``None`` when the run wrote no findings files — i.e. it was not a review
+    run, or it ran with ``synthesis_mode=llm`` and a synthesis agent produced the
+    report instead. Never raises: a merge failure must not fail the terminal report,
+    and the individual findings files remain on disk either way.
+    """
+    if not run_id:
+        return None
+    try:
+        from .findings_merge import merge, read_run_findings, render_report
+
+        per_agent = read_run_findings(run_id)
+        if not per_agent:
+            return None
+        flat = [f for findings in per_agent.values() for f in findings]
+        merged = merge(flat)
+        reviewed_files = sorted({f.path for f in flat})
+        return {
+            "source": "python",
+            "agents": len(per_agent),
+            "findings_total": merged.total,
+            "duplicates_collapsed": len(merged.duplicates),
+            "counts_by_severity": merged.counts_by_severity,
+            "report": render_report(merged, reviewed_files=reviewed_files),
+        }
+    except Exception:
+        log.debug("host_learning: python review merge failed for %s", run_id, exc_info=True)
+        return None
 
 
 def inspect_host_swarm(db: Database, run_id: str) -> dict[str, Any] | None:
