@@ -66,6 +66,7 @@ class AgentDefinition:
     definition: str
     match_count: int = 0
     id: str | None = None
+    role: str | None = None
 
     @property
     def context_preamble(self) -> str:
@@ -636,6 +637,10 @@ def generate_agent_draft(project_id: str, candidate: dict, db: Database | None =
     model = _infer_model_alias(candidate)
     description = _summarize_candidate_description(project_id, candidate)
     lane = str(readiness.get("lane") or "shared")
+    from .roles import derive_role_from_task, DEFAULT_ROLE
+    candidate_desc = str(candidate.get("description") or "")
+    derived_role = derive_role_from_task(candidate_desc)
+    suggested_role = derived_role if derived_role != DEFAULT_ROLE else None
     draft = {
         "id": draft_id,
         "project_id": project_id,
@@ -658,6 +663,7 @@ def generate_agent_draft(project_id: str, candidate: dict, db: Database | None =
         "created_at": created_at,
         "updated_at": created_at,
         "fingerprint": fingerprint,
+        "role": suggested_role,
     }
 
     existing = database.get_agent_definition(fingerprint)
@@ -1616,10 +1622,12 @@ def _parse_sections(md_text: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def match_agent(subtask_desc: str, agents: list[AgentDefinition],
-                min_score: float = 0.3) -> PatternMatch | None:
+                min_score: float = 0.3, subtask_role: str | None = None) -> PatternMatch | None:
     """Find the best matching agent for a subtask description.
 
     Uses keyword overlap between the subtask and agent pattern_desc + definition.
+    If subtask_role is provided and agent has a role, they must match (role gating).
+    Agents with no role set match any subtask (backward compat).
     Returns the best match above min_score, or None.
     """
     if not agents:
@@ -1632,6 +1640,9 @@ def match_agent(subtask_desc: str, agents: list[AgentDefinition],
     best_match: PatternMatch | None = None
 
     for agent in agents:
+        if agent.role and subtask_role and agent.role != subtask_role:
+            continue
+
         agent_kw = extract_keywords(agent.pattern_desc)
         agent_kw |= extract_keywords(agent.definition)
 
@@ -1671,6 +1682,29 @@ class AgentRegistry:
         self._project_path = Path.cwd()
         self._agents_cache: list[AgentDefinition] | None = None
         log.debug("AgentRegistry initialized (threshold=%d)", self._threshold)
+
+    @staticmethod
+    def _extract_role_from_definition(row: dict) -> str | None:
+        """Extract role from stored agent definition JSON.
+
+        Role is stored as draft["role"] in the definition JSON blob.
+        Falls back to None if not present (legacy agents match any role).
+        """
+        import json as _json
+        definition_raw = row.get("definition") or ""
+        if not definition_raw:
+            return None
+        try:
+            if isinstance(definition_raw, str):
+                definition = _json.loads(definition_raw)
+            elif isinstance(definition_raw, dict):
+                definition = definition_raw
+            else:
+                return None
+        except (ValueError, TypeError):
+            return None
+        role = definition.get("role")
+        return str(role).strip() if isinstance(role, str) and role.strip() else None
 
     def track_subtask(self, description: str, tier: str) -> int:
         """Track a subtask occurrence. Returns occurrence count.
@@ -1814,6 +1848,7 @@ class AgentRegistry:
                 definition=r["definition"],
                 match_count=r["match_count"],
                 id=r.get("id"),
+                role=self._extract_role_from_definition(r),
             )
             for r in rows
             if r.get("promotion_state", "active") == "active"
@@ -1844,7 +1879,9 @@ class AgentRegistry:
             desc = st.get("description", "")
             if st.get("agent_assigned"):
                 continue  # already assigned — don't stack preambles
-            result = match_agent(desc, agents)
+            from .roles import derive_role_from_task
+            st_role = st.get("role") or derive_role_from_task(desc)
+            result = match_agent(desc, agents, subtask_role=st_role)
             if result:
                 preamble = result.agent.context_preamble
                 if preamble and preamble not in desc:
@@ -1937,6 +1974,7 @@ class AgentRegistry:
                     definition=agent.get('definition', ''),
                     match_count=agent.get('match_count', 0),
                     id=agent.get('id'),
+                    role=self._extract_role_from_definition(agent),
                 )
                 for agent in active_agents
             ]

@@ -493,12 +493,16 @@ def build_quality_snapshot(
     *,
     since: str = _DEFAULT_WINDOW,
     config: "TGsConfig | None" = None,
+    by_role: bool = False,
 ) -> dict[str, Any]:
     """Return the aggregated model-quality ledger for operator/MCP/doc surfaces.
 
     Groups ``model_quality_events`` by ``(model, effort, dimension, sub_dimension)``
     with mean score, sample count, and per-source breakdown, joined with an
     approximate escalation rate per ``(model, effort)``. Empty-safe on a fresh DB.
+
+    When ``by_role=True``, additionally returns a ``by_role`` facet joining with
+    ``telemetry.role`` to show per-role quality breakdown.
     """
     since_ts, window_label = parse_quality_window(since)
     rows_out: list[dict[str, Any]] = []
@@ -573,6 +577,7 @@ def build_quality_snapshot(
         "event_count": total_events,
         "scored_outputs": scored_outputs,
         "rows": rows_out,
+        "by_role": _build_by_role_facet(db, since_ts) if by_role else None,
         "disclaimer": (
             "score_0_10 blends free review-findings precision (source='findings') "
             "and an opt-out LLM judge (source='judge'); those two are relative "
@@ -583,6 +588,47 @@ def build_quality_snapshot(
         ),
         "cli_hint": f"threnody quality --since {window_label}",
     }
+
+
+def _build_by_role_facet(db: Database, since_ts: float) -> list[dict[str, Any]]:
+    """Per-role quality breakdown via JOIN on telemetry.role.
+
+    Joins model_quality_events with telemetry on task_hash and time window
+    to surface quality by semantic role (Implementer, Reviewer, etc.).
+    """
+    try:
+        with db.conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.role, m.model, m.effort,
+                       COUNT(*), AVG(m.score_0_10),
+                       SUM(CASE WHEN m.source IN ('static_recall','verify_gate','ladder')
+                                THEN 1 ELSE 0 END),
+                       AVG(CASE WHEN m.source IN ('static_recall','verify_gate','ladder')
+                                THEN m.score_0_10 END)
+                FROM model_quality_events m
+                JOIN telemetry t ON t.task_hash = m.task_hash
+                WHERE m.ts >= ? AND t.role IS NOT NULL AND t.role != ''
+                GROUP BY t.role, m.model, m.effort
+                ORDER BY t.role, m.model
+                """,
+                (since_ts,),
+            ).fetchall()
+    except Exception:
+        log.debug("model_quality: by_role facet query failed", exc_info=True)
+        return []
+    return [
+        {
+            "role": r[0],
+            "model": r[1],
+            "effort": r[2],
+            "n": int(r[3] or 0),
+            "avg_score": round(float(r[4] or 0.0), 2),
+            "objective_n": int(r[5] or 0),
+            "objective_avg": round(float(r[6]), 2) if r[6] is not None else None,
+        }
+        for r in rows
+    ]
 
 
 __all__ = [

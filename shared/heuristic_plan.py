@@ -710,7 +710,10 @@ def _finalize_subtasks(subtasks: list[dict[str, object]]) -> list[dict[str, obje
     ownership sentence, so prompt scope can never exceed declared ownership (#3).
 
     Task-level subtasks (no target file) are left untouched.
+    Also derives semantic role from description for each subtask.
     """
+    from .roles import derive_role_from_task, DEFAULT_ROLE
+
     for st in subtasks:
         tfs = st.get("target_files")
         if isinstance(tfs, list) and tfs:
@@ -719,14 +722,20 @@ def _finalize_subtasks(subtasks: list[dict[str, object]]) -> list[dict[str, obje
             tf = st.get("target_file")
             target_files = [str(tf)] if isinstance(tf, str) and tf.strip() else []
         if not target_files:
+            desc = str(st.get("description", ""))
+            role = derive_role_from_task(desc)
+            if role != DEFAULT_ROLE and "role" not in st:
+                st["role"] = role
             continue
-        # Preserve order, drop dupes.
         seen: set[str] = set()
         deduped = [p for p in target_files if not (p.lower() in seen or seen.add(p.lower()))]
         st["target_files"] = deduped
         desc = str(st.get("description", "")).rstrip()
         if "You own exactly these files:" not in desc:
             st["description"] = _close_sentence(desc) + _ownership_line(deduped)
+        role = derive_role_from_task(str(st.get("description", "")))
+        if role != DEFAULT_ROLE and "role" not in st:
+            st["role"] = role
     return subtasks
 
 

@@ -279,3 +279,57 @@ def get_band_stats(db: Database) -> list[dict]:
         }
         for r in rows
     ]
+
+
+_TIER_UP = {"low": "medium", "medium": "high", "high": "high"}
+
+
+def get_role_tier_bumps(
+    db: Database,
+    *,
+    rework_threshold: float = 0.25,
+    min_samples: int = 5,
+) -> dict[str, str]:
+    """Return per-role tier bumps based on rework rate from telemetry.
+
+    For each role with >= min_samples observations and rework rate >= rework_threshold,
+    return a mapping role -> bumped tier (e.g. {"Reviewer": "high"}).
+    Roles below threshold or sample floor are excluded.
+    """
+    try:
+        with db.conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT role,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN rework = 1 OR rework_count > 0 THEN 1 ELSE 0 END) AS rework_count
+                FROM telemetry
+                WHERE role IS NOT NULL AND role != ''
+                GROUP BY role
+                HAVING total >= ?
+                """,
+                (min_samples,),
+            ).fetchall()
+    except Exception:
+        log.debug("get_role_tier_bumps query failed", exc_info=True)
+        return {}
+
+    bumps: dict[str, str] = {}
+    for role, total, rework_count in rows:
+        if total <= 0:
+            continue
+        rate = rework_count / total
+        if rate >= rework_threshold:
+            if role in ("low",):
+                bumps[role] = "medium"
+            elif role in ("medium",):
+                bumps[role] = "high"
+            else:
+                bumps[role] = "high"
+        log.debug(
+            "role %s: rework rate %.2f (%d/%d) %s threshold %.2f",
+            role, rate, rework_count, total,
+            ">= (bumping)" if rate >= rework_threshold else "<",
+            rework_threshold,
+        )
+    return bumps

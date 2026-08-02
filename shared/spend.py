@@ -191,6 +191,7 @@ def build_spend_snapshot(
     since_ts, window_label = parse_spend_window(since)
     by_tier = db.get_cost_summary(since_ts=since_ts, group_by="tier")
     by_provider = db.get_cost_summary(since_ts=since_ts, group_by="provider_id")
+    by_role = db.get_cost_summary(since_ts=since_ts, group_by="role")
     totals = _aggregate_rows(by_tier)
     totals.update(_free_subtask_stats(db, since_ts))
     routing = _routing_telemetry_summary(db, since_ts)
@@ -238,6 +239,7 @@ def build_spend_snapshot(
         "totals": totals,
         "by_tier": by_tier,
         "by_provider": by_provider,
+        "by_role": by_role,
         "routing_telemetry": routing,
         "receipts": {
             "count": len(receipts),

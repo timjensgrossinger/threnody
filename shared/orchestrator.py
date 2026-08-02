@@ -280,6 +280,7 @@ class AgentResult:
     gate_signals: dict | None = None  # per-signal results
     convergence_rounds_data: list | None = None  # plan 14: [{round, score, idem_key}]
     convergence_exhausted: bool = False           # plan 14: max_rounds hit, min_score unmet
+    role: str | None = None  # semantic role from task derivation
 
 
 class CircuitBreakerError(RuntimeError):
@@ -897,6 +898,7 @@ class Orchestrator:
         used_speculation: bool = False,
         reason: str = "subtask_result",
         effort: str | None = None,
+        role: str | None = None,
     ) -> None:
         if self._db is None:
             return
@@ -915,6 +917,7 @@ class Orchestrator:
             reason=reason,
             effort=effort,
             version="orchestrator",
+            role=role,
         )
 
     def _record_cost_telemetry_for_result(
@@ -963,6 +966,7 @@ class Orchestrator:
                 est_cost_usd=est_cost,
                 counterfactual_tier="high",
                 counterfactual_cost_usd=counterfactual_cost,
+                role=result.role,
             )
         except Exception:
             log.debug("_record_cost_telemetry_for_result failed", exc_info=True)
@@ -987,6 +991,7 @@ class Orchestrator:
             used_fallback=result.used_fallback,
             used_speculation=result.used_speculation,
             effort=getattr(result, "effort", None),
+            role=result.role,
         )
         # Opt-out, off-hot-path quality judge (source='judge'). Non-blocking:
         # submits to the warm-path executor and returns immediately, so it never
@@ -1371,6 +1376,7 @@ class Orchestrator:
                     success=success_actual,
                     used_speculation=True,
                     effort=self._effort_for_subtask(subtask, spec_tier),
+                    role=getattr(subtask, "role", None),
                 )
 
         # Normal execution path
@@ -1515,6 +1521,7 @@ class Orchestrator:
             escalated=escalated,
             success=success_actual,
             effort=self._effort_for_subtask(subtask, current_tier),
+            role=getattr(subtask, "role", None),
         )
 
     def _execute_subtask_with_prefetch(

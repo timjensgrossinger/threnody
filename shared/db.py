@@ -838,6 +838,7 @@ class Database:
         self._ensure_audit_chain_schema(conn)
         self._ensure_worker_lease_schema(conn)
         self._ensure_cost_telemetry_schema(conn)
+        self._ensure_role_columns(conn)
         self._ensure_foreach_schema(conn)
         self._ensure_gate_verdict_schema(conn)
         self._ensure_worker_sessions_schema(conn)
@@ -1881,6 +1882,41 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_cost_telemetry_tier"
             " ON cost_telemetry (tier, ts)"
         )
+
+    @staticmethod
+    def _ensure_role_columns(conn: sqlite3.Connection) -> None:
+        """Add role column to telemetry and cost_telemetry for role-aware analytics."""
+        for table in ("telemetry", "cost_telemetry"):
+            cols = {
+                row[1]
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "role" not in cols:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN role TEXT"
+                )
+        existing = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(telemetry)").fetchall()
+        }
+        if "idx_telemetry_role" not in {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_telemetry_role"
+                " ON telemetry (role, ts)"
+            )
+        if "idx_cost_telemetry_role" not in {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cost_telemetry_role"
+                " ON cost_telemetry (role, ts)"
+            )
 
     @staticmethod
     def _ensure_foreach_schema(conn: sqlite3.Connection) -> None:
@@ -4555,6 +4591,7 @@ class Database:
         coordinator_round_count: int = 0,
         coordinator_amendment_count: int = 0,
         complexity_score: float | None = None,
+        role: str | None = None,
     ) -> int:
         """Persist one telemetry row.
 
@@ -4596,6 +4633,7 @@ class Database:
             coordinator_round_count=coordinator_round_count,
             coordinator_amendment_count=coordinator_amendment_count,
             complexity_score=complexity_score,
+            role=role,
         )
         with self.conn() as conn:
             placeholders = ", ".join(["?"] * len(values))
@@ -4638,6 +4676,7 @@ class Database:
         coordinator_round_count: int = 0,
         coordinator_amendment_count: int = 0,
         complexity_score: float | None = None,
+        role: str | None = None,
     ) -> tuple[list[str], list[object]]:
         """Build the ordered (columns, values) for one telemetry INSERT.
 
@@ -4678,6 +4717,7 @@ class Database:
             "coordinator_round_count",
             "coordinator_amendment_count",
             "complexity_score",
+            "role",
             "ts",
         ]
         values = [
@@ -4713,6 +4753,7 @@ class Database:
             int(coordinator_round_count),
             int(coordinator_amendment_count),
             complexity_score,
+            role,
             time.time(),
         ]
         return columns, values
@@ -6342,6 +6383,7 @@ class Database:
         est_cost_usd: float,
         counterfactual_tier: str = "high",
         counterfactual_cost_usd: float = 0.0,
+        role: str | None = None,
     ) -> None:
         """Record per-subtask cost telemetry for savings tracking."""
         import time as _time
@@ -6349,13 +6391,13 @@ class Database:
             conn.execute(
                 "INSERT INTO cost_telemetry"
                 " (task_id, tier, provider_id, model, input_tokens, output_tokens,"
-                "  est_cost_usd, counterfactual_tier, counterfactual_cost_usd, ts)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  est_cost_usd, counterfactual_tier, counterfactual_cost_usd, role, ts)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id, tier, provider_id, model,
                     input_tokens, output_tokens, est_cost_usd,
                     counterfactual_tier, counterfactual_cost_usd,
-                    _time.time(),
+                    role, _time.time(),
                 ),
             )
 
@@ -6366,9 +6408,9 @@ class Database:
     ) -> list[dict]:
         """Return aggregated cost summary since since_ts, grouped by group_by.
 
-        group_by: "tier" | "provider" | "model"
+        group_by: "tier" | "provider_id" | "model" | "role"
         """
-        allowed_groups = {"tier", "provider_id", "model"}
+        allowed_groups = {"tier", "provider_id", "model", "role"}
         col = group_by if group_by in allowed_groups else "tier"
         with self.conn() as conn:
             rows = conn.execute(

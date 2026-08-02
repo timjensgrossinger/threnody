@@ -106,6 +106,7 @@ class Subtask:
     convergence_target: ConvergenceTarget | None = None  # plan 14: quality convergence loop
     subagent_type: str | None = None  # override host subagent type (e.g. "review-security")
     read_only: bool = False  # skip direct_edit; force host_task method
+    role: str | None = None  # semantic role derived from task (e.g. "Implementer", "Reviewer")
     # Plan-shape metadata produced by the heuristic/review builders. Carried
     # through the ExecutionPlan round-trip so the host-native path and the
     # learning ingest see what the builder decided.
@@ -1449,6 +1450,13 @@ class Planner:
             raw_subagent_type = self._coerce_optional_text(st_data.get("subagent_type"))
             subagent_type: str | None = raw_subagent_type.strip() if raw_subagent_type else None
             read_only = bool(st_data.get("read_only", False))
+            raw_role = self._coerce_optional_text(st_data.get("role"))
+            if raw_role and raw_role.strip():
+                subtask_role: str | None = raw_role.strip()
+            else:
+                from .roles import derive_role_from_task
+                derived = derive_role_from_task(description)
+                subtask_role = derived if derived != "Worker" else None
 
             # Check if this subtask matches a template
             explicit_route_declared = any(
@@ -1500,6 +1508,7 @@ class Planner:
                 single_file_insertion=single_file_insertion,
                 subagent_type=subagent_type,
                 read_only=read_only,
+                role=subtask_role,
                 wave_kind=self._coerce_optional_text(st_data.get("wave_kind")),
                 review_dimension=self._coerce_optional_text(st_data.get("review_dimension")),
                 expected_rules=expected_rules,
@@ -1894,6 +1903,8 @@ class Planner:
                 subtask_payload["subagent_type"] = st.subagent_type
             if st.read_only:
                 subtask_payload["read_only"] = True
+            if st.role is not None:
+                subtask_payload["role"] = st.role
             if st.wave_kind is not None:
                 subtask_payload["wave_kind"] = st.wave_kind
             if st.review_dimension is not None:

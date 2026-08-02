@@ -18,6 +18,7 @@ from .config import (
 )
 from .context import is_within_repo, normalize_target_path
 from .discovery import HOST_PROVIDER_NAMES, ROUTER_ONLY_PROVIDERS
+from .roles import derive_role_from_task, DEFAULT_ROLE
 
 HOST_SPAWN_ERROR = "HostNativeRequired"
 HOST_EXECUTION_CONTRACT = "spawn_subagents"
@@ -56,6 +57,7 @@ class HostSpawnSpec:
     # changes with prompt-economy settings. Absent → learning falls back to hashing
     # the description, as it always did.
     pattern_hash: str | None = None
+    role: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -85,6 +87,8 @@ class HostSpawnSpec:
             payload["artifact_path"] = self.artifact_path
         if self.upstream:
             payload["upstream"] = [dict(item) for item in self.upstream]
+        if self.role:
+            payload["role"] = self.role
         return payload
 
 
@@ -234,6 +238,7 @@ def build_host_spawn(
     pattern_hash: str | None = None,
     artifact_path: str | None = None,
     upstream: list[dict[str, Any]] | None = None,
+    role: str | None = None,
 ) -> HostSpawnSpec:
     # Review agents use named subagent types on shells that resolve them to an
     # exported definition; every other host falls back to the tier-derived type.
@@ -245,12 +250,16 @@ def build_host_spawn(
     )
     # read_only tasks must never use direct_edit — they read source context only.
     method = "host_task" if read_only else host_native_method_for_tier(tier)
+    resolved_role = role or derive_role_from_task(prompt)
+    enriched_prompt = prompt
+    if resolved_role and not prompt.startswith("["):
+        enriched_prompt = f"[{resolved_role}] {prompt}"
     return HostSpawnSpec(
         tool=host_tool_for_caller(caller),
         method=method,
         model=model or host_native_model_for_tier(config, caller, tier),
         subagent_type=resolved_subagent_type,
-        prompt=prompt,
+        prompt=enriched_prompt,
         tier=tier,
         caller=normalized_caller,
         wave_id=wave_id,
@@ -259,6 +268,7 @@ def build_host_spawn(
         pattern_hash=pattern_hash,
         artifact_path=artifact_path,
         upstream=list(upstream or []),
+        role=resolved_role,
     )
 
 
@@ -950,6 +960,12 @@ def build_host_spawn_waves(
                         "host_spawn_waves: findings protocol injection failed",
                         exc_info=True,
                     )
+            raw_role = subtask.get("role")
+            subtask_role = (
+                str(raw_role).strip()
+                if isinstance(raw_role, str) and str(raw_role).strip()
+                else None
+            )
             agents.append(
                 build_host_spawn(
                     config=config,
@@ -969,6 +985,7 @@ def build_host_spawn_waves(
                     ),
                     artifact_path=artifact_path_str,
                     upstream=upstream_specs,
+                    role=subtask_role,
                 ).to_dict()
             )
         if agents:
@@ -976,6 +993,68 @@ def build_host_spawn_waves(
     if _caller_is_host(caller) and host_waves:
         return enrich_host_spawn_waves(host_waves)
     return host_waves
+
+
+def build_plan_summary(plan_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Build human-readable plan summary with role counts, targets, cost estimate."""
+    subtasks = plan_dict.get("subtasks")
+    waves = plan_dict.get("waves")
+    if not isinstance(subtasks, list) or not isinstance(waves, list):
+        return {}
+
+    role_counts: dict[str, int] = {}
+    target_files: set[str] = set()
+    tier_counts: dict[str, int] = {"low": 0, "medium": 0, "high": 0}
+
+    for st in subtasks:
+        if not isinstance(st, dict):
+            continue
+        role = st.get("role") or derive_role_from_task(str(st.get("description", "")))
+        role_counts[role] = role_counts.get(role, 0) + 1
+        tier = str(st.get("tier", "medium"))
+        if tier in tier_counts:
+            tier_counts[tier] += 1
+        tfs = st.get("target_files")
+        if isinstance(tfs, list):
+            for tf in tfs:
+                if isinstance(tf, str) and tf.strip():
+                    target_files.add(tf.strip())
+        else:
+            tf = st.get("target_file")
+            if isinstance(tf, str) and tf.strip():
+                target_files.add(tf.strip())
+
+    tier_cost_est = {"low": 0.005, "medium": 0.02, "high": 0.05}
+    estimated_cost = sum(
+        tier_counts.get(t, 0) * tier_cost_est.get(t, 0.02) for t in tier_counts
+    )
+
+    sorted_targets = sorted(target_files)[:10]
+    targets_str = ", ".join(sorted_targets)
+    if len(target_files) > 10:
+        targets_str += f" (+{len(target_files) - 10} more)"
+
+    role_parts = []
+    for role, count in sorted(role_counts.items(), key=lambda x: -x[1]):
+        role_parts.append(f"{role}\u00d7{count}")
+    roles_str = ", ".join(role_parts) if role_parts else "Worker"
+
+    n_tasks = len(subtasks)
+    n_waves = len([w for w in waves if isinstance(w, list)])
+
+    text = (
+        f"{n_tasks} tasks / {n_waves} waves / {roles_str} "
+        f"/ est ${estimated_cost:.2f} / targets: {targets_str or '(none)'}"
+    )
+
+    return {
+        "text": text,
+        "role_counts": role_counts,
+        "target_files": sorted(target_files),
+        "estimated_cost_usd": round(estimated_cost, 4),
+        "n_tasks": n_tasks,
+        "n_waves": n_waves,
+    }
 
 
 def build_consensus_wave(

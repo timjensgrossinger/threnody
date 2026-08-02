@@ -771,6 +771,8 @@ def _provider_override_payload(
     endpoint_providers: list[object] | None = None,
     preferred_routing_by_caller: Mapping[str, object] | None = None,
     provider_usage_windows: Mapping[str, object] | None = None,
+    delegation_utilities_enabled: bool | None = None,
+    delegation_utilities: list[object] | None = None,
 ) -> dict[str, object] | None:
     def _serialize_routing_preferences(raw: Mapping[str, object] | None) -> dict[str, list[object]]:
         serialized: dict[str, list[object]] = {}
@@ -850,6 +852,18 @@ def _provider_override_payload(
                 serialized_endpoint_providers.append(entry)
         if serialized_endpoint_providers:
             payload["endpoint_providers"] = serialized_endpoint_providers
+    if delegation_utilities_enabled is not None:
+        payload.setdefault("providers", {})["delegation_utilities_enabled"] = bool(
+            delegation_utilities_enabled
+        )
+    if delegation_utilities:
+        normalized_delegation = [
+            str(item).strip().lower()
+            for item in delegation_utilities
+            if isinstance(item, str) and item.strip()
+        ]
+        if normalized_delegation:
+            payload.setdefault("providers", {})["delegation_utilities"] = normalized_delegation
     return payload or None
 
 
@@ -864,6 +878,8 @@ def _registry_config_overrides(config: TGsConfig | None = None) -> dict[str, obj
             config.endpoint_providers,
             config.preferred_routing_by_caller,
             config.provider_usage_windows,
+            delegation_utilities_enabled=config.delegation_utilities_enabled,
+            delegation_utilities=config.delegation_utilities,
         )
 
     signature = _config_file_signature()
@@ -878,6 +894,8 @@ def _registry_config_overrides(config: TGsConfig | None = None) -> dict[str, obj
                     fresh_config.endpoint_providers,
                     fresh_config.preferred_routing_by_caller,
                     fresh_config.provider_usage_windows,
+                    delegation_utilities_enabled=fresh_config.delegation_utilities_enabled,
+                    delegation_utilities=fresh_config.delegation_utilities,
                 )
                 _registry_override_signature = signature
             except Exception:
@@ -893,6 +911,8 @@ def _registry_config_overrides(config: TGsConfig | None = None) -> dict[str, obj
                         _config.endpoint_providers,
                         _config.preferred_routing_by_caller,
                         _config.provider_usage_windows,
+                        delegation_utilities_enabled=_config.delegation_utilities_enabled,
+                        delegation_utilities=_config.delegation_utilities,
                     )
                 _registry_override_signature = signature
         return _registry_override_cache
@@ -1773,7 +1793,8 @@ TOOLS = [
         "description": (
             "Return the granular model quality ledger: per-(model x effort x dimension x "
             "sub_dimension) average score (0-10), sample count, findings/judge breakdown, and "
-            "approximate escalation rate for a time window. e.g. opus | high | security/sql-injection."
+            "approximate escalation rate for a time window. e.g. opus | high | security/sql-injection. "
+            "Set by_role=true to include per-role quality breakdown."
         ),
         "inputSchema": {
             "type": "object",
@@ -1781,6 +1802,10 @@ TOOLS = [
                 "since": {
                     "type": "string",
                     "description": "Time window (7d, 30d, 24h, all). Default: 7d",
+                },
+                "by_role": {
+                    "type": "boolean",
+                    "description": "Include per-role quality breakdown via JOIN on telemetry.role. Default: false",
                 },
             },
         },
@@ -3414,6 +3439,10 @@ def _attach_host_spawn_metadata(
         )
         if waves:
             payload["host_spawn_waves"] = waves
+            from shared.host_spawn import build_plan_summary
+            summary = build_plan_summary(payload)
+            if summary:
+                payload["plan_summary"] = summary
             payload["host_execution_contract"] = HOST_EXECUTION_CONTRACT
             _maybe_attach_workflow_script(
                 payload,
@@ -9114,15 +9143,18 @@ def handle_inspect_spend(args: dict) -> dict:
     return inspect_spend(str(args.get("since") or "7d"))
 
 
-def inspect_quality(since: str = "7d") -> dict:
+def inspect_quality(since: str = "7d", by_role: bool = False) -> dict:
     config, db, *_ = _ensure_init()
     from shared.model_quality import build_quality_snapshot
 
-    return build_quality_snapshot(db, since=str(since or "7d"), config=config)
+    return build_quality_snapshot(db, since=str(since or "7d"), config=config, by_role=by_role)
 
 
 def handle_inspect_quality(args: dict) -> dict:
-    return inspect_quality(str(args.get("since") or "7d"))
+    return inspect_quality(
+        str(args.get("since") or "7d"),
+        by_role=bool(args.get("by_role", False)),
+    )
 
 
 def handle_inspect_run_receipt(args: dict) -> dict:
