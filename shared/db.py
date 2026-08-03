@@ -2016,6 +2016,30 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_routing_decisions_ts"
             " ON routing_decisions (ts)"
         )
+        # Trained arm state. Without this the LinUCB models live only in the MCP
+        # process that built them, so every restart discards all training and the
+        # bandit can never cross its min-updates gate.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bandit_arms (
+                arm_id     TEXT PRIMARY KEY,
+                a_json     TEXT NOT NULL,
+                b_json     TEXT NOT NULL,
+                n_updates  INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL
+            )
+        """)
+        # High-water mark so training replays each scored decision exactly once.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bandit_train_state (
+                id            INTEGER PRIMARY KEY CHECK (id = 1),
+                last_row_id   INTEGER NOT NULL DEFAULT 0,
+                updated_at    REAL NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_routing_decisions_scored"
+            " ON routing_decisions (id) WHERE outcome_score IS NOT NULL"
+        )
 
     @staticmethod
     def _ensure_resilience_schema(conn: sqlite3.Connection) -> None:
@@ -2069,7 +2093,7 @@ class Database:
         if _PROJECT_SETTING_DEFAULTS_CACHE is None:
             cfg = TGsConfig()
             _PROJECT_SETTING_DEFAULTS_CACHE = {
-                "learning_enabled": False,
+                "learning_enabled": bool(cfg.project_learning_default),
                 "concurrency_limit": int(cfg.parallelism.max_workers),
                 "budget_hard_cap_tokens": int(cfg.budgets.default_hard_cap_tokens),
                 "fanout_cap": int(DEFAULT_PROJECT_FANOUT_CAP),
@@ -2208,10 +2232,15 @@ class Database:
                     if row and row[0]
                     else self._default_project_routing_overrides()
                 )
+                # NULL, not 0: the column is tri-state — NULL means "no explicit
+                # operator choice, fall back to project_learning_default", while
+                # 0 means "explicitly opted out". Writing 0 here would make
+                # `tune reset learning_enabled` silently DISABLE learning rather
+                # than restore the configured default.
                 conn.execute(
                     """
                     INSERT INTO project_routing (project_path, overrides_json, learning_enabled, ts)
-                    VALUES (?, ?, 0, ?)
+                    VALUES (?, ?, NULL, ?)
                     ON CONFLICT(project_path) DO UPDATE SET
                         overrides_json = excluded.overrides_json,
                         learning_enabled = excluded.learning_enabled,
@@ -2713,10 +2742,59 @@ class Database:
             except Exception:
                 log.debug("Could not prune %s", old, exc_info=True)
 
+    def _drain_wal(self, conn: sqlite3.Connection) -> bool:
+        """Merge this connection's committed WAL frames into the main DB file.
+
+        ``PRAGMA wal_checkpoint`` returns ``(busy, log_frames, checkpointed)``.
+        Under contention it returns ``busy=1`` and transfers nothing — a silent
+        no-op. Frames left behind belong to a WAL that a peer may delete when it
+        believes it is the last connection, and the commits in them are then gone
+        even though every ``commit()`` returned. So retry while busy, and only
+        give up after a bounded wait.
+
+        TRUNCATE first (it also resets the file, keeping the WAL small); PASSIVE
+        as the fallback, since transferring the frames is what matters and
+        PASSIVE succeeds against readers that block a truncate.
+        """
+        # Bounded well below db_busy_timeout_ms: this runs on every close(), and
+        # a long tail here shows up as slow shutdown for every MCP server sharing
+        # the WAL. A few seconds is enough for peers to release; past that the
+        # frames are still committed and a peer will checkpoint them.
+        deadline = time.monotonic() + min(
+            5.0, max(1.0, self._db_busy_timeout_ms / 1000.0)
+        )
+        delay = self._db_lock_base_delay_s
+        while True:
+            for mode in ("TRUNCATE", "PASSIVE"):
+                try:
+                    row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+                except sqlite3.Error:
+                    log.debug("close: %s checkpoint errored", mode, exc_info=True)
+                    continue
+                # No WAL (journal_mode != wal) → nothing to drain.
+                if row is None:
+                    return True
+                busy, log_frames, checkpointed = (
+                    int(row[0] or 0),
+                    int(row[1] or 0),
+                    int(row[2] or 0),
+                )
+                if busy == 0 or log_frames <= 0 or checkpointed >= log_frames:
+                    return True
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "close: could not drain the WAL at %s before detaching; "
+                    "committed frames stay in the WAL for a peer to checkpoint",
+                    self._db_path,
+                )
+                return False
+            time.sleep(min(delay, self._db_lock_max_delay_s))
+            delay = min(delay * 2, self._db_lock_max_delay_s)
+
     def close(self) -> None:
         for conn in list(self._legacy_conns.values()):
             try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._drain_wal(conn)
                 conn.close()
             except Exception:
                 log.debug("close: legacy conn cleanup failed", exc_info=True)
@@ -2724,7 +2802,7 @@ class Database:
         tl_conn = getattr(self._thread_local, "conn", None)
         if tl_conn is not None:
             try:
-                tl_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._drain_wal(tl_conn)
                 tl_conn.close()
             except Exception:
                 log.debug("close: thread-local conn cleanup failed", exc_info=True)
@@ -6344,6 +6422,117 @@ class Database:
                 (outcome_score, regret, task_id, task_id),
             )
 
+    def load_bandit_arms(self) -> dict[str, dict]:
+        """Return persisted LinUCB arm state keyed by arm_id."""
+        out: dict[str, dict] = {}
+        try:
+            with self.conn() as conn:
+                rows = conn.execute(
+                    "SELECT arm_id, a_json, b_json, n_updates FROM bandit_arms"
+                ).fetchall()
+        except Exception:
+            log.debug("bandit arm load failed", exc_info=True)
+            return {}
+        for arm_id, a_json, b_json, n_updates in rows:
+            try:
+                out[str(arm_id)] = {
+                    "A": json.loads(a_json),
+                    "b": json.loads(b_json),
+                    "n_updates": int(n_updates or 0),
+                }
+            except (TypeError, ValueError):
+                log.debug("bandit arm %s has unreadable state; skipping", arm_id)
+        return out
+
+    def save_bandit_arm(
+        self,
+        arm_id: str,
+        a_matrix: list[list[float]],
+        b_vector: list[float],
+        n_updates: int,
+    ) -> None:
+        """Upsert one arm's trained state. Best-effort — never raises to callers."""
+        try:
+            with self.conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO bandit_arms (arm_id, a_json, b_json, n_updates, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(arm_id) DO UPDATE SET
+                        a_json = excluded.a_json,
+                        b_json = excluded.b_json,
+                        n_updates = excluded.n_updates,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(arm_id),
+                        json.dumps(a_matrix),
+                        json.dumps(b_vector),
+                        int(n_updates),
+                        time.time(),
+                    ),
+                )
+        except Exception:
+            log.debug("bandit arm save failed for %s", arm_id, exc_info=True)
+
+    def get_bandit_train_cursor(self) -> int:
+        """Highest routing_decisions.id already replayed into the arm models."""
+        try:
+            with self.conn() as conn:
+                row = conn.execute(
+                    "SELECT last_row_id FROM bandit_train_state WHERE id = 1"
+                ).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        except Exception:
+            log.debug("bandit train cursor read failed", exc_info=True)
+            return 0
+
+    def set_bandit_train_cursor(self, last_row_id: int) -> None:
+        try:
+            with self.conn() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO bandit_train_state (id, last_row_id, updated_at)
+                    VALUES (1, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        last_row_id = excluded.last_row_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (int(last_row_id), time.time()),
+                )
+        except Exception:
+            log.debug("bandit train cursor write failed", exc_info=True)
+
+    def get_scored_routing_decisions(self, after_row_id: int = 0, limit: int = 500) -> list[dict]:
+        """Scored decisions newer than ``after_row_id``, oldest first (training order)."""
+        try:
+            with self.conn() as conn:
+                rows = conn.execute(
+                    "SELECT id, features, chosen, outcome_score"
+                    " FROM routing_decisions"
+                    " WHERE outcome_score IS NOT NULL AND id > ?"
+                    " ORDER BY id ASC LIMIT ?",
+                    (int(after_row_id), int(limit)),
+                ).fetchall()
+        except Exception:
+            log.debug("scored routing decision read failed", exc_info=True)
+            return []
+        out: list[dict] = []
+        for row_id, features_json, chosen, score in rows:
+            try:
+                features = json.loads(features_json)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(features, list):
+                continue
+            out.append({
+                "id": int(row_id),
+                "features": [float(f) for f in features],
+                "chosen": str(chosen),
+                "outcome_score": float(score),
+            })
+        return out
+
     def get_bandit_summary(
         self,
         limit: int = 500,
@@ -6562,27 +6751,14 @@ class Database:
             "last_run_ts": float(row[4]) if row[4] is not None else None,
         }
 
-    def close(self) -> None:
-        """Close all database connections
- and clean up resources."""
-        # Close legacy thread-pool connections
-        with self._legacy_conn_lock:
-            for conn in self._legacy_conns.values():
-                conn.close()
-            self._legacy_conns.clear()
-        
-        # Close thread-local connections (FNDX-01)
-        # Note: We can only close the current thread's connection from this thread.
-        # Other threads' connections remain until those threads exit.
-        if hasattr(self._thread_local, 'conn'):
-            try:
-                self._thread_local.conn.close()
-            except Exception as e:
-                log.debug(f"Error closing thread-local connection: {e}", exc_info=True)
-            finally:
-                # Clean up the thread-local attribute
-                if hasattr(self._thread_local, 'conn'):
-                    delattr(self._thread_local, 'conn')
+    # NOTE: `close()` is defined once, above, next to the other WAL lifecycle
+    # helpers. A second definition used to live here and — being later in the
+    # class body — silently shadowed it. That copy closed the connections
+    # WITHOUT checkpointing, so a writer's committed frames stayed in the WAL;
+    # when several processes shared one cache.db, whichever raced to close last
+    # deleted the WAL along with frames its peers had committed but never
+    # merged. Symptom: one worker's rows vanish wholesale after every commit
+    # returned successfully. Do not reintroduce a second definition.
 
     # ------------------------------------------------------------------
     # Routing exceptions CRUD

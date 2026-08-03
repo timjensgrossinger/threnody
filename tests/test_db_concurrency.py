@@ -20,6 +20,67 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from shared.db import Database  # noqa: E402
 
 
+def test_close_checkpoints_the_wal() -> None:
+    """close() must merge committed frames, and must not be shadowed.
+
+    A second `def close()` later in the Database class body once overrode the
+    checkpointing one. Because it closed connections without a checkpoint, every
+    writer left its commits sitting in the WAL, and whichever process raced to
+    close last removed that WAL along with its peers' frames — one worker's rows
+    vanished wholesale despite every commit having returned. Source inspection is
+    the only way to catch a redefinition; a behavioural test alone would still
+    pass whenever the race did not fire.
+    """
+    import inspect
+
+    source = inspect.getsource(Database.close)
+    assert "_drain_wal" in source, "Database.close() no longer drains the WAL"
+    drain = inspect.getsource(Database._drain_wal)
+    assert "wal_checkpoint" in drain
+    # A checkpoint that reports busy transfers nothing; close() must not treat
+    # that as done, or the frames it was meant to merge stay in the WAL.
+    assert "busy" in drain, "_drain_wal ignores the checkpoint busy result"
+
+    class_source = inspect.getsource(Database)
+    assert class_source.count("\n    def close(self)") == 1, (
+        "Database defines close() more than once — the later definition silently "
+        "shadows the earlier one"
+    )
+
+
+def test_committed_rows_survive_close(tmp_path: Path) -> None:
+    """Committed rows must be visible to a fresh process-level open after close."""
+    db_path = tmp_path / "cache.db"
+    db = Database(db_path)
+    with db.conn() as conn:
+        conn.execute(
+            "INSERT INTO cache(key, task, result, model, ts) VALUES (?,?,?,?,?)",
+            ("survives", "t", "r", "m", time.time()),
+        )
+    db.close()
+
+    reopened = Database(db_path)
+    with reopened.conn() as conn:
+        keys = {row[0] for row in conn.execute("SELECT key FROM cache")}
+    reopened.close()
+    assert "survives" in keys
+
+
+def _contention_timeout_s(n_procs: int, base_s: float = 60.0) -> float:
+    """Wall-clock budget for n_procs writers contending for one WAL.
+
+    Scales with the writer count so a busy machine starves rather than fails.
+    Overridable for CI via THRENODY_TEST_CONTENTION_TIMEOUT_S.
+    """
+    override = os.environ.get("THRENODY_TEST_CONTENTION_TIMEOUT_S")
+    if override:
+        try:
+            return max(1.0, float(override))
+        except ValueError:
+            pass
+    return base_s * max(1, n_procs) / 2.0
+
+
 def _writer_worker(repo_root: str, db_path: str, idx: int, rows: int, result_q) -> None:
     """Subprocess entry: open the shared DB and write rows; report outcome on queue."""
     sys.path.insert(0, repo_root)
@@ -51,6 +112,11 @@ def test_concurrent_processes_no_corruption() -> None:
 
         ctx = multiprocessing.get_context("spawn")
         n_procs, rows = 4, 15
+        # Each writer contends with every other for the same WAL, so the wall
+        # time scales with the writer count — a fixed timeout turns ordinary
+        # starvation on a loaded CI box into a failure that reads like
+        # corruption. Both modes were observed; only one of them is a bug.
+        timeout_s = _contention_timeout_s(n_procs)
         result_q = ctx.Queue()
         procs = [
             ctx.Process(target=_writer_worker, args=(repo_root, db_path, i, rows, result_q))
@@ -60,10 +126,10 @@ def test_concurrent_processes_no_corruption() -> None:
             p.start()
         results = {}
         for _ in range(n_procs):
-            idx, status = result_q.get(timeout=60)
+            idx, status = result_q.get(timeout=timeout_s)
             results[idx] = status
         for p in procs:
-            p.join(timeout=60)
+            p.join(timeout=timeout_s)
 
         failures = {i: s for i, s in results.items() if s != "ok"}
         assert not failures, failures
@@ -74,9 +140,21 @@ def test_concurrent_processes_no_corruption() -> None:
         db = Database(Path(db_path))
         assert db.last_integrity_ok is True
         with db.conn() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM cache").fetchone()[0]
+            stored = {row[0] for row in conn.execute("SELECT key FROM cache")}
         db.close()
-        assert count == n_procs * rows
+
+        # Assert the missing SET, not the count. Every worker above reported
+        # "ok", which means each of its commits returned — so a shortfall here
+        # is data loss after a successful commit, and naming the exact rows is
+        # the difference between a diagnosable failure and "47 != 60".
+        expected = {f"p{i}-r{r}" for i in range(n_procs) for r in range(rows)}
+        missing = expected - stored
+        assert not missing, (
+            f"{len(missing)} committed row(s) lost: "
+            f"{sorted(missing)[:10]}{' ...' if len(missing) > 10 else ''} "
+            f"(by worker: { {i: sum(1 for k in missing if k.startswith(f'p{i}-')) for i in range(n_procs)} })"
+        )
+        assert stored == expected
 
 
 def test_lock_not_misclassified_as_corruption() -> None:

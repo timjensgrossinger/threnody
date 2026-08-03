@@ -67,6 +67,19 @@ budgets:
   default_hard_cap_tokens: 1000
   default_soft_warning_pct: 0.8
 
+# Contextual bandit routing. shadow = log the bandit's pick beside the heuristic's
+# without executing it. live selection additionally waits until every arm has
+# bandit_min_updates observations — an untrained arm scores identically for every
+# tier, so acting on it would be arbitrary rather than learned.
+routing:
+  bandit_mode: shadow
+  bandit_alpha: 1.0
+  bandit_min_updates: 50
+
+# Per-project routing learning for a project with no explicit learning_enabled
+# value. An explicit `threnody tune set learning_enabled false` always wins.
+project_learning_default: true
+
 cache:
   ttl_hours: 24
   backup_keep: 3

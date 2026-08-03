@@ -13,6 +13,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .config import (
     TGsConfig,
@@ -28,6 +29,9 @@ from .config import (
     WORD_BOUNDARY_COMPLEXITY_SIGNALS,
 )
 from .db import Database
+
+if TYPE_CHECKING:  # bandit is imported lazily at call sites to keep import cost off
+    from .bandit import BanditDecision  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -447,10 +451,12 @@ class TaskRouter:
     def is_learning_enabled(self, project_id: str) -> bool:
         """Return whether project-local learning is enabled for this project.
 
-        A stored row always wins, so an operator who turned learning off stays
-        off. A project with NO row falls back to ``project_learning_default`` —
-        without that, a never-configured project could never accumulate routing
-        feedback, which is every project by default.
+        ``project_routing.learning_enabled`` is tri-state: 1 = explicitly opted
+        in, 0 = explicitly opted out, NULL/absent = no operator choice. An
+        explicit value always wins, so someone who turned learning off stays
+        off; everything else falls back to ``project_learning_default``. Without
+        that fallback a never-configured project could never accumulate routing
+        feedback — which was every project.
         """
         if not self._db or not project_id:
             return False
@@ -460,7 +466,7 @@ class TaskRouter:
                     "SELECT learning_enabled FROM project_routing WHERE project_path = ?",
                     (project_id,),
                 ).fetchone()
-            if row is not None:
+            if row is not None and row[0] is not None:
                 return bool(row[0])
             return bool(getattr(self._config, "project_learning_default", True))
         except Exception:
@@ -778,35 +784,75 @@ class TaskRouter:
             expected_duration_bucket=duration_bucket,
             expected_file_count=file_count,
         )
-        self._shadow_bandit_log(task, decision, project_path=project_path)
+        bandit_decision = self._log_bandit_decision(
+            task, decision, project_path=project_path
+        )
+        # In live mode (and only once every arm has cleared bandit_min_updates)
+        # the bandit's pick is the routing decision, not a shadow annotation.
+        #
+        # Safety floors still bind. A learned policy is allowed to disagree with
+        # the score, never to undercut the security risk floor or the reasoning
+        # minimum — those exist because some work must not run cheap regardless
+        # of what past outcomes looked like.
+        if bandit_decision is not None and bandit_decision.reason == "bandit":
+            bandit_tier = bandit_decision.chosen_arm.split(":", 1)[0]
+            floor_tier = "low"
+            if security_floor_fired:
+                floor_tier = risk_floor
+            elif reasoning_fired:
+                floor_tier = "medium"
+            if (
+                bandit_tier in _TIER_RANK
+                and bandit_tier != decision.tier
+                and _TIER_RANK[bandit_tier] >= _TIER_RANK.get(floor_tier, 0)
+            ):
+                decision.tier = bandit_tier
+                decision.agents = 2 if bandit_tier != "high" else 1
+                decision.reason = f"{reason} → bandit:{bandit_tier}"
         return decision
 
-    def _shadow_bandit_log(
+    def _log_bandit_decision(
         self,
         task: str,
         decision: "RoutingDecision",
         project_path: str | None = None,
-    ) -> None:
-        """Log bandit shadow pick alongside heuristic pick. Best-effort."""
+    ) -> "BanditDecision | None":
+        """Log the bandit pick alongside the heuristic pick. Best-effort.
+
+        The row is keyed on :func:`shared.outcomes.route_task_id` — the same
+        stable task hash ``route_task`` → ``record_outcome`` already correlate
+        on. It used to be a fresh ``uuid4()``, which no outcome writer could ever
+        join against, so ``outcome_score`` stayed NULL on every row ever written
+        and the bandit had no training data at all.
+        """
         if self._db is None:
             return
         try:
             from .bandit import extract_task_features, get_bandit_policy
+            from .outcomes import route_task_id
+
             features = extract_task_features(task, project_id=project_path or "")
             heuristic_arm = f"{decision.tier}:heuristic"
-            # Available arms: one per tier for simplicity in shadow mode
+            # One arm per tier — the arm space routing actually chooses between.
             available_arms = [
                 "low:heuristic", "medium:heuristic", "high:heuristic"
             ]
-            policy = get_bandit_policy(db=self._db, mode="shadow")
+            routing_cfg = getattr(self._config, "routing", None)
+            policy = get_bandit_policy(
+                db=self._db,
+                alpha=float(getattr(routing_cfg, "bandit_alpha", 1.0)),
+                mode=str(getattr(routing_cfg, "bandit_mode", "shadow")),
+                min_updates=int(getattr(routing_cfg, "bandit_min_updates", 50)),
+            )
             bandit_decision = policy.select(features, available_arms, heuristic_arm)
-            import uuid as _uuid
             self._db.log_routing_decision(
-                task_id=str(_uuid.uuid4()),
+                task_id=route_task_id(task),
                 features=features,
                 heuristic_pick=bandit_decision.heuristic_arm,
                 bandit_pick=bandit_decision.bandit_arm,
                 chosen=bandit_decision.chosen_arm,
             )
+            return bandit_decision
         except Exception:
-            log.debug("shadow bandit log failed", exc_info=True)
+            log.debug("bandit decision log failed", exc_info=True)
+            return None

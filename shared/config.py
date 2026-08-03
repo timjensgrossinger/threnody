@@ -531,6 +531,22 @@ class HostFastStartConfig:
 
 
 @dataclass
+class RoutingConfig:
+    """Contextual-bandit routing policy (``shared/bandit.py``).
+
+    ``bandit_mode`` defaults to ``shadow``: picks are logged next to the
+    heuristic choice but never executed. ``live`` lets the bandit choose — but
+    only once every candidate arm has at least ``bandit_min_updates``
+    observations, because an untrained LinUCB arm scores on its exploration
+    bonus alone and would pick arbitrarily.
+    """
+
+    bandit_mode: str = "shadow"  # shadow | live
+    bandit_alpha: float = 1.0  # exploration weight
+    bandit_min_updates: int = 50  # per-arm observations before live selection
+
+
+@dataclass
 class ModelQualityConfig:
     """Controls the granular per-(model x effort x dimension) quality ledger.
 
@@ -1612,6 +1628,7 @@ class TGsConfig:
     host_native: HostNativeConfig = field(default_factory=HostNativeConfig)
     host_fast_start: HostFastStartConfig = field(default_factory=HostFastStartConfig)
     model_quality: ModelQualityConfig = field(default_factory=ModelQualityConfig)
+    routing: RoutingConfig = field(default_factory=RoutingConfig)
     budgets: BudgetConfig = field(default_factory=BudgetConfig)
 
     # Cache
@@ -1651,11 +1668,16 @@ class TGsConfig:
     review_learning_enabled: bool = True
     # Whether per-project routing learning is on for a project that has never been
     # explicitly configured. A stored project_routing row always wins, so an
-    # operator opt-out is never overridden; this only decides the never-seen case.
-    # Defaults False to preserve the documented opt-in gate (see
-    # tests/test_router.py::test_project_local_optin_gate) — set it true to have
-    # router.learn_project_routing accumulate without a per-project opt-in.
-    project_learning_default: bool = False
+    # operator opt-out (`threnody tune set learning_enabled false`) is never
+    # overridden; this only decides the never-seen case.
+    #
+    # Defaults True: with it False nothing ever wrote a project_routing row, so
+    # adaptive thresholds, observation recording and the project tier bias were
+    # dormant on every project — the loops existed but could not accumulate.
+    # Acting on thin data is already prevented by the sample gates
+    # (ACTIVATION_MIN_SAMPLES=5, adaptive.PROJECT_SAMPLE_MIN=3), so turning this
+    # on changes what is *recorded* long before it changes what is *routed*.
+    project_learning_default: bool = True
 
     # Prior-review memory. When enabled, a (file revision x dimension) cell already
     # reviewed at an equal-or-stronger tier is skipped and its stored findings are
@@ -2084,6 +2106,32 @@ class TGsConfig:
             default=cfg.project_learning_default,
             field_name="project_learning_default",
         )
+
+        routing_raw = raw.get("routing", {})
+        if isinstance(routing_raw, Mapping):
+            raw_bandit_mode = routing_raw.get("bandit_mode")
+            if isinstance(raw_bandit_mode, str) and raw_bandit_mode.strip().lower() in {
+                "shadow",
+                "live",
+            }:
+                cfg.routing.bandit_mode = raw_bandit_mode.strip().lower()
+            elif raw_bandit_mode is not None:
+                log.warning(
+                    "routing.bandit_mode must be 'shadow' or 'live'; keeping %s",
+                    cfg.routing.bandit_mode,
+                )
+            raw_alpha = routing_raw.get("bandit_alpha")
+            if raw_alpha is not None:
+                try:
+                    cfg.routing.bandit_alpha = max(0.0, float(raw_alpha))
+                except (TypeError, ValueError):
+                    log.warning("routing.bandit_alpha must be a float; keeping default")
+            cfg.routing.bandit_min_updates = _coerce_config_int(
+                routing_raw.get("bandit_min_updates", cfg.routing.bandit_min_updates),
+                default=cfg.routing.bandit_min_updates,
+                field_name="routing.bandit_min_updates",
+                minimum=0,
+            )
         cfg.review_memory_enabled = raw.get("review_memory_enabled", True) is True
         cfg.review_structural_dim_gating = (
             raw.get("review_structural_dim_gating", True) is True
