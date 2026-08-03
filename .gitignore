@@ -59,6 +59,10 @@ tests/eval/baseline.json
 # Internal planning artifacts (not part of public release)
 .planning/
 
+# Knowledge-graph output from the graphify skill — a regenerable local AST cache,
+# not part of the repo. Rebuilt on branch switch, so it churns constantly.
+graphify-out/
+
 # Environment and secrets
 .env
 .env.*
