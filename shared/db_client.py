@@ -328,7 +328,7 @@ def open_database(db_path: str | Path | None = None, *, config=None):
     Safe default: any failure to reach/spawn the daemon falls back to a direct
     ``Database`` (today's behavior) unless the operator disables fallback.
     """
-    from .config import TGsConfig
+    from .config import DB_BACKUP_INTERVAL_HOURS, DB_BACKUP_KEEP, TGsConfig
     from .db import Database
 
     if config is None:
@@ -349,8 +349,10 @@ def open_database(db_path: str | Path | None = None, *, config=None):
                 raise
             log.warning("db daemon unavailable (%s) — using direct DB", exc)
 
-    backup_keep = int(getattr(config, "db_backup_keep", 3) or 3)
-    backup_interval_hours = int(getattr(config, "db_backup_interval_hours", 6) or 0)
+    backup_keep = int(getattr(config, "db_backup_keep", DB_BACKUP_KEEP) or DB_BACKUP_KEEP)
+    backup_interval_hours = int(
+        getattr(config, "db_backup_interval_hours", DB_BACKUP_INTERVAL_HOURS) or 0
+    )
     resilience = getattr(config, "resilience", None)
     if resolved_path:
         return Database(

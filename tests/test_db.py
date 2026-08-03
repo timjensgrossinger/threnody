@@ -874,6 +874,73 @@ def test_auto_backup_skipped_after_recovery() -> None:
         assert _backups(path) == []
 
 
+def test_backup_retention_defaults_agree_across_every_site() -> None:
+    """The shipped retention policy must be one value, not five copies of it.
+
+    The default previously appeared as a bare literal in TGsConfig, in
+    TGsConfig.from_yaml, in Database.__init__, in _prune_old_backups and in
+    db_client.open_database. Any one of them drifting silently shortens the
+    restore window, and nothing would fail — so assert they resolve identically.
+    """
+    import inspect
+
+    from shared.config import DB_BACKUP_INTERVAL_HOURS, DB_BACKUP_KEEP, TGsConfig
+
+    cfg = TGsConfig()
+    assert cfg.db_backup_keep == DB_BACKUP_KEEP
+    assert cfg.db_backup_interval_hours == DB_BACKUP_INTERVAL_HOURS
+
+    # from_yaml() falls back to the same constants when no cache: block is set.
+    from_yaml = TGsConfig.from_yaml()
+    assert from_yaml.db_backup_keep == DB_BACKUP_KEEP
+    assert from_yaml.db_backup_interval_hours == DB_BACKUP_INTERVAL_HOURS
+
+    params = inspect.signature(Database.__init__).parameters
+    assert params["backup_keep"].default == DB_BACKUP_KEEP
+    assert params["backup_interval_hours"].default == DB_BACKUP_INTERVAL_HOURS
+    prune = inspect.signature(Database._prune_old_backups).parameters
+    assert prune["keep"].default == DB_BACKUP_KEEP
+
+
+def test_backup_retention_policy_covers_seven_days() -> None:
+    """Count x cadence is the restore window; the shipped policy is 7 days."""
+    from shared.config import DB_BACKUP_INTERVAL_HOURS, DB_BACKUP_KEEP
+
+    assert DB_BACKUP_KEEP * DB_BACKUP_INTERVAL_HOURS == 7 * 24
+    # Cadence must stay well under a day: the newest snapshot bounds how much
+    # accumulated learning a restore forfeits.
+    assert DB_BACKUP_INTERVAL_HOURS <= 6
+
+
+def test_prune_keeps_newest_and_never_empties_the_set() -> None:
+    """Rotation is count-based, so it must never drop the last candidate.
+
+    An age-based prune would delete every snapshot on an install left idle past
+    the cutoff. Assert the newest `keep` survive and that pruning a set older
+    than any plausible cutoff still leaves them.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path, backup_interval_hours=0)
+        try:
+            base = int(time.time()) - 90 * 24 * 3600  # all ~3 months old
+            made = []
+            for offset in range(6):
+                stamp = base + offset
+                candidate = Path(f"{path}.bak.{stamp}")
+                candidate.write_bytes(b"x")
+                made.append(str(candidate))
+
+            db._prune_old_backups(keep=2)
+
+            survivors = _backups(path)
+            assert len(survivors) == 2, survivors
+            # The two newest timestamps win, despite every file being ancient.
+            assert sorted(survivors) == sorted(made[-2:]), survivors
+        finally:
+            db.close()
+
+
 if __name__ == "__main__":
     tests = [
         test_cache_put_and_get,

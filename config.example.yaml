@@ -82,7 +82,11 @@ project_learning_default: true
 
 cache:
   ttl_hours: 24
-  backup_keep: 3
+  # Rotating-backup retention count. With backup_interval_hours below, this is the
+  # restore window: 28 * 6h = 7 days. A COUNT rather than an age cutoff on purpose —
+  # an age-based prune deletes every snapshot once an install sits idle past the
+  # cutoff, losing the last restore candidate when it matters most.
+  backup_keep: 28
   # Hours between automatic rotating backups (0 disables). Without a backup on
   # disk, a corrupt cache.db is quarantined and recreated empty — silently
   # resetting every accumulated learning table. Taken at startup only, skipped

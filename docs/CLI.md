@@ -55,6 +55,22 @@ threnody db check
 threnody db backup
 ```
 
+### Backup retention
+
+`db check` reports `backups_present` and `newest_backup_age_hours`, both read from the
+`cache.db.bak.*` files on disk. It deliberately does not report `last_backup_ts`, which
+only records a backup the current process took and so reads "never" on a healthy install.
+
+The shipped policy keeps **28 snapshots at a 6h cadence — a 7-day restore window**, tuned
+via `cache.backup_keep` / `cache.backup_interval_hours` (see `config.example.yaml`). This
+is a learning-durability control: with no snapshot on disk, a corrupt `cache.db` is
+quarantined and recreated empty, resetting `review_tier_bias`, `model_quality_events`,
+`project_routing` and every other accumulated table.
+
+Retention is a **count, not an age cutoff**. An age-based prune deletes every snapshot once
+an install sits idle past the cutoff — dropping the last restore candidate exactly when it
+can no longer be regenerated.
+
 ## Live monitoring
 
 ```bash

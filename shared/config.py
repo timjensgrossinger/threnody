@@ -90,6 +90,27 @@ PLANNER_ALLOW_TOPOLOGY_FALLBACK = False
 # ---------------------------------------------------------------------------
 PLAN_CACHE_TTL_HOURS = 168  # 7 days
 RESULT_CACHE_TTL_HOURS = 168
+
+# ---------------------------------------------------------------------------
+# DB backup retention
+# ---------------------------------------------------------------------------
+# The auto-backup is opportunistic: it is taken at startup when one is due, so
+# the restore window is roughly ``DB_BACKUP_KEEP * DB_BACKUP_INTERVAL_HOURS`` —
+# 28 * 6h = 7 days. This is a learning-durability policy, not housekeeping. With
+# no ``.bak.*`` on disk, ``Database._recover_db_locked`` has no candidate and a
+# single corruption quarantines cache.db and recreates it EMPTY, resetting
+# review_tier_bias, model_quality_events, project_routing, subtask_patterns and
+# every other accumulated table.
+#
+# Rotation is deliberately count-based rather than age-based. An age-based prune
+# ("delete anything older than 7 days") deletes *every* snapshot once an install
+# sits idle past the cutoff — dropping the last restore candidate at exactly the
+# moment it can no longer be regenerated. A count never reaches zero.
+#
+# The interval stays at 6h rather than daily so a restore costs at most ~6h of
+# accumulated learning; depth comes from the count, not from a longer cadence.
+DB_BACKUP_INTERVAL_HOURS = 6
+DB_BACKUP_KEEP = 28  # 28 * 6h = 7 days of restore history
 # Bumped to 2: plans now carry plural `target_files` ownership, `inline_files`
 # and `coverage`. Cached v1 plans predate the ownership fix (a coupled group was
 # stored owning a single file while its prompt claimed several) and must not be
@@ -1633,11 +1654,14 @@ class TGsConfig:
 
     # Cache
     db_path: Path = field(default_factory=lambda: DB_PATH)
-    db_backup_keep: int = 3
+    # Rotating-backup retention count. With the interval below this is the
+    # restore window: 28 * 6h = 7 days. See DB_BACKUP_KEEP for why the policy is
+    # count-based rather than age-based.
+    db_backup_keep: int = DB_BACKUP_KEEP
     # Hours between automatic rotating DB backups (0 disables). Without a backup
     # candidate, one corruption quarantines the DB and every learning table
     # resets to empty — see Database._maybe_auto_backup.
-    db_backup_interval_hours: int = 6
+    db_backup_interval_hours: int = DB_BACKUP_INTERVAL_HOURS
     plan_cache_ttl_hours: int = PLAN_CACHE_TTL_HOURS
     result_cache_ttl_hours: int = RESULT_CACHE_TTL_HOURS
 
@@ -1973,10 +1997,15 @@ class TGsConfig:
                 default_soft_warning_pct=budgets_raw.get("default_soft_warning_pct", 0.8),
             ),
             plan_cache_ttl_hours=cache_raw.get("ttl_hours", PLAN_CACHE_TTL_HOURS),
-            db_backup_keep=_coerce_config_int(cache_raw.get("backup_keep", 3), default=3, field_name="cache.backup_keep", minimum=1),
+            db_backup_keep=_coerce_config_int(
+                cache_raw.get("backup_keep", DB_BACKUP_KEEP),
+                default=DB_BACKUP_KEEP,
+                field_name="cache.backup_keep",
+                minimum=1,
+            ),
             db_backup_interval_hours=_coerce_config_int(
-                cache_raw.get("backup_interval_hours", 6),
-                default=6,
+                cache_raw.get("backup_interval_hours", DB_BACKUP_INTERVAL_HOURS),
+                default=DB_BACKUP_INTERVAL_HOURS,
                 field_name="cache.backup_interval_hours",
                 minimum=0,
             ),
