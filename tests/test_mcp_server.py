@@ -15,6 +15,18 @@ import pytest
 from shared.config import RoutingPreference, TGsConfig
 from shared.db import Database
 
+# `_provider_override_payload` forwards the delegation-utility gate unconditionally
+# (it tests `is not None`, and the gate defaults to False rather than None), so every
+# registry override payload carries this block even for a stock config. Derived from
+# TGsConfig defaults so a change to DEFAULT_DELEGATION_UTILITIES does not desync these
+# expectations.
+_DELEGATION_OVERRIDES: dict[str, object] = {
+    "providers": {
+        "delegation_utilities_enabled": TGsConfig().delegation_utilities_enabled,
+        "delegation_utilities": list(TGsConfig().delegation_utilities),
+    }
+}
+
 
 class StubRegistry:
     def select_provider_for_tier(
@@ -171,7 +183,7 @@ def test_check_providers_does_not_require_full_init(monkeypatch) -> None:
     result = mcp_server.handle_check_providers({})
 
     assert result == {"providers": [{"id": "github-copilot"}], "total": 1}
-    assert seen_config == [{"provider_cost_overrides": {"fresh": {}}}]
+    assert seen_config == [{"provider_cost_overrides": {"fresh": {}}} | _DELEGATION_OVERRIDES]
 
 
 def test_check_providers_falls_back_to_cached_config_on_reload_error(monkeypatch) -> None:
@@ -209,8 +221,8 @@ def test_check_providers_falls_back_to_cached_config_on_reload_error(monkeypatch
     assert result == {"providers": [{"id": "github-copilot"}], "total": 1}
     assert second_result == result
     assert seen_config == [
-        {"provider_cost_overrides": {"cached": {}}},
-        {"provider_cost_overrides": {"cached": {}}},
+        {"provider_cost_overrides": {"cached": {}}} | _DELEGATION_OVERRIDES,
+        {"provider_cost_overrides": {"cached": {}}} | _DELEGATION_OVERRIDES,
     ]
     assert reload_attempts == 1
 
@@ -258,7 +270,7 @@ def test_check_providers_forwards_preferred_routing(monkeypatch) -> None:
     result = mcp_server.handle_check_providers({})
 
     assert result == {"providers": [{"id": "claude-code"}], "total": 1}
-    assert seen_config == [{"preferred_routing": preferred_routing}]
+    assert seen_config == [{"preferred_routing": preferred_routing} | _DELEGATION_OVERRIDES]
 
 
 def test_ensure_init_does_not_start_background_services(monkeypatch, tmp_path: Path) -> None:

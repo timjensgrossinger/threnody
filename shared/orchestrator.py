@@ -966,7 +966,7 @@ class Orchestrator:
                 est_cost_usd=est_cost,
                 counterfactual_tier="high",
                 counterfactual_cost_usd=counterfactual_cost,
-                role=result.role,
+                role=getattr(result, "role", None),
             )
         except Exception:
             log.debug("_record_cost_telemetry_for_result failed", exc_info=True)
@@ -991,7 +991,7 @@ class Orchestrator:
             used_fallback=result.used_fallback,
             used_speculation=result.used_speculation,
             effort=getattr(result, "effort", None),
-            role=result.role,
+            role=getattr(result, "role", None),
         )
         # Opt-out, off-hot-path quality judge (source='judge'). Non-blocking:
         # submits to the warm-path executor and returns immediately, so it never
