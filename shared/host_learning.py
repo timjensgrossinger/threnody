@@ -1992,14 +1992,30 @@ def finalize_host_swarm(
             routing_learning_warning = f"routing_bias:{exc}"
             log.debug("routing bias learning failed for %s", run_id, exc_info=True)
 
+    # Close the bandit loop. routing_decisions rows are keyed on
+    # outcomes.route_task_id(task), so the run's task_hint must be resolved
+    # through the same helper — passing run_id (as this did) matched nothing,
+    # leaving outcome_score NULL on every row and the routing arms untrained.
     try:
-        db.update_routing_decision_outcome(
-            run_id,
-            outcome_score=1.0 if success else 0.0,
-            regret=0.0 if success else 1.0,
-        )
+        task_hint = str(meta.get("task_hint") or "").strip()
+        if task_hint:
+            from .outcomes import route_task_id
+
+            db.update_routing_decision_outcome(
+                route_task_id(task_hint),
+                outcome_score=1.0 if success else 0.0,
+                regret=0.0 if success else 1.0,
+            )
     except Exception:
         log.debug("bandit outcome update skipped for %s", run_id, exc_info=True)
+
+    # Cold-path training: replay newly scored decisions into the arm models.
+    try:
+        from .bandit import train_from_decisions
+
+        train_from_decisions(db)
+    except Exception:
+        log.debug("bandit training skipped for %s", run_id, exc_info=True)
 
     if config is not None:
         try:

@@ -2,11 +2,18 @@
 Contextual bandit routing policy (plan 11).
 
 LinUCB / Thompson sampling over (tier, provider_id) arms.
-Shadow-only today: arms are updated from recorded outcomes (currently consensus
-persona picks, see host_learning) and readable via ``arm_stats``, but nothing
-executes a bandit choice. There is no ``config.routing.bandit_mode`` knob — that
-config section does not exist; promoting this to live routing is unimplemented
-work, not a setting.
+Runs in shadow mode by default — logs picks but executes the heuristic choice.
+Promote with ``config.routing.bandit_mode = 'live'``.
+
+Live selection is additionally gated on training: an arm with no observations has
+``A = I`` and ``b = 0``, so its UCB score is pure exploration bonus and identical
+for every tier. Selecting on that would not be "learned routing", it would be
+"whichever arm was enumerated first". :meth:`BanditPolicy.select` therefore falls
+back to the heuristic until every candidate arm has at least
+``routing.bandit_min_updates`` observations.
+
+Arms are persisted in ``bandit_arms`` and trained off the hot path by
+:func:`train_from_decisions`, which replays scored ``routing_decisions`` rows.
 """
 from __future__ import annotations
 
@@ -169,6 +176,10 @@ class BanditDecision:
     bandit_score: float
     heuristic_arm: str
     chosen_arm: str  # = heuristic_arm in shadow mode
+    # Why chosen_arm is what it is: "shadow", "untrained", "no_arms" or "bandit".
+    # Without this an operator cannot tell a live bandit that agreed with the
+    # heuristic from one that never got to choose.
+    reason: str = "shadow"
 
 
 class BanditPolicy:
@@ -179,13 +190,52 @@ class BanditPolicy:
         db: "Database | None" = None,
         alpha: float = 1.0,
         mode: str = "shadow",
+        min_updates: int = 50,
     ) -> None:
         self._db = db
         self._alpha = alpha
         self._mode = mode  # shadow | live
+        self._min_updates = max(0, int(min_updates))
         self._arms: dict[str, LinUCBArmModel] = {}
+        self._loaded = False
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def _load_persisted(self) -> None:
+        """Hydrate arm models from the DB once per policy instance."""
+        if self._loaded:
+            return
+        self._loaded = True
+        if self._db is None:
+            return
+        try:
+            for arm_id, state in self._db.load_bandit_arms().items():
+                a_matrix = state.get("A")
+                b_vector = state.get("b")
+                if (
+                    not isinstance(a_matrix, list)
+                    or len(a_matrix) != FEATURE_DIM
+                    or not isinstance(b_vector, list)
+                    or len(b_vector) != FEATURE_DIM
+                ):
+                    # Feature layout changed since this row was written; a stale
+                    # shape would silently score against the wrong dimensions.
+                    log.debug("bandit arm %s has stale feature shape; ignoring", arm_id)
+                    continue
+                self._arms[arm_id] = LinUCBArmModel(
+                    arm_id=arm_id,
+                    alpha=self._alpha,
+                    A=a_matrix,
+                    b=b_vector,
+                    n_updates=int(state.get("n_updates") or 0),
+                )
+        except Exception:  # pragma: no cover - persistence is best-effort
+            log.debug("bandit arm hydration failed", exc_info=True)
 
     def _get_or_create_arm(self, arm_id: str) -> LinUCBArmModel:
+        self._load_persisted()
         if arm_id not in self._arms:
             self._arms[arm_id] = LinUCBArmModel(arm_id=arm_id, alpha=self._alpha)
         return self._arms[arm_id]
@@ -196,45 +246,104 @@ class BanditPolicy:
         available_arms: list[str],
         heuristic_arm: str,
     ) -> BanditDecision:
-        """Select best arm by UCB score. Always executes heuristic in shadow mode."""
+        """Select the best arm by UCB score.
+
+        Executes the heuristic in shadow mode, and also in live mode while any
+        candidate arm is still under ``min_updates`` — an untrained arm scores on
+        its exploration bonus alone, so acting on it would be arbitrary rather
+        than learned.
+        """
         if not available_arms:
             return BanditDecision(
                 bandit_arm=heuristic_arm,
                 bandit_score=0.0,
                 heuristic_arm=heuristic_arm,
                 chosen_arm=heuristic_arm,
+                reason="no_arms",
             )
         best_arm = heuristic_arm
         best_score = -float("inf")
+        trained = True
         for arm_id in available_arms:
             model = self._get_or_create_arm(arm_id)
+            if model.n_updates < self._min_updates:
+                trained = False
             score = model.ucb_score(features)
             if score > best_score:
                 best_score = score
                 best_arm = arm_id
 
-        chosen = heuristic_arm if self._mode == "shadow" else best_arm
+        if self._mode != "live":
+            reason = "shadow"
+        elif not trained:
+            reason = "untrained"
+        else:
+            reason = "bandit"
+        chosen = best_arm if reason == "bandit" else heuristic_arm
         return BanditDecision(
             bandit_arm=best_arm,
             bandit_score=best_score,
             heuristic_arm=heuristic_arm,
             chosen_arm=chosen,
+            reason=reason,
         )
 
     def update(self, arm_id: str, features: list[float], reward: float) -> None:
-        """Update arm model with observed reward (0..1)."""
+        """Update arm model with observed reward (0..1) and persist it."""
+        if len(features) != FEATURE_DIM:
+            log.debug(
+                "bandit update for %s ignored: %d features, expected %d",
+                arm_id, len(features), FEATURE_DIM,
+            )
+            return
         model = self._get_or_create_arm(arm_id)
         model.update(features, reward)
+        if self._db is not None:
+            self._db.save_bandit_arm(arm_id, model.A, model.b, model.n_updates)
 
     def arm_stats(self) -> list[dict]:
+        self._load_persisted()
         return [
             {
                 "arm_id": arm_id,
                 "n_updates": m.n_updates,
                 "alpha": m.alpha,
+                "trained": m.n_updates >= self._min_updates,
             }
             for arm_id, m in sorted(self._arms.items())
         ]
+
+
+def train_from_decisions(db: "Database", limit: int = 500) -> dict[str, int]:
+    """Replay scored ``routing_decisions`` rows into the arm models.
+
+    This is the training step the routing arms never had: ``_log_bandit_decision``
+    scores arms named ``{tier}:heuristic`` while the only historical ``update()``
+    call wrote ``{tier}:persona:{winner}`` — a disjoint namespace — so the routing
+    arms stayed at their identity prior forever.
+
+    Cold path only (swarm finalize / operator CLI). Each row is replayed exactly
+    once via the ``bandit_train_state`` high-water mark. Best-effort: returns
+    counts and never raises into a caller.
+    """
+    result = {"trained": 0, "last_row_id": 0}
+    try:
+        cursor = db.get_bandit_train_cursor()
+        rows = db.get_scored_routing_decisions(after_row_id=cursor, limit=limit)
+        if not rows:
+            result["last_row_id"] = cursor
+            return result
+        policy = get_bandit_policy(db=db)
+        highest = cursor
+        for row in rows:
+            policy.update(row["chosen"], row["features"], row["outcome_score"])
+            highest = max(highest, int(row["id"]))
+            result["trained"] += 1
+        db.set_bandit_train_cursor(highest)
+        result["last_row_id"] = highest
+    except Exception:  # pragma: no cover - training is best-effort
+        log.debug("bandit training failed", exc_info=True)
+    return result
 
 
 # Module-level singleton for MCP process lifetime.
@@ -244,9 +353,40 @@ _bandit_policy: BanditPolicy | None = None
 def get_bandit_policy(
     db: "Database | None" = None,
     alpha: float = 1.0,
-    mode: str = "shadow",
+    mode: str | None = None,
+    min_updates: int | None = None,
 ) -> BanditPolicy:
+    """Return the process-wide policy, reconfiguring it if the caller asks.
+
+    The old version froze ``db`` and ``mode`` at whichever call happened to be
+    first, so a later live-mode caller silently got a shadow policy (or one with
+    no DB, hence no persistence).
+
+    ``mode`` and ``min_updates`` are ``None`` by default and only applied when
+    passed — a caller that just needs the policy (training, ``arm_stats``) must
+    not reconfigure it. Defaulting ``mode`` to ``"shadow"`` here would mean
+    ``train_from_decisions`` silently demoted a live policy every time it ran.
+    """
     global _bandit_policy
     if _bandit_policy is None:
-        _bandit_policy = BanditPolicy(db=db, alpha=alpha, mode=mode)
+        _bandit_policy = BanditPolicy(
+            db=db,
+            alpha=alpha,
+            mode=mode or "shadow",
+            min_updates=50 if min_updates is None else min_updates,
+        )
+        return _bandit_policy
+    if db is not None and _bandit_policy._db is None:
+        _bandit_policy._db = db
+        _bandit_policy._loaded = False  # hydrate from the DB we just gained
+    if mode is not None:
+        _bandit_policy._mode = mode
+    if min_updates is not None:
+        _bandit_policy._min_updates = max(0, int(min_updates))
     return _bandit_policy
+
+
+def reset_bandit_policy() -> None:
+    """Drop the singleton. For tests and for reconfiguration after a config reload."""
+    global _bandit_policy
+    _bandit_policy = None

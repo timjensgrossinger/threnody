@@ -148,9 +148,15 @@ def test_hard_bounds_respected() -> None:
 
 
 def test_project_local_optin_gate() -> None:
+    """The opt-in gate itself, exercised with the default turned off.
+
+    Asserts the mechanism (no row -> configured default, explicit enable wins),
+    not the shipped default value — which is now True, see
+    test_project_learning_on_by_default.
+    """
     with tempfile.TemporaryDirectory() as td:
         db = Database(Path(td) / "router.db")
-        router = TaskRouter(TGsConfig(), db=db)
+        router = TaskRouter(TGsConfig(project_learning_default=False), db=db)
         project_id = str(Path(td) / "project")
 
         assert router.is_learning_enabled(project_id) is False
@@ -162,14 +168,35 @@ def test_project_local_optin_gate() -> None:
 def test_project_learning_setting_round_trip_through_db_helper() -> None:
     with tempfile.TemporaryDirectory() as td:
         db = Database(Path(td) / "router.db")
-        router = TaskRouter(TGsConfig(), db=db)
+        router = TaskRouter(TGsConfig(project_learning_default=False), db=db)
         project_id = str((Path(td) / "project").resolve())
 
         assert router.is_learning_enabled(project_id) is False
         db.set_project_setting(project_id, "learning_enabled", True)
         assert router.is_learning_enabled(project_id) is True
         db.reset_project_setting(project_id, "learning_enabled")
+        # Back to no stored row -> falls through to the configured default.
         assert router.is_learning_enabled(project_id) is False
+        db.close()
+
+
+def test_project_learning_on_by_default() -> None:
+    """Shipped default: an unconfigured project learns, an opt-out still wins."""
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "router.db")
+        router = TaskRouter(TGsConfig(), db=db)
+        project_id = str((Path(td) / "project").resolve())
+
+        # No project_routing row at all -> the configured default decides.
+        assert router.is_learning_enabled(project_id) is True
+
+        # An explicit operator opt-out is never overridden by the default.
+        db.set_project_setting(project_id, "learning_enabled", False)
+        assert router.is_learning_enabled(project_id) is False
+
+        # Clearing the row returns it to the default rather than to False.
+        db.reset_project_setting(project_id, "learning_enabled")
+        assert router.is_learning_enabled(project_id) is True
         db.close()
 
 

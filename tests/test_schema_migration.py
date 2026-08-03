@@ -151,7 +151,10 @@ def test_project_setting_helpers_round_trip() -> None:
         assert reset_one["concurrency_limit"] == defaults["concurrency_limit"]
 
         reset_all = db.reset_project_setting("project-a")
-        assert reset_all["learning_enabled"] is False
+        # Reset restores the configured default, exactly like concurrency_limit
+        # below. It used to hard-write 0, which made "reset learning_enabled"
+        # silently mean "disable learning" rather than "forget my choice".
+        assert reset_all["learning_enabled"] == defaults["learning_enabled"]
         assert reset_all["concurrency_limit"] == defaults["concurrency_limit"]
         db.close()
 
