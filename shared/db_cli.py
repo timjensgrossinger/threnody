@@ -9,6 +9,36 @@ from pathlib import Path
 from .db import Database
 
 
+def _backup_count(db: Database) -> int | str:
+    """Number of ``.bak.*`` restore candidates beside the live DB."""
+    import glob as _glob
+
+    db_path = getattr(db, "_db_path", None)
+    if db_path is None:
+        return "unknown"  # RemoteDatabase / stub — no local path to scan.
+    try:
+        return len(_glob.glob(str(db_path) + ".bak.*"))
+    except OSError:
+        return "unknown"
+
+
+def _newest_backup_age_hours(db: Database) -> str:
+    """Age of the newest restore candidate, or a warning when there is none."""
+    age_fn = getattr(db, "_newest_backup_age_s", None)
+    if not callable(age_fn):
+        return "unknown"
+    try:
+        age_s = age_fn()
+    except Exception:
+        return "unknown"
+    if age_s is None:
+        return (
+            "none — a corruption would quarantine cache.db and reset every "
+            "learning table (run: threnody db backup)"
+        )
+    return f"{age_s / 3600:.1f}"
+
+
 def cmd_check(args):
     """Run integrity check on the database."""
     db_path = args.db
@@ -19,8 +49,13 @@ def cmd_check(args):
         print(f"integrity_ok: {db.last_integrity_ok}")
         print(f"db_path: {db_path}")
         print(f"memory_fts_rows: {rebuilt}")
-        last_backup = db.last_backup_ts if db.last_backup_ts is not None else "never"
-        print(f"last_backup: {last_backup}")
+        # Report the restore candidate on *disk*, not `last_backup_ts` — that only
+        # records a backup this process took, so it reads "never" on every healthy
+        # install and made the one command an operator runs to ask "am I protected?"
+        # claim there was no backup while several sat next to the DB. Mirrors
+        # status._load_backup_health.
+        print(f"backups_present: {_backup_count(db)}")
+        print(f"newest_backup_age_hours: {_newest_backup_age_hours(db)}")
         if not db.last_integrity_ok:
             sys.exit(1)
     finally:

@@ -39,6 +39,8 @@ from .resilience import (
 
 from .config import (
     CURRENT_PLAN_SCHEMA_VERSION,
+    DB_BACKUP_INTERVAL_HOURS,
+    DB_BACKUP_KEEP,
     DB_PATH,
     PLAN_CACHE_TTL_HOURS,
     RESULT_CACHE_TTL_HOURS,
@@ -123,8 +125,8 @@ class Database:
         db_path: Path | None = None,
         result_ttl_hours: int = RESULT_CACHE_TTL_HOURS,
         plan_ttl_hours: int = PLAN_CACHE_TTL_HOURS,
-        backup_keep: int = 3,
-        backup_interval_hours: int = 6,
+        backup_keep: int = DB_BACKUP_KEEP,
+        backup_interval_hours: int = DB_BACKUP_INTERVAL_HOURS,
         resilience: object | None = None,
     ) -> None:
         self._db_path = (db_path or DB_PATH).expanduser() if db_path else DB_PATH
@@ -2727,7 +2729,7 @@ class Database:
             log.warning("DB backup failed", exc_info=True)
             return None
 
-    def _prune_old_backups(self, keep: int = 3) -> None:
+    def _prune_old_backups(self, keep: int = DB_BACKUP_KEEP) -> None:
         import glob as _glob
         pattern = str(self._db_path) + ".bak.*"
         candidates = sorted(
