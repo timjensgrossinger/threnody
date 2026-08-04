@@ -312,6 +312,7 @@ def _normalize_path_key(path: object, base: str | None = None) -> str:
 
 
 def _index_handoff_snapshots(
+    run_id: str,
     snapshots: list[dict[str, object]],
     workspace_root: str | None = None,
 ) -> tuple[
@@ -363,6 +364,22 @@ def _index_handoff_snapshots(
                     prior_wave = 0
                 if 0 < wave_num < prior_wave or prior_wave == 0:
                     by_target_file[key] = snap
+        # Review agents are read-only w.r.t. their target file — their only
+        # Write hits their own findings artifact. Index that path too, or the
+        # PostToolUse hook (which only ever sees the artifact write) can never
+        # resolve a review agent's hook record back to this snapshot.
+        subagent_type = str(snap.get("subagent_type") or "")
+        if subagent_type in _REVIEW_SUBAGENT_TO_DIM and isinstance(spawn_id, str) and spawn_id.strip():
+            try:
+                from .findings_merge import findings_path
+
+                art_key = _normalize_path_key(
+                    str(findings_path(run_id, spawn_id.strip())), workspace_root
+                )
+            except Exception:
+                art_key = ""
+            if art_key:
+                by_target_file.setdefault(art_key, snap)
     return by_task_id, by_spawn_id, by_wave_agent, by_target_file
 
 
@@ -417,7 +434,7 @@ def _enrich_agent_from_handoff(
         snap = snapshots_by_wave_agent.get((wave_index, agent_index))
     if snap is None:
         return merged
-    for key in ("prompt", "tier", "model", "task_id", "spawn_id"):
+    for key in ("prompt", "tier", "model", "task_id", "spawn_id", "subagent_type"):
         if not merged.get(key) and snap.get(key):
             merged[key] = snap[key]
     if not merged.get("description") and snap.get("prompt"):
@@ -426,6 +443,9 @@ def _enrich_agent_from_handoff(
     snap_targets = snap.get("target_files")
     if not target_files and isinstance(snap_targets, list):
         merged["target_files"] = list(snap_targets)
+        target_files = snap_targets
+    if not merged.get("target_file") and isinstance(target_files, list) and target_files:
+        merged["target_file"] = target_files[0]
     return merged
 
 
@@ -530,6 +550,7 @@ def register_host_run_handoff(
                     "model": model,
                     "prompt": agent.get("prompt"),
                     "target_files": target_files,
+                    "subagent_type": str(agent.get("subagent_type") or "") or None,
                     "wave": wave_idx,
                     "agent_index": agent_index,
                 }
@@ -1254,7 +1275,7 @@ def ingest_host_wave(
 
     snapshots = db.get_handoff_agent_snapshots(run_id)
     by_task_id, by_spawn_id, by_wave_agent, by_target_file = _index_handoff_snapshots(
-        snapshots, effective_root
+        run_id, snapshots, effective_root
     )
 
     tracker = _wave_tracker(run_id)
@@ -1295,6 +1316,8 @@ def ingest_host_wave(
             "model": enriched.get("model"),
             "prompt": enriched.get("prompt"),
             "description": enriched.get("description") or enriched.get("prompt"),
+            "subagent_type": enriched.get("subagent_type"),
+            "target_file": enriched.get("target_file"),
         }
         touched_files_raw = enriched.get("touched_files")
         touched_files: list[str] = []
@@ -1597,7 +1620,7 @@ def import_run_log(
     by_target_file: dict[str, Mapping[str, object]] = {}
     try:
         _, _, _, by_target_file = _index_handoff_snapshots(
-            db.get_handoff_agent_snapshots(run_id), workspace_root
+            run_id, db.get_handoff_agent_snapshots(run_id), workspace_root
         )
     except Exception:
         log.debug("handoff path index unavailable for %s", run_id, exc_info=True)

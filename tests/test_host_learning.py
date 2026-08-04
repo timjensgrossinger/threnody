@@ -981,7 +981,7 @@ def test_hook_record_is_attributed_to_planned_agent_by_target_file(
 
     snapshots = db.get_handoff_agent_snapshots("swarm-attrib")
     by_task, by_spawn, by_wave, by_path = _index_handoff_snapshots(
-        snapshots, str(workspace)
+        "swarm-attrib", snapshots, str(workspace)
     )
     assert by_path, "handoff snapshots must be indexed by target file"
 
