@@ -217,6 +217,19 @@ def diagnose(db, repair: bool = False, dry_run: bool = False) -> int:
             print(f"  → {_DB_SUGGEST['db_corrupt']}")
         if rep.get("lock_present"):
             print("DB: recovery lock file present (normal during concurrent init)")
+        snapshot_fn = getattr(db, "db_health_snapshot", None)
+        if callable(snapshot_fn):
+            try:
+                snapshot = snapshot_fn()
+            except Exception:
+                snapshot = {}
+            detected_ts = (snapshot or {}).get("corruption_detected_ts")
+            if detected_ts:
+                import datetime as _dt
+
+                when = _dt.datetime.fromtimestamp(detected_ts).strftime("%Y-%m-%d %H:%M")
+                recovered = " (recovered)" if snapshot.get("recovered_this_session") else ""
+                print(f"DB: corruption detected this session at {when}{recovered}")
 
     # Single-writer daemon health (only when opted in)
     _daemon_health_check(db)

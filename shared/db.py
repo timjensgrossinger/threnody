@@ -41,7 +41,9 @@ from .config import (
     CURRENT_PLAN_SCHEMA_VERSION,
     DB_BACKUP_INTERVAL_HOURS,
     DB_BACKUP_KEEP,
+    DB_INTEGRITY_REPROBE_INTERVAL_HOURS,
     DB_PATH,
+    DB_SYNCHRONOUS_DEFAULT,
     PLAN_CACHE_TTL_HOURS,
     RESULT_CACHE_TTL_HOURS,
     TGsConfig,
@@ -128,12 +130,25 @@ class Database:
         backup_keep: int = DB_BACKUP_KEEP,
         backup_interval_hours: int = DB_BACKUP_INTERVAL_HOURS,
         resilience: object | None = None,
+        integrity_reprobe_interval_hours: float = DB_INTEGRITY_REPROBE_INTERVAL_HOURS,
+        synchronous: str = DB_SYNCHRONOUS_DEFAULT,
     ) -> None:
         self._db_path = (db_path or DB_PATH).expanduser() if db_path else DB_PATH
         self._result_ttl = result_ttl_hours * 3600
         self._plan_ttl = plan_ttl_hours * 3600
         self._backup_keep = backup_keep
         self._backup_interval_s = max(0, int(backup_interval_hours)) * 3600
+        self._integrity_reprobe_interval_s = max(
+            0.0, float(integrity_reprobe_interval_hours)
+        ) * 3600.0
+        self._synchronous_mode = (
+            synchronous if synchronous in ("NORMAL", "FULL") else "NORMAL"
+        )
+        # Set the instant a query first observes ``PRAGMA integrity_check`` fail —
+        # distinct from ``_last_integrity_ok`` (a point-in-time verdict) so a caller
+        # can tell "checked once, ok" apart from "corruption was seen and handled".
+        self._corruption_detected_ts: float | None = None
+        self._corruption_recovery_lock = threading.Lock()
         # SQLite contention knobs (shared WAL across concurrent MCP servers). Falls
         # back to safe hard defaults when no ResilienceConfig is supplied.
         self._db_busy_timeout_ms = int(getattr(resilience, "db_busy_timeout_ms", 30000) or 30000)
@@ -160,6 +175,7 @@ class Database:
         self._ensure_private_db_file(self._db_path)
         self._restrict_db_permissions()
         self._check_integrity_and_recover()
+        self._last_integrity_probe_ts = time.time()
         self._maybe_auto_backup()
 
     def _ensure_private_db_directory(self) -> None:
@@ -1595,7 +1611,7 @@ class Database:
         """Apply the standard pragmas. busy_timeout is the primary lock guard."""
         if set_wal:
             conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA synchronous={self._synchronous_mode}")
         conn.execute(f"PRAGMA busy_timeout = {int(self._db_busy_timeout_ms)}")
         # Bound WAL growth under long-running swarms (only close() checkpointed before).
         conn.execute("PRAGMA wal_autocheckpoint = 1000")
@@ -1673,6 +1689,7 @@ class Database:
             with db.conn() as conn:
                 conn.execute("INSERT INTO telemetry ...")
         """
+        self._maybe_reprobe_integrity()
         conn = self._get_connection()
         try:
             yield conn
@@ -1691,8 +1708,15 @@ class Database:
             # Auto-reconnect: on persistent lock/operational failure, drop the cached
             # thread-local connection so the next call reopens fresh (the programmatic
             # equivalent of an MCP reconnect). Best-effort.
-            if classify_sqlite_error(exc) in (ErrorCategory.DB_LOCKED, ErrorCategory.DB_CORRUPT):
+            category = classify_sqlite_error(exc)
+            if category in (ErrorCategory.DB_LOCKED, ErrorCategory.DB_CORRUPT):
                 self._drop_thread_local_conn()
+            if category == ErrorCategory.DB_CORRUPT:
+                # Immediate detection, not just the periodic re-probe above — a
+                # write can hit corruption between probes, and the exception path
+                # is the fastest possible signal that something is actually wrong
+                # (vs. a probe that might not run for up to the reprobe interval).
+                self._handle_corruption_detected("conn_exception")
             raise
         # Note: Connection is NOT closed here — it persists in thread-local storage
         # for reuse by subsequent calls in the same thread (FNDX-01)
@@ -2446,6 +2470,107 @@ class Database:
         """Public/legacy entry — always runs under the cross-process lock."""
         with self._process_lock():
             self._recover_db_locked()
+
+    def _maybe_reprobe_integrity(self) -> None:
+        """Periodic mid-session corruption check.
+
+        ``_check_integrity_and_recover`` only ever ran once, at ``__init__`` —
+        fine for a short-lived CLI, silent for the long-lived MCP server that
+        holds the actual learning ledger. This piggybacks on ordinary ``conn()``
+        traffic the same way ``_maybe_auto_backup`` piggybacks on startup: a
+        cheap timestamp comparison in the common case, a real probe only once
+        per ``_integrity_reprobe_interval_s``.
+        """
+        if self._integrity_reprobe_interval_s <= 0:
+            return
+        now = time.time()
+        if now - getattr(self, "_last_integrity_probe_ts", 0.0) < self._integrity_reprobe_interval_s:
+            return
+        self._last_integrity_probe_ts = now
+        try:
+            result = self._integrity_probe(str(self._db_path))
+        except Exception:
+            log.debug("periodic integrity re-probe failed", exc_info=True)
+            return
+        if result is None:
+            return  # contention, not corruption — leave the verdict as-is
+        self._last_integrity_ok = result
+        if not result:
+            self._handle_corruption_detected("periodic_reprobe")
+
+    def _corruption_forensics(self) -> dict[str, object]:
+        """Best-effort breadcrumb for repeat-corruption diagnosis.
+
+        Ten quarantines have accumulated for this install over time — that is a
+        pattern, not bad luck. Capturing WAL size, sidecar presence, and whether
+        another process currently holds the file at the moment corruption is
+        *detected* (not after recovery, when the evidence is already gone) is
+        what makes the next occurrence traceable instead of another mystery.
+        """
+        info: dict[str, object] = {}
+        try:
+            wal, shm = self._sidecar_paths()
+            info["wal_exists"] = wal.exists()
+            info["wal_size_bytes"] = wal.stat().st_size if wal.exists() else 0
+            info["shm_exists"] = shm.exists()
+            info["main_size_bytes"] = (
+                self._db_path.stat().st_size if self._db_path.exists() else 0
+            )
+        except OSError:
+            log.debug("corruption forensics: stat failed", exc_info=True)
+        try:
+            info["exclusive_available"] = self._can_take_exclusive()
+        except Exception:
+            log.debug("corruption forensics: exclusive probe failed", exc_info=True)
+        info["synchronous_mode"] = self._synchronous_mode
+        return info
+
+    def _handle_corruption_detected(self, source: str) -> None:
+        """Loud, deduped corruption handling — the counterpart to silent recovery.
+
+        A quarantine-and-recreate that only ever ``log.warning``s is exactly how
+        this install accumulated ten ``cache.db.corrupt.*`` files without anyone
+        noticing until a review surfaced it. This makes the event visible on
+        ``self`` (for ``db_health_snapshot`` / MCP responses / ``threnody doctor``)
+        and attempts recovery immediately rather than waiting for the next
+        ``__init__``. Rate-limited via ``_corruption_recovery_lock`` so concurrent
+        callers hitting the same corruption don't pile on redundant recovery
+        attempts.
+        """
+        self._last_integrity_ok = False
+        already_recovering = not self._corruption_recovery_lock.acquire(blocking=False)
+        if already_recovering:
+            self._corruption_detected_ts = self._corruption_detected_ts or time.time()
+            return
+        try:
+            first_detection = self._corruption_detected_ts is None
+            self._corruption_detected_ts = self._corruption_detected_ts or time.time()
+            if first_detection:
+                log.warning(
+                    "DB corruption detected (source=%s) at %s — forensics: %s",
+                    source,
+                    self._db_path,
+                    self._corruption_forensics(),
+                )
+            self._recover_db()
+        finally:
+            self._corruption_recovery_lock.release()
+
+    def db_health_snapshot(self) -> dict[str, object]:
+        """Single producer of DB health for MCP responses, status, and doctor.
+
+        ``healthy`` reflects the last-known verdict, not a fresh probe — callers
+        that need a guaranteed-current answer should force one via
+        ``_check_integrity_and_recover()`` first (that is what ``threnody db
+        check`` does).
+        """
+        return {
+            "healthy": self._last_integrity_ok is not False,
+            "last_integrity_ok": self._last_integrity_ok,
+            "corruption_detected_ts": self._corruption_detected_ts,
+            "recovered_this_session": self._recovered_this_session,
+            "last_integrity_probe_ts": getattr(self, "_last_integrity_probe_ts", None),
+        }
 
     def _sidecar_paths(self) -> tuple[Path, Path]:
         """The ``-wal`` / ``-shm`` sidecars belonging to the main DB file."""
@@ -3549,7 +3674,19 @@ class Database:
         return envelopes
 
     def persist_swarm_run(self, swarm_run: Mapping[str, object]) -> None:
-        """Insert or update one authoritative swarm run record."""
+        """Insert or update one authoritative swarm run record.
+
+        The INSERT branch (first write for this ``swarm_id``) always fills every
+        column with its usual default, exactly as before. The ON CONFLICT branch
+        only overwrites columns whose key was actually present in *swarm_run* — a
+        ``{"swarm_id": ..., "status": "running"}`` progress ping must not zero out
+        ``requested_agents``/``effective_agents``/``task_hash``/etc. that an
+        earlier call already set. Before this, every host-native progress update
+        (``register_host_run_handoff``, wave-progress pings) reset those columns
+        to their bare defaults on every single call, which is why
+        ``requested_agents``/``effective_agents`` read 0 and ``task_hash`` read
+        ``''`` on every host-native ``swarm_runs`` row in production.
+        """
         swarm_id = str(swarm_run.get("swarm_id") or "").strip()
         if not swarm_id:
             raise ValueError("swarm_id is required")
@@ -3577,65 +3714,59 @@ class Database:
                 chosen_checkpoint_index_raw,
                 field_name="chosen_checkpoint_index",
             )
+
+        # (mapping key, insert value) pairs used for both the INSERT VALUES and,
+        # filtered to keys the caller actually passed, the ON CONFLICT SET clause.
+        insert_values: dict[str, object] = {
+            "task_hash": str(swarm_run.get("task_hash") or ""),
+            "created_ts": created_ts,
+            "status": str(swarm_run.get("status") or "planned"),
+            "requested_agents": self._coerce_swarm_int(
+                swarm_run.get("requested_agents", 0), field_name="requested_agents"
+            ),
+            "effective_agents": self._coerce_swarm_int(
+                swarm_run.get("effective_agents", 0), field_name="effective_agents"
+            ),
+            "progress_counters": progress_counters,
+            "cost_summary_ref": swarm_run.get("cost_summary_ref"),
+            "topology": swarm_run.get("topology"),
+            "round": self._coerce_swarm_int(swarm_run.get("round", 0), field_name="round"),
+            "resumable": resumable,
+            "resume_status": resume_status,
+            "parent_swarm_id": parent_swarm_id,
+            "chosen_checkpoint_index": chosen_checkpoint_index,
+        }
+        # created_ts is deliberately never in the update set — a run's creation
+        # time does not change on a progress ping. resumable/resume_status update
+        # together (resume_status's default is derived from resumable) whenever
+        # either key was actually passed, matching the coupling above.
+        update_columns = [
+            col for col in (
+                "task_hash", "status", "requested_agents", "effective_agents",
+                "progress_counters", "cost_summary_ref", "topology", "round",
+                "parent_swarm_id", "chosen_checkpoint_index",
+            )
+            if col in swarm_run
+        ]
+        if "resumable" in swarm_run or "resume_status" in swarm_run:
+            update_columns.extend(["resumable", "resume_status"])
+
+        insert_columns = ["swarm_id", *insert_values.keys()]
+        set_clause = (
+            ", ".join(f"{col} = excluded.{col}" for col in update_columns)
+            if update_columns
+            # SQLite requires at least one assignment in DO UPDATE SET; a call
+            # that only ever named swarm_id updates nothing but must not error.
+            else "swarm_id = excluded.swarm_id"
+        )
         with self.conn() as conn:
             conn.execute(
-                """
-                INSERT INTO swarm_runs (
-                    swarm_id,
-                    task_hash,
-                    created_ts,
-                    status,
-                    requested_agents,
-                    effective_agents,
-                    progress_counters,
-                    cost_summary_ref,
-                    topology,
-                    round,
-                    resumable,
-                    resume_status,
-                    parent_swarm_id,
-                    chosen_checkpoint_index
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(swarm_id) DO UPDATE SET
-                    task_hash = excluded.task_hash,
-                    status = excluded.status,
-                    requested_agents = excluded.requested_agents,
-                    effective_agents = excluded.effective_agents,
-                    progress_counters = excluded.progress_counters,
-                    cost_summary_ref = excluded.cost_summary_ref,
-                    topology = excluded.topology,
-                    round = excluded.round,
-                    resumable = excluded.resumable,
-                    resume_status = excluded.resume_status,
-                    parent_swarm_id = excluded.parent_swarm_id,
-                    chosen_checkpoint_index = excluded.chosen_checkpoint_index
+                f"""
+                INSERT INTO swarm_runs ({", ".join(insert_columns)})
+                VALUES ({", ".join(["?"] * len(insert_columns))})
+                ON CONFLICT(swarm_id) DO UPDATE SET {set_clause}
                 """,
-                (
-                    swarm_id,
-                    str(swarm_run.get("task_hash") or ""),
-                    created_ts,
-                    str(swarm_run.get("status") or "planned"),
-                    self._coerce_swarm_int(
-                        swarm_run.get("requested_agents", 0),
-                        field_name="requested_agents",
-                    ),
-                    self._coerce_swarm_int(
-                        swarm_run.get("effective_agents", 0),
-                        field_name="effective_agents",
-                    ),
-                    progress_counters,
-                    swarm_run.get("cost_summary_ref"),
-                    swarm_run.get("topology"),
-                    self._coerce_swarm_int(
-                        swarm_run.get("round", 0),
-                        field_name="round",
-                    ),
-                    resumable,
-                    resume_status,
-                    parent_swarm_id,
-                    chosen_checkpoint_index,
-                ),
+                (swarm_id, *insert_values.values()),
             )
 
     @staticmethod

@@ -93,6 +93,11 @@ class VerifyReport:
     signals: dict[str, dict[str, Any]] = field(default_factory=dict)
     new_failures: list[str] = field(default_factory=list)
     preexisting_failures: list[str] = field(default_factory=list)
+    # Required signals that never ran because their command doesn't exist (e.g.
+    # mypy not installed) — distinct from new_failures, which means the check
+    # ran and found a real regression. A missing tool is a configuration gap,
+    # not something the run introduced; it must not warn/reject on its own.
+    degraded_signals: list[str] = field(default_factory=list)
     baseline_ref: str | None = None
     baseline_used: bool = False
     note: str = ""
@@ -103,6 +108,7 @@ class VerifyReport:
             "signals": self.signals,
             "new_failures": self.new_failures,
             "preexisting_failures": self.preexisting_failures,
+            "degraded_signals": self.degraded_signals,
             "baseline_ref": self.baseline_ref,
             "baseline_used": self.baseline_used,
             "note": self.note,
@@ -471,8 +477,16 @@ def run_verify_gate(
                 report.new_failures.append(f"{name}:failed")
             if gate_cfg.signals[name].required:
                 any_required_new = True
+        elif outcome.unavailable and gate_cfg.signals[name].required:
+            # The command doesn't exist — a configuration gap (unconfigured
+            # required signal), not a regression this run introduced. Reported
+            # separately so an operator sees it, but it must never warn/reject
+            # on its own; `threnody doctor` is where an unconfigured required
+            # signal should be raised.
+            report.degraded_signals.append(name)
         elif not outcome.passed and gate_cfg.signals[name].required:
-            # Unavailable or timed-out required signal still blocks.
+            # Timed out or errored: the check *ran* and we genuinely don't know
+            # the result — unlike "unavailable", this still blocks.
             any_required_new = True
         report.signals[name] = entry
 

@@ -101,9 +101,25 @@ class _Dim(NamedTuple):
         focus = f"{self.focus[:1].upper()}{self.focus[1:]}" if self.focus else ""
         return f"{self.title}. {focus} {self.report}"
 
-    def variable_line(self, path: str) -> str:
-        """The only per-agent-varying part of a review prompt."""
-        return f"Review this file: {path}"
+    def variable_line(self, path: str, *, changed_lines: str = "") -> str:
+        """The only per-agent-varying part of a review prompt.
+
+        Names the dimension explicitly — a bare "Review this file: X" left a
+        reviewer with no idea which dimension it was assigned even under
+        ``BOILERPLATE_DEFINITION``, where the exported subagent definition
+        (a separate system prompt) is the only other place that would say so —
+        and, when known, the changed-line ranges so a reviewer prioritizes the
+        diff without losing whole-file context (the file is still read whole
+        either way: content_sha, LOC bucket, and static-recall grading are
+        unaffected by this clause).
+        """
+        base = f"{self.title} of {path}."
+        if changed_lines:
+            return (
+                f"{base}\nChanged lines: {changed_lines} — prioritize these; "
+                "read the whole file for context."
+            )
+        return f"{base}\nReview the whole file."
 
 
 REVIEW_DIMENSIONS: list[_Dim] = [
@@ -225,6 +241,43 @@ def is_fast_review_intent(task: str) -> bool:
     if not isinstance(task, str):
         return False
     return task.strip().upper().startswith(_FAST_REVIEW_SENTINEL)
+
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def _changed_line_ranges(path: str, ref: str, project_root: str, *, max_ranges: int = 6) -> str:
+    """Changed-line ranges for *path* since *ref*, formatted as ``"12-34, 56"``.
+
+    Read from ``git diff -U0`` hunk headers on the ``+start,count`` side —
+    post-change line numbers, matching what a reviewer sees when it opens the
+    *current* file (the file is still read whole regardless; this only tells
+    the reviewer where to look first). Returns ``""`` on any git failure, no
+    diff, or a path outside the repo — the caller then omits the changed-lines
+    clause entirely rather than risk pointing at the wrong lines.
+    """
+    from .verify import _git
+
+    result = _git(["diff", "-U0", ref, "--", path], project_root)
+    if result is None or result.returncode != 0:
+        return ""
+    ranges: list[tuple[int, int]] = []
+    for line in result.stdout.splitlines():
+        match = _HUNK_HEADER_RE.match(line)
+        if not match:
+            continue
+        start = int(match.group(1))
+        count = int(match.group(2)) if match.group(2) is not None else 1
+        if count == 0:
+            # A pure-deletion hunk reports the line *after* the deleted block
+            # with a 0 count — nothing to highlight in the current file.
+            continue
+        ranges.append((start, start + count - 1))
+    if not ranges:
+        return ""
+    labels = [f"{a}-{b}" if a != b else str(a) for a, b in ranges[:max_ranges]]
+    suffix = f" (+{len(ranges) - max_ranges} more)" if len(ranges) > max_ranges else ""
+    return ", ".join(labels) + suffix
 
 
 def _read_file_safe(path: str) -> str | None:
@@ -761,11 +814,13 @@ def _cell_description(
     *,
     mode: str,
     budget: int,
+    changed_lines: str = "",
 ) -> str:
     """Render one review cell's prompt under the resolved boilerplate *mode*.
 
     ``legacy`` reproduces the pre-split string exactly — same wording, same
-    concatenation, no separator changes — so opting out is a true no-op.
+    concatenation, no separator changes — so opting out is a true no-op. That
+    contract means ``changed_lines`` is deliberately not applied there.
     """
     from .prompt_budget import (
         BOILERPLATE_DEFINITION,
@@ -782,14 +837,14 @@ def _cell_description(
     if mode == BOILERPLATE_DEFINITION:
         # The exported subagent definition already carries title/focus/report.
         stable: list[str] = []
-        variable = [dim.variable_line(path), leads, resolved]
+        variable = [dim.variable_line(path, changed_lines=changed_lines), leads, resolved]
     elif mode == BOILERPLATE_LEGACY:
         # Budget-only pass: keep the legacy wording, cap the appended blocks.
         stable = [dim.prompt_template.format(path=path)]
         variable = [leads, resolved]
     else:
         stable = [dim.stable_block]
-        variable = [dim.variable_line(path), leads, resolved]
+        variable = [dim.variable_line(path, changed_lines=changed_lines), leads, resolved]
     return render(stable=stable, variable=variable, budget=budget).text
 
 
@@ -1149,8 +1204,44 @@ def build_review_subtasks(
         getattr(cfg, "review_structural_dim_gating", False) if cfg is not None else False
     )
 
+    # Resolved once per run, not per cell — same convention as heuristic_plan's
+    # _changed_file_entries (git command cost is real; the ref never changes
+    # mid-run). A cache miss (no merge base, not a git repo) means every cell's
+    # variable_line simply omits the changed-lines clause and still reviews the
+    # whole file — never a hard failure.
+    _diff_ref: str | None = None
+    _diff_ref_resolved = False
+    _changed_lines_cache: dict[str, str] = {}
+
+    def _changed_lines_for(path: str) -> str:
+        nonlocal _diff_ref, _diff_ref_resolved
+        if not _diff_ref_resolved:
+            _diff_ref_resolved = True
+            try:
+                from .verify import resolve_baseline_ref
+
+                _diff_ref = resolve_baseline_ref(str(Path.cwd()))
+            except Exception:
+                log.debug("review_fanout: baseline ref resolution failed", exc_info=True)
+                _diff_ref = None
+        if not _diff_ref:
+            return ""
+        if path not in _changed_lines_cache:
+            try:
+                _changed_lines_cache[path] = _changed_line_ranges(
+                    path, _diff_ref, str(Path.cwd())
+                )
+            except Exception:
+                log.debug("review_fanout: changed-line lookup failed for %s", path, exc_info=True)
+                _changed_lines_cache[path] = ""
+        return _changed_lines_cache[path]
+
     # Compute per-file (dims, profile) — profile carries raw LOC for tiering
     file_dims: list[tuple[str, list[_Dim], ReviewProfile]] = []
+    # What the band/smell engine actually wanted to run per file, captured before
+    # prior-review memory or the max_agents cap can shrink it — the only way a
+    # caller can tell "planned 3 of 15" apart from "planned 3, this file only had 3".
+    expected_by_file: dict[str, list[str]] = {}
     for path, _ in entries:
         prof = estimate_review_profile(path, db=db)
         dims = dimensions_for(
@@ -1165,6 +1256,7 @@ def build_review_subtasks(
         # because the user named some other dimension.
         if task_force_high and not any(dim.key == "security" for dim in dims):
             dims = [_DIM_BY_KEY["security"]] + dims
+        expected_by_file[path] = [d.key for d in dims]
         file_dims.append((path, dims, prof))
 
     # Flatten to (path, dim, profile) ordered by never-drop first (per-run priority)
@@ -1202,6 +1294,7 @@ def build_review_subtasks(
     # Cap: drop highest effective-priority cells first, reserving a slot for the
     # synthesis agent only when one will actually be planned. Under python synthesis
     # the merge is in-process, so reserving a slot would silently cost a review cell.
+    dropped_labels: list[str] = []
     if max_agents is not None and max_agents > 0:
         review_cap = max_agents if synthesis_mode == "python" else max(1, max_agents - 1)
         if len(all_cells) > review_cap:
@@ -1238,7 +1331,9 @@ def build_review_subtasks(
         subtasks.append({
             "id": idx,
             "description": _cell_description(
-                path, dim, dim_smells, db, mode=boilerplate, budget=prompt_char_budget
+                path, dim, dim_smells, db,
+                mode=boilerplate, budget=prompt_char_budget,
+                changed_lines=_changed_lines_for(path),
             ),
             "tier": t,
             "target_file": path,
@@ -1292,6 +1387,7 @@ def build_review_subtasks(
 
     n_files = len(entries)
     n_dims = len(all_cells)
+    total_expected = sum(len(v) for v in expected_by_file.values())
     cached_note = (
         f" {len(replayed)} cell(s) served from prior-review memory (unchanged revision)."
         if replayed
@@ -1302,9 +1398,23 @@ def build_review_subtasks(
         if synthesis_mode == "python"
         else " + 1 synthesis."
     )
+    skipped_prior_review = [f"{r.path}:{r.dimension}" for r in replayed]
+    # A max_agents cap that dropped real coverage must say so in the sentence a
+    # caller is most likely to actually read — a coverage dict nobody looks at is
+    # the same silent under-review this exists to prevent.
+    if dropped_labels:
+        coverage_clause = (
+            f"{n_dims} of {total_expected} dimension agent(s) — "
+            f"{len(dropped_labels)} dropped by max_agents={max_agents}."
+        )
+    else:
+        coverage_clause = f"{n_dims} dimension agent(s)."
+    planned_by_file: dict[str, list[str]] = {}
+    for path, dim, _ in all_cells:
+        planned_by_file.setdefault(path, []).append(dim.key)
     return {
         "analysis": (
-            f"Review fanout: {n_files} file(s), {n_dims} dimension agent(s)."
+            f"Review fanout: {n_files} file(s), {coverage_clause}"
             f"{synthesis_note}"
             f"{cached_note} Host-native DAG. No external planner LLM was called."
         ),
@@ -1315,6 +1425,13 @@ def build_review_subtasks(
         "synthesis_mode": synthesis_mode,
         "reviewed_files": reviewed_files,
         "replayed_findings": replayed_findings,
+        "coverage": {
+            "files": [path for path, _ in entries],
+            "dimensions_expected": expected_by_file,
+            "dimensions_planned": planned_by_file,
+            "dropped_cells": dropped_labels,
+            "skipped_prior_review": skipped_prior_review,
+        },
     }
 
 

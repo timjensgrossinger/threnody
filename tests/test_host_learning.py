@@ -879,7 +879,6 @@ def test_batch_import_parity_with_inline(tmp_path: Path, monkeypatch) -> None:
     from shared.host_learning import import_run_log
 
     monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
-    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", tmp_path / "runs" / "active.json")
 
     n = 5
     cfg = TGsConfig()
@@ -923,7 +922,6 @@ def test_import_run_log_is_idempotent(tmp_path: Path, monkeypatch) -> None:
     from shared.host_learning import import_run_log
 
     monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
-    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", tmp_path / "runs" / "active.json")
 
     db = Database(tmp_path / "idem.db")
     db._init_schema(db._get_connection())
@@ -1011,13 +1009,122 @@ def test_hook_record_is_attributed_to_planned_agent_by_target_file(
     db.close()
 
 
+def test_build_host_agent_record_uses_spawn_role(tmp_path: Path) -> None:
+    """agent_spec['role'] (set by build_host_spawn) is preferred over deriving one."""
+    from shared.host_learning import build_host_agent_record
+
+    db = Database(tmp_path / "role1.db")
+    db._init_schema(db._get_connection())
+    rec = build_host_agent_record(
+        db,
+        run_id="run-role-1",
+        agent_spec={"id": "1", "tier": "medium", "model": "sonnet", "role": "Debugger",
+                    "description": "add a new feature"},
+        result={"success": True, "output_excerpt": "done"},
+    )
+    assert rec["telemetry_payload"]["role"] == "Debugger"
+    db.close()
+
+
+def test_build_host_agent_record_derives_role_when_absent(tmp_path: Path) -> None:
+    """Without an explicit role, fall back to deriving one from the description."""
+    from shared.host_learning import build_host_agent_record
+
+    db = Database(tmp_path / "role2.db")
+    db._init_schema(db._get_connection())
+    rec = build_host_agent_record(
+        db,
+        run_id="run-role-2",
+        agent_spec={"id": "1", "tier": "medium", "model": "sonnet",
+                    "description": "fix the crash in the parser"},
+        result={"success": True, "output_excerpt": "done"},
+    )
+    assert rec["telemetry_payload"]["role"] == "Debugger"
+    db.close()
+
+
+def test_record_verify_quality_attributes_hook_record_via_handoff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """_record_verify_quality must resolve model/role for a hook-captured writer.
+
+    Under the default learning_capture=hook mode a raw run_log record carries no
+    model/tier/role of its own (same gap fixed earlier this session for review
+    agents) — it must be enriched against the handoff snapshot by target file
+    before being counted as a writer, or verify_gate rows always land on
+    MODEL_UNRESOLVED / DIMENSION_GENERAL regardless of who actually wrote.
+    """
+    from shared import run_log
+    from shared.host_learning import _record_verify_quality, register_host_run_handoff
+
+    monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
+
+    db = Database(tmp_path / "verifyq.db")
+    db._init_schema(db._get_connection())
+    workspace = tmp_path / "project"
+    (workspace / "shared").mkdir(parents=True)
+    target = workspace / "shared" / "util.py"
+    target.write_text("def f():\n    pass\n")
+
+    run_id = "swarm-verifyq"
+    register_host_run_handoff(
+        db,
+        run_id=run_id,
+        host_spawn_waves=[
+            {
+                "wave": 1,
+                "agents": [
+                    {
+                        "id": "1",
+                        "tier": "high",
+                        "model": "opus",
+                        "role": "Implementer",
+                        "prompt": "add input validation",
+                        "target_files": ["shared/util.py"],
+                    }
+                ],
+            }
+        ],
+        planned_subtasks=1,
+        workspace_root=str(workspace),
+    )
+
+    run_log.append_agent_record(
+        run_id,
+        {
+            "wave": 0,
+            "spawn_id": "",
+            "task_id": "",
+            "tier": None,
+            "model": None,
+            "success": True,
+            "touched_files": [str(target)],
+            "source": "post_tool_use_hook",
+        },
+    )
+
+    _record_verify_quality(
+        db,
+        run_id,
+        {"new_failures": [], "preexisting_failures": [], "baseline_used": True},
+        config=TGsConfig(),
+        workspace_root=str(workspace),
+    )
+
+    with db.conn() as conn:
+        rows = conn.execute(
+            "SELECT model, dimension, source FROM model_quality_events"
+        ).fetchall()
+    assert rows == [("opus", "implementer", "verify_gate")]
+    db.close()
+
+
 def test_unmatched_hook_record_stays_on_wave_one(tmp_path: Path, monkeypatch) -> None:
     """A touched file nobody planned must not be attributed to a random agent."""
     from shared import run_log
     from shared.host_learning import import_run_log
 
     monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
-    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", tmp_path / "runs" / "active.json")
 
     db = Database(tmp_path / "unmatched.db")
     db._init_schema(db._get_connection())
@@ -1071,7 +1178,6 @@ def test_hook_record_wave_recovered_from_plan(tmp_path: Path, monkeypatch) -> No
     from shared.host_learning import import_run_log
 
     monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
-    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", tmp_path / "runs" / "active.json")
 
     db = Database(tmp_path / "waves.db")
     db._init_schema(db._get_connection())
@@ -1154,3 +1260,49 @@ def test_effective_capture_respects_explicit_model_and_off() -> None:
     assert effective_learning_capture(cfg, "claude-code") == "off"
     cfg.host_native = HostNativeConfig(learning_capture="model")
     assert effective_learning_capture(cfg, "claude-code") == "model"
+
+
+def test_import_run_log_folds_in_wave_with_no_captured_records(
+    db: Database, tmp_path: Path, monkeypatch
+) -> None:
+    """Regression: a read-only wave (e.g. a review synthesis agent) writes no
+    file, so the PostToolUse hook never captures a record for it and
+    ingest_host_wave is never called for that wave — completed_waves silently
+    omitted it (reported as [1] instead of [1, 2]) even though the host already
+    ran and reported it complete.
+    """
+    from shared import run_log
+    from shared.host_learning import _HOST_RUN_META, import_run_log
+
+    monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
+    cfg = TGsConfig()
+    run_id = "swarm-synth-wave"
+
+    register_host_run_handoff(
+        db,
+        run_id=run_id,
+        host_spawn_waves=[
+            {"wave": 1, "agents": [{"id": "1", "tier": "low", "model": "m", "prompt": "review a.py"}]},
+            {"wave": 2, "agents": [{"id": "2", "tier": "medium", "model": "m", "prompt": "synthesize"}]},
+        ],
+        planned_subtasks=2,
+        workspace_root="/tmp/project",
+    )
+    # Only wave 1's agent touched a file; the wave-2 synthesis agent is
+    # read-only and leaves no run-log record at all.
+    run_log.append_agent_record(run_id, {
+        "wave": 1,
+        "spawn_id": "1",
+        "task_id": host_task_id(run_id, "1"),
+        "success": True,
+        "touched_files": ["a.py"],
+        "output_excerpt": "reviewed a.py",
+    })
+
+    result = import_run_log(db, run_id, outcome="accepted", config=cfg)
+    assert result["imported_waves"] == 1  # only wave 1 had a record to replay
+
+    meta = _HOST_RUN_META[run_id]
+    assert meta["completed_waves"] == [1, 2]
+    assert meta["waves_planned"] == [1, 2]
+    assert meta["waves_captured"] == [1]

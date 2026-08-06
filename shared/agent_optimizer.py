@@ -3,7 +3,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from .heuristic_plan import assess_task_complexity, extract_task_file_entries
+from .heuristic_plan import (
+    assess_task_complexity,
+    expected_review_agent_count,
+    extract_task_file_entries,
+)
 
 
 def choose_agent_count(task: str, *, requested: int | None = None, hard_cap: int = 12) -> dict[str, Any]:
@@ -32,6 +36,24 @@ def choose_agent_count(task: str, *, requested: int | None = None, hard_cap: int
             "strategy": "user_requested",
             "rationale": "Honoring explicit max_agents subject to configured cap.",
         }
+    # REVIEW: sentinel tasks fan out per (file, dimension), not per file — sizing
+    # from file_count alone silently drops most cells to review_fanout's own cap
+    # before it ever gets a say. Checked before the generic complexity path below,
+    # which stays for informal "review"/"security" mentions without the sentinel.
+    if isinstance(task, str):
+        expected_dims = expected_review_agent_count(task)
+        if expected_dims > 0:
+            return {
+                "recommended_agents": _cap(expected_dims),
+                "strategy": "review_dimension_fanout",
+                "rationale": (
+                    "REVIEW: sentinel — sized from the actual file x dimension "
+                    "band table (review_fanout.dimensions_for), not a file-count "
+                    "guess; bounded by swarm.max_agents only when a cap is "
+                    "configured."
+                ),
+                "signals": {"expected_dimension_agents": expected_dims},
+            }
     complexity = assess_task_complexity(task)
     entries = extract_task_file_entries(task, intent_templates=True) if isinstance(task, str) else []
     file_count = len(entries)

@@ -11,6 +11,7 @@ from shared.heuristic_plan import (
     build_heuristic_plan_payload,
     extract_task_file_entries,
 )
+from shared import heuristic_plan as heuristic_plan_module
 
 
 CALCULATOR_TASK = (
@@ -326,3 +327,93 @@ def test_fullstack_plan_accounts_for_template_files() -> None:
     assert coverage["deferred"] == []
     assert coverage["packed"]["cap"] == 2
     assert "Agent budget 2" in payload["analysis"]
+
+
+# ---------------------------------------------------------------------------
+# _load_role_quality_bias — write-path sibling of _load_quality_tier_bias
+# ---------------------------------------------------------------------------
+
+def test_load_role_quality_bias_disabled_by_default() -> None:
+    """routing_bias_enabled defaults to False -> always {} regardless of ledger."""
+    assert heuristic_plan_module._load_role_quality_bias() == {}
+
+
+def test_load_role_quality_bias_agreement_across_models(monkeypatch) -> None:
+    from shared.config import ModelQualityConfig, TGsConfig
+
+    cfg = TGsConfig()
+    cfg.model_quality = ModelQualityConfig(enabled=True, routing_bias_enabled=True)
+    monkeypatch.setattr(TGsConfig, "from_yaml", staticmethod(lambda *a, **k: cfg))
+    monkeypatch.setattr(
+        "shared.quality_bias.load_model_quality_bias",
+        lambda db, **k: {("opus", "implementer"): 1, ("sonnet", "implementer"): 1},
+    )
+    monkeypatch.setattr("shared.quality_bias.apply_quality_floor", lambda db, raw: raw)
+    monkeypatch.setattr("shared.agents._get_agent_db", lambda: object())
+
+    assert heuristic_plan_module._load_role_quality_bias() == {"implementer": 1}
+
+
+def test_load_role_quality_bias_disagreement_yields_nothing(monkeypatch) -> None:
+    from shared.config import ModelQualityConfig, TGsConfig
+
+    cfg = TGsConfig()
+    cfg.model_quality = ModelQualityConfig(enabled=True, routing_bias_enabled=True)
+    monkeypatch.setattr(TGsConfig, "from_yaml", staticmethod(lambda *a, **k: cfg))
+    monkeypatch.setattr(
+        "shared.quality_bias.load_model_quality_bias",
+        lambda db, **k: {("opus", "implementer"): 1, ("sonnet", "implementer"): -1},
+    )
+    monkeypatch.setattr("shared.quality_bias.apply_quality_floor", lambda db, raw: raw)
+    monkeypatch.setattr("shared.agents._get_agent_db", lambda: object())
+
+    assert heuristic_plan_module._load_role_quality_bias() == {}
+
+
+# ---------------------------------------------------------------------------
+# _finalize_subtasks — role-bias tier nudge on the write path
+# ---------------------------------------------------------------------------
+
+def test_finalize_subtasks_applies_role_tier_bias(monkeypatch) -> None:
+    monkeypatch.setattr(
+        heuristic_plan_module, "_load_role_quality_bias", lambda: {"implementer": 1}
+    )
+    subtasks = [
+        {
+            "description": "add a new export helper",
+            "target_files": ["shared/exporter.py"],
+            "tier": "low",
+        }
+    ]
+    out = heuristic_plan_module._finalize_subtasks(subtasks)
+    assert out[0]["role"] == "Implementer"
+    assert out[0]["tier"] == "medium"
+
+
+def test_finalize_subtasks_no_bias_leaves_tier_unchanged(monkeypatch) -> None:
+    monkeypatch.setattr(heuristic_plan_module, "_load_role_quality_bias", lambda: {})
+    subtasks = [
+        {
+            "description": "add a new export helper",
+            "target_files": ["shared/exporter.py"],
+            "tier": "low",
+        }
+    ]
+    out = heuristic_plan_module._finalize_subtasks(subtasks)
+    assert out[0]["role"] == "Implementer"
+    assert out[0]["tier"] == "low"
+
+
+def test_finalize_subtasks_bias_clamps_at_high(monkeypatch) -> None:
+    monkeypatch.setattr(
+        heuristic_plan_module, "_load_role_quality_bias", lambda: {"implementer": 1}
+    )
+    subtasks = [
+        {
+            "description": "add a new export helper",
+            "target_files": ["shared/exporter.py"],
+            "tier": "high",
+        }
+    ]
+    out = heuristic_plan_module._finalize_subtasks(subtasks)
+    assert out[0]["tier"] == "high"

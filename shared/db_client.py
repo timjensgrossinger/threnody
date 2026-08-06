@@ -328,7 +328,13 @@ def open_database(db_path: str | Path | None = None, *, config=None):
     Safe default: any failure to reach/spawn the daemon falls back to a direct
     ``Database`` (today's behavior) unless the operator disables fallback.
     """
-    from .config import DB_BACKUP_INTERVAL_HOURS, DB_BACKUP_KEEP, TGsConfig
+    from .config import (
+        DB_BACKUP_INTERVAL_HOURS,
+        DB_BACKUP_KEEP,
+        DB_INTEGRITY_REPROBE_INTERVAL_HOURS,
+        DB_SYNCHRONOUS_DEFAULT,
+        TGsConfig,
+    )
     from .db import Database
 
     if config is None:
@@ -353,6 +359,17 @@ def open_database(db_path: str | Path | None = None, *, config=None):
     backup_interval_hours = int(
         getattr(config, "db_backup_interval_hours", DB_BACKUP_INTERVAL_HOURS) or 0
     )
+    integrity_reprobe_interval_hours = float(
+        getattr(
+            config,
+            "db_integrity_reprobe_interval_hours",
+            DB_INTEGRITY_REPROBE_INTERVAL_HOURS,
+        )
+        or 0.0
+    )
+    synchronous = str(
+        getattr(config, "db_synchronous", DB_SYNCHRONOUS_DEFAULT) or DB_SYNCHRONOUS_DEFAULT
+    )
     resilience = getattr(config, "resilience", None)
     if resolved_path:
         return Database(
@@ -360,9 +377,13 @@ def open_database(db_path: str | Path | None = None, *, config=None):
             backup_keep=backup_keep,
             backup_interval_hours=backup_interval_hours,
             resilience=resilience,
+            integrity_reprobe_interval_hours=integrity_reprobe_interval_hours,
+            synchronous=synchronous,
         )
     return Database(
         backup_keep=backup_keep,
         backup_interval_hours=backup_interval_hours,
         resilience=resilience,
+        integrity_reprobe_interval_hours=integrity_reprobe_interval_hours,
+        synchronous=synchronous,
     )

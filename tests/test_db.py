@@ -941,6 +941,150 @@ def test_prune_keeps_newest_and_never_empties_the_set() -> None:
             db.close()
 
 
+def test_periodic_reprobe_detects_and_recovers_mid_session_corruption() -> None:
+    """Corruption today is only ever caught at __init__ — this is the mid-session path.
+
+    A long-lived MCP server never reopens the DB, so without a periodic re-probe
+    a corruption that appears while the process is alive goes unnoticed until
+    the next restart. Force the reprobe timer stale, corrupt the file on disk
+    under the *same* live instance, and confirm the next probe both notices and
+    recovers — mirroring test_corruption_recovers_from_auto_backup_instead_of_quarantine
+    but without a process restart.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path, backup_interval_hours=6, integrity_reprobe_interval_hours=1)
+        _seed_row(db)
+        db.close()
+        db = Database(path, backup_interval_hours=6, integrity_reprobe_interval_hours=1)  # takes backup
+        db.close()
+        assert len(_backups(path)) == 1
+
+        db = Database(path, backup_interval_hours=6, integrity_reprobe_interval_hours=1)
+        try:
+            snapshot = db.db_health_snapshot()
+            assert snapshot["healthy"] is True
+            assert snapshot["corruption_detected_ts"] is None
+
+            with open(path, "r+b") as handle:
+                handle.seek(4096)
+                handle.write(b"\x00" * 8192)
+            for sidecar in ("-wal", "-shm"):
+                stale = Path(str(path) + sidecar)
+                if stale.exists():
+                    stale.unlink()
+
+            # Force the reprobe due without waiting a real hour.
+            db._last_integrity_probe_ts = 0.0
+            db._maybe_reprobe_integrity()
+
+            snapshot = db.db_health_snapshot()
+            assert snapshot["corruption_detected_ts"] is not None
+            # Recovery ran inline — the seeded row survived via the backup, not
+            # a quarantine-and-recreate-empty.
+            assert _count(db, "telemetry") == 1
+        finally:
+            db.close()
+
+
+def test_handle_corruption_detected_dedupes_concurrent_callers() -> None:
+    """Two callers racing the same corruption must not both attempt recovery.
+
+    ``conn()``'s exception path and the periodic re-probe can both observe the
+    same corruption; only one recovery attempt should run, and the detection
+    timestamp must not be overwritten by the second caller.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path)
+        try:
+            db._corruption_recovery_lock.acquire()  # simulate a recovery in flight
+            db._handle_corruption_detected("test_caller")
+            first_ts = db._corruption_detected_ts
+            assert first_ts is not None
+            db._handle_corruption_detected("test_caller_again")
+            assert db._corruption_detected_ts == first_ts
+        finally:
+            db._corruption_recovery_lock.release()
+            db.close()
+
+
+def test_db_health_snapshot_shape() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path)
+        try:
+            snapshot = db.db_health_snapshot()
+            assert snapshot == {
+                "healthy": True,
+                "last_integrity_ok": True,
+                "corruption_detected_ts": None,
+                "recovered_this_session": False,
+                "last_integrity_probe_ts": snapshot["last_integrity_probe_ts"],
+            }
+            assert isinstance(snapshot["last_integrity_probe_ts"], float)
+        finally:
+            db.close()
+
+
+def test_synchronous_mode_configurable_and_defaults_to_normal() -> None:
+    from shared.config import DB_SYNCHRONOUS_DEFAULT
+
+    assert DB_SYNCHRONOUS_DEFAULT == "NORMAL"
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path, synchronous="FULL")
+        try:
+            with db.conn() as conn:
+                mode = conn.execute("PRAGMA synchronous").fetchone()[0]
+            # SQLite reports synchronous as an integer: FULL=2, NORMAL=1.
+            assert mode == 2
+        finally:
+            db.close()
+
+        db = Database(path, synchronous="not-a-real-mode")
+        try:
+            with db.conn() as conn:
+                mode = conn.execute("PRAGMA synchronous").fetchone()[0]
+            assert mode == 1  # invalid value falls back to NORMAL, not raises
+        finally:
+            db.close()
+
+
+def test_integrity_reprobe_disabled_by_zero_interval() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cache.db"
+        db = Database(path, integrity_reprobe_interval_hours=0)
+        try:
+            db._last_integrity_probe_ts = 0.0
+            with open(path, "r+b") as handle:
+                handle.seek(4096)
+                handle.write(b"\x00" * 8192)
+            for sidecar in ("-wal", "-shm"):
+                stale = Path(str(path) + sidecar)
+                if stale.exists():
+                    stale.unlink()
+            db._maybe_reprobe_integrity()
+            # Disabled — must not have probed, must not have "seen" the corruption.
+            assert db._corruption_detected_ts is None
+        finally:
+            db.close()
+
+
+def test_integrity_reprobe_config_default_agrees_with_database_default() -> None:
+    import inspect
+
+    from shared.config import DB_INTEGRITY_REPROBE_INTERVAL_HOURS, TGsConfig
+
+    cfg = TGsConfig()
+    assert cfg.db_integrity_reprobe_interval_hours == DB_INTEGRITY_REPROBE_INTERVAL_HOURS
+    from_yaml = TGsConfig.from_yaml()
+    assert from_yaml.db_integrity_reprobe_interval_hours == DB_INTEGRITY_REPROBE_INTERVAL_HOURS
+
+    params = inspect.signature(Database.__init__).parameters
+    assert params["integrity_reprobe_interval_hours"].default == DB_INTEGRITY_REPROBE_INTERVAL_HOURS
+
+
 if __name__ == "__main__":
     tests = [
         test_cache_put_and_get,

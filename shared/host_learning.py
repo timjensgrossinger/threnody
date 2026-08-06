@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 from .agents import check_draft_ready, derive_learning_quality, pattern_hash, structured_pattern_example
 from .config import TGsConfig
+from .roles import derive_role_from_task
 from .consensus import (
     build_judge_prompt,
     consensus_tally,
@@ -282,6 +283,33 @@ def _load_host_run_meta_from_db(db: Database, run_id: str) -> dict[str, Any]:
     return {}
 
 
+def _reconcile_completed_waves(db: Database, run_id: str, planned_waves: set[int]) -> None:
+    """Fold waves that wrote nothing into ``completed_waves`` at finalize.
+
+    ``ingest_host_wave`` only ever runs for waves with captured run-log records
+    — a read-only wave (a review synthesis agent, or any agent that touches no
+    file) never triggers it, so ``completed_waves`` silently omitted it even
+    though the handoff planned it and the host already reported it complete via
+    this very call (``import_run_log`` only runs at terminal/outcome time, so
+    every planned wave has, by definition, already executed). Records
+    ``waves_planned`` alongside ``waves_captured`` so a real mismatch — a crash
+    mid-run, not this — stays visible instead of both collapsing to one list.
+    """
+    if not planned_waves:
+        return
+    try:
+        meta = _ensure_host_run_meta(db, run_id)
+        captured = {int(w) for w in (meta.get("completed_waves") or [])}
+        meta["waves_planned"] = sorted(planned_waves)
+        meta["waves_captured"] = sorted(captured)
+        if planned_waves - captured:
+            meta["completed_waves"] = sorted(captured | planned_waves)
+        _HOST_RUN_META[run_id] = meta
+        _persist_host_run_meta(db, run_id, meta)
+    except Exception:
+        log.debug("completed_waves reconciliation failed for %s", run_id, exc_info=True)
+
+
 def _ensure_host_run_meta(db: Database, run_id: str) -> dict[str, Any]:
     meta = _HOST_RUN_META.get(run_id)
     if meta:
@@ -434,7 +462,7 @@ def _enrich_agent_from_handoff(
         snap = snapshots_by_wave_agent.get((wave_index, agent_index))
     if snap is None:
         return merged
-    for key in ("prompt", "tier", "model", "task_id", "spawn_id", "subagent_type"):
+    for key in ("prompt", "tier", "model", "task_id", "spawn_id", "subagent_type", "role"):
         if not merged.get(key) and snap.get(key):
             merged[key] = snap[key]
     if not merged.get("description") and snap.get("prompt"):
@@ -551,6 +579,7 @@ def register_host_run_handoff(
                     "prompt": agent.get("prompt"),
                     "target_files": target_files,
                     "subagent_type": str(agent.get("subagent_type") or "") or None,
+                    "role": str(agent.get("role") or "") or None,
                     "wave": wave_idx,
                     "agent_index": agent_index,
                 }
@@ -1151,6 +1180,8 @@ def build_host_agent_record(
         review_outcome["run_id"] = run_id
         review_outcome["task_hash"] = ph
 
+    role = str(agent_spec.get("role") or "").strip() or derive_role_from_task(description)
+
     return {
         "task_id": task_id,
         "pattern_hash": ph,
@@ -1177,6 +1208,7 @@ def build_host_agent_record(
             "provider_name": "host-native",
             "reason": "host_agent_complete",
             "version": "host_native",
+            "role": role,
             "timing_ms": int(result.get("duration_ms") or 0) if result.get("duration_ms") else None,
         },
     }
@@ -1318,6 +1350,7 @@ def ingest_host_wave(
             "description": enriched.get("description") or enriched.get("prompt"),
             "subagent_type": enriched.get("subagent_type"),
             "target_file": enriched.get("target_file"),
+            "role": enriched.get("role"),
         }
         touched_files_raw = enriched.get("touched_files")
         touched_files: list[str] = []
@@ -1618,10 +1651,12 @@ def import_run_log(
     # Without this every hook record collapses onto wave 1 and cross-wave rework
     # detection sees a single flat wave.
     by_target_file: dict[str, Mapping[str, object]] = {}
+    planned_waves: set[int] = set()
     try:
-        _, _, _, by_target_file = _index_handoff_snapshots(
+        _, _, by_wave_agent, by_target_file = _index_handoff_snapshots(
             run_id, db.get_handoff_agent_snapshots(run_id), workspace_root
         )
+        planned_waves = {wave for wave, _agent_idx in by_wave_agent}
     except Exception:
         log.debug("handoff path index unavailable for %s", run_id, exc_info=True)
 
@@ -1665,6 +1700,7 @@ def import_run_log(
             workspace_root=workspace_root,
         )
         _promote_verify_keys(result)
+        _reconcile_completed_waves(db, run_id, planned_waves)
         run_log.mark_imported(run_id)
         return result
 
@@ -1687,6 +1723,7 @@ def import_run_log(
             result["rework_events"] = wave_result.get("rework_events", [])
             _promote_verify_keys(result)
 
+    _reconcile_completed_waves(db, run_id, planned_waves)
     run_log.mark_imported(run_id)
     try:
         keep = config.host_native.runs_keep if config is not None else 20
@@ -1764,6 +1801,7 @@ def _record_verify_quality(
     verify_report: Mapping[str, Any],
     *,
     config: TGsConfig | None,
+    workspace_root: str | None = None,
 ) -> None:
     """Record the gate result as an objective quality event per model that wrote.
 
@@ -1771,6 +1809,11 @@ def _record_verify_quality(
     passed its tests, or it did not. Score is 10 for a clean run and degrades with
     the number of newly introduced failures. Attributed to each model that actually
     wrote files in this run, read back from the run log.
+
+    Raw run-log records are hook-captured under the default ``learning_capture:
+    hook`` mode and so carry no model/tier/role of their own (the same gap fixed
+    for review agents earlier) — each is enriched against the handoff snapshot by
+    target file before being counted as a writer, exactly like ``import_run_log``.
     """
     mq_cfg = getattr(config, "model_quality", None) if config is not None else None
     if mq_cfg is None or not getattr(mq_cfg, "enabled", True):
@@ -1784,22 +1827,43 @@ def _record_verify_quality(
     try:
         from . import model_quality, run_log
 
-        writers: dict[str, str | None] = {}
+        by_target_file: dict[str, Mapping[str, object]] = {}
+        try:
+            _, _, _, by_target_file = _index_handoff_snapshots(
+                run_id, db.get_handoff_agent_snapshots(run_id), workspace_root
+            )
+        except Exception:
+            log.debug("handoff path index unavailable for %s", run_id, exc_info=True)
+
+        writers: dict[str, tuple[str | None, str | None]] = {}
         for rec in run_log.read_run_log(run_id):
             if not isinstance(rec, Mapping) or rec.get("read_only"):
                 continue
-            if not rec.get("files") and not rec.get("target_file"):
+            touched_files = _agent_touched_files(rec)
+            if not touched_files:
                 continue
-            model = str(rec.get("model") or "").strip()
+            enriched = rec
+            if not str(rec.get("model") or "").strip():
+                snap: Mapping[str, object] | None = None
+                for touched in touched_files:
+                    snap = by_target_file.get(_normalize_path_key(touched, workspace_root))
+                    if snap is not None:
+                        break
+                if snap is not None:
+                    enriched = {**rec, **{k: v for k, v in snap.items() if not rec.get(k) and v}}
+            model = str(enriched.get("model") or "").strip()
             if model:
-                writers[model] = (str(rec.get("effort")).strip() or None) if rec.get("effort") else None
+                effort = (str(enriched.get("effort")).strip() or None) if enriched.get("effort") else None
+                role = str(enriched.get("role") or "").strip() or None
+                writers[model] = (effort, role)
         if not writers:
-            writers = {model_quality.MODEL_UNRESOLVED: None}
-        for model, effort in writers.items():
+            writers = {model_quality.MODEL_UNRESOLVED: (None, None)}
+        for model, (effort, role) in writers.items():
             model_quality.record_verify_gate_score(
                 db,
                 model=model,
                 effort=effort,
+                role=role,
                 score_0_10=score,
                 new_failure_count=len(new_failures),
                 preexisting_count=len(verify_report.get("preexisting_failures") or []),
@@ -2063,7 +2127,7 @@ def finalize_host_swarm(
     )
     if verify_report is not None:
         meta["verify_report"] = verify_report
-        _record_verify_quality(db, run_id, verify_report, config=config)
+        _record_verify_quality(db, run_id, verify_report, config=config, workspace_root=effective_root)
 
     _record_hybrid_split_outcome(
         db, meta, success=success, rework_events=rework_events, config=config

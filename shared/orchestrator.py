@@ -278,6 +278,7 @@ class AgentResult:
     effort: str | None = None  # applied reasoning effort (low|medium|high), if resolved
     gate_verdict: str | None = None  # pass | warn | block | rejected (plan 04)
     gate_signals: dict | None = None  # per-signal results
+    gate_degraded_signals: list | None = None  # required signals whose command is missing
     convergence_rounds_data: list | None = None  # plan 14: [{round, score, idem_key}]
     convergence_exhausted: bool = False           # plan 14: max_rounds hit, min_score unmet
     role: str | None = None  # semantic role from task derivation
@@ -1851,6 +1852,7 @@ class Orchestrator:
         )
         result.gate_verdict = report.verdict
         result.gate_signals = report.signals
+        result.gate_degraded_signals = report.degraded_signals
         if report.verdict == "rejected":
             result.success = False
         return result

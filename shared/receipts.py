@@ -12,6 +12,24 @@ from .db import Database
 _TIER_TOKEN_BUDGETS = {"low": 2000, "medium": 8000, "high": 20000}
 
 
+def _model_price_known(model: str | None) -> bool:
+    """Whether *model* has a real entry in the bundled price table.
+
+    Distinct from "cost estimates to $0" — an unrecognized model and a
+    genuinely free one both produce a $0.0 estimate from ``_estimate_model_cost``
+    otherwise, and a savings figure computed from two unpriced numbers is not an
+    estimate, it is a coincidence.
+    """
+    if not model:
+        return False
+    try:
+        from .model_catalog import _load_price_data
+
+        return model.lower() in _load_price_data()
+    except Exception:
+        return False
+
+
 def _estimate_model_cost(model: str | None, *, tier: str, agents: int = 1) -> float:
     if not model:
         return 0.0
@@ -32,11 +50,15 @@ def _estimate_model_cost(model: str | None, *, tier: str, agents: int = 1) -> fl
 
 
 def _agent_count_from_payload(payload: Mapping[str, Any] | None, fallback: int = 1) -> int:
+    """Prefer the actually-emitted ``host_spawn_waves`` over the planner's
+    internal ``subtasks`` list — the two can diverge (sanitization dropping
+    entries, an inline_files bucket, a max_agents cap applied after subtasks
+    were built), and host_spawn_waves is what the host actually spawns. Using
+    the pre-divergence ``subtasks`` count is what made a collapsed review plan's
+    receipt report an agent_count nobody actually ran.
+    """
     if not isinstance(payload, Mapping):
         return max(1, fallback)
-    subtasks = payload.get("subtasks")
-    if isinstance(subtasks, list) and subtasks:
-        return len(subtasks)
     waves = payload.get("host_spawn_waves")
     if isinstance(waves, list):
         count = 0
@@ -45,6 +67,9 @@ def _agent_count_from_payload(payload: Mapping[str, Any] | None, fallback: int =
                 count += len(wave["agents"])
         if count:
             return count
+    subtasks = payload.get("subtasks")
+    if isinstance(subtasks, list) and subtasks:
+        return len(subtasks)
     return max(1, fallback)
 
 
@@ -60,22 +85,61 @@ def build_cost_receipt(
     rationale: str | None = None,
     skipped_calls: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build a compact, response-safe savings receipt."""
+    """Build a compact, response-safe savings receipt.
+
+    ``savings`` is only ever populated from two priced numbers. When either side
+    can't be priced (unrecognized model) or the "counterfactual" isn't actually
+    more expensive than what was selected (e.g. a host-native run comparing
+    itself against itself, both opus), ``estimated_usd``/``pct`` are ``None``
+    with a ``basis`` explaining why — never a fabricated fallback like
+    "selected + $0.0025/agent", which is how a same-model comparison previously
+    read as "100% savings, $0.0025".
+    """
     agent_count = _agent_count_from_payload(payload)
     resolved_tier = tier or "medium"
-    selected_cost = (
-        round(float(estimated_cost_usd), 6)
-        if isinstance(estimated_cost_usd, (int, float))
-        else _estimate_model_cost(model, tier=resolved_tier, agents=agent_count)
+
+    if isinstance(estimated_cost_usd, (int, float)):
+        selected_cost: float | None = round(float(estimated_cost_usd), 6)
+        selected_priced = True
+    else:
+        selected_priced = _model_price_known(model)
+        selected_cost = (
+            _estimate_model_cost(model, tier=resolved_tier, agents=agent_count)
+            if selected_priced
+            else None
+        )
+
+    # Catalog id uses hyphens ("claude-opus-4-6"), not the "4.6" version string
+    # used elsewhere for display — the dotted form was never in the price table,
+    # so this counterfactual silently priced to $0 on every call, which is what
+    # drove the old fallback formula to fire unconditionally (every receipt
+    # showing "100% savings" regardless of the model actually selected).
+    counterfactual_model = "claude-opus-4-6"
+    counterfactual_priced = _model_price_known(counterfactual_model)
+    high_counterfactual = (
+        _estimate_model_cost(counterfactual_model, tier="high", agents=agent_count)
+        if counterfactual_priced
+        else None
     )
-    high_counterfactual = _estimate_model_cost(
-        "claude-opus-4.6",
-        tier="high",
-        agents=agent_count,
+
+    comparable = (
+        selected_priced
+        and counterfactual_priced
+        and selected_cost is not None
+        and high_counterfactual is not None
+        and high_counterfactual > selected_cost
     )
-    if high_counterfactual <= selected_cost:
-        high_counterfactual = round(selected_cost + (0.0025 * agent_count), 6)
-    savings = round(high_counterfactual - selected_cost, 6)
+    if comparable:
+        savings_usd = round(high_counterfactual - selected_cost, 6)
+        savings_pct = round((savings_usd / high_counterfactual) * 100.0, 1) if high_counterfactual else 0.0
+        savings_basis = "priced"
+    else:
+        savings_usd = None
+        savings_pct = None
+        savings_basis = (
+            "unpriced" if not (selected_priced and counterfactual_priced) else "not_comparable"
+        )
+
     host_native = bool(
         (payload or {}).get("host_spawn")
         or (payload or {}).get("host_spawn_waves")
@@ -89,6 +153,9 @@ def build_cost_receipt(
         "source_tool": source_tool,
         "task_hash": sha256(task.encode("utf-8")).hexdigest()[:16],
         "agent_count": agent_count,
+        # These are token-budget-per-tier estimates (_TIER_TOKEN_BUDGETS), not
+        # measured spend — labeled so the figure is never read as billed usage.
+        "estimate_basis": "tier_token_budget",
         "selected": {
             "tier": resolved_tier,
             "model": model,
@@ -98,12 +165,13 @@ def build_cost_receipt(
         },
         "counterfactual": {
             "tier": "high",
-            "model": "claude-opus-4.6",
-            "estimated_cost_usd": round(high_counterfactual, 6),
+            "model": counterfactual_model,
+            "estimated_cost_usd": high_counterfactual,
         },
         "savings": {
-            "estimated_usd": savings,
-            "pct": round((savings / high_counterfactual) * 100.0, 1) if high_counterfactual else 0.0,
+            "estimated_usd": savings_usd,
+            "pct": savings_pct,
+            "basis": savings_basis,
         },
         "skipped_calls": sorted(set(s for s in skipped if s)),
         "rationale": rationale or "Selected the cheapest host-native path that matched the task tier.",
@@ -168,12 +236,22 @@ def receipt_to_markdown(receipt: Mapping[str, Any]) -> str:
     if cost:
         selected = cost.get("selected") if isinstance(cost.get("selected"), Mapping) else {}
         savings = cost.get("savings") if isinstance(cost.get("savings"), Mapping) else {}
+        selected_cost_display = (
+            f"${float(selected.get('estimated_cost_usd')):.6f}"
+            if isinstance(selected.get("estimated_cost_usd"), (int, float))
+            else "n/a (unpriced model)"
+        )
+        savings_display = (
+            f"${float(savings.get('estimated_usd')):.6f}"
+            if isinstance(savings.get("estimated_usd"), (int, float))
+            else f"n/a ({savings.get('basis') or 'unavailable'})"
+        )
         lines.extend([
             "",
             "## Cost Receipt",
             f"- Selected: `{selected.get('tier')}` / `{selected.get('model')}`",
-            f"- Estimated cost: `${float(selected.get('estimated_cost_usd') or 0.0):.6f}`",
-            f"- Estimated savings vs high-tier counterfactual: `${float(savings.get('estimated_usd') or 0.0):.6f}`",
+            f"- Estimated cost: `{selected_cost_display}`",
+            f"- Estimated savings vs high-tier counterfactual: `{savings_display}`",
         ])
     if subtasks:
         lines.extend(["", "## Subtasks"])

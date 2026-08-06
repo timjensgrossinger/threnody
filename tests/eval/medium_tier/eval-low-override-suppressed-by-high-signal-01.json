@@ -1,0 +1,16 @@
+{
+  "id": "eval-low-override-suppressed-by-high-signal-01",
+  "category": "medium_tier",
+  "tags": [
+    "stable",
+    "low-override-suppression"
+  ],
+  "prompt": "Rename this helper inside the async, distributed, concurrency-sensitive permission module.",
+  "expected": {
+    "tier": "medium",
+    "score_min": 0.65,
+    "score_max": 0.75,
+    "urgency_expected": false,
+    "fanout_expected": "favor_parallel"
+  }
+}

@@ -110,10 +110,35 @@ def build_status_snapshot(
                 else None
             ),
             "last_integrity_ok": getattr(db, 'last_integrity_ok', None),
+            **_load_db_health_snapshot(db),
             **_load_backup_health(db),
         },
         "explainability_link": "threnody inspect status --details",
         "spend_link": "threnody inspect spend --since 7d",
+    }
+
+
+def _load_db_health_snapshot(db: Database) -> dict:
+    """Corruption-detection state — the single producer is Database.db_health_snapshot.
+
+    Kept separate from ``_load_backup_health`` (which answers "is there a restore
+    candidate on disk") — this answers "has this live process actually seen
+    corruption", which only ``Database`` itself can know.
+    """
+    snapshot_fn = getattr(db, "db_health_snapshot", None)
+    if not callable(snapshot_fn):
+        return {}  # RemoteDatabase / stub without the method — nothing to report.
+    try:
+        snapshot = snapshot_fn()
+    except Exception:
+        log.debug("db health snapshot probe failed", exc_info=True)
+        return {}
+    if not isinstance(snapshot, dict):
+        return {}
+    return {
+        "healthy": snapshot.get("healthy"),
+        "corruption_detected_ts": snapshot.get("corruption_detected_ts"),
+        "recovered_this_session": snapshot.get("recovered_this_session"),
     }
 
 

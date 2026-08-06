@@ -732,3 +732,108 @@ def test_review_run_response_is_compact(monkeypatch, tmp_path: Path) -> None:
     }
     assert "high" in tiers and "low" in tiers  # mixed tiers, not all-medium
     db.close()
+
+
+def test_review_run_with_capped_agents_surfaces_coverage_warning(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Regression: a max_agents cap that drops review dimensions must be visible
+    at the top level of the wire response, not only inside plan_summary.coverage
+    (which a host reading only host_spawn_waves + a headline warning would miss).
+    """
+    from shared.planner import CLIBackend, Planner
+
+    class _NoBackend(CLIBackend):
+        def call(self, prompt, model=None, timeout=120):  # pragma: no cover
+            raise AssertionError("review heuristic must not call the LLM backend")
+
+    db_path = tmp_path / "review-coverage-warning.db"
+    cfg = TGsConfig(db_path=db_path)
+    db = Database(db_path=db_path)
+    db._init_schema(db._get_connection())
+    planner = Planner(cfg, _NoBackend())
+
+    f1 = tmp_path / "big.py"
+    f1.write_text("\n".join(f"line {i}" for i in range(210)), encoding="utf-8")
+
+    task = f"REVIEW: {f1}"
+    out = mcp_server._execute_swarm_host_native_response(
+        config=cfg,
+        db=db,
+        planner=planner,
+        router=None,
+        swarm_id="swarm-review-coverage-warning",
+        task_text=task,
+        caller="claude-code",
+        request_meta={
+            "topology": "dag",
+            "workspace_root": str(tmp_path),
+            "effective_agents": 3,  # 5 dims expected; forces a drop
+        },
+        estimated_cost=0.0,
+    )
+    result = out["result"]
+
+    assert "coverage_warning" in result
+    assert "dropped" in result["coverage_warning"]
+    assert result["plan_summary"]["coverage"]["dropped_cells"]
+    contract = result["plan_summary"]["contract"]
+    assert contract["dropped"]
+    assert contract["expected_agents"] > contract["planned_agents"]
+    assert contract["warnings"]
+    db.close()
+
+
+def test_host_native_handoff_persists_task_hash_and_agent_counts(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Regression: swarm_runs previously read (task_hash='', requested_agents=0,
+    effective_agents=0) on every host-native run — persist_swarm_run's old
+    unconditional upsert reset those columns on every later progress ping, no
+    matter what register_host_run_handoff had set moments earlier. This asserts
+    the wire-level fix: the handoff itself writes real values, and a later sparse
+    progress ping (which register_host_run_handoff's own meta-counter write is)
+    does not erase them.
+    """
+    from shared.planner import CLIBackend, Planner
+
+    class _NoBackend(CLIBackend):
+        def call(self, prompt, model=None, timeout=120):  # pragma: no cover
+            raise AssertionError("heuristic path must not call the LLM backend")
+
+    db_path = tmp_path / "handoff-fields.db"
+    cfg = TGsConfig(db_path=db_path)
+    db = Database(db_path=db_path)
+    db._init_schema(db._get_connection())
+    planner = Planner(cfg, _NoBackend())
+
+    f1 = tmp_path / "a.py"
+    f1.write_text("x = 1\n", encoding="utf-8")
+    f2 = tmp_path / "b.py"
+    f2.write_text("y = 2\n", encoding="utf-8")
+    task = f"Implement feature touching {f1} and {f2}"
+
+    mcp_server._execute_swarm_host_native_response(
+        config=cfg,
+        db=db,
+        planner=planner,
+        router=None,
+        swarm_id="swarm-handoff-fields",
+        task_text=task,
+        caller="claude-code",
+        request_meta={
+            "topology": "dag",
+            "workspace_root": str(tmp_path),
+            "requested_agents": 5,
+            "effective_agents": 5,
+        },
+        estimated_cost=0.0,
+    )
+
+    summary = db.get_swarm_summary("swarm-handoff-fields")
+    assert summary is not None
+    assert summary["task_hash"] != ""
+    assert summary["requested_agents"] == 5
+    assert summary["effective_agents"] == 5
+    assert summary["topology"] == "dag"
+    db.close()

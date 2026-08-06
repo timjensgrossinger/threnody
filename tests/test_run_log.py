@@ -14,10 +14,9 @@ from shared import run_log
 
 @pytest.fixture(autouse=True)
 def isolated_runs_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect RUNS_ROOT (and the active pointer) into a temp dir."""
+    """Redirect RUNS_ROOT (active pointer paths derive from it) into a temp dir."""
     root = tmp_path / "runs"
     monkeypatch.setattr(run_log, "RUNS_ROOT", root)
-    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", root / "active.json")
     return root
 
 
@@ -81,14 +80,40 @@ def test_iter_pending_runs_excludes_imported() -> None:
 
 
 def test_active_run_pointer_lifecycle() -> None:
-    assert run_log.get_active_run() is None
+    assert run_log.get_active_run(workspace_root="/tmp/p") is None
     run_log.set_active_run("swarm-active", workspace_root="/tmp/p")
-    assert run_log.get_active_run() == "swarm-active"
+    assert run_log.get_active_run(workspace_root="/tmp/p") == "swarm-active"
     # Mismatched clear is a no-op.
-    run_log.clear_active_run("other")
-    assert run_log.get_active_run() == "swarm-active"
-    run_log.clear_active_run("swarm-active")
+    run_log.clear_active_run("other", workspace_root="/tmp/p")
+    assert run_log.get_active_run(workspace_root="/tmp/p") == "swarm-active"
+    run_log.clear_active_run("swarm-active", workspace_root="/tmp/p")
+    assert run_log.get_active_run(workspace_root="/tmp/p") is None
+
+
+def test_active_run_pointer_is_scoped_per_workspace() -> None:
+    """Regression: a single global active.json meant two concurrent sessions in
+    different repos shared one PostToolUse learning-hook target — one session's
+    file edits were appended to the other's run log. Each workspace must get its
+    own pointer.
+    """
+    run_log.set_active_run("swarm-a", workspace_root="/tmp/repo-a")
+    run_log.set_active_run("swarm-b", workspace_root="/tmp/repo-b")
+    assert run_log.get_active_run(workspace_root="/tmp/repo-a") == "swarm-a"
+    assert run_log.get_active_run(workspace_root="/tmp/repo-b") == "swarm-b"
+    # Clearing one workspace's run must not affect the other's pointer.
+    run_log.clear_active_run("swarm-a", workspace_root="/tmp/repo-a")
+    assert run_log.get_active_run(workspace_root="/tmp/repo-a") is None
+    assert run_log.get_active_run(workspace_root="/tmp/repo-b") == "swarm-b"
+
+
+def test_get_active_run_without_workspace_root_uses_legacy_global_pointer() -> None:
+    """A caller with genuinely no workspace_root (rare) falls back to the
+    pre-existing global pointer rather than always seeing None."""
     assert run_log.get_active_run() is None
+    run_log.set_active_run("swarm-global")
+    assert run_log.get_active_run() == "swarm-global"
+    # A workspace-scoped lookup must not accidentally see the global pointer.
+    assert run_log.get_active_run(workspace_root="/tmp/other") is None
 
 
 def test_prune_keeps_most_recent() -> None:

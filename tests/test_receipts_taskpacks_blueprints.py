@@ -41,6 +41,80 @@ def _payload() -> dict:
     }
 
 
+def test_cost_receipt_does_not_fabricate_savings_for_unpriced_selection() -> None:
+    """Regression: every route_task receipt previously reported "100% savings,
+    $0.0025" regardless of the actual model, because the counterfactual model
+    id ("claude-opus-4.6", a typo for the catalog's "claude-opus-4-6") was
+    never in the price table, so high_counterfactual silently priced to $0 and
+    the old fallback (selected_cost + 0.0025 * agents) fired unconditionally.
+    """
+    cost = build_cost_receipt(
+        source_tool="route_task",
+        task="opus-vs-opus",
+        tier="high",
+        model="not-a-real-model-id",
+        provider="claude-code",
+        payload={"host_spawn": {"tool": "Task"}},
+    )
+    assert cost["selected"]["estimated_cost_usd"] is None
+    assert cost["savings"]["estimated_usd"] is None
+    assert cost["savings"]["pct"] is None
+    assert cost["savings"]["basis"] == "unpriced"
+    assert cost["estimate_basis"] == "tier_token_budget"
+
+
+def test_cost_receipt_reports_not_comparable_for_opus_vs_opus() -> None:
+    """Selecting the same model as the counterfactual (host-native opus vs the
+    opus counterfactual) must not read as a real savings figure."""
+    cost = build_cost_receipt(
+        source_tool="execute_swarm",
+        task="host-native opus run",
+        tier="high",
+        model="claude-opus-4-6",
+        provider="claude-code",
+        payload={"host_spawn_waves": [{"wave": 1, "agents": [{}, {}]}]},
+        estimated_cost_usd=5.0,  # deliberately higher than the counterfactual estimate
+    )
+    assert cost["savings"]["estimated_usd"] is None
+    assert cost["savings"]["basis"] == "not_comparable"
+
+
+def test_cost_receipt_reports_real_savings_when_both_sides_priced() -> None:
+    """The happy path still works: a cheap priced model vs. the priced opus
+    counterfactual produces a real, positive savings figure."""
+    cost = build_cost_receipt(
+        source_tool="route_task",
+        task="cheap task",
+        tier="low",
+        model="claude-haiku-4-5-20251001",
+        provider="claude-code",
+        payload={"host_spawn": {"tool": "Task"}},
+    )
+    assert cost["savings"]["basis"] == "priced"
+    assert cost["savings"]["estimated_usd"] > 0
+    assert cost["savings"]["pct"] > 0
+
+
+def test_agent_count_prefers_host_spawn_waves_over_collapsed_subtasks() -> None:
+    """Regression: agent_count previously came from the planner's internal
+    subtasks list, which can diverge from what actually got spawned (e.g. a
+    sanitization step or max_agents cap trimming host_spawn_waves separately).
+    """
+    payload = {
+        "subtasks": [{"id": 1}, {"id": 2}, {"id": 3}],  # pre-divergence, larger
+        "host_spawn_waves": [{"wave": 1, "agents": [{"id": "a"}]}],  # actually spawned
+    }
+    cost = build_cost_receipt(
+        source_tool="execute_swarm",
+        task="t",
+        tier="low",
+        model="gpt-5-mini",
+        provider="github-copilot",
+        payload=payload,
+    )
+    assert cost["agent_count"] == 1
+
+
 def test_run_receipt_persistence_and_formats(tmp_path: Path) -> None:
     db = Database(tmp_path / "receipts.db")
     payload = _payload()
@@ -187,6 +261,78 @@ def test_agent_count_optimizer_scales_large_reviews_to_cap() -> None:
     decision = choose_agent_count(f"Review these files: {files}", hard_cap=12)
     assert decision["recommended_agents"] == 12
     assert decision["strategy"] == "review_file_sweep"
+
+
+def test_agent_count_optimizer_sizes_review_sentinel_by_dimension_not_file_count(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Regression: a REVIEW: sentinel task must be sized from the actual
+    (file x dimension) fanout, not a dimension-blind file_count + 1 guess that
+    silently caps a 3-file/5-dim review down to ~4 agents before review_fanout
+    ever gets a say (the Aug swarm-review fanout collapse).
+
+    Uses relative filenames (chdir'd into tmp_path) rather than the absolute
+    tmp_path — extract_task_file_entries(allow_external=True) has a separate,
+    pre-existing dual-match bug on absolute paths that is not part of this fix.
+    """
+    names = ("a.py", "b.py", "c.py")
+    for name in names:
+        (tmp_path / name).write_text(
+            "\n".join(f"line {i}" for i in range(210)), encoding="utf-8"
+        )
+    monkeypatch.chdir(tmp_path)
+    task = "REVIEW: " + " ".join(names)
+
+    decision = choose_agent_count(task, hard_cap=100)
+    assert decision["strategy"] == "review_dimension_fanout"
+    assert decision["recommended_agents"] == 16  # 3 files x 5 dims + 1 synthesis
+
+    # A configured hard_cap still bounds it — the fix removes the dimension-blind
+    # guess, not the operator's ability to cap.
+    capped = choose_agent_count(task, hard_cap=4)
+    assert capped["recommended_agents"] == 4
+
+
+def test_inspect_run_receipt_distinguishes_pending_failed_and_absent(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Regression: a live-DB read that reported RunReceiptNotFound for a receipt
+    that genuinely existed (19 rows in the table) collapsed three different
+    facts — not written yet, write failed, or never registered — into one
+    error, giving an operator no way to tell whether to retry.
+    """
+    db = Database(tmp_path / "receipt-states.db")
+    db._init_schema(db._get_connection())
+    monkeypatch.setattr(
+        mcp_server, "_ensure_init", lambda: (TGsConfig.defaults(), db, None, None, None)
+    )
+    monkeypatch.setattr(mcp_server, "_pending_receipts", {})
+    monkeypatch.setattr(mcp_server, "_failed_receipts", {})
+
+    # Genuinely never registered.
+    out = mcp_server.handle_inspect_run_receipt({"run_id": "swarm-none"})
+    assert out == {"error": "RunReceiptNotFound", "run_id": "swarm-none"}
+
+    # Background persist thread hasn't completed yet.
+    mcp_server._pending_receipts["swarm-pending"] = 0.0
+    out = mcp_server.handle_inspect_run_receipt({"run_id": "swarm-pending"})
+    assert out["error"] == "RunReceiptPending"
+    assert out["run_id"] == "swarm-pending"
+
+    # Background persist thread raised.
+    mcp_server._failed_receipts["swarm-failed"] = "boom"
+    out = mcp_server.handle_inspect_run_receipt({"run_id": "swarm-failed"})
+    assert out == {
+        "error": "RunReceiptWriteFailed",
+        "run_id": "swarm-failed",
+        "details": "boom",
+    }
+
+    # Actually written and readable.
+    record_run_receipt(db, run_id="swarm-ok", source_tool="test", task="t", payload={})
+    out = mcp_server.handle_inspect_run_receipt({"run_id": "swarm-ok"})
+    assert out["receipt"]["run_id"] == "swarm-ok"
+    db.close()
 
 
 def test_new_mcp_tools_registered() -> None:

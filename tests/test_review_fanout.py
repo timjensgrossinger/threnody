@@ -674,6 +674,61 @@ class TestBuildReviewSubtasks:
         # At least security and logic should be kept (drop_priority 0 and 1)
         assert "review-security" in dropped_keys or "review-logic" in dropped_keys
 
+    def test_max_agents_drop_is_reported_in_coverage_and_analysis(self, tmp_path: Path):
+        """The Aug-3/Aug-5 regression: a cap-driven drop must be visible, not silent.
+
+        Same 5-dim complex file + tight cap as test_max_agents_drops_lowest_priority_first,
+        but asserting the *reporting* surface: plan_summary.coverage.dropped_cells and
+        the human-readable analysis sentence, not just which cells survived.
+        """
+        f = tmp_path / "big.md"
+        f.write_text("\n".join(f"line {i}" for i in range(210)), encoding="utf-8")
+        result = build_review_subtasks(
+            [(str(f), "")], f"REVIEW: {f}", max_agents=4, config=_llm_synthesis_config()
+        )
+        coverage = result["coverage"]
+        # 5 expected dims; max_agents=4 under llm synthesis reserves a synthesis
+        # slot, so review_cap = max(1, 4-1) = 3 -> 2 dropped.
+        assert coverage["dropped_cells"], "cap dropped cells but coverage says nothing was dropped"
+        assert len(coverage["dropped_cells"]) == 2
+        assert set(coverage["dimensions_expected"][str(f)]) == {
+            "security", "logic", "edge", "types", "performance",
+        }
+        assert len(coverage["dimensions_planned"][str(f)]) == 3
+        assert "dropped" in result["analysis"]
+        assert "of 5" in result["analysis"]
+
+    def test_multi_file_complex_review_plans_every_dimension_uncapped(self, tmp_path: Path):
+        """Regression for the Aug swarm-review fanout collapse.
+
+        3 complex (>200 LOC) files with no explicit cap must plan one agent per
+        (file, dimension) — 5 dims each — not collapse to a handful of
+        security-only agents because an upstream agent-count budget was
+        dimension-blind. Uncapped here (max_agents=None) isolates review_fanout's
+        own behavior from agent_optimizer.choose_agent_count, which is covered
+        separately in test_receipts_taskpacks_blueprints.py.
+        """
+        files = []
+        for name in ("a.py", "b.py", "c.py"):
+            f = tmp_path / name
+            f.write_text("\n".join(f"line {i}" for i in range(210)), encoding="utf-8")
+            files.append(f)
+        entries = [(str(f), "") for f in files]
+        result = build_review_subtasks(
+            entries,
+            "REVIEW: " + " ".join(str(f) for f in files),
+            config=_llm_synthesis_config(),
+        )
+        review = [s for s in result["subtasks"] if not s.get("depends_on")]
+        synthesis = [s for s in result["subtasks"] if s.get("depends_on")]
+        assert len(review) == 15  # 3 files x 5 dims
+        assert len(synthesis) == 1
+        for f in files:
+            assert sorted(result["coverage"]["dimensions_planned"][str(f)]) == sorted(
+                ["security", "logic", "edge", "types", "performance"]
+            )
+        assert result["coverage"]["dropped_cells"] == []
+
     def test_requested_dim_survives_cap_over_security(self, tmp_path: Path):
         # Defect-3 regression: a risky file + explicit [dims=performance] under a
         # tight cap must KEEP performance — it is drop-protected — even though the
@@ -1063,3 +1118,108 @@ class TestStaticSmellWiring:
             [("/nonexistent/zz.py", "")], "REVIEW: /nonexistent/zz.py"
         )
         assert len(plan["subtasks"]) >= 2  # >=1 review cell + synthesis
+
+
+def _git_cmd(args: list[str], cwd: Path) -> None:
+    import subprocess
+
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+class TestChangedLineScopedPrompts:
+    """Regression for the "bare prompt" defect: under a boilerplate mode that
+    drops the stable instruction block (BOILERPLATE_DEFINITION, claude-code's
+    default), the description previously collapsed to just "Review this file:
+    <path>" — no dimension name, no scope. It must now name the dimension and,
+    when a merge base exists, the changed-line ranges — without changing what
+    file content gets read (whole-file, always) or how it's cached (content_sha
+    unaffected).
+    """
+
+    def _repo_with_a_change(self, tmp_path: Path) -> tuple[Path, Path]:
+        root = tmp_path / "repo"
+        root.mkdir()
+        _git_cmd(["init", "-b", "main"], root)
+        _git_cmd(["config", "user.email", "t@example.com"], root)
+        _git_cmd(["config", "user.name", "T"], root)
+        target = root / "big.py"
+        base_lines = [f"line {i}" for i in range(210)]
+        target.write_text("\n".join(base_lines), encoding="utf-8")
+        _git_cmd(["add", "-A"], root)
+        _git_cmd(["commit", "-m", "base"], root)
+
+        changed_lines = list(base_lines)
+        changed_lines[100] = "CHANGED line 100"
+        target.write_text("\n".join(changed_lines), encoding="utf-8")
+        _git_cmd(["commit", "-am", "change line 100"], root)
+        return root, target
+
+    def test_names_dimension_and_changed_lines_under_definition_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from shared.config import TGsConfig
+
+        root, target = self._repo_with_a_change(tmp_path)
+        monkeypatch.chdir(root)
+
+        plan = build_review_subtasks(
+            [(str(target), "")],
+            f"REVIEW: {target}",
+            caller="claude-code",
+            config=TGsConfig(),
+        )
+        security = next(
+            st for st in plan["subtasks"] if st.get("review_dimension") == "security"
+        )
+        desc = security["description"]
+        assert "Security review of" in desc
+        assert "Review this file:" not in desc  # the old bare form
+        assert "Changed lines:" in desc
+        assert "101" in desc  # 0-indexed line 100 -> 1-indexed line 101 in git
+
+    def test_omits_changed_lines_clause_without_a_merge_base(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No git repo at all: still names the dimension, no fabricated range."""
+        from shared.config import TGsConfig
+
+        f = tmp_path / "big.py"
+        f.write_text("\n".join(f"line {i}" for i in range(210)), encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        plan = build_review_subtasks(
+            [(str(f), "")],
+            f"REVIEW: {f}",
+            caller="claude-code",
+            config=TGsConfig(),
+        )
+        security = next(
+            st for st in plan["subtasks"] if st.get("review_dimension") == "security"
+        )
+        desc = security["description"]
+        assert "Security review of" in desc
+        assert "Changed lines:" not in desc
+        assert "Review the whole file." in desc
+
+    def test_content_sha_and_cell_count_unaffected_by_diff_scoping(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The prompt changes; the learning-key surface (content_sha, dimension
+        count) must not — review_memory replay and static-recall grading key
+        off content_sha, not off wording."""
+        from shared.config import TGsConfig
+
+        root, target = self._repo_with_a_change(tmp_path)
+        monkeypatch.chdir(root)
+
+        with_diff = build_review_subtasks(
+            [(str(target), "")], f"REVIEW: {target}", caller="claude-code", config=TGsConfig()
+        )
+        without_diff = build_review_subtasks([(str(target), "")], f"REVIEW: {target}")
+
+        shas_a = sorted(st["content_sha"] for st in with_diff["subtasks"] if st.get("content_sha"))
+        shas_b = sorted(st["content_sha"] for st in without_diff["subtasks"] if st.get("content_sha"))
+        assert shas_a == shas_b
+        review_a = [st for st in with_diff["subtasks"] if st.get("review_dimension")]
+        review_b = [st for st in without_diff["subtasks"] if st.get("review_dimension")]
+        assert len(review_a) == len(review_b)

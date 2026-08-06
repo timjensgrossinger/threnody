@@ -110,6 +110,68 @@ def test_persist_and_query_swarm() -> None:
         db.close()
 
 
+def test_sparse_progress_ping_does_not_zero_out_prior_fields() -> None:
+    """Regression: every host-native progress ping is a sparse dict like
+    ``{"swarm_id": ..., "status": "running"}``. Database.persist_swarm_run's old
+    unconditional upsert reset requested_agents/effective_agents/task_hash/
+    topology/etc. to their bare defaults on every one of those calls — which is
+    why production swarm_runs rows for host-native swarms read
+    (task_hash='', requested_agents=0, effective_agents=0) despite the handoff
+    having set real values first.
+    """
+    from shared.db import Database
+
+    with tempfile.NamedTemporaryFile(suffix=".db") as handle:
+        db = Database(Path(handle.name))
+        swarm_id = "swarm-sparse-ping"
+        db.persist_swarm_run({
+            "swarm_id": swarm_id,
+            "task_hash": "real-task-hash",
+            "status": "planned",
+            "requested_agents": 7,
+            "effective_agents": 7,
+            "topology": "dag",
+            "round": 2,
+        })
+
+        # A bare progress ping — exactly what host_learning's wave-progress and
+        # handoff-meta-counter writes send.
+        db.persist_swarm_run({"swarm_id": swarm_id, "status": "running"})
+
+        summary = db.get_swarm_summary(swarm_id)
+        assert summary is not None
+        assert summary["status"] == "running"  # the actual update took effect
+        assert summary["task_hash"] == "real-task-hash"
+        assert summary["requested_agents"] == 7
+        assert summary["effective_agents"] == 7
+        assert summary["topology"] == "dag"
+        assert summary["round"] == 2
+        db.close()
+
+
+def test_persist_swarm_run_with_only_swarm_id_is_a_no_op_update() -> None:
+    """A call naming nothing but swarm_id (e.g. a bare existence-touch) must not
+    error and must not change any existing column — SQLite requires at least one
+    assignment in DO UPDATE SET, which this exercises via the fallback clause.
+    """
+    from shared.db import Database
+
+    with tempfile.NamedTemporaryFile(suffix=".db") as handle:
+        db = Database(Path(handle.name))
+        swarm_id = "swarm-touch-only"
+        db.persist_swarm_run({
+            "swarm_id": swarm_id,
+            "status": "running",
+            "requested_agents": 5,
+        })
+        db.persist_swarm_run({"swarm_id": swarm_id})
+
+        summary = db.get_swarm_summary(swarm_id)
+        assert summary["status"] == "running"
+        assert summary["requested_agents"] == 5
+        db.close()
+
+
 def test_invalid_swarm_numeric_inputs_raise_clear_errors() -> None:
     """Malformed numeric swarm fields should raise explicit ValueError messages."""
     from shared.swarm import SwarmRun, persist_swarm_run

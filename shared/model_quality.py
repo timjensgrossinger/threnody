@@ -311,6 +311,7 @@ def record_verify_gate_score(
     score_0_10: float,
     new_failure_count: int = 0,
     preexisting_count: int = 0,
+    role: str | None = None,
     task_hash: str | None = None,
     run_id: str | None = None,
 ) -> None:
@@ -318,13 +319,17 @@ def record_verify_gate_score(
 
     Objective: the written code either passed lint/types/tests or introduced new
     failures relative to the merge base. ``preexisting_count`` is stored for
-    context only and never affects the score.
+    context only and never affects the score. ``role`` (the semantic role of the
+    agent that wrote the code — Implementer, Debugger, etc., see ``shared/roles.py``)
+    becomes the dimension when known, so non-review work gets a real axis instead
+    of one flat ``general`` bucket; falls back to ``general`` when the role is
+    unresolved.
     """
     _write_event(
         db,
         model=model,
         effort=effort,
-        dimension=DIMENSION_GENERAL,
+        dimension=role.strip().lower() if role and role.strip() else DIMENSION_GENERAL,
         sub_dimension="verify",
         score_0_10=score_0_10,
         source=SOURCE_VERIFY_GATE,
@@ -434,15 +439,22 @@ def record_judge_score(
     reason: str | None = None,
     dimension: str = DIMENSION_GENERAL,
     sub_dimension: str | None = None,
+    role: str | None = None,
     task_hash: str | None = None,
     run_id: str | None = None,
 ) -> None:
-    """Record one warm-path judge score (source='judge')."""
+    """Record one warm-path judge score (source='judge').
+
+    ``role`` (see ``shared/roles.py``), when the caller has one, overrides
+    ``dimension`` the same way ``record_verify_gate_score`` does — a real axis
+    for non-review work instead of a flat ``general`` bucket. Omitted by
+    callers that don't yet track a role, so existing behavior is unchanged.
+    """
     _write_event(
         db,
         model=model,
         effort=effort,
-        dimension=dimension,
+        dimension=role.strip().lower() if role and role.strip() else dimension,
         sub_dimension=sub_dimension,
         score_0_10=score_0_10,
         source=SOURCE_JUDGE,
@@ -593,8 +605,11 @@ def build_quality_snapshot(
 def _build_by_role_facet(db: Database, since_ts: float) -> list[dict[str, Any]]:
     """Per-role quality breakdown via JOIN on telemetry.role.
 
-    Joins model_quality_events with telemetry on task_hash and time window
-    to surface quality by semantic role (Implementer, Reviewer, etc.).
+    Joins model_quality_events with telemetry on (run, model) and time window
+    to surface quality by semantic role (Implementer, Reviewer, etc.). Not
+    ``task_hash`` — telemetry writes ``task_hash=task_id`` while quality events
+    write ``task_hash=pattern_hash``; those are different values for the same
+    agent, so that join could never match a row.
     """
     try:
         with db.conn() as conn:
@@ -607,7 +622,7 @@ def _build_by_role_facet(db: Database, since_ts: float) -> list[dict[str, Any]]:
                        AVG(CASE WHEN m.source IN ('static_recall','verify_gate','ladder')
                                 THEN m.score_0_10 END)
                 FROM model_quality_events m
-                JOIN telemetry t ON t.task_hash = m.task_hash
+                JOIN telemetry t ON t.session_id = m.run_id AND t.model = m.model
                 WHERE m.ts >= ? AND t.role IS NOT NULL AND t.role != ''
                 GROUP BY t.role, m.model, m.effort
                 ORDER BY t.role, m.model

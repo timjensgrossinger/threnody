@@ -798,6 +798,14 @@ def test_route_task_preserves_routed_plan_guard_during_active_handoff(
         assert isinstance(guard, dict)
         assert guard.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN
 
+        # Regression: quick_action must reflect the active-handoff
+        # recommended_action, not a stale value computed before the override —
+        # the two used to disagree in the same response (one said "spawn
+        # host_spawn_waves ... do not use direct Write/Edit", the other said
+        # "Use direct edits or host Task tool for trivial changes").
+        assert routed["quick_action"] == routed["execution_hint"]["recommended_action"]
+        assert "do not use direct Write/Edit" in routed["quick_action"]
+
 
 def test_route_task_active_handoff_keeps_codex_host_native_metadata(
     monkeypatch: pytest.MonkeyPatch,

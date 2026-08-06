@@ -269,6 +269,24 @@ class TaskRouter:
                 )
         return None
 
+    def _matched_high_signal(self, task_lower: str) -> bool:
+        """True when a genuine high-tier complexity keyword matched.
+
+        Distinct from "the raw score is high" (several medium/low signals can
+        stack to the same number) — this asks specifically whether a *high*-level
+        keyword fired, mirroring ``_compute_score``'s own matching for that one
+        level so a caller can suppress a low-tier nudge on the actual signal that
+        made this task risky, not an aggregate score that could arrive several
+        other ways.
+        """
+        for kw in self._signals.get("high", []):
+            if kw in task_lower:
+                return True
+        for kw in WORD_BOUNDARY_COMPLEXITY_SIGNALS.get("high", []):
+            if re.search(r'\b' + re.escape(kw) + r'\b', task_lower):
+                return True
+        return False
+
     def _low_override_delta(
         self, task_lower: str, computed_score: float
     ) -> tuple[float, list[str]]:
@@ -282,6 +300,11 @@ class TaskRouter:
 
         - a security/risk token co-occurs (``_risk_floor_re``),
         - the task references 3+ files (multi-concern; mirrors ``_compute_score``),
+        - a genuine high-tier complexity keyword matched (``_matched_high_signal``)
+          — e.g. "rename this concurrency-sensitive permission check" must not
+          route low just because "rename" is also a low-tier keyword; the risk
+          floor above only catches *filename* patterns, not concept-level signals
+          like "concurrency" or "permission" in the task text itself,
         - the raw complexity score already sits at/above the low boundary.
         """
         if computed_score >= self._thresholds.low_max:
@@ -289,6 +312,8 @@ class TaskRouter:
         if self._risk_floor_re is not None and self._risk_floor_re.search(task_lower):
             return 0.0, []
         if len(re.findall(r'\b\w+\.\w{1,4}\b', task_lower)) >= 3:
+            return 0.0, []
+        if self._matched_high_signal(task_lower):
             return 0.0, []
         for kw in self._overrides.get("low", []):
             if re.search(rf"\b{re.escape(kw)}\b", task_lower):

@@ -111,6 +111,16 @@ RESULT_CACHE_TTL_HOURS = 168
 # accumulated learning; depth comes from the count, not from a longer cadence.
 DB_BACKUP_INTERVAL_HOURS = 6
 DB_BACKUP_KEEP = 28  # 28 * 6h = 7 days of restore history
+# Corruption is otherwise only ever probed at Database.__init__ — fine for a
+# short-lived CLI, silent for the long-lived MCP server that actually holds the
+# ledger. This is a periodic re-probe, not a substitute for the exception-path
+# detection in Database.conn() (which fires immediately, not on a timer).
+DB_INTEGRITY_REPROBE_INTERVAL_HOURS = 1
+# NORMAL (SQLite's WAL-mode default) risks losing the last commit(s) on an OS
+# crash/power loss but not corrupting the file; FULL trades write latency for
+# that guarantee. Kept at NORMAL until a specific install's corruption pattern
+# is traced to synchronous mode rather than concurrent-writer contention.
+DB_SYNCHRONOUS_DEFAULT = "NORMAL"
 # Bumped to 2: plans now carry plural `target_files` ownership, `inline_files`
 # and `coverage`. Cached v1 plans predate the ownership fix (a coupled group was
 # stored owning a single file while its prompt claimed several) and must not be
@@ -1215,6 +1225,42 @@ def _coerce_config_int(
     return value
 
 
+def _coerce_config_float(
+    raw_value: Any,
+    *,
+    default: float,
+    field_name: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        log.warning("%s: invalid numeric value %r; using default %s", field_name, raw_value, default)
+        return default
+    if minimum is not None and value < minimum:
+        log.warning(
+            "%s: value %r is below minimum %s; using default %s",
+            field_name,
+            raw_value,
+            minimum,
+            default,
+        )
+        return default
+    if maximum is not None and value > maximum:
+        log.warning(
+            "%s: value %r is above maximum %s; using default %s",
+            field_name,
+            raw_value,
+            maximum,
+            default,
+        )
+        return default
+    return value
+
+
 def _coerce_config_bool(raw_value: Any, *, default: bool, field_name: str) -> bool:
     if raw_value is None:
         return default
@@ -1662,6 +1708,12 @@ class TGsConfig:
     # candidate, one corruption quarantines the DB and every learning table
     # resets to empty — see Database._maybe_auto_backup.
     db_backup_interval_hours: int = DB_BACKUP_INTERVAL_HOURS
+    # Periodic mid-session corruption re-probe (hours; 0 disables). See
+    # DB_INTEGRITY_REPROBE_INTERVAL_HOURS for why __init__-only checking is not
+    # enough for a long-lived MCP server.
+    db_integrity_reprobe_interval_hours: float = DB_INTEGRITY_REPROBE_INTERVAL_HOURS
+    # "NORMAL" or "FULL" — see DB_SYNCHRONOUS_DEFAULT.
+    db_synchronous: str = DB_SYNCHRONOUS_DEFAULT
     plan_cache_ttl_hours: int = PLAN_CACHE_TTL_HOURS
     result_cache_ttl_hours: int = RESULT_CACHE_TTL_HOURS
 
@@ -2008,6 +2060,21 @@ class TGsConfig:
                 default=DB_BACKUP_INTERVAL_HOURS,
                 field_name="cache.backup_interval_hours",
                 minimum=0,
+            ),
+            db_integrity_reprobe_interval_hours=_coerce_config_float(
+                cache_raw.get(
+                    "integrity_reprobe_interval_hours",
+                    DB_INTEGRITY_REPROBE_INTERVAL_HOURS,
+                ),
+                default=DB_INTEGRITY_REPROBE_INTERVAL_HOURS,
+                field_name="cache.integrity_reprobe_interval_hours",
+                minimum=0.0,
+            ),
+            db_synchronous=(
+                str(cache_raw.get("synchronous", DB_SYNCHRONOUS_DEFAULT) or "").strip().upper()
+                if str(cache_raw.get("synchronous", DB_SYNCHRONOUS_DEFAULT) or "").strip().upper()
+                in ("NORMAL", "FULL")
+                else DB_SYNCHRONOUS_DEFAULT
             ),
         )
         cfg.code_review = raw.get("code_review", False) is True

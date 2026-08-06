@@ -369,3 +369,114 @@ class TestStaticRecall:
         # The judge row is a proxy source and must not enter the objective column.
         assert by_dim["general"]["objective_n"] == 0
         assert by_dim["general"]["objective_avg"] is None
+
+
+# ---------------------------------------------------------------------------
+# role-as-dimension for non-review sources (write-path coverage)
+# ---------------------------------------------------------------------------
+
+class TestRoleAsDimension:
+    def test_verify_gate_role_becomes_dimension(self, db: Database) -> None:
+        mq.record_verify_gate_score(
+            db, model="opus", effort="high", score_0_10=10.0, role="Implementer",
+        )
+        with db.conn() as conn:
+            row = conn.execute(
+                "SELECT dimension, sub_dimension, source FROM model_quality_events"
+            ).fetchone()
+        assert row == ("implementer", "verify", mq.SOURCE_VERIFY_GATE)
+
+    def test_verify_gate_no_role_falls_back_to_general(self, db: Database) -> None:
+        mq.record_verify_gate_score(db, model="opus", effort="high", score_0_10=10.0)
+        with db.conn() as conn:
+            dimension = conn.execute(
+                "SELECT dimension FROM model_quality_events"
+            ).fetchone()[0]
+        assert dimension == mq.DIMENSION_GENERAL
+
+    def test_verify_gate_blank_role_falls_back_to_general(self, db: Database) -> None:
+        mq.record_verify_gate_score(db, model="opus", effort="high", score_0_10=10.0, role="   ")
+        with db.conn() as conn:
+            dimension = conn.execute(
+                "SELECT dimension FROM model_quality_events"
+            ).fetchone()[0]
+        assert dimension == mq.DIMENSION_GENERAL
+
+    def test_judge_role_overrides_dimension(self, db: Database) -> None:
+        mq.record_judge_score(
+            db, model="sonnet", effort="medium", score_0_10=7.0,
+            dimension="general", role="Debugger",
+        )
+        with db.conn() as conn:
+            dimension = conn.execute(
+                "SELECT dimension FROM model_quality_events"
+            ).fetchone()[0]
+        assert dimension == "debugger"
+
+    def test_judge_no_role_keeps_explicit_dimension(self, db: Database) -> None:
+        mq.record_judge_score(
+            db, model="sonnet", effort="medium", score_0_10=7.0, dimension="security",
+        )
+        with db.conn() as conn:
+            dimension = conn.execute(
+                "SELECT dimension FROM model_quality_events"
+            ).fetchone()[0]
+        assert dimension == "security"
+
+
+# ---------------------------------------------------------------------------
+# by-role facet: join must actually match (was task_hash=task_hash, always empty)
+# ---------------------------------------------------------------------------
+
+class TestByRoleFacet:
+    def test_by_role_facet_matches_on_run_and_model(self, db: Database) -> None:
+        mq.record_verify_gate_score(
+            db, model="opus", effort="high", score_0_10=9.0, role="Implementer",
+            run_id="run-xyz",
+        )
+        db.log_agent_result(
+            session_id="run-xyz",
+            task_hash="some-task-id",
+            agent_id=1,
+            tier="high",
+            model="opus",
+            role="Implementer",
+        )
+        snap = mq.build_quality_snapshot(db, since="all", by_role=True)
+        by_role = {(r["role"], r["model"]): r for r in snap["by_role"]}
+        assert ("Implementer", "opus") in by_role
+        assert by_role[("Implementer", "opus")]["n"] == 1
+
+    def test_by_role_facet_empty_when_telemetry_role_unset(self, db: Database) -> None:
+        mq.record_verify_gate_score(
+            db, model="opus", effort="high", score_0_10=9.0, role="Implementer",
+            run_id="run-xyz",
+        )
+        db.log_agent_result(
+            session_id="run-xyz",
+            task_hash="some-task-id",
+            agent_id=1,
+            tier="high",
+            model="opus",
+        )
+        snap = mq.build_quality_snapshot(db, since="all", by_role=True)
+        assert snap["by_role"] == []
+
+    def test_by_role_facet_does_not_match_on_task_hash_alone(self, db: Database) -> None:
+        # Regression guard: quality events key task_hash on pattern_hash, telemetry
+        # keys it on task_id. A join on task_hash alone must never match even
+        # when both values coincidentally look similar, or the old bug is back.
+        mq.record_verify_gate_score(
+            db, model="opus", effort="high", score_0_10=9.0, role="Implementer",
+            task_hash="shared-value", run_id="run-a",
+        )
+        db.log_agent_result(
+            session_id="run-b",  # different run -> must not match
+            task_hash="shared-value",
+            agent_id=1,
+            tier="high",
+            model="opus",
+            role="Implementer",
+        )
+        snap = mq.build_quality_snapshot(db, since="all", by_role=True)
+        assert snap["by_role"] == []

@@ -114,7 +114,11 @@ def test_gate_failing_nonrequired_does_not_reject():
     assert r.success is True
 
 
-def test_gate_auto_detect_no_tool_rejects_required_signal():
+def test_gate_auto_detect_no_tool_does_not_reject_required_signal():
+    """A missing tool (e.g. no linter installed) is a configuration gap, not a
+    regression this run introduced — it must not warn/reject on its own, and
+    is surfaced separately via degraded_signals for an operator to notice.
+    """
     cfg = VerifyGateConfig(
         enabled=True, mode="block",
         signals={"lint": VerifyGateSignalConfig(command="auto", required=True)},
@@ -122,10 +126,11 @@ def test_gate_auto_detect_no_tool_rejects_required_signal():
     orch = _make_orchestrator(cfg)
     with patch.object(orch, "_detect_gate_command", return_value=""):
         r = orch._run_verify_gate(_subtask("/tmp/f.py"), _result())
-    assert r.gate_verdict == "rejected"
-    assert r.success is False
+    assert r.gate_verdict == "pass"
+    assert r.success is True
     assert r.gate_signals["lint"]["unavailable"] is True
     assert r.gate_signals["lint"]["passed"] is False
+    assert r.gate_degraded_signals == ["lint"]
 
 
 def test_gate_auto_detect_no_tool_skips_optional_signal():

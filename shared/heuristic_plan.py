@@ -710,9 +710,25 @@ def _finalize_subtasks(subtasks: list[dict[str, object]]) -> list[dict[str, obje
     ownership sentence, so prompt scope can never exceed declared ownership (#3).
 
     Task-level subtasks (no target file) are left untouched.
-    Also derives semantic role from description for each subtask.
+    Also derives semantic role from description for each subtask, and — opt-in
+    via ``model_quality.routing_bias_enabled`` — nudges tier by the objective
+    quality bias recorded for that role (see ``_load_role_quality_bias``).
     """
     from .roles import derive_role_from_task, DEFAULT_ROLE
+
+    role_bias = _load_role_quality_bias()
+
+    def _apply_role(st: dict[str, object], role: str) -> None:
+        if role == DEFAULT_ROLE:
+            return
+        if "role" not in st:
+            st["role"] = role
+        if not role_bias:
+            return
+        step = role_bias.get(role.lower())
+        tier = st.get("tier")
+        if step and isinstance(tier, str) and tier in _TIER_ORDER:
+            st["tier"] = _tier_step(tier, step)
 
     for st in subtasks:
         tfs = st.get("target_files")
@@ -723,9 +739,7 @@ def _finalize_subtasks(subtasks: list[dict[str, object]]) -> list[dict[str, obje
             target_files = [str(tf)] if isinstance(tf, str) and tf.strip() else []
         if not target_files:
             desc = str(st.get("description", ""))
-            role = derive_role_from_task(desc)
-            if role != DEFAULT_ROLE and "role" not in st:
-                st["role"] = role
+            _apply_role(st, derive_role_from_task(desc))
             continue
         seen: set[str] = set()
         deduped = [p for p in target_files if not (p.lower() in seen or seen.add(p.lower()))]
@@ -733,9 +747,7 @@ def _finalize_subtasks(subtasks: list[dict[str, object]]) -> list[dict[str, obje
         desc = str(st.get("description", "")).rstrip()
         if "You own exactly these files:" not in desc:
             st["description"] = _close_sentence(desc) + _ownership_line(deduped)
-        role = derive_role_from_task(str(st.get("description", "")))
-        if role != DEFAULT_ROLE and "role" not in st:
-            st["role"] = role
+        _apply_role(st, derive_role_from_task(str(st.get("description", ""))))
     return subtasks
 
 
@@ -1499,6 +1511,44 @@ def _load_quality_tier_bias() -> dict[tuple[str, str], int]:
     }
 
 
+def _load_role_quality_bias() -> dict[str, int]:
+    """Load the objective model-quality bias for non-review (write-path) work.
+
+    Non-review agents write ``dimension=role.lower()`` (see
+    ``model_quality.record_verify_gate_score``/``record_judge_score``), so this
+    is the sibling of ``_load_quality_tier_bias`` for the write path: returns
+    ``{role_lower: step}`` instead of a review profile key. Same opt-in
+    (``model_quality.routing_bias_enabled``), same "only act when all models
+    agree" collapse, same empty-on-any-failure fallback so a fresh or
+    thin-history repo is unaffected.
+    """
+    try:
+        from .config import TGsConfig
+
+        mq_cfg = getattr(TGsConfig.from_yaml(), "model_quality", None)
+        if mq_cfg is None or not getattr(mq_cfg, "enabled", True):
+            return {}
+        if not getattr(mq_cfg, "routing_bias_enabled", False):
+            return {}
+        from .agents import _get_agent_db
+        from .quality_bias import apply_quality_floor, load_model_quality_bias
+
+        db = _get_agent_db()
+        raw = apply_quality_floor(db, load_model_quality_bias(db))
+    except Exception:  # pragma: no cover - learning read is best-effort
+        return {}
+
+    by_dimension: dict[str, set[int]] = {}
+    for (_model, dimension), step in raw.items():
+        by_dimension.setdefault(dimension, set()).add(step)
+
+    return {
+        dimension: steps.pop()
+        for dimension, steps in by_dimension.items()
+        if len(steps) == 1
+    }
+
+
 _FULL_SWEEP_RE = re.compile(
     r"\b(?:full(?:\s+(?:sweep|review|audit))?|audit|everything|entire|whole\s+repo)\b",
     re.IGNORECASE,
@@ -1554,6 +1604,47 @@ def _intel_db() -> object | None:
         return _get_agent_db()
     except Exception:  # pragma: no cover - cache handle is best-effort
         return None
+
+
+def expected_review_agent_count(task: str, *, db: object | None = None) -> int:
+    """True per-(file, dimension) agent count for a ``REVIEW:`` task, uncapped.
+
+    ``agent_optimizer.choose_agent_count`` previously sized a review swarm from
+    ``file_count + 1`` — dimension-blind, so a 3-file/5-dimension review got a
+    budget of 4 and ``review_fanout``'s own cap then dropped 12 of 15 cells
+    before the caller ever saw the shape of the plan. This asks the same
+    band/smell engine ``build_review_subtasks`` uses, uncapped, so the caller's
+    ``hard_cap`` is the only thing that can still trim it — and can report the
+    shortfall rather than hide it.
+
+    Returns 0 for a non-review task (the caller falls through to its existing
+    heuristic), 1 for a review task naming no resolvable file.
+    """
+    from .review_fanout import (
+        build_review_subtasks,
+        is_fast_review_intent,
+        is_review_intent,
+        strip_dims_token,
+    )
+
+    if not isinstance(task, str) or not is_review_intent(task):
+        return 0
+    entries = extract_task_file_entries(
+        strip_dims_token(task), intent_templates=False, allow_external=True
+    )
+    if not entries:
+        entries = _changed_file_entries(task)
+    if not entries:
+        return 1
+    if is_fast_review_intent(task):
+        return len(entries) + 1
+    try:
+        payload = build_review_subtasks(entries, task, max_agents=None, db=db)
+    except Exception:  # pragma: no cover - best-effort; caller has a fallback
+        log.debug("expected_review_agent_count: build_review_subtasks failed", exc_info=True)
+        return len(entries) + 1
+    subtasks = payload.get("subtasks") if isinstance(payload, dict) else None
+    return len(subtasks) if isinstance(subtasks, list) and subtasks else 1
 
 
 def _load_risk_floor() -> tuple["re.Pattern[str] | None", str]:

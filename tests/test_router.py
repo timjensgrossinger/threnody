@@ -59,6 +59,33 @@ def test_low_override_suppressed_by_risk_cooccurrence() -> None:
     assert decision.override is False
 
 
+def test_low_override_suppressed_by_high_signal_keyword() -> None:
+    """Regression: a task naming a genuine high-tier complexity concept (not a
+    risky *filename*, which _risk_floor_re alone catches) must not be dragged to
+    low by a co-occurring low-tier keyword. The reported failure: a 520-line
+    rewrite of a concurrency- and permission-sensitive module routed low because
+    the description also said "rename" — "concurrency"/"permission" are
+    concept-level signals in the task text, not filename patterns, so the old
+    risk-floor-only suppression never saw them.
+    """
+    router = _make_router()
+    decision = router.classify(
+        "Rename this helper inside the async, distributed, "
+        "concurrency-sensitive permission module."
+    )
+    assert "low_override" not in decision.reason
+    assert decision.tier in {"medium", "high"}
+
+
+def test_low_override_still_applies_without_a_high_signal() -> None:
+    """The suppression must not become a blanket exemption — an ordinary
+    low-tier task with no high-signal keyword still gets the nudge."""
+    router = _make_router()
+    decision = router.classify("rename this variable")
+    assert "low_override" in decision.reason
+    assert decision.tier == "low"
+
+
 def test_deep_security_review_override_high() -> None:
     """Explicit deep security review should force high tier."""
     router = _make_router()

@@ -314,7 +314,11 @@ class TestGateWithBaseline:
         )
         assert report.verdict == verify.VERDICT_PASS
 
-    def test_required_unavailable_signal_rejects(self, repo: Path):
+    def test_required_unavailable_signal_does_not_reject(self, repo: Path):
+        """A required signal with no configured/detectable command is a
+        configuration gap (e.g. mypy not installed), not a regression this run
+        introduced — it must not warn/reject, only show up in degraded_signals.
+        """
         report = verify.run_verify_gate(
             VerifyGateConfig(
                 enabled=True, mode="block",
@@ -322,9 +326,10 @@ class TestGateWithBaseline:
             ),
             project_root=str(repo),
         )
-        assert report.verdict == verify.VERDICT_REJECTED
+        assert report.verdict == verify.VERDICT_PASS
         assert report.signals["lint"]["unavailable"] is True
         assert report.signals["lint"]["passed"] is False
+        assert report.degraded_signals == ["lint"]
 
     def test_command_resolver_override(self, repo: Path):
         calls: list[str] = []

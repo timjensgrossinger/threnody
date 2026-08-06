@@ -24,7 +24,6 @@ from shared.host_learning import host_task_id, register_host_run_handoff
 @pytest.fixture(autouse=True)
 def isolated_runs_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(run_log, "RUNS_ROOT", tmp_path / "runs")
-    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", tmp_path / "runs" / "active.json")
 
 
 def _init(monkeypatch, tmp_path: Path, capture: str = "model") -> Database:

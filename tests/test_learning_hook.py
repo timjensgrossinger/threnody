@@ -19,7 +19,6 @@ from shared import learning_hook, run_log
 def isolated_runs_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "runs"
     monkeypatch.setattr(run_log, "RUNS_ROOT", root)
-    monkeypatch.setattr(run_log, "_ACTIVE_POINTER", root / "active.json")
     return root
 
 
@@ -60,6 +59,48 @@ def test_capture_noop_without_target_file() -> None:
     assert out["captured"] is False
 
 
+def test_capture_edit_does_not_cross_workspaces() -> None:
+    """Regression: two concurrent Claude Code sessions in different repos must
+    never have one session's file edits appended to the other's run log — the
+    root cause of the foreign assigned_files entries and wrong reported_agents
+    count seen in a production run receipt.
+    """
+    run_log.set_active_run("swarm-repo-a", workspace_root="/tmp/repo-a")
+    run_log.set_active_run("swarm-repo-b", workspace_root="/tmp/repo-b")
+
+    out_a = learning_hook.capture_edit(
+        {"cwd": "/tmp/repo-a", "target_file": "/tmp/repo-a/x.py", "success": True}
+    )
+    assert out_a == {
+        "captured": True,
+        "run_id": "swarm-repo-a",
+        "files": ["/tmp/repo-a/x.py"],
+    }
+
+    out_b = learning_hook.capture_edit(
+        {"cwd": "/tmp/repo-b", "target_file": "/tmp/repo-b/y.py", "success": True}
+    )
+    assert out_b["run_id"] == "swarm-repo-b"
+
+    records_a = run_log.read_run_log("swarm-repo-a")
+    records_b = run_log.read_run_log("swarm-repo-b")
+    assert [r["touched_files"] for r in records_a] == [["/tmp/repo-a/x.py"]]
+    assert [r["touched_files"] for r in records_b] == [["/tmp/repo-b/y.py"]]
+
+
+def test_capture_edit_drops_targets_outside_cwd() -> None:
+    """A target file outside the hook's own cwd is dropped rather than appended
+    to this run's log — the containment check available without DB access."""
+    run_log.set_active_run("swarm-contain", workspace_root="/tmp/repo-a")
+    out = learning_hook.capture_edit({
+        "cwd": "/tmp/repo-a",
+        "target_files": ["/tmp/repo-a/in.py", "/tmp/other-repo/out.py"],
+        "success": True,
+    })
+    assert out["captured"] is True
+    assert out["files"] == ["/tmp/repo-a/in.py"]
+
+
 def test_main_ignores_non_edit_tools(capsys: pytest.CaptureFixture) -> None:
     run_log.set_active_run("swarm-hook3")
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
@@ -71,7 +112,7 @@ def test_main_ignores_non_edit_tools(capsys: pytest.CaptureFixture) -> None:
 
 
 def test_main_captures_edit(capsys: pytest.CaptureFixture) -> None:
-    run_log.set_active_run("swarm-hook4")
+    run_log.set_active_run("swarm-hook4", workspace_root="/tmp/p")
     payload = json.dumps(
         {
             "tool_name": "Edit",

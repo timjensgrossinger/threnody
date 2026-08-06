@@ -230,6 +230,15 @@ _client_name: str | None = None  # set from MCP initialize handshake
 _bg_loop: asyncio.AbstractEventLoop | None = None
 _bg_loop_thread: threading.Thread | None = None
 _bg_loop_ready = threading.Event()
+# Run receipts persist off the hot path (see _attach_and_persist_plan_receipt /
+# execute_swarm's own background persist). Without these, inspect_run_receipt's
+# only signal on a miss is KeyError — "not written yet" (normal, retry shortly),
+# "write failed" (background persist raised), and "genuinely never existed" all
+# collapsed to the same RunReceiptNotFound. Best-effort, in-memory: resets on
+# restart, which is fine — the DB row is the actual source of truth once it
+# lands; this only improves what a miss, in the meantime, tells the caller.
+_pending_receipts: dict[str, float] = {}
+_failed_receipts: dict[str, str] = {}
 _bg_loop_lock = threading.Lock()
 _stdout_lock = threading.Lock()  # serialise all JSON-RPC writes
 
@@ -2392,6 +2401,7 @@ def _attach_and_persist_plan_receipt(
         # after the background persist completes.
         _snapshot = dict(result)
         _receipt_snap = dict(receipt)
+        _pending_receipts[run_id] = time.time()
         def _bg_persist() -> None:
             try:
                 record_run_receipt(
@@ -2403,8 +2413,11 @@ def _attach_and_persist_plan_receipt(
                     cost_receipt=_receipt_snap,
                     workspace_root=workspace_root,
                 )
-            except Exception:
+            except Exception as exc:
                 log.debug("%s receipt persist failed for %s", source_tool, run_id, exc_info=True)
+                _failed_receipts[run_id] = str(exc)[:200]
+            finally:
+                _pending_receipts.pop(run_id, None)
         threading.Thread(target=_bg_persist, daemon=True, name=f"receipt-persist-{run_id}").start()
 
 
@@ -3533,6 +3546,56 @@ def _enrich_fleet_waves_with_host_spawn(
     return enriched
 
 
+def _build_plan_contract(
+    coverage: Mapping[str, object] | None, subtask_count: int
+) -> dict[str, object]:
+    """Normalize review vs write-path coverage into one shape a skill can check
+    before spawning, without knowing which planner produced the plan.
+
+    ``coverage`` has two distinct shapes today: review's
+    ``{dimensions_expected, dimensions_planned, dropped_cells, skipped_prior_review}``
+    and the write path's ``{files_total, files_assigned, files_inline, deferred,
+    packed}``. A skill that wants to verify "did I get the fanout I expected"
+    (the exact gap that let a dimension-blind agent budget collapse a 15-agent
+    review to 3 without anyone noticing) shouldn't have to know which one it's
+    looking at.
+    """
+    contract: dict[str, object] = {
+        "expected_agents": subtask_count,
+        "planned_agents": subtask_count,
+        "dropped": [],
+        "deferred": [],
+        "warnings": [],
+    }
+    if not isinstance(coverage, Mapping):
+        return contract
+    if "dimensions_expected" in coverage:
+        expected_map = coverage.get("dimensions_expected")
+        total_expected = (
+            sum(len(v) for v in expected_map.values() if isinstance(v, list))
+            if isinstance(expected_map, Mapping)
+            else subtask_count
+        )
+        # +1 for the synthesis agent nearly every review plan has; an exact
+        # match isn't the point here — the dropped/warnings signal is.
+        contract["expected_agents"] = total_expected + 1
+        dropped = [str(d) for d in (coverage.get("dropped_cells") or [])]
+        contract["dropped"] = dropped
+        if dropped:
+            contract["warnings"].append(
+                f"{len(dropped)} dimension(s) dropped by the agent budget"
+            )
+    else:
+        deferred = [str(d) for d in (coverage.get("deferred") or [])]
+        contract["expected_agents"] = subtask_count + len(deferred)
+        contract["deferred"] = deferred
+        if deferred:
+            contract["warnings"].append(
+                f"{len(deferred)} file(s) deferred — no owning agent"
+            )
+    return contract
+
+
 def _execute_swarm_host_native_response(
     *,
     config: TGsConfig,
@@ -3600,6 +3663,22 @@ def _execute_swarm_host_native_response(
     host_waves = plan_dict.get("host_spawn_waves")
     if not isinstance(host_waves, list):
         host_waves = []
+    if host_waves:
+        # These are exactly the fields that previously read (task_hash='',
+        # requested_agents=0, effective_agents=0) on every host-native swarm_runs
+        # row — persist_swarm_run's old unconditional upsert reset them on every
+        # later progress ping. The Database.persist_swarm_run partial-update fix
+        # is what makes it safe to set them here once, at handoff, and never again.
+        try:
+            db.persist_swarm_run({
+                "swarm_id": swarm_id,
+                "task_hash": hashlib.sha256(task_text.encode("utf-8")).hexdigest()[:16],
+                "requested_agents": int(request_meta.get("requested_agents") or 0),
+                "effective_agents": int(request_meta.get("effective_agents") or 0),
+                "topology": str(request_meta.get("topology") or plan.topology or "linear"),
+            })
+        except Exception:
+            log.debug("swarm_runs handoff field persist failed for %s", swarm_id, exc_info=True)
     # Append the host-native consensus wave (persona-diverse review queens) when
     # enabled. The host spawns these read-only agents after the worker waves; the
     # consensus decision is tallied in ingest_host_wave when they are reported.
@@ -3796,6 +3875,7 @@ def _execute_swarm_host_native_response(
     _bg_swarm_id = swarm_id
     _bg_workspace = resolved_workspace
     _bg_task = task_text
+    _pending_receipts[_bg_swarm_id] = time.time()
     def _bg_receipt_persist() -> None:
         try:
             record_run_receipt(
@@ -3807,8 +3887,11 @@ def _execute_swarm_host_native_response(
                 cost_receipt=_cost_snap,
                 workspace_root=_bg_workspace,
             )
-        except Exception:
+        except Exception as exc:
             log.debug("execute_swarm receipt persist failed for %s", _bg_swarm_id, exc_info=True)
+            _failed_receipts[_bg_swarm_id] = str(exc)[:200]
+        finally:
+            _pending_receipts.pop(_bg_swarm_id, None)
     threading.Thread(
         target=_bg_receipt_persist, daemon=True, name=f"receipt-persist-{swarm_id}"
     ).start()
@@ -3832,7 +3915,22 @@ def _execute_swarm_host_native_response(
         for _key in ("coverage", "inline_files", "sanitization", "hybrid_split"):
             if p.get(_key):
                 plan_summary[_key] = p.get(_key)
+        plan_summary["contract"] = _build_plan_contract(
+            p.get("coverage") if isinstance(p.get("coverage"), Mapping) else None,
+            plan_summary["subtask_count"],
+        )
         swarm_result["plan_summary"] = plan_summary
+        _coverage = p.get("coverage") if isinstance(p.get("coverage"), Mapping) else None
+        _dropped = (_coverage or {}).get("dropped_cells") if _coverage else None
+        if _dropped:
+            # Top-level, not nested under plan_summary.coverage — a host that reads
+            # nothing else about the plan (the fast-start contract discourages it)
+            # must still see that this run did not cover what it looked like it would.
+            swarm_result["coverage_warning"] = (
+                f"{len(_dropped)} review dimension(s) dropped by the agent budget: "
+                f"{', '.join(_dropped[:8])}"
+                f"{'...' if len(_dropped) > 8 else ''}. See plan_summary.coverage."
+            )
     if review_run:
         # Review never executes a workflow script, so drop that whole family too.
         for _k in (
@@ -4857,11 +4955,6 @@ def handle_route_task(args: dict) -> dict:
         result["host_model"] = host_model
     if delegate_model is not None:
         result["delegate_model"] = delegate_model
-    result["quick_action"] = _route_quick_action(
-        tier=decision.tier,
-        caller=caller,
-        execution_hint=execution_hint,
-    )
     if (
         execution_mode == "delegate"
         and isinstance(selection, dict)
@@ -4915,6 +5008,17 @@ def handle_route_task(args: dict) -> dict:
         )
         if guard is not None:
             result["routing_guard"] = guard
+    # Computed last, from the final execution_hint — the active-handoff branch
+    # above overrides execution_hint["recommended_action"], and _route_quick_action
+    # prefers that field. Computing quick_action before this override meant the
+    # two fields in the same response could disagree (one said "spawn
+    # host_spawn_waves... do not use direct Write/Edit", the other said "Use
+    # direct edits or host Task tool") every time a call landed mid-handoff.
+    result["quick_action"] = _route_quick_action(
+        tier=decision.tier,
+        caller=caller,
+        execution_hint=execution_hint,
+    )
     _attach_host_spawn_metadata(
         result,
         config=config,
@@ -9165,10 +9269,34 @@ def handle_inspect_run_receipt(args: dict) -> dict:
     fmt = str(args.get("format") or "json").strip().lower()
     if fmt not in {"json", "markdown", "html"}:
         return {"error": "format must be one of: json, markdown, html"}
+    normalized_run_id = run_id.strip()
     try:
-        return load_run_receipt(db, run_id.strip(), format=fmt)
+        return load_run_receipt(db, normalized_run_id, format=fmt)
     except KeyError:
-        return {"error": "RunReceiptNotFound", "run_id": run_id.strip()}
+        if normalized_run_id in _failed_receipts:
+            return {
+                "error": "RunReceiptWriteFailed",
+                "run_id": normalized_run_id,
+                "details": _failed_receipts[normalized_run_id],
+            }
+        if normalized_run_id in _pending_receipts:
+            return {
+                "error": "RunReceiptPending",
+                "run_id": normalized_run_id,
+                "hint": "background persist has not completed yet; retry shortly",
+            }
+        return {"error": "RunReceiptNotFound", "run_id": normalized_run_id}
+    except Exception as exc:
+        # A corrupt-DB read (or any other read failure) must not escape as a raw
+        # sqlite error or be misreported as "not found" — those are different
+        # facts for an operator deciding whether to retry or run `threnody db
+        # check`.
+        log.debug("inspect_run_receipt read failed for %s", normalized_run_id, exc_info=True)
+        return {
+            "error": "RunReceiptReadFailed",
+            "run_id": normalized_run_id,
+            "details": str(exc)[:200],
+        }
 
 
 def handle_list_task_packs(_args: dict) -> dict:
@@ -12014,6 +12142,46 @@ HANDLERS = {
 # Main loop
 # ---------------------------------------------------------------------------
 
+
+def _maybe_attach_db_health(result: object) -> object:
+    """Surface DB corruption on every tool response, not just ones that ask.
+
+    A corrupt-DB read failing partway through a handler — or a partial-upsert
+    silently succeeding on some columns and not others — is exactly the "some
+    of it works, some doesn't" failure mode a caller has no way to detect from
+    an individual tool's own payload. One producer (``Database.db_health_snapshot``,
+    also read by ``shared/status.py``), attached here so no handler has to
+    remember to check it, and callers that already ignore unknown keys see no
+    change when the DB is healthy.
+    """
+    if not isinstance(result, dict) or "db_health" in result:
+        return result
+    db_ref = _db
+    if db_ref is None:
+        return result
+    snapshot_fn = getattr(db_ref, "db_health_snapshot", None)
+    if not callable(snapshot_fn):
+        return result
+    try:
+        snapshot = snapshot_fn()
+    except Exception:
+        log.debug("db_health snapshot probe failed", exc_info=True)
+        return result
+    if not isinstance(snapshot, dict) or snapshot.get("healthy") is not False:
+        return result
+    result["db_health"] = {
+        "healthy": False,
+        "corruption_detected_ts": snapshot.get("corruption_detected_ts"),
+        "warning": (
+            "Threnody's local database detected corruption during this session. "
+            "Automatic recovery runs when a backup exists; treat any routing/"
+            "learning state in this response as unverified until `threnody db "
+            "check` confirms current health."
+        ),
+    }
+    return result
+
+
 def handle_request(request: dict) -> None:
     req_id = request.get("id")
     method = request.get("method", "")
@@ -12068,6 +12236,7 @@ def handle_request(request: dict) -> None:
                             )
                             _retry_policy.wait(_attempt)
                             continue
+                        result = _maybe_attach_db_health(result)
                         send_response(req_id, {
                             "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
                         })

@@ -18,6 +18,7 @@ idempotent (see ``host_learning.import_run_log``).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -36,10 +37,10 @@ _META_NAME = "meta.json"
 # only *name* a dependency, so the dependent agent either re-derives the upstream
 # analysis or the host re-pastes it into every dependent prompt.
 _ARTIFACTS_NAME = "artifacts"
-# Pointer to the run a PostToolUse learning hook should append to. The MCP
-# execute_swarm/plan response sets it; the terminal report clears it. The hook
-# stays dependency-light (run_log only) by reading this rather than the DB.
-_ACTIVE_POINTER = RUNS_ROOT / "active.json"
+# Pointer(s) to the run a PostToolUse learning hook should append to — one file
+# per workspace (see _active_pointer_path) plus a legacy global fallback. The
+# MCP execute_swarm/plan response sets it; the terminal report clears it. The
+# hook stays dependency-light (run_log only) by reading this rather than the DB.
 
 # A run id is a generated ``swarm-<hex>`` token, but callers may pass a
 # user-supplied id. Constrain it to a single safe path segment so it can never
@@ -209,36 +210,74 @@ def prune_runs(keep: int = 20) -> None:
             log.debug("run_log: prune failed for %s", stale, exc_info=True)
 
 
+def _normalize_workspace_root(workspace_root: str) -> str:
+    return os.path.normpath(str(workspace_root))
+
+
+def _active_pointer_path(workspace_root: str | None) -> Path:
+    """One pointer file per workspace, not one global file for every session.
+
+    A single global ``active.json`` meant two concurrent Claude Code sessions in
+    different repos shared one PostToolUse learning-hook target: session B's file
+    edits were appended to session A's run log, and vice versa — the source of
+    both the foreign ``assigned_files`` entries and the wrong ``reported_agents``
+    count seen in production. ``None`` keeps the pre-existing global file as a
+    fallback for the rare caller that genuinely has no workspace to scope by.
+    """
+    if not workspace_root:
+        return RUNS_ROOT / "active.json"
+    digest = hashlib.sha256(
+        _normalize_workspace_root(workspace_root).encode("utf-8")
+    ).hexdigest()[:12]
+    return RUNS_ROOT / f"active-{digest}.json"
+
+
 def set_active_run(run_id: str, *, workspace_root: str | None = None) -> None:
     """Mark *run_id* as the run the PostToolUse learning hook should append to."""
     try:
         RUNS_ROOT.mkdir(parents=True, exist_ok=True)
         payload = {"run_id": _safe_run_id(run_id), "ts": time.time()}
         if workspace_root:
-            payload["workspace_root"] = workspace_root
-        _ACTIVE_POINTER.write_text(
+            payload["workspace_root"] = _normalize_workspace_root(workspace_root)
+        _active_pointer_path(workspace_root).write_text(
             json.dumps(payload, separators=(",", ":")), encoding="utf-8"
         )
     except Exception:
         log.debug("run_log: set_active_run failed for %s", run_id, exc_info=True)
 
 
-def get_active_run() -> str | None:
-    if not _ACTIVE_POINTER.exists():
+def get_active_run(workspace_root: str | None = None) -> str | None:
+    """Return the active run for *workspace_root*, or the legacy global pointer.
+
+    When *workspace_root* is given but the resolved pointer's own recorded root
+    disagrees (defensive — pointer files are keyed by hash, so this only matters
+    if two roots ever collided), the mismatch is treated as "no active run"
+    rather than risk attributing a hook capture to the wrong session.
+    """
+    path = _active_pointer_path(workspace_root)
+    if not path.exists():
         return None
     try:
-        data = json.loads(_ACTIVE_POINTER.read_text(encoding="utf-8"))
-        rid = data.get("run_id")
-        return str(rid) if rid else None
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if workspace_root:
+        stored_root = data.get("workspace_root")
+        if stored_root and stored_root != _normalize_workspace_root(workspace_root):
+            return None
+    rid = data.get("run_id")
+    return str(rid) if rid else None
 
 
-def clear_active_run(run_id: str | None = None) -> None:
+def clear_active_run(run_id: str | None = None, *, workspace_root: str | None = None) -> None:
     """Clear the active-run pointer (optionally only if it matches *run_id*)."""
     try:
-        if run_id is not None and get_active_run() not in (None, _safe_run_id(run_id)):
+        path = _active_pointer_path(workspace_root)
+        if run_id is not None and get_active_run(workspace_root=workspace_root) not in (
+            None,
+            _safe_run_id(run_id),
+        ):
             return
-        _ACTIVE_POINTER.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
     except Exception:
         log.debug("run_log: clear_active_run failed", exc_info=True)

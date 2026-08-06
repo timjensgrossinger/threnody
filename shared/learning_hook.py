@@ -95,17 +95,45 @@ def parse_hook_payload(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_within_root(path: str, root: str) -> bool:
+    """Local, dependency-light containment check.
+
+    Deliberately not ``context.is_within_repo`` — that module pulls in config/DB
+    machinery this hook must stay free of (see module docstring): it runs on
+    every Edit/Write and has to add zero round-trips.
+    """
+    from pathlib import Path
+
+    try:
+        resolved = Path(path).expanduser().resolve(strict=False)
+        base = Path(root).expanduser().resolve(strict=False)
+        return resolved == base or resolved.is_relative_to(base)
+    except (OSError, ValueError):
+        return False
+
+
 def capture_edit(fields: dict[str, Any]) -> dict[str, Any]:
     """Append one run-log record for a file-edit event. Best-effort, never raises."""
     from . import run_log
 
-    run_id = fields.get("run_id") or run_log.get_active_run()
+    cwd = fields.get("cwd")
+    cwd = cwd if isinstance(cwd, str) and cwd else None
+    run_id = fields.get("run_id") or run_log.get_active_run(workspace_root=cwd)
     if not run_id:
         return {"captured": False, "reason": "no active run"}
     targets = fields.get("target_files") or (
         [fields["target_file"]] if fields.get("target_file") else []
     )
     targets = [str(t) for t in targets if t]
+    if cwd:
+        # The run's own registered workspace_root is what actually gates this
+        # (host_learning enforces it at import), but a PostToolUse hook has no DB
+        # access — this cwd is the same value get_active_run just scoped the
+        # pointer lookup by, so it is the best available proxy without one. This
+        # is what stops a concurrent session's edits (a different cwd, hence a
+        # different active-run pointer file) from ever reaching this run's log
+        # even if the two pointer lookups somehow raced onto the same run_id.
+        targets = [t for t in targets if _is_within_root(t, cwd)]
     if not targets:
         return {"captured": False, "reason": "no target file"}
 
