@@ -896,6 +896,9 @@ def _build_review_outcome(
         "target_file": target_file,
         "dimension": dim,
         "tier": tier,
+        # Carried so the quality ledger can key a row to the exact agent that
+        # produced it, not just to the run.
+        "spawn_id": str(agent_spec.get("spawn_id") or ""),
         "model": str(agent_spec.get("model") or ""),
         "effort": (str(agent_spec.get("effort")).strip() or None) if agent_spec.get("effort") else None,
         "findings_total": findings_total,
@@ -1036,9 +1039,29 @@ def _record_static_recall(
             findings_total=findings_total,
             task_hash=outcome.get("task_hash"),
             run_id=outcome.get("run_id"),
+            # static_recall is the objective review source, so it is the one the
+            # routing bias actually reads — it must carry the join axes or the
+            # bias can only ever be keyed on the model as a whole.
+            tier=str(outcome.get("tier") or "") or None,
+            profile_key=_profile_key_for_outcome(outcome, prof),
+            spawn_id=str(outcome.get("spawn_id") or "") or None,
         )
     except Exception:  # pragma: no cover - best-effort learning
         log.debug("model-quality static-recall capture failed", exc_info=True)
+
+
+def _profile_key_for_outcome(outcome: Mapping[str, Any], prof: Any) -> str | None:
+    """``ext|loc_bucket|density_bucket`` for this reviewed file, or None."""
+    target = str(outcome.get("target_file") or "").strip()
+    if not target or prof is None:
+        return None
+    try:
+        from .review_fanout import profile_key_for
+
+        return profile_key_for(prof, target)
+    except Exception:  # pragma: no cover - best-effort
+        log.debug("profile key resolution failed for %s", target, exc_info=True)
+        return None
 
 
 def _record_review_outcome(
@@ -1104,6 +1127,13 @@ def _record_review_outcome(
             kept_by_synthesis=bool(outcome["kept_by_synthesis"]),
             task_hash=task_hash,
             run_id=run_id,
+            # The join axes. Without them the ledger knows which model scored
+            # what, but not at which tier or on what shape of file — and
+            # review_tier_bias holds the profile with no model, so the two
+            # ledgers could never be joined to answer the actual question.
+            tier=str(outcome.get("tier") or "") or None,
+            profile_key=profile_key,
+            spawn_id=str(outcome.get("spawn_id") or "") or None,
         )
         # Per-category sub-dimension scores (e.g. security -> sql-injection).
         categories = outcome.get("categories")
@@ -1122,6 +1152,9 @@ def _record_review_outcome(
                     kept_by_synthesis=bool(cat.get("kept", True)),
                     task_hash=task_hash,
                     run_id=run_id,
+                    tier=str(outcome.get("tier") or "") or None,
+                    profile_key=profile_key,
+                    spawn_id=str(outcome.get("spawn_id") or "") or None,
                 )
     except Exception:  # pragma: no cover - best-effort learning
         log.debug("model-quality findings capture failed", exc_info=True)

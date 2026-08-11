@@ -220,3 +220,65 @@ def test_stats_is_empty_safe(journal_root) -> None:
     assert stats["events"] == 0
     assert stats["by_kind"] == {}
     assert stats["newest_ts"] is None
+
+
+def test_review_quality_rows_carry_tier_and_profile_key(
+    journal_root, db, tmp_path: Path
+) -> None:
+    """The review path must populate the join axes, not just the write path.
+
+    `tier` and `profile_key` were added to the ledger so that "which model, at
+    which tier, on which shape of file" becomes answerable — review_tier_bias
+    holds the profile with no model, and the quality ledger held the model with
+    no profile, so the two could never be joined. Threading the kwargs through
+    `model_quality` is not enough: the review call sites in `host_learning` have
+    to pass them, and they silently did not, leaving every review row NULL on
+    both columns.
+    """
+    from shared.config import TGsConfig
+    from shared.host_learning import _record_review_outcome
+
+    target = tmp_path / "auth_token.py"
+    target.write_text(
+        "import subprocess\n"
+        "def run(c):\n"
+        "    return subprocess.run(c, shell=True)\n"
+        + "\n".join(f"def f{i}(x):\n    return x" for i in range(60)),
+        encoding="utf-8",
+    )
+
+    _record_review_outcome(
+        db,
+        {
+            "target_file": str(target),
+            "dimension": "security",
+            "tier": "high",
+            "spawn_id": "7",
+            "model": "opus",
+            "effort": None,
+            "findings_total": 1,
+            "findings_high": 1,
+            "kept_by_synthesis": True,
+            "categories": {"security/command-injection": {
+                "findings_total": 1, "findings_high": 1, "kept": True,
+            }},
+            "findings": None,
+            "run_id": "swarm-axes",
+            "task_hash": "abc123",
+        },
+        TGsConfig(),
+    )
+
+    with db.conn() as conn:
+        rows = conn.execute(
+            "SELECT source, model, tier, profile_key, spawn_id "
+            "FROM model_quality_events ORDER BY source"
+        ).fetchall()
+    assert rows, "review path wrote no ledger rows"
+    for source, model, tier, profile_key, spawn_id in rows:
+        assert model == "opus", source
+        assert tier == "high", f"{source} row lost the tier"
+        assert profile_key and profile_key.startswith(".py|"), f"{source}: {profile_key}"
+        assert spawn_id == "7", source
+    # The objective source is the one routing bias reads — it must be present.
+    assert "static_recall" in {r[0] for r in rows}
