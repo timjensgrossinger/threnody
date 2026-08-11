@@ -290,7 +290,20 @@ def _drop_bare_duplicates(entries: list[tuple[str, str]]) -> list[tuple[str, str
     ``agents/evaluator.py`` and a later bare ``evaluator.py`` are the same file
     mentioned twice; keeping both spawned two agents for one file (and the bare
     one lost its directory, so it pointed at the repo root).
+
+    The same collision happens one level up: ``_ABSOLUTE_PATH`` and ``_BARE_PATH``
+    both match an absolute target, yielding ``/tmp/x/a.py`` *and* ``tmp/x/a.py``.
+    Those are one file, but they compare unequal, so an absolute review target
+    silently planned two agents per dimension — and the rooted-away copy usually
+    could not be read, so it was profiled as a default ``moderate`` file.
     """
+    rooted = {path.lstrip("/").lower() for path, _ in entries if path.startswith("/")}
+    if rooted:
+        entries = [
+            (path, hint)
+            for path, hint in entries
+            if path.startswith("/") or path.lower() not in rooted
+        ]
     qualified_names = {
         PurePosixPath(path).name.lower() for path, _ in entries if "/" in path
     }
@@ -1647,6 +1660,17 @@ def expected_review_agent_count(task: str, *, db: object | None = None) -> int:
     return len(subtasks) if isinstance(subtasks, list) and subtasks else 1
 
 
+def _review_config() -> "Any | None":
+    """Live config for the review path, or None so review_fanout falls back."""
+    try:
+        from .config import TGsConfig
+
+        return TGsConfig.from_yaml()
+    except Exception:  # pragma: no cover - config read is best-effort
+        log.debug("heuristic_plan: review config load failed", exc_info=True)
+        return None
+
+
 def _load_risk_floor() -> tuple["re.Pattern[str] | None", str]:
     """Resolve the risk-floor matcher + tier from live config. Fail-safe.
 
@@ -1709,6 +1733,7 @@ def build_heuristic_plan_payload(
     urgency_score: float | None = None,
     duration_bucket: str | None = None,
     caller: str | None = None,
+    workspace_root: str | None = None,
 ) -> dict[str, object]:
     """Build planner JSON compatible with ``Planner._build_plan`` without an LLM.
 
@@ -1727,13 +1752,26 @@ def build_heuristic_plan_payload(
         if duration_bucket is None:
             duration_bucket = derived_duration
     # Review fanout: REVIEW: sentinel → per-file × dimension DAG plan
-    from .review_fanout import is_review_intent, build_review_subtasks, strip_dims_token
+    # Config-derived context (loaded once): risk-aware tier floor (#4) and the
+    # direct-edit exemption lists (#5). Both fail-safe to bundled defaults.
+    # Loaded ahead of the review branch on purpose — it used to sit below the
+    # early return, so the credential/auth/crypto filename floor documented in
+    # config.py had never once applied to a review cell.
+    risk_re, floor_tier = _load_risk_floor()
+    exempt_filetypes, exempt_paths = _load_exempt()
+
+    from .review_fanout import (
+        is_review_intent,
+        build_review_subtasks,
+        strip_intent_tokens,
+    )
     if isinstance(task, str) and is_review_intent(task):
         # Review fanout is read-only — allow absolute/out-of-root review targets.
-        # Strip the [dims=...] intent token first so it is never mistaken for a
-        # file path; build_review_subtasks re-parses intent from the full task.
+        # Strip the [dims=...]/[tier=...] intent tokens first so neither is ever
+        # mistaken for a file path; build_review_subtasks re-parses intent from
+        # the full task.
         entries = extract_task_file_entries(
-            strip_dims_token(task), intent_templates=False, allow_external=True
+            strip_intent_tokens(task), intent_templates=False, allow_external=True
         )
         if not entries:
             # No explicit file named. A directory target ("REVIEW: shared/") otherwise
@@ -1752,15 +1790,15 @@ def build_heuristic_plan_payload(
             tier_bias=tier_bias,
             db=_intel_db(),
             caller=caller,
+            risk_floor=(risk_re, floor_tier),
+            # Without this, review_fanout re-reads and re-parses config.yaml for
+            # every review plan built, on the fast-start path.
+            config=_review_config(),
+            workspace_root=workspace_root,
         )  # type: ignore[return-value]
 
     task_lower = task.lower() if isinstance(task, str) else ""
     prefix = _directory_prefix_from_task(task) if isinstance(task, str) else ""
-
-    # Config-derived context (loaded once): risk-aware tier floor (#4) and the
-    # direct-edit exemption lists (#5). Both fail-safe to bundled defaults.
-    risk_re, floor_tier = _load_risk_floor()
-    exempt_filetypes, exempt_paths = _load_exempt()
 
     if intent_templates and isinstance(task, str) and _is_fullstack_intent(task_lower):
         raw_subtasks = infer_fullstack_subtasks(task, prefix)

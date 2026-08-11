@@ -2269,6 +2269,7 @@ def _planner_plan_for_caller(
     *,
     topology: str | None = None,
     max_agents: int | None = None,
+    workspace_root: str | None = None,
 ) -> tuple[ExecutionPlan, bool]:
     use_heuristic = (
         _caller_is_host(caller)
@@ -2329,6 +2330,7 @@ def _planner_plan_for_caller(
             topology=topology,
             max_agents=max_agents,
             caller=caller,
+            workspace_root=workspace_root,
         ), True
     return planner.plan(
         task,
@@ -3452,10 +3454,10 @@ def _attach_host_spawn_metadata(
         )
         if waves:
             payload["host_spawn_waves"] = waves
-            from shared.host_spawn import build_plan_summary
-            summary = build_plan_summary(payload)
-            if summary:
-                payload["plan_summary"] = summary
+            # No build_plan_summary here: it wrote into plan_dict, which the
+            # response assembly pops and replaces with its own plan_summary, so
+            # the work (role counts, a second full target_files list, a cost
+            # estimate) was computed and discarded on the fast-start path.
             payload["host_execution_contract"] = HOST_EXECUTION_CONTRACT
             _maybe_attach_workflow_script(
                 payload,
@@ -3546,8 +3548,76 @@ def _enrich_fleet_waves_with_host_spawn(
     return enriched
 
 
+_CELL_DROP_REASONS = {
+    "budget": "agent budget (max_agents)",
+    "dedup": "duplicate file ownership (sanitizer)",
+    "unsafe": "unsafe target or fragment prompt (sanitizer)",
+    "prior_review": "prior review (unchanged revision, already covered at >= tier)",
+    "unaccounted": "not emitted in host_spawn_waves — cause unrecorded",
+}
+
+
+def _emitted_cell_labels(
+    host_waves: object, subtasks: object
+) -> tuple[list[str], int]:
+    """Return ``(review cell labels, non-cell agent count)`` actually emitted.
+
+    Derived from ``host_spawn_waves`` — the list the host will really spawn —
+    not from ``len(subtasks)``. Any stage that removes a subtask after the plan
+    was costed (the ownership dedup, containment stripping, a fragment prompt)
+    is therefore visible here by construction, which is what makes the dropped
+    set below impossible to under-report.
+    """
+    from shared.host_spawn import review_cell_label
+    from shared.review_fanout import dimension_for_subagent_type
+
+    by_id: dict[str, str] = {}
+    if isinstance(subtasks, list):
+        for st in subtasks:
+            if not isinstance(st, Mapping):
+                continue
+            label = review_cell_label(st)
+            if label and st.get("id") is not None:
+                by_id[str(st.get("id"))] = label
+
+    labels: list[str] = []
+    non_cells = 0
+    if not isinstance(host_waves, list):
+        return labels, non_cells
+    for wave in host_waves:
+        if not isinstance(wave, Mapping):
+            continue
+        agents = wave.get("agents")
+        if not isinstance(agents, list):
+            continue
+        for agent in agents:
+            if not isinstance(agent, Mapping):
+                continue
+            label = by_id.get(str(agent.get("id")), "")
+            if not label:
+                # Fall back to the manifest's own fields when the plan's subtask
+                # list is unavailable (or ids were renumbered downstream).
+                dim = dimension_for_subagent_type(agent.get("subagent_type"))
+                target = agent.get("target_file")
+                if not isinstance(target, str) or not target.strip():
+                    tfs = agent.get("target_files")
+                    target = tfs[0] if isinstance(tfs, list) and tfs else ""
+                if dim and isinstance(target, str) and target.strip():
+                    label = f"{target.strip()}:{dim}"
+            if label:
+                labels.append(label)
+            else:
+                non_cells += 1
+    return labels, non_cells
+
+
 def _build_plan_contract(
-    coverage: Mapping[str, object] | None, subtask_count: int
+    coverage: Mapping[str, object] | None,
+    subtask_count: int,
+    *,
+    host_waves: object = None,
+    sanitization: Mapping[str, object] | None = None,
+    subtasks: object = None,
 ) -> dict[str, object]:
     """Normalize review vs write-path coverage into one shape a skill can check
     before spawning, without knowing which planner produced the plan.
@@ -3559,33 +3629,26 @@ def _build_plan_contract(
     (the exact gap that let a dimension-blind agent budget collapse a 15-agent
     review to 3 without anyone noticing) shouldn't have to know which one it's
     looking at.
+
+    For review plans the numbers are a **set difference**, not a count: every
+    ``(file x dimension)`` the band table expected, minus every one the emitted
+    ``host_spawn_waves`` actually carries. Counting was the original defect —
+    ``dropped`` read one removal channel (the agent budget) out of four, so a
+    review that lost 13 cells to the sanitizer's ownership dedup reported 3.
+    A difference cannot under-report; at worst a cell lands under the
+    ``unaccounted`` reason, which is still a visible failure.
     """
     contract: dict[str, object] = {
         "expected_agents": subtask_count,
         "planned_agents": subtask_count,
         "dropped": [],
+        "skipped": [],
         "deferred": [],
         "warnings": [],
     }
     if not isinstance(coverage, Mapping):
         return contract
-    if "dimensions_expected" in coverage:
-        expected_map = coverage.get("dimensions_expected")
-        total_expected = (
-            sum(len(v) for v in expected_map.values() if isinstance(v, list))
-            if isinstance(expected_map, Mapping)
-            else subtask_count
-        )
-        # +1 for the synthesis agent nearly every review plan has; an exact
-        # match isn't the point here — the dropped/warnings signal is.
-        contract["expected_agents"] = total_expected + 1
-        dropped = [str(d) for d in (coverage.get("dropped_cells") or [])]
-        contract["dropped"] = dropped
-        if dropped:
-            contract["warnings"].append(
-                f"{len(dropped)} dimension(s) dropped by the agent budget"
-            )
-    else:
+    if "dimensions_expected" not in coverage:
         deferred = [str(d) for d in (coverage.get("deferred") or [])]
         contract["expected_agents"] = subtask_count + len(deferred)
         contract["deferred"] = deferred
@@ -3593,6 +3656,79 @@ def _build_plan_contract(
             contract["warnings"].append(
                 f"{len(deferred)} file(s) deferred — no owning agent"
             )
+        return contract
+
+    expected_map = coverage.get("dimensions_expected")
+    expected: list[str] = []
+    if isinstance(expected_map, Mapping):
+        for path, dims in expected_map.items():
+            if isinstance(dims, list):
+                expected.extend(f"{path}:{dim}" for dim in dims)
+
+    emitted, non_cells = _emitted_cell_labels(host_waves, subtasks)
+    if not isinstance(host_waves, list):
+        # No manifest to diff against (non-host callers): fall back to the
+        # planner's own accounting rather than reporting a bogus full sweep.
+        dropped_cells = [str(d) for d in (coverage.get("dropped_cells") or [])]
+        contract["expected_agents"] = len(expected) + 1
+        contract["planned_agents"] = subtask_count
+        contract["dropped"] = [
+            {"cell": c, "reason": _CELL_DROP_REASONS["budget"]} for c in dropped_cells
+        ]
+        if dropped_cells:
+            contract["warnings"].append(
+                f"{len(dropped_cells)} dimension(s) dropped by the agent budget"
+            )
+        return contract
+
+    reasons: dict[str, str] = {}
+    for cell in coverage.get("dropped_cells") or []:
+        reasons[str(cell)] = _CELL_DROP_REASONS["budget"]
+    for cell in coverage.get("skipped_prior_review") or []:
+        reasons[str(cell)] = _CELL_DROP_REASONS["prior_review"]
+    if isinstance(sanitization, Mapping):
+        for entry in sanitization.get("dedup") or []:
+            if isinstance(entry, Mapping) and entry.get("dropped") and entry.get("cell"):
+                reasons[str(entry["cell"])] = _CELL_DROP_REASONS["dedup"]
+        for entry in sanitization.get("dropped_subtasks") or []:
+            if isinstance(entry, Mapping) and entry.get("cell"):
+                reasons[str(entry["cell"])] = _CELL_DROP_REASONS["unsafe"]
+
+    emitted_set = set(emitted)
+    prior = {str(c) for c in (coverage.get("skipped_prior_review") or [])}
+    dropped: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for cell in expected:
+        if cell in emitted_set:
+            continue
+        entry = {"cell": cell, "reason": reasons.get(cell, _CELL_DROP_REASONS["unaccounted"])}
+        (skipped if cell in prior else dropped).append(entry)
+
+    contract["planned_agents"] = len(emitted) + non_cells
+    # Non-cell agents (synthesis, consensus queens) are legitimately planned but
+    # never appear in dimensions_expected — count them on both sides so that
+    # expected == planned + dropped + skipped holds exactly.
+    contract["expected_agents"] = len(expected) + non_cells
+    contract["dropped"] = dropped
+    contract["skipped"] = skipped
+    if dropped:
+        by_reason: dict[str, int] = {}
+        for entry in dropped:
+            by_reason[entry["reason"]] = by_reason.get(entry["reason"], 0) + 1
+        for reason, count in by_reason.items():
+            contract["warnings"].append(f"{count} review cell(s) dropped: {reason}")
+    if skipped:
+        contract["warnings"].append(
+            f"{len(skipped)} review cell(s) served from prior-review memory "
+            "(findings replayed, no agent spawned)"
+        )
+    added = [str(f) for f in (coverage.get("added_files") or [])]
+    if added:
+        contract["added_files"] = added
+        contract["warnings"].append(
+            f"{len(added)} file(s) added from task prose, not the caller's list: "
+            f"{', '.join(added[:5])}{'...' if len(added) > 5 else ''}"
+        )
     return contract
 
 
@@ -3636,6 +3772,9 @@ def _execute_swarm_host_native_response(
             task_text,
             topology=topology_value,
             max_agents=max_agents,
+            # The changed-line diff must resolve against the same root target
+            # containment is checked against, not the process cwd.
+            workspace_root=resolved_workspace,
         )
     except PlannerParseError as exc:
         return {
@@ -3682,8 +3821,9 @@ def _execute_swarm_host_native_response(
     # Append the host-native consensus wave (persona-diverse review queens) when
     # enabled. The host spawns these read-only agents after the worker waves; the
     # consensus decision is tallied in ingest_host_wave when they are reported.
+    requested_topology = str(request_meta.get("topology") or "").strip().lower()
     consensus_eligible = str(
-        request_meta.get("topology") or plan.topology or "linear"
+        requested_topology or plan.topology or "linear"
     ).strip().lower() in {"star", "auto"}
     emit_on = bool(plan_dict.get("workflow_emit"))
     consensus_in_wf = bool(plan_dict.get("consensus_in_workflow"))
@@ -3818,7 +3958,7 @@ def _execute_swarm_host_native_response(
         "execution_note": (
             "Execute each host_spawn_waves entry via the host Agent/Task tool; "
             "for each wave, start every agent in that wave as a batch before waiting at the wave barrier. "
-            "Use spawn_batch when present; otherwise use agents. "
+            "The agent list is `agents`; `parallel_start_required` means start them together. "
             "Do not use direct Write/Edit on planned target_files. "
             "Do not call execute_subtask for same-host work. "
             "When an agent spec carries artifact_path, that agent's prompt already "
@@ -3918,19 +4058,38 @@ def _execute_swarm_host_native_response(
         plan_summary["contract"] = _build_plan_contract(
             p.get("coverage") if isinstance(p.get("coverage"), Mapping) else None,
             plan_summary["subtask_count"],
+            host_waves=host_waves,
+            sanitization=(
+                p.get("sanitization") if isinstance(p.get("sanitization"), Mapping) else None
+            ),
+            subtasks=p.get("subtasks"),
         )
         swarm_result["plan_summary"] = plan_summary
-        _coverage = p.get("coverage") if isinstance(p.get("coverage"), Mapping) else None
-        _dropped = (_coverage or {}).get("dropped_cells") if _coverage else None
+        # Top-level, not nested under plan_summary.coverage — a host that reads
+        # nothing else about the plan (the fast-start contract discourages it)
+        # must still see that this run did not cover what it looked like it would.
+        # Driven by the contract's set difference, not by coverage.dropped_cells:
+        # the budget is only one of four ways a cell can go missing.
+        _dropped = plan_summary["contract"].get("dropped") or []
         if _dropped:
-            # Top-level, not nested under plan_summary.coverage — a host that reads
-            # nothing else about the plan (the fast-start contract discourages it)
-            # must still see that this run did not cover what it looked like it would.
+            _cells = [str(d.get("cell")) for d in _dropped if isinstance(d, Mapping)]
             swarm_result["coverage_warning"] = (
-                f"{len(_dropped)} review dimension(s) dropped by the agent budget: "
-                f"{', '.join(_dropped[:8])}"
-                f"{'...' if len(_dropped) > 8 else ''}. See plan_summary.coverage."
+                f"{len(_dropped)} review cell(s) planned but not emitted: "
+                f"{', '.join(_cells[:8])}"
+                f"{'...' if len(_cells) > 8 else ''}. "
+                "See plan_summary.contract.dropped for the reason on each."
             )
+    if review_run and requested_topology and requested_topology != "dag":
+        # A REVIEW: plan hardcodes topology="dag" and never reads the caller's
+        # value, so accepting one and silently discarding it was the worst of the
+        # three options. Say so: the argument does change one thing (whether a
+        # consensus wave is appended), and `dag` — which the review skill
+        # instructs the host to send — is precisely the value that disables it.
+        swarm_result["topology_ignored_reason"] = (
+            f"REVIEW: plans are always emitted as a dag; requested "
+            f"topology={requested_topology!r} was not applied. Only 'star' or "
+            f"'auto' would add a consensus wave."
+        )
     if review_run:
         # Review never executes a workflow script, so drop that whole family too.
         for _k in (
@@ -4076,8 +4235,15 @@ def _handoff_payload_writes_files(payload: Mapping[str, object], task: str) -> b
             if not isinstance(agents, list):
                 continue
             for agent in agents:
-                if isinstance(agent, dict) and agent.get("target_files"):
-                    return True
+                if not isinstance(agent, dict) or not agent.get("target_files"):
+                    continue
+                # A read-only agent names its target so it knows what to READ.
+                # Treating that as write intent issued a write guard — with
+                # resolved absolute file hints on the wire — for every review
+                # run, which is exactly the run type that never writes.
+                if agent.get("read_only"):
+                    continue
+                return True
     return False
 
 

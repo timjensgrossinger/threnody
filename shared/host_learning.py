@@ -583,6 +583,24 @@ def register_host_run_handoff(
                     "wave": wave_idx,
                     "agent_index": agent_index,
                 }
+                # Journal before the DB write. This snapshot is the join key the
+                # entire learning path depends on: a hook-captured run-log line
+                # carries no model/tier/role/dimension of its own, and import
+                # recovers all four by matching touched files against these. If
+                # the DB is the thing that got corrupted, every surviving
+                # wave.jsonl becomes unreplayable without this copy.
+                from .learning_journal import KIND_HANDOFF_AGENT, append
+
+                append(
+                    KIND_HANDOFF_AGENT,
+                    {
+                        "run_id": run_id,
+                        "spawn_id": spawn_id,
+                        "task_id": task_id,
+                        "agent_index": global_worker_index,
+                        "snapshot": snapshot,
+                    },
+                )
                 db.persist_worker_snapshot(
                     run_id,
                     worker_index=global_worker_index,
@@ -591,11 +609,11 @@ def register_host_run_handoff(
                 global_worker_index += 1
             except Exception:
                 log.debug("host handoff stub failed for %s", task_id, exc_info=True)
-        if wave.get("spawn_batch") is not None:
-            wave["spawn_batch"] = [
-                dict(agent) if isinstance(agent, dict) else agent
-                for agent in agents
-            ]
+        # `spawn_batch` no longer exists (it duplicated `agents` verbatim and was
+        # half the wire payload); mutations above land on `agents` directly, so
+        # there is nothing left to re-sync. Older payloads may still carry the
+        # key — drop it rather than leave a stale copy the host might spawn from.
+        wave.pop("spawn_batch", None)
 
 
 def record_consensus_handoff(

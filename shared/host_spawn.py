@@ -58,6 +58,11 @@ class HostSpawnSpec:
     # the description, as it always did.
     pattern_hash: str | None = None
     role: str | None = None
+    # True for review/diagnosis agents. Emitted so "this agent must not write" is
+    # machine-readable rather than only stated in prose the host may not follow —
+    # and so the routing guard can tell a review target (named to be READ) apart
+    # from a write target instead of issuing a write guard for every review run.
+    read_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -89,6 +94,8 @@ class HostSpawnSpec:
             payload["upstream"] = [dict(item) for item in self.upstream]
         if self.role:
             payload["role"] = self.role
+        if self.read_only:
+            payload["read_only"] = True
         return payload
 
 
@@ -269,6 +276,7 @@ def build_host_spawn(
         artifact_path=artifact_path,
         upstream=list(upstream or []),
         role=resolved_role,
+        read_only=bool(read_only),
     )
 
 
@@ -335,13 +343,16 @@ def enrich_host_spawn_waves(
 
 
 def _batch_spawn_metadata(agents: list[Any]) -> dict[str, Any]:
-    """Machine-readable same-wave launch metadata for host-native handoffs."""
-    return {
-        "parallel_start_required": True,
-        "spawn_batch": [
-            dict(agent) if isinstance(agent, dict) else agent for agent in agents
-        ],
-    }
+    """Machine-readable same-wave launch metadata for host-native handoffs.
+
+    ``spawn_batch`` used to carry a verbatim copy of ``agents``, which was
+    exactly half of ``host_spawn_waves`` — itself ~93% of the wire payload — for
+    a field the execution note told the host to read *instead of* ``agents``, not
+    in addition to. A 22-agent review handoff came to 55 KB and overflowed the
+    host's context before the first agent spawned. The launch semantics live
+    entirely in the flag; the agent list has always been ``agents``.
+    """
+    return {"parallel_start_required": True}
 
 
 _BARE_FILE_TOKEN = re.compile(r"[\w.-]+\.[A-Za-z][A-Za-z0-9]{0,4}")
@@ -376,6 +387,22 @@ def _target_within_workspace(target: str, root: str) -> bool:
     except ValueError:
         return False
     return is_within_repo(resolved, root)
+
+
+def review_cell_label(subtask: Mapping[str, Any]) -> str:
+    """Return the ``"<path>:<dimension>"`` label for a review cell, else ``""``.
+
+    This is the same label ``review_fanout`` uses for ``coverage.dropped_cells``
+    and ``coverage.skipped_prior_review``, so a removal recorded anywhere in the
+    pipeline can be reconciled against the expected set by string identity.
+    """
+    dim = subtask.get("review_dimension")
+    path = subtask.get("target_file")
+    if not isinstance(dim, str) or not dim.strip():
+        return ""
+    if not isinstance(path, str) or not path.strip():
+        return ""
+    return f"{path.strip()}:{dim.strip()}"
 
 
 def sanitize_plan_for_host(
@@ -417,6 +444,11 @@ def sanitize_plan_for_host(
             continue
         st = dict(raw)
         sid = st.get("id")
+        # Every removal below records the review cell it destroyed, so the coverage
+        # contract can name it. Without this the report is a list of subtask ids
+        # whose subtasks no longer exist, and a caller cannot tell which
+        # (file x dimension) it lost.
+        cell_label = review_cell_label(st)
         target = st.get("target_file")
         target_files = st.get("target_files")
         target_basename: str | None = None
@@ -436,7 +468,7 @@ def sanitize_plan_for_host(
                     external_targets.append(candidate.strip())
         if external_targets and not allow_external_read_only:
             report.setdefault("dropped_subtasks", []).append(
-                {"id": sid, "target_files": external_targets}
+                {"id": sid, "target_files": external_targets, "cell": cell_label}
             )
             report.setdefault("reasons", []).append(
                 f"subtask {sid}: target outside workspace root"
@@ -481,7 +513,7 @@ def sanitize_plan_for_host(
         # target itself has been removed — a coherent prompt for a valid file is fine.
         if _is_fragment_prompt(desc, None if target else target_basename):
             report.setdefault("dropped_subtasks", []).append(
-                {"id": sid, "description": desc[:80]}
+                {"id": sid, "description": desc[:80], "cell": cell_label}
             )
             report.setdefault("reasons", []).append(
                 f"subtask {sid}: fragment/empty prompt"
@@ -493,13 +525,20 @@ def sanitize_plan_for_host(
         # Disjoint ownership (#2): every file is owned by exactly one subtask.
         # Trim already-claimed paths; drop a subtask whose ownership is fully
         # claimed by an earlier one (prevents two agents editing the same file).
-        owned = _subtask_target_files(st)
+        #
+        # read_only subtasks are exempt for the same reason they are exempt from
+        # containment stripping above: they never write, so they cannot conflict.
+        # Review fanout gives every (file x dimension) cell the same target_file,
+        # so applying ownership here would silently collapse an N-dimension review
+        # to its first dimension per file. They must also not *claim* a path — a
+        # reviewer holding ownership would evict the writer that follows it.
+        owned = [] if read_only else _subtask_target_files(st)
         if owned:
             fresh = [p for p in owned if p.lower() not in claimed]
             removed = [p for p in owned if p.lower() in claimed]
             if not fresh:
                 report.setdefault("dedup", []).append(
-                    {"id": sid, "removed": removed, "dropped": True}
+                    {"id": sid, "removed": removed, "dropped": True, "cell": cell_label}
                 )
                 report.setdefault("reasons", []).append(
                     f"subtask {sid}: ownership already claimed; dropped duplicate"
@@ -836,12 +875,18 @@ def build_host_spawn_waves(
         if raw_id is not None:
             subtask_by_id[_subtask_id_key(raw_id)] = raw
 
-    # The plan already decided how findings are merged; the spawn layer only honors
-    # it. "llm" means a synthesis agent reads the replies, so the replies must stay
-    # in the conversation.
-    findings_protocol = (
-        str(plan_dict.get("synthesis_mode") or "").strip().lower() == "python"
-    )
+    # Review cells always write their findings to a file, in both synthesis modes.
+    #
+    # This used to be python-mode only, on the reasoning that an LLM synthesis
+    # agent reads the replies. But the synthesis agent already depends on those
+    # cells, so it is handed their file paths and can read them directly — and
+    # gating on the mode meant the parsed, categorised findings existed only for
+    # narrow reviews (python mode is chosen for <=6 cells / <=2 files). Those
+    # categories are what `model_quality.record_static_recall_score` grades a
+    # reviewer against, so the one objective review signal was unavailable for
+    # exactly the broad reviews where it matters most, and the replies were being
+    # re-sent through the conversation on top.
+    findings_protocol = True
     if findings_protocol and run_id:
         _materialize_replayed_findings(run_id, plan_dict.get("replayed_findings"))
 
@@ -915,11 +960,32 @@ def build_host_spawn_waves(
                 try:
                     from .run_log import artifact_path as _artifact_path
 
+                    def _output_path(st: dict[str, Any], spawn: str) -> str:
+                        """Where this agent leaves its output.
+
+                        A review cell writes to its findings file and nowhere
+                        else. Giving it a separate artifact path too would ask one
+                        read-only agent for the same content twice, in two
+                        formats, and leave the merge reading a different file than
+                        the synthesis agent.
+                        """
+                        if str(st.get("review_dimension") or "").strip():
+                            from .findings_merge import findings_path
+
+                            return str(findings_path(run_id or "", spawn))
+                        return str(_artifact_path(run_id or "", spawn))
+
+                    is_review_cell = bool(
+                        str(subtask.get("review_dimension") or "").strip()
+                    )
                     if _subtask_id_key(sid) in depended_upon:
-                        artifact_path_str = str(
-                            _artifact_path(run_id or "", resolved_spawn_id)
-                        )
-                        prompt = prompt + "\n\n" + _artifact_write_block(artifact_path_str)
+                        artifact_path_str = _output_path(subtask, resolved_spawn_id)
+                        # The findings-protocol block below already tells a review
+                        # cell where to write, in the format the merge parses.
+                        if not is_review_cell:
+                            prompt = (
+                                prompt + "\n\n" + _artifact_write_block(artifact_path_str)
+                            )
                     for dep in subtask.get("depends_on") or []:
                         dep_subtask = subtask_by_id.get(_subtask_id_key(dep))
                         if not isinstance(dep_subtask, dict):
@@ -928,9 +994,7 @@ def build_host_spawn_waves(
                         upstream_specs.append(
                             {
                                 "id": dep_spawn_id,
-                                "artifact_path": str(
-                                    _artifact_path(run_id or "", dep_spawn_id)
-                                ),
+                                "artifact_path": _output_path(dep_subtask, dep_spawn_id),
                             }
                         )
                     if upstream_specs:

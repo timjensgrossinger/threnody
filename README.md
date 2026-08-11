@@ -213,6 +213,8 @@ ghcs "how to list files recursively in python"        # quick routed call
 threnody inspect status --project . --details         # provider readiness
 threnody quality --since 7d                           # model quality ledger
 threnody ladder run --tier low,medium,high            # graded ground truth (spends tokens)
+threnody db learn status                              # durable learning journal + table counts
+threnody db learn rebuild                             # rebuild the DB's learning tables from the journal
 threnody-watch                                        # live TUI monitor
 ```
 

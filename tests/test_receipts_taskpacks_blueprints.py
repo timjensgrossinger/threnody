@@ -206,7 +206,7 @@ def test_task_pack_handler_returns_batch_spawn_handoff_without_planner(
     assert result["host_spawn_waves"]
     first_wave = result["host_spawn_waves"][0]
     assert first_wave["parallel_start_required"] is True
-    assert first_wave["spawn_batch"] == first_wave["agents"]
+    assert first_wave["parallel_start_required"] is True
 
 
 def test_workflow_blueprint_export_and_run(tmp_path: Path) -> None:

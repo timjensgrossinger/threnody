@@ -40,14 +40,38 @@ def record_review_tier_outcome(
     findings_high: int,
     findings_total: int,
     kept_by_synthesis: bool,
+    run_id: str | None = None,
+    spawn_id: str | None = None,
+    journal: bool = True,
 ) -> None:
     """EMA-update the bias signal for one reviewed (profile, dimension, tier).
 
     Only the EMA relevant to the tier that ran is moved: a cheap tier feeds the
     escalate signal, a high tier feeds the idle signal. sample_count always ++.
     Best-effort — never raises into the finalize path.
+
+    The raw observation is journaled first. Once absorbed into the EMA it exists
+    nowhere else, so without the journal a quarantined database takes every
+    accumulated review-tier bias with it and the loop restarts from zero.
+    ``journal=False`` is for the rebuild path, which is replaying that journal.
     """
     tier = (tier or "").lower()
+    if journal:
+        from .learning_journal import KIND_REVIEW_TIER, append
+
+        append(
+            KIND_REVIEW_TIER,
+            {
+                "run_id": run_id,
+                "spawn_id": spawn_id,
+                "profile_key": profile_key,
+                "dimension": dimension,
+                "tier": tier,
+                "findings_high": int(findings_high),
+                "findings_total": int(findings_total),
+                "kept_by_synthesis": bool(kept_by_synthesis),
+            },
+        )
     if tier == "high":
         col = "idle_ema"
         obs = 1.0 if findings_total <= 0 else 0.0

@@ -611,9 +611,16 @@ class ModelQualityConfig:
     judge_model: str = "gpt-5-mini"
     # Feed the ledger back into tier selection (shared/quality_bias.py). Reads
     # only the OBJECTIVE sources (verify_gate / static_recall / ladder) once at
-    # plan build. Opt-in: it changes which tier runs, so it should not switch on
-    # silently under an existing install.
-    routing_bias_enabled: bool = False
+    # plan build.
+    #
+    # On by default: with it off, five sources wrote model_quality_events and
+    # nothing ever read it back into a routing decision, so the ledger could not
+    # change any outcome no matter how much it accumulated. The guards that make
+    # this safe are all in quality_bias: objective sources only, a minimum sample
+    # count, unanimity across models, a ladder floor that vetoes a contradicting
+    # de-escalation, and a single-tier clamp in _cell_tier so two learners cannot
+    # compound. An empty ledger yields {} and the pure heuristic runs unchanged.
+    routing_bias_enabled: bool = True
 
 
 def normalize_parallelism_limit(
@@ -1622,21 +1629,30 @@ class ResilienceConfig:
 
 @dataclass
 class DbDaemonConfig:
-    """Single-writer DB daemon settings. Opt-in; off by default.
+    """Single-writer DB daemon settings. On by default.
 
     When enabled, one daemon process owns cache.db and all sessions access it
     over a local Unix socket — eliminating the multi-process WAL -shm mmap that
     can SIGBUS under heavy concurrency. Disabled → each process opens the DB
     directly (legacy behavior).
 
+    Default flipped to on: with it off, the MCP server, every operator CLI, the
+    routing hook and the periodic online backup each mmap their own ``-shm`` over
+    the same file, and this install quarantined nine corrupt images in five
+    weeks. The terminal learning report — the write-heaviest operation in the
+    system — is exactly where that surfaced as
+    ``DatabaseError: database disk image is malformed``.
+
     Caveat: ``fallback_to_direct`` (default True) means a process that cannot reach
     the daemon silently opens a DIRECT connection. If some processes reach the
     daemon while others fall back, the multi-process -shm mmap this feature exists
     to remove is reintroduced for the duration. For a strict single-writer
     guarantee under high concurrency, set ``fallback_to_direct: false`` (processes
-    then fail loudly instead of degrading).
+    then fail loudly instead of degrading). It is left on because a hard failure
+    to open the DB is a worse default than a temporarily reintroduced mmap, and
+    the journal now makes a corruption recoverable either way.
     """
-    enabled: bool = False
+    enabled: bool = True
     socket_path: str = ""          # empty → derived as <db_path>.sock
     idle_timeout_s: float = 900.0  # daemon self-exits after this idle; 0 = never
     connect_timeout_s: float = 5.0
@@ -3102,17 +3118,41 @@ class TGsConfig:
                 db_lock_max_delay_s=max(0.01, float(db_raw.get("lock_max_delay_s", 2.0))),
             )
 
-        # Single-writer DB daemon (opt-in). Loaded from db.daemon.*
+        # Single-writer DB daemon. Loaded from db.daemon.*
+        # Every fallback here reads the dataclass field default rather than
+        # repeating a literal: a hardcoded `False` meant flipping the documented
+        # default had no effect on any install whose config.yaml happened to
+        # contain a `db:` block, which is the desync CLAUDE.md warns about for the
+        # backup constants.
+        _daemon_defaults = DbDaemonConfig()
         db_cfg_raw = raw.get("db", {})
         if isinstance(db_cfg_raw, Mapping):
             daemon_raw = db_cfg_raw.get("daemon", {}) or {}
             if isinstance(daemon_raw, Mapping):
                 cfg.db_daemon = DbDaemonConfig(
-                    enabled=bool(daemon_raw.get("enabled", False)),
+                    enabled=bool(daemon_raw.get("enabled", _daemon_defaults.enabled)),
                     socket_path=str(daemon_raw.get("socket_path", "") or ""),
-                    idle_timeout_s=max(0.0, float(daemon_raw.get("idle_timeout_s", 900.0))),
-                    connect_timeout_s=max(0.1, float(daemon_raw.get("connect_timeout_s", 5.0))),
-                    fallback_to_direct=bool(daemon_raw.get("fallback_to_direct", True)),
+                    idle_timeout_s=max(
+                        0.0,
+                        float(
+                            daemon_raw.get(
+                                "idle_timeout_s", _daemon_defaults.idle_timeout_s
+                            )
+                        ),
+                    ),
+                    connect_timeout_s=max(
+                        0.1,
+                        float(
+                            daemon_raw.get(
+                                "connect_timeout_s", _daemon_defaults.connect_timeout_s
+                            )
+                        ),
+                    ),
+                    fallback_to_direct=bool(
+                        daemon_raw.get(
+                            "fallback_to_direct", _daemon_defaults.fallback_to_direct
+                        )
+                    ),
                 )
 
         # Background daemon cadence (health-probe + warm-path loops).

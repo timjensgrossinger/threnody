@@ -45,7 +45,7 @@ def test_build_host_spawn_waves_from_plan() -> None:
     assert waves[1]["agents"][0]["spawn_required"] is True
     assert waves[1]["execution_contract"] == "spawn_subagents"
     assert waves[1]["parallel_start_required"] is True
-    assert waves[1]["spawn_batch"] == waves[1]["agents"]
+    assert "spawn_batch" not in waves[1]  # duplicated agents; half the payload
     assert waves[1]["agents"][0]["target_files"] == ["tests/test_auth.py"]
 
 
@@ -71,9 +71,9 @@ def test_build_host_spawn_waves_exposes_batch_metadata_for_same_wave_agents() ->
     assert wave["parallel"] is True
     assert wave["execution_contract"] == HOST_EXECUTION_CONTRACT
     assert wave["parallel_start_required"] is True
-    assert wave["spawn_batch"] == wave["agents"]
-    assert [agent["id"] for agent in wave["spawn_batch"]] == ["a", "b"]
-    for agent in wave["spawn_batch"]:
+    assert "spawn_batch" not in wave
+    assert [agent["id"] for agent in wave["agents"]] == ["a", "b"]
+    for agent in wave["agents"]:
         assert agent["method"] == "host_task"
         assert agent["spawn_required"] is True
 
@@ -145,8 +145,8 @@ def test_enrich_host_spawn_waves_forces_host_task_contract() -> None:
     )
     assert waves[0]["execution_contract"] == HOST_EXECUTION_CONTRACT
     assert waves[0]["parallel_start_required"] is True
-    assert waves[0]["spawn_batch"] == waves[0]["agents"]
-    assert [agent["id"] for agent in waves[0]["spawn_batch"]] == ["1", "2"]
+    assert "spawn_batch" not in waves[0]
+    assert [agent["id"] for agent in waves[0]["agents"]] == ["1", "2"]
     for agent in waves[0]["agents"]:
         assert agent["method"] == "host_task"
         assert agent["spawn_required"] is True
@@ -290,6 +290,83 @@ def test_sanitize_dedupes_overlapping_target_ownership() -> None:
     assert report.get("dedup"), "expected a dedup report entry"
 
 
+def test_sanitize_keeps_every_read_only_cell_for_one_file() -> None:
+    """Regression: ownership dedup silently collapsed review fanout.
+
+    Every (file x dimension) review cell carries the same ``target_file``. The
+    disjoint-ownership rule exists to stop two agents *editing* one file, but it
+    had no read_only exemption, so a 5-dimension review of one file emitted a
+    single security agent and recorded the other four only in
+    ``sanitization.dedup`` — a field the coverage contract never read. A
+    2-dimension review of 11 files reported 12 planned agents and 3 drops.
+    """
+    dims = ["security", "logic", "edge", "types", "performance"]
+    plan = {
+        "subtasks": [
+            {
+                "id": i,
+                "description": f"{d.title()} review of app/core.py.",
+                "tier": "medium",
+                "target_file": "app/core.py",
+                "subagent_type": f"review-{d}",
+                "review_dimension": d,
+                "read_only": True,
+                "depends_on": [],
+            }
+            for i, d in enumerate(dims, start=1)
+        ],
+        "waves": [list(range(1, len(dims) + 1))],
+    }
+    report = sanitize_plan_for_host(plan, workspace_root=None, task="REVIEW: app/core.py")
+    assert len(plan["subtasks"]) == len(dims)
+    assert [st["review_dimension"] for st in plan["subtasks"]] == dims
+    assert not report.get("dedup")
+
+
+def test_read_only_cell_does_not_claim_ownership_from_a_writer() -> None:
+    """A reviewer must not evict the writer that follows it.
+
+    Exempting read_only subtasks from the dedup is only half correct: they must
+    also not populate ``claimed``, or a review cell listed ahead of a write
+    subtask for the same file would take ownership and the writer would be
+    dropped as a duplicate.
+    """
+    plan = {
+        "subtasks": [
+            {"id": 1, "description": "Security review of app/core.py.", "tier": "low",
+             "target_file": "app/core.py", "subagent_type": "review-security",
+             "review_dimension": "security", "read_only": True},
+            {"id": 2, "description": "Implement the retry policy in app/core.py.",
+             "tier": "medium", "target_file": "app/core.py"},
+        ],
+        "waves": [[1, 2]],
+    }
+    report = sanitize_plan_for_host(plan, workspace_root=None, task="review then fix")
+    assert {st["id"] for st in plan["subtasks"]} == {1, 2}
+    assert not report.get("dedup")
+
+
+def test_dedup_records_the_review_cell_it_removed() -> None:
+    """Removal records must name the cell, not just a subtask id.
+
+    The contract reconciles removals against ``dimensions_expected`` by label.
+    An id alone is useless downstream because the subtask it names is gone by
+    the time the contract is built.
+    """
+    plan = {
+        "subtasks": [
+            {"id": 1, "description": "Own the module", "tier": "medium",
+             "target_file": "app/core.py"},
+            {"id": 2, "description": "Security review of app/core.py.", "tier": "low",
+             "target_file": "app/core.py", "review_dimension": "security"},
+        ],
+        "waves": [[1, 2]],
+    }
+    report = sanitize_plan_for_host(plan, workspace_root=None, task="build app")
+    dropped = [e for e in report.get("dedup", []) if e.get("dropped")]
+    assert dropped and dropped[0]["cell"] == "app/core.py:security"
+
+
 def test_subtask_target_files_reads_plural_list() -> None:
     """_subtask_target_files honors the plural list, not just the scalar (#2)."""
     from shared.host_spawn import _subtask_target_files
@@ -345,7 +422,7 @@ def test_unknown_shell_spawn_matches_tier_derived_type() -> None:
     assert spec.subagent_type == "threnody-medium"
 
 
-def test_findings_protocol_only_under_python_synthesis() -> None:
+def test_findings_protocol_under_python_synthesis() -> None:
     config = TGsConfig()
     plan = _review_plan()
     plan["synthesis_mode"] = "python"
@@ -357,16 +434,54 @@ def test_findings_protocol_only_under_python_synthesis() -> None:
     assert "dim=security" in prompt
 
 
-def test_findings_protocol_absent_under_llm_synthesis() -> None:
-    """With a synthesis agent reading the replies, redirecting them to disk would
-    starve it."""
+def test_findings_protocol_also_applies_under_llm_synthesis() -> None:
+    """Both modes, because the categories are a learning input, not a merge detail.
+
+    Gating this on python mode meant parsed per-category findings existed only
+    for narrow reviews (python is chosen for <=6 cells / <=2 files), so
+    `record_static_recall_score` — the only objective signal a read-only review
+    run can produce — was unavailable for exactly the broad reviews where it
+    matters. The synthesis agent is not starved: it depends on those cells, so it
+    receives their findings paths and reads them.
+    """
     config = TGsConfig()
     plan = _review_plan()
     plan["synthesis_mode"] = "llm"
     waves = build_host_spawn_waves(
         plan, config=config, caller="claude-code", run_id="swarm-fp-test"
     )
-    assert "Write your findings to" not in waves[0]["agents"][0]["prompt"]
+    assert "Write your findings to" in waves[0]["agents"][0]["prompt"]
+
+
+def test_review_cell_has_exactly_one_output_file() -> None:
+    """A review cell must not be asked for the same content twice.
+
+    Its artifact path IS its findings path, so the merge and the synthesis agent
+    read the same file rather than two files in two formats.
+    """
+    config = TGsConfig()
+    plan = _review_plan()
+    plan["synthesis_mode"] = "llm"
+    # A synthesis agent depending on the cell is what gives the cell an artifact.
+    plan["subtasks"].append({
+        "id": 2,
+        "description": "Synthesize the review findings.",
+        "tier": "medium",
+        "read_only": True,
+        "subagent_type": "",
+        "depends_on": [1],
+    })
+    plan["waves"] = [[1], [2]]
+    waves = build_host_spawn_waves(
+        plan, config=config, caller="claude-code", run_id="swarm-fp-test"
+    )
+    cell = waves[0]["agents"][0]
+    assert "/findings/" in str(cell["artifact_path"])
+    assert "Write your output to" not in cell["prompt"]
+    synthesis = waves[-1]["agents"][-1]
+    upstream = synthesis.get("upstream") or []
+    assert upstream, "synthesis must be handed its upstream findings files"
+    assert all("/findings/" in str(u["artifact_path"]) for u in upstream)
 
 
 def test_findings_protocol_absent_without_run_id() -> None:

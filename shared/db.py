@@ -168,6 +168,8 @@ class Database:
         # Set by _recover_db_locked so _maybe_auto_backup can tell a healthy DB
         # apart from one this process just restored or recreated.
         self._recovered_this_session = False
+        # Set when a damaged image was salvaged in place rather than replaced.
+        self._salvaged_this_session = False
         # Per-thread connection storage for wave parallelism (FNDX-01)
         # Each thread gets its own SQLite connection to avoid ProgrammingError
         # when multiple threads access the shared database.
@@ -177,6 +179,13 @@ class Database:
         self._check_integrity_and_recover()
         self._last_integrity_probe_ts = time.time()
         self._maybe_auto_backup()
+        # A recovery that was not an in-place salvage lost rows: either it rolled
+        # back to a backup up to backup_interval_hours old, or it quarantined the
+        # file and recreated it empty. Either way the accumulated learning tables
+        # are behind or gone, so re-apply the journal. This is what turns a
+        # corrupt image from "the ledger resets to zero" into "a rebuild runs".
+        if self._recovered_this_session and not self._salvaged_this_session:
+            self.replay_learning_journal(rebuild=True)
 
     def _ensure_private_db_directory(self) -> None:
         if not hasattr(os, "O_NOFOLLOW"):
@@ -705,6 +714,19 @@ class Database:
                 sample_meta   TEXT,
                 task_hash     TEXT,
                 run_id        TEXT,
+                -- The tier that produced the score. Known at spawn
+                -- (swarm_workers.tier) and previously discarded here, which made
+                -- "which tier can actually do this work" unanswerable from the
+                -- ledger alone.
+                tier          TEXT,
+                -- review_fanout.profile_key_for: ext|loc_bucket|density_bucket.
+                -- review_tier_bias has the profile but no model; this ledger had
+                -- the model but no profile, so the two could never be joined.
+                profile_key   TEXT,
+                spawn_id      TEXT,
+                -- Idempotency key from shared/learning_journal.py. Makes a replay
+                -- (or a retried terminal report) a no-op instead of a double count.
+                event_id      TEXT,
                 ts            REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_model_quality_events_key
@@ -986,6 +1008,19 @@ class Database:
                 sample_meta   TEXT,
                 task_hash     TEXT,
                 run_id        TEXT,
+                -- The tier that produced the score. Known at spawn
+                -- (swarm_workers.tier) and previously discarded here, which made
+                -- "which tier can actually do this work" unanswerable from the
+                -- ledger alone.
+                tier          TEXT,
+                -- review_fanout.profile_key_for: ext|loc_bucket|density_bucket.
+                -- review_tier_bias has the profile but no model; this ledger had
+                -- the model but no profile, so the two could never be joined.
+                profile_key   TEXT,
+                spawn_id      TEXT,
+                -- Idempotency key from shared/learning_journal.py. Makes a replay
+                -- (or a retried terminal report) a no-op instead of a double count.
+                event_id      TEXT,
                 ts            REAL NOT NULL
             )
             """
@@ -995,6 +1030,34 @@ class Database:
             "ON model_quality_events (model, effort, dimension, ts)"
         )
         Database._ensure_model_quality_sources(conn)
+        Database._ensure_model_quality_columns(conn)
+
+    @staticmethod
+    def _ensure_model_quality_columns(conn: sqlite3.Connection) -> None:
+        """Add the join axes and the idempotency key to an existing ledger.
+
+        ``tier``/``profile_key`` are what let the ledger answer "which model, at
+        which tier, on which shape of file"; ``event_id`` is what makes a journal
+        replay or a retried terminal report a no-op instead of a double count.
+        """
+        existing = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(model_quality_events)").fetchall()
+        }
+        for column in ("tier", "profile_key", "spawn_id", "event_id"):
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE model_quality_events ADD COLUMN {column} TEXT"
+                )
+        # Partial index: legacy rows carry no event_id and must not collide on NULL.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_model_quality_events_event_id "
+            "ON model_quality_events (event_id) WHERE event_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_quality_events_tier_profile "
+            "ON model_quality_events (model, tier, profile_key, dimension)"
+        )
 
     @staticmethod
     def _ensure_model_quality_sources(conn: sqlite3.Connection) -> None:
@@ -1038,6 +1101,19 @@ class Database:
                 sample_meta   TEXT,
                 task_hash     TEXT,
                 run_id        TEXT,
+                -- The tier that produced the score. Known at spawn
+                -- (swarm_workers.tier) and previously discarded here, which made
+                -- "which tier can actually do this work" unanswerable from the
+                -- ledger alone.
+                tier          TEXT,
+                -- review_fanout.profile_key_for: ext|loc_bucket|density_bucket.
+                -- review_tier_bias has the profile but no model; this ledger had
+                -- the model but no profile, so the two could never be joined.
+                profile_key   TEXT,
+                spawn_id      TEXT,
+                -- Idempotency key from shared/learning_journal.py. Makes a replay
+                -- (or a retried terminal report) a no-op instead of a double count.
+                event_id      TEXT,
                 ts            REAL NOT NULL
             )
             """
@@ -2678,6 +2754,21 @@ class Database:
             )
             self._last_integrity_ok = None
             return
+
+        # Salvage before falling back, but ONLY for an image that actually fails
+        # integrity. A backup restore discards everything written since it was
+        # taken (up to backup_interval_hours) and a quarantine discards the lot,
+        # whereas sqlite's own .recover walks the b-tree page by page and usually
+        # returns almost all of it — that is the difference between losing hours
+        # of accumulated learning and losing only the genuinely damaged rows.
+        #
+        # The guard matters: recovery is also invoked explicitly (`threnody db
+        # repair`) against a readable file, and there the caller is asking to roll
+        # back to a known-good backup and drop a possibly-poisoned WAL. Salvaging
+        # would instead preserve that WAL, quietly overriding the request.
+        if self._integrity_probe(str(self._db_path)) is False and self._salvage_db():
+            return
+
         pattern = str(self._db_path) + ".bak.*"
         candidates = sorted(
             _glob.glob(pattern),
@@ -2741,6 +2832,164 @@ class Database:
         # DB. Report ok so callers don't immediately re-run recovery on the fresh
         # file (which would quarantine an empty database).
         self._last_integrity_ok = True
+
+    def salvage_file(self, source: Path | str, destination: Path | str) -> int:
+        """Recover readable rows out of a damaged image. Returns rows written.
+
+        Public so ``threnody db salvage`` can point it at one of the quarantined
+        ``.corrupt.*`` files already on disk. Returns 0 when nothing usable came
+        out, leaving *destination* absent.
+        """
+        return self._salvage_to(Path(source), Path(destination))
+
+    def _salvage_to(self, source: Path, destination: Path) -> int:
+        """Run sqlite's ``.recover`` from *source* into a fresh *destination*.
+
+        ``.recover`` is a shell-level dot command, so it needs the ``sqlite3``
+        binary; when that is unavailable we fall back to ``VACUUM INTO``, which
+        works whenever the damage is confined to free/unreferenced pages. Both
+        are read-only with respect to *source* — a failed salvage never makes the
+        corrupt file worse, so the backup and quarantine paths stay available.
+        """
+        import shutil as _shutil
+        import subprocess
+
+        if destination.exists():
+            destination.unlink()
+
+        sqlite_bin = _shutil.which("sqlite3")
+        if sqlite_bin:
+            try:
+                dump = subprocess.run(
+                    [sqlite_bin, str(source), ".recover"],
+                    capture_output=True,
+                    timeout=300,
+                )
+                if dump.returncode == 0 and dump.stdout.strip():
+                    load = subprocess.run(
+                        [sqlite_bin, str(destination)],
+                        input=dump.stdout,
+                        capture_output=True,
+                        timeout=300,
+                    )
+                    if load.returncode == 0 and destination.exists():
+                        rows = self._count_rows(destination)
+                        if rows > 0:
+                            return rows
+                    destination.unlink(missing_ok=True)
+            except (OSError, subprocess.SubprocessError):
+                log.debug("sqlite3 .recover salvage failed", exc_info=True)
+                destination.unlink(missing_ok=True)
+
+        try:
+            conn = sqlite3.connect(str(source), timeout=10)
+            try:
+                conn.execute("VACUUM INTO ?", (str(destination),))
+            finally:
+                conn.close()
+            if destination.exists():
+                rows = self._count_rows(destination)
+                if rows > 0:
+                    return rows
+                destination.unlink(missing_ok=True)
+        except Exception:
+            log.debug("VACUUM INTO salvage failed", exc_info=True)
+            destination.unlink(missing_ok=True)
+        return 0
+
+    @staticmethod
+    def _count_rows(path: Path) -> int:
+        """Total rows across all user tables — the salvage yield metric."""
+        total = 0
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+            try:
+                if conn.execute("PRAGMA integrity_check(1)").fetchone()[0] != "ok":
+                    return 0
+                names = [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name NOT LIKE 'sqlite_%'"
+                    ).fetchall()
+                ]
+                for name in names:
+                    try:
+                        total += int(
+                            conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+                        )
+                    except sqlite3.Error:
+                        continue
+            finally:
+                conn.close()
+        except Exception:
+            log.debug("salvage row count failed for %s", path, exc_info=True)
+            return 0
+        return total
+
+    def _salvage_db(self) -> bool:
+        """Try to salvage the live DB in place. True when it now verifies."""
+        staging = self._db_path.with_name(self._db_path.name + ".salvage.tmp")
+        try:
+            rows = self._salvage_to(self._db_path, staging)
+        except Exception:
+            log.debug("salvage stage failed", exc_info=True)
+            staging.unlink(missing_ok=True)
+            return False
+        if rows <= 0:
+            staging.unlink(missing_ok=True)
+            return False
+        try:
+            # Keep the damaged original for forensics, but NOT under `.corrupt.*`:
+            # that name means "quarantined, data not recovered" to `db check`, the
+            # status snapshot and _corruption_forensics. A successful salvage lost
+            # nothing, so labelling it that way would report a data loss that did
+            # not happen.
+            preserved = self._db_path.with_name(
+                self._db_path.name + f".presalvage.{int(time.time())}"
+            )
+            os.replace(self._db_path, preserved)
+            self._discard_wal_sidecars(move_to=preserved)
+            os.replace(staging, self._db_path)
+            self._ensure_private_db_file(self._db_path)
+            if self._integrity_probe(str(self._db_path)) is False:
+                log.warning("Salvaged DB did not verify in place — falling back")
+                os.replace(self._db_path, staging)
+                os.replace(preserved, self._db_path)
+                staging.unlink(missing_ok=True)
+                return False
+        except Exception:
+            log.debug("salvage swap failed", exc_info=True)
+            staging.unlink(missing_ok=True)
+            return False
+        self._last_integrity_ok = True
+        self._salvaged_this_session = True
+        log.warning(
+            "DB salvaged in place (%d rows recovered); original kept at %s",
+            rows,
+            preserved,
+        )
+        return True
+
+    def replay_learning_journal(self, *, rebuild: bool = False) -> dict[str, int]:
+        """Re-apply journaled learning events to this database.
+
+        Called automatically after a recovery that lost rows, which is the whole
+        point of the journal: a quarantine used to reset ``review_tier_bias``,
+        ``model_quality_events`` and every other accumulated table with no way
+        back. Best-effort — a replay failure must not stop the process opening a
+        working database.
+        """
+        try:
+            from .learning_journal import replay
+
+            counts = replay(self, rebuild=rebuild)
+            if counts:
+                log.warning("Replayed learning journal into recovered DB: %s", counts)
+            return counts
+        except Exception:
+            log.debug("learning journal replay failed", exc_info=True)
+            return {}
 
     def _newest_backup_age_s(self) -> float | None:
         """Age of the most recent ``.bak.*`` in seconds, or None when there is none."""

@@ -438,6 +438,8 @@ Usage:
   threnody db repair [--db PATH]
   threnody db backup [--db PATH]
   threnody db prune [--db PATH] [--keep N]
+  threnody db salvage <cache.db.corrupt.TS> [--out PATH]
+  threnody db learn status|rebuild|import <run_id>
   threnody quality [--since 7d] [--json] [--write-docs]
   threnody ladder list [--level 0,1]
   threnody ladder run [--tier low,medium,high] [--level N] [--case ID] [--json]
@@ -1351,12 +1353,12 @@ PY
             local pybin=""
             pybin=$(_tgs_python) || return 1
             case "$subcmd" in
-                check|repair|backup|prune)
+                check|repair|backup|prune|salvage|learn)
                     (cd "$_ROUTER_DIR" && "$pybin" -m shared.db_cli "$subcmd" "$@")
                     return $?
                     ;;
                 ""|-h|--help)
-                    echo "Usage: threnody db {check|repair|backup|prune} [--db PATH] [--keep N]" >&2
+                    echo "Usage: threnody db {check|repair|backup|prune|salvage|learn} [--db PATH] [--keep N]" >&2
                     return 0
                     ;;
                 *)

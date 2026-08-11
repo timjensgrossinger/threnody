@@ -505,6 +505,183 @@ class TestRequestedDimensions:
         assert "a.py" in out and "b.py" in out
 
 
+class TestTaskFocus:
+    """The caller's stated intent must reach the agents.
+
+    Regression: the planner lexed a file list out of the task string and threw
+    the rest away, so a three-part threat model produced five generic prompts.
+    """
+
+    THREAT_TASK = (
+        "REVIEW: [dims=security,logic] app/auth.py app/store.py\n\n"
+        "Threat focus:\n"
+        "1. Prompt injection through untrusted agent output.\n"
+        "2. Memory tamper via data/store.json.\n"
+    )
+
+    def test_focus_survives_extraction(self):
+        from shared.review_fanout import extract_task_focus
+        focus = extract_task_focus(
+            self.THREAT_TASK, ["app/auth.py", "app/store.py", "data/store.json"]
+        )
+        assert "Prompt injection" in focus
+        assert "Memory tamper" in focus
+
+    def test_path_named_mid_sentence_is_not_blanked(self):
+        """Deleting path substrings turned prose into nonsense ('tamper via .')."""
+        from shared.review_fanout import extract_task_focus
+        focus = extract_task_focus(
+            self.THREAT_TASK, ["app/auth.py", "app/store.py", "data/store.json"]
+        )
+        assert "Memory tamper via data/store.json." in focus
+
+    def test_bare_file_list_has_no_focus(self):
+        from shared.review_fanout import extract_task_focus
+        assert extract_task_focus("REVIEW: a.py b.py", ["a.py", "b.py"]) == ""
+        assert extract_task_focus("REVIEW: [dims=security] a.py", ["a.py"]) == ""
+
+    def test_focus_is_capped(self):
+        from shared.review_fanout import extract_task_focus, FOCUS_MAX_CHARS
+        task = "REVIEW: a.py\n" + ("word " * 4000)
+        assert len(extract_task_focus(task, ["a.py"])) <= FOCUS_MAX_CHARS
+
+    def test_focus_reaches_every_cell(self, tmp_path):
+        from shared.review_fanout import build_review_subtasks
+        f = tmp_path / "auth.py"
+        f.write_text("\n".join(f"x = {i}" for i in range(210)), encoding="utf-8")
+        task = f"REVIEW: [dims=security,logic] {f}\n\nFocus on token replay."
+        plan = build_review_subtasks([(str(f), "")], task, db=None, caller="claude-code")
+        assert len(plan["subtasks"]) == 2  # 2 dims; python synthesis plans no agent
+        for st in plan["subtasks"]:
+            assert "token replay" in st["description"]
+
+    def test_focus_reaches_the_synthesis_agent(self, tmp_path):
+        """Wide enough to plan an LLM synthesis agent, which must be primed too."""
+        from shared.review_fanout import build_review_subtasks
+        entries = []
+        for name in ("a.py", "b.py", "c.py", "d.py"):
+            f = tmp_path / name
+            f.write_text("\n".join(f"x = {i}" for i in range(210)), encoding="utf-8")
+            entries.append((str(f), ""))
+        paths = " ".join(p for p, _ in entries)
+        task = f"REVIEW: [dims=security,logic] {paths}\n\nFocus on token replay."
+        plan = build_review_subtasks(entries, task, db=None, caller="claude-code")
+        assert plan["synthesis_mode"] == "llm"
+        synthesis = plan["subtasks"][-1]
+        assert synthesis["depends_on"]
+        assert "token replay" in synthesis["description"]
+
+    def test_prose_named_file_is_reported_as_added(self, tmp_path):
+        """Scope may widen; it may not widen silently."""
+        from shared.review_fanout import build_review_subtasks
+        listed = tmp_path / "auth.py"
+        listed.write_text("x = 1\n", encoding="utf-8")
+        extra = tmp_path / "store.json"
+        extra.write_text("{}\n", encoding="utf-8")
+        task = f"REVIEW: {listed}\n\nThe tamper artifact is {extra}."
+        plan = build_review_subtasks(
+            [(str(listed), ""), (str(extra), "")], task, db=None
+        )
+        assert plan["coverage"]["added_files"] == [str(extra)]
+
+    def test_declared_list_is_not_reported_as_added(self, tmp_path):
+        from shared.review_fanout import build_review_subtasks
+        a = tmp_path / "a.py"
+        b = tmp_path / "b.py"
+        for f in (a, b):
+            f.write_text("x = 1\n", encoding="utf-8")
+        plan = build_review_subtasks(
+            [(str(a), ""), (str(b), "")], f"REVIEW: {a} {b}", db=None
+        )
+        assert plan["coverage"]["added_files"] == []
+
+
+class TestRiskAwareTierFloors:
+    """Tier must follow risk, not only file size.
+
+    Regression: a 189-line module that was the only in-band injection defence in
+    its repo drew five `low` reviewers, and the one that mattered rated a real
+    HIGH as LOW. The band table only knew how big the file was. The configured
+    filename floor (risk_floor_tier) did exist — but it was loaded downstream of
+    the review branch's early return, so it had never applied to a review cell.
+    """
+
+    BODY = "\n".join(f"def rule_{i}(x):\n    return x" for i in range(94))
+
+    def _plan(self, tmp_path, name, task_prefix="REVIEW: [dims=security,logic]"):
+        from shared.heuristic_plan import build_heuristic_plan_payload
+        f = tmp_path / name
+        f.write_text(self.BODY, encoding="utf-8")
+        plan = build_heuristic_plan_payload(
+            f"{task_prefix} {f}", max_agents=22, caller="claude-code"
+        )
+        return {st["subagent_type"]: st["tier"] for st in plan["subtasks"]}
+
+    def test_plain_small_file_stays_cheap(self, tmp_path):
+        tiers = self._plan(tmp_path, "plain_helpers.py")
+        assert tiers["review-security"] == "low"
+
+    def test_risk_vocabulary_filename_floors_to_medium(self, tmp_path):
+        """The file body never says sql/exec/token — only its name is a signal."""
+        assert self._plan(tmp_path, "token_store.py")["review-security"] == "medium"
+        assert self._plan(tmp_path, "oauth_guard.py")["review-security"] == "medium"
+
+    def test_explicit_tier_token_floors_every_cell(self, tmp_path):
+        tiers = self._plan(
+            tmp_path, "plain_helpers.py", "REVIEW: [tier=high] [dims=security,logic]"
+        )
+        assert set(tiers.values()) == {"high"}
+
+    def test_tier_token_is_a_floor_not_a_ceiling(self):
+        from shared.review_fanout import _cell_tier, _DIM_BY_KEY, ReviewProfile
+        prof = ReviewProfile(
+            band="complex", has_risk=True, loc=900,
+            density_score=0.9, concrete_high_risk=True, intel=None,
+        )
+        tier, _ = _cell_tier(
+            "big.py", _DIM_BY_KEY["security"], prof,
+            task_force_high=True, tier_bias=None, tier_floor="low",
+        )
+        assert tier == "high"
+
+
+class TestAbsolutePathDedup:
+    def test_absolute_target_is_not_extracted_twice(self, tmp_path):
+        """`_ABSOLUTE_PATH` and `_BARE_PATH` both match /a/b.py, yielding a
+        rooted and an unrooted copy of one file — two agents per dimension, the
+        second pointing at a path that does not resolve."""
+        from shared.heuristic_plan import extract_task_file_entries
+        from shared.review_fanout import strip_intent_tokens
+        f = tmp_path / "helpers.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+        entries = extract_task_file_entries(
+            strip_intent_tokens(f"REVIEW: [dims=security] {f}"),
+            intent_templates=False,
+            allow_external=True,
+        )
+        assert [p for p, _ in entries] == [str(f)]
+
+
+class TestRequestedTierFloor:
+    def test_parsed(self):
+        from shared.review_fanout import requested_tier_floor
+        assert requested_tier_floor("REVIEW: [tier=high] a.py") == "high"
+
+    def test_absent(self):
+        from shared.review_fanout import requested_tier_floor
+        assert requested_tier_floor("REVIEW: a.py") == ""
+
+    def test_tier_token_is_not_lexed_as_a_path(self):
+        from shared.heuristic_plan import extract_task_file_entries
+        from shared.review_fanout import strip_intent_tokens
+        entries = extract_task_file_entries(
+            strip_intent_tokens("REVIEW: [tier=high] [dims=security] a.py"),
+            intent_templates=False,
+            allow_external=True,
+        )
+        assert [p for p, _ in entries] == ["a.py"]
+
+
 class TestDimensionsForRequested:
     def test_requested_only_runs_named(self):
         dims = dimensions_for("complex", False, requested=["performance"])
@@ -1164,9 +1341,10 @@ class TestChangedLineScopedPrompts:
 
         plan = build_review_subtasks(
             [(str(target), "")],
-            f"REVIEW: {target}",
+            f"REVIEW: {target} — review the changes on this branch",
             caller="claude-code",
             config=TGsConfig(),
+            workspace_root=str(root),
         )
         security = next(
             st for st in plan["subtasks"] if st.get("review_dimension") == "security"
@@ -1176,6 +1354,62 @@ class TestChangedLineScopedPrompts:
         assert "Review this file:" not in desc  # the old bare form
         assert "Changed lines:" in desc
         assert "101" in desc  # 0-indexed line 100 -> 1-indexed line 101 in git
+
+    def test_plain_review_does_not_scope_to_a_branch_delta(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """"Review this file" is not "review what changed on this branch".
+
+        Emitting merge-base ranges unasked told every agent to prioritize a delta
+        the caller never mentioned — and only for files that happened to be in it,
+        so one run mixed narrowed and whole-file review with nothing saying so.
+        """
+        from shared.config import TGsConfig
+
+        root, target = self._repo_with_a_change(tmp_path)
+        monkeypatch.chdir(root)
+
+        plan = build_review_subtasks(
+            [(str(target), "")],
+            f"REVIEW: {target}",
+            caller="claude-code",
+            config=TGsConfig(),
+            workspace_root=str(root),
+        )
+        for st in plan["subtasks"]:
+            assert "Changed lines:" not in st["description"]
+        security = next(
+            st for st in plan["subtasks"] if st.get("review_dimension") == "security"
+        )
+        assert "Review the whole file." in security["description"]
+
+    def test_delta_intent_uses_the_handoff_root_not_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The diff must resolve against the same root containment is checked at.
+
+        Resolving it from Path.cwd() meant that whenever the process cwd and the
+        handoff workspace_root disagreed, every cell silently degraded to
+        whole-file with nothing reporting why.
+        """
+        from shared.config import TGsConfig
+
+        root, target = self._repo_with_a_change(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        plan = build_review_subtasks(
+            [(str(target), "")],
+            f"REVIEW: {target} — what changed since main?",
+            caller="claude-code",
+            config=TGsConfig(),
+            workspace_root=str(root),
+        )
+        security = next(
+            st for st in plan["subtasks"] if st.get("review_dimension") == "security"
+        )
+        assert "Changed lines:" in security["description"]
 
     def test_omits_changed_lines_clause_without_a_merge_base(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

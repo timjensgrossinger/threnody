@@ -130,6 +130,15 @@ All MCP hosts installed from this repo share `~/.local/lib/threnody/cache.db`. U
 2. Call `record_outcome(task_id=..., outcome=...)` when work finishes.
 3. Enable per-project learning: `threnody tune set learning_enabled true --project .`
 
+Learning is durable independently of SQLite. Every learning event is appended and
+fsynced to `~/.local/lib/threnody/journal/<YYYY-MM>.jsonl` before the database
+write, so a corrupt `cache.db` costs a rebuild rather than the accumulated
+ledger: recovery salvages the image in place where it can, and a quarantine is
+followed by an automatic replay. Inspect it with `threnody db learn status`, and
+re-apply it by hand with `threnody db learn rebuild`. A run whose terminal report
+failed can be imported later with `threnody db learn import <run_id>`; imports are
+idempotent, so re-running one never double-counts.
+
 ## Legal and provider terms
 
 Threnody is not affiliated with or endorsed by any AI provider. Operators are

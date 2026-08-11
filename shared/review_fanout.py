@@ -208,6 +208,24 @@ REVIEW_DIMENSIONS: list[_Dim] = [
 ]
 
 _DIM_BY_KEY: dict[str, _Dim] = {d.key: d for d in REVIEW_DIMENSIONS}
+# Fast review runs one agent per file covering every dimension. It still needs a
+# cell label so both review shapes reconcile against the same coverage contract.
+FAST_REVIEW_DIMENSION = "all"
+FAST_REVIEW_SUBAGENT = "review-fast-file"
+_DIM_BY_SUBAGENT: dict[str, str] = {d.subagent_type: d.key for d in REVIEW_DIMENSIONS}
+_DIM_BY_SUBAGENT[FAST_REVIEW_SUBAGENT] = FAST_REVIEW_DIMENSION
+
+
+def dimension_for_subagent_type(subagent_type: object) -> str:
+    """Map ``review-edge-cases`` -> ``edge``; ``""`` for a non-review agent.
+
+    Lets a consumer holding only the spawn manifest (no plan) identify which
+    review cell an agent is, without the manifest having to carry a redundant
+    ``review_dimension`` field per agent.
+    """
+    if not isinstance(subagent_type, str):
+        return ""
+    return _DIM_BY_SUBAGENT.get(subagent_type.strip(), "")
 
 _SYNTHESIS_PROMPT = """\
 You are the synthesis agent for a multi-dimension code review swarm.
@@ -394,6 +412,26 @@ _DIM_ALIASES = {
 }
 _DIM_KEYS = ("performance", "security", "logic", "types", "edge")
 
+# Explicit tier intent: "REVIEW: [tier=high] <paths>". A *floor*, never a ceiling —
+# the heuristic may still escalate above it. This is the caller's escape hatch for
+# the case the LOC-driven bands cannot see: a small file that is the whole threat
+# surface (189 lines of injection defence tiering to `low` because the band table
+# only knows how big it is).
+_REQUESTED_TIER = re.compile(r"\[tier=(low|medium|high)\]", re.IGNORECASE)
+
+
+def requested_tier_floor(task: str) -> str:
+    """Return the caller-requested tier floor, or ``""`` when unset."""
+    if not isinstance(task, str) or not task:
+        return ""
+    m = _REQUESTED_TIER.search(task)
+    return m.group(1).lower() if m else ""
+
+
+def strip_intent_tokens(task: str) -> str:
+    """Strip every bracket intent token so file extraction never lexes one."""
+    return _REQUESTED_TIER.sub(" ", strip_dims_token(task))
+
 
 def _requested_dimensions(task: str) -> list[str]:
     """Dimensions the user explicitly asked for, in request order.
@@ -422,6 +460,103 @@ def strip_dims_token(task: str) -> str:
     if not isinstance(task, str):
         return task
     return _REQUESTED_DIMS.sub(" ", task)
+
+
+# Cap on the caller-focus block. Paid once per agent, so a fan-out multiplies it;
+# long enough for a three-part threat model, short enough that 25 agents carrying
+# it stays cheaper than one of them re-deriving it.
+FOCUS_MAX_CHARS = 600
+_SENTINEL_RE = re.compile(r"^\s*(?:FAST_)?REVIEW\s*:", re.IGNORECASE)
+_FOCUS_NOISE_RE = re.compile(r"[\s,;]+")
+
+
+def partition_declared_paths(
+    task: str, paths: "list[str]"
+) -> "tuple[list[str], list[str]]":
+    """Split extracted paths into ``(declared, added)``.
+
+    File extraction regex-scans the *whole* task string, prose included, so a
+    path named inside a threat-model paragraph silently becomes a review target
+    with its own dimension fanout. That discovery is often useful, but it must
+    not be invisible.
+
+    "Declared" is the contiguous run of paths immediately following the
+    ``REVIEW:`` sentinel and its bracket tokens — the shape a caller writes when
+    listing files. Anything matched later in the string is reported as added.
+    Falls back to treating everything as declared when the run is empty, so a
+    caller who writes prose-first is never told their own list was invented.
+    """
+    declared, _end = _declared_run(task, paths)
+    if not declared:
+        return list(paths), []
+    declared_set = set(declared)
+    added = [p for p in paths if p not in declared_set]
+    return [p for p in paths if p in declared_set], added
+
+
+def _declared_run(task: str, paths: "list[str]") -> "tuple[list[str], int]":
+    """Return the contiguous post-sentinel path run and the offset just past it."""
+    if not isinstance(task, str) or not paths:
+        return [], 0
+    cursor = 0
+    m = _SENTINEL_RE.match(task)
+    if m:
+        cursor = m.end()
+    for token_re in (_REQUESTED_DIMS, _REQUESTED_TIER):
+        tok = token_re.search(task, cursor)
+        if tok and not task[cursor : tok.start()].strip():
+            cursor = tok.end()
+
+    by_length = sorted({p for p in paths if p}, key=len, reverse=True)
+    declared: list[str] = []
+    while True:
+        gap_end = cursor
+        while gap_end < len(task) and task[gap_end] in " \t\r\n,;":
+            gap_end += 1
+        match = next((p for p in by_length if task.startswith(p, gap_end)), None)
+        if match is None:
+            break
+        if match not in declared:
+            declared.append(match)
+        cursor = gap_end + len(match)
+    return declared, cursor
+
+
+def extract_task_focus(task: str, paths: "list[str] | None" = None) -> str:
+    """Return what the caller wrote *besides* the sentinel, dims token and paths.
+
+    The review planner lexes a file list out of the task string and drops
+    everything else, so a caller-supplied threat model or focus never reached any
+    agent — every prompt came out generic. This recovers that remainder so it can
+    be injected per cell.
+
+    Deliberately conservative: it only *removes* known-structural tokens, so
+    anything it cannot classify survives into the focus rather than being lost.
+    """
+    if not isinstance(task, str) or not task.strip():
+        return ""
+    known = [p for p in (paths or []) if p]
+    _declared, end = _declared_run(task, known)
+    # Slice past the declared file list rather than deleting path substrings —
+    # a path named mid-sentence ("memory tamper via data/store.json") is part of
+    # the caller's meaning, and blanking it turns the sentence into nonsense.
+    text = task[end:] if end else _SENTINEL_RE.sub(" ", strip_intent_tokens(task))
+    text = strip_intent_tokens(text)
+    # Drop lines that are nothing but paths (a caller who listed files on their
+    # own line after prose), while leaving prose lines untouched.
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and all(tok in known for tok in stripped.split()):
+            continue
+        kept.append(stripped)
+    text = "\n".join(kept).strip(" \t\r\n-–—:,;")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not _FOCUS_NOISE_RE.sub("", text):
+        return ""
+    if len(text) > FOCUS_MAX_CHARS:
+        text = text[: FOCUS_MAX_CHARS - 1].rstrip() + "…"
+    return text
 
 
 Complexity = str  # "trivial" | "moderate" | "complex"
@@ -575,12 +710,30 @@ def _cell_tier(
     *,
     task_force_high: bool,
     tier_bias: dict[tuple[str, str], int] | None,
+    risk_floor: "tuple[Any, str] | None" = None,
+    tier_floor: str = "",
 ) -> tuple[str, "list[Smell]"]:
     """Resolve one cell's tier and its dimension smells.
 
     Extracted so the review-memory skip check and the subtask builder agree on the
     planned tier — a skip decision compared against a different tier than the one
     that would actually run would be unsound.
+
+    Three floors apply on top of the size-driven band, because file size is a poor
+    proxy for how much reasoning a file deserves: a 189-line module that is the
+    only in-band injection defence in a repo tiers to ``low`` on LOC alone.
+
+    * ``tier_floor`` — the caller's ``[tier=]`` token. Explicit intent wins.
+    * ``risk_floor`` — ``(matcher, tier)`` over the *filename* vocabulary
+      (auth/credential/crypto/token/...). Already configured as
+      ``risk_floor_enabled``/``risk_floor_tier`` and applied on the write path,
+      but it was loaded downstream of the review branch's early return, so it had
+      never once applied to a review cell.
+    * a high-severity static hit anywhere in the file floors the *security*
+      dimension, independent of whether the body happens to contain one of the
+      ``_RISK_SIGNALS`` keywords.
+
+    All three are floors, never ceilings — the heuristic may still go higher.
     """
     bias = 0
     if tier_bias:
@@ -606,7 +759,58 @@ def _cell_tier(
         concrete_high_risk=prof.concrete_high_risk,
         bias=bias,
     )
+
+    floors: list[str] = []
+    if tier_floor in _TIER_ORDER:
+        floors.append(tier_floor)
+    if risk_floor is not None:
+        matcher, floor_tier = risk_floor
+        if (
+            matcher is not None
+            and floor_tier in _TIER_ORDER
+            and matcher.search(Path(path).name)
+        ):
+            floors.append(floor_tier)
+    if dim.key == "security" and _has_high_severity(prof):
+        floors.append("medium")
+    for floor in floors:
+        if _TIER_ORDER.index(floor) > _TIER_ORDER.index(tier):
+            tier = floor
     return tier, dim_smells
+
+
+def _has_high_severity(prof: ReviewProfile) -> bool:
+    """True when the static scan found a high-severity smell in *any* dimension.
+
+    ``has_risk`` is a keyword scan of the file body, so a module that *is* the
+    security surface but never literally writes ``sql``/``exec``/``token`` reads as
+    risk-free. A confirmed high-severity static hit is stronger evidence than the
+    keyword scan and does not depend on the author's vocabulary.
+    """
+    if prof.intel is None:
+        return False
+    from .code_intel import SEVERITY_HIGH
+
+    return any(s.severity == SEVERITY_HIGH for s in prof.intel.smells)
+
+
+# Delta-review intent. Without one of these the caller asked for a review of the
+# code, not of a branch diff, and prompting agents to "prioritize" merge-base
+# hunks narrows the review for a reason unconnected to the request — while files
+# untouched since the baseline get no ranges at all, so the fanout is not even
+# consistently narrowed.
+_DELTA_REVIEW_SIGNALS = re.compile(
+    r"\b(?:diff|changed?|changes|since|branch|pr|pull[-\s]?request|"
+    r"merge[-\s]?base|staged|unstaged|uncommitted|delta|recent)\b",
+    re.IGNORECASE,
+)
+
+
+def wants_delta_review(task: str) -> bool:
+    """True when the caller asked about changes rather than about the code."""
+    if not isinstance(task, str) or not task:
+        return False
+    return bool(_DELTA_REVIEW_SIGNALS.search(task))
 
 
 _DIRECTORY_TOKEN = re.compile(r"(?<![\w./-])((?:[\w.-]+/)+|\.)(?![\w.-]*\.[A-Za-z])")
@@ -815,12 +1019,18 @@ def _cell_description(
     mode: str,
     budget: int,
     changed_lines: str = "",
+    focus: str = "",
 ) -> str:
     """Render one review cell's prompt under the resolved boilerplate *mode*.
 
     ``legacy`` reproduces the pre-split string exactly — same wording, same
     concatenation, no separator changes — so opting out is a true no-op. That
     contract means ``changed_lines`` is deliberately not applied there.
+
+    ``focus`` is whatever the caller wrote past the file list. It goes in the
+    *variable* half on purpose: ``stable`` has to stay byte-identical across every
+    cell for the provider prefix cache to hit, and ``render`` only compresses the
+    variable half under a char budget.
     """
     from .prompt_budget import (
         BOILERPLATE_DEFINITION,
@@ -830,22 +1040,45 @@ def _cell_description(
 
     leads = _format_leads(dim_smells)
     resolved = _format_resolved(db, path, dim.key)
+    focus_block = _format_focus(focus)
 
     if mode == BOILERPLATE_LEGACY and budget <= 0:
-        return dim.prompt_template.format(path=path) + leads + resolved
+        return dim.prompt_template.format(path=path) + focus_block + leads + resolved
 
     if mode == BOILERPLATE_DEFINITION:
         # The exported subagent definition already carries title/focus/report.
         stable: list[str] = []
-        variable = [dim.variable_line(path, changed_lines=changed_lines), leads, resolved]
+        variable = [
+            dim.variable_line(path, changed_lines=changed_lines),
+            focus_block,
+            leads,
+            resolved,
+        ]
     elif mode == BOILERPLATE_LEGACY:
         # Budget-only pass: keep the legacy wording, cap the appended blocks.
         stable = [dim.prompt_template.format(path=path)]
-        variable = [leads, resolved]
+        variable = [focus_block, leads, resolved]
     else:
         stable = [dim.stable_block]
-        variable = [dim.variable_line(path, changed_lines=changed_lines), leads, resolved]
+        variable = [
+            dim.variable_line(path, changed_lines=changed_lines),
+            focus_block,
+            leads,
+            resolved,
+        ]
     return render(stable=stable, variable=variable, budget=budget).text
+
+
+def _format_focus(focus: str) -> str:
+    """Prompt block carrying the caller's stated review focus, or ``""``."""
+    if not focus:
+        return ""
+    # Same leading-separator convention as _format_leads / format_resolved_block,
+    # so the legacy concatenation path stays well-formed.
+    return (
+        "\n\nCaller focus — prioritize this, but do not restrict the review to it:\n"
+        f"{focus}"
+    )
 
 
 def _format_resolved(db: "Database | None", path: str, dimension: str) -> str:
@@ -921,6 +1154,8 @@ def _apply_review_memory(
     *,
     task_force_high: bool,
     tier_bias: dict[tuple[str, str], int] | None,
+    risk_floor: "tuple[Any, str] | None" = None,
+    tier_floor: str = "",
 ) -> tuple[list[tuple[str, _Dim, ReviewProfile]], list[Any]]:
     """Split cells into (to-run, replayed-from-memory).
 
@@ -944,7 +1179,13 @@ def _apply_review_memory(
             keep.append((path, dim, prof))
             continue
         planned_tier, _ = _cell_tier(
-            path, dim, prof, task_force_high=task_force_high, tier_bias=tier_bias
+            path,
+            dim,
+            prof,
+            task_force_high=task_force_high,
+            tier_bias=tier_bias,
+            risk_floor=risk_floor,
+            tier_floor=tier_floor,
         )
         cached = load_cached_scan(db, path, sha, dim.key)
         if cached is not None and tier_covers(cached.tier, planned_tier):
@@ -1160,6 +1401,8 @@ def build_review_subtasks(
     db: "Database | None" = None,
     caller: str | None = None,
     config: "Any | None" = None,
+    risk_floor: "tuple[Any, str] | None" = None,
+    workspace_root: str | None = None,
 ) -> dict:
     """Build a DAG plan dict with per-(file, dimension) subtasks + synthesis.
 
@@ -1174,6 +1417,11 @@ def build_review_subtasks(
         keeps the pre-split prompt wording exactly.
     config: optional pre-loaded TGsConfig, so a fan-out resolves prompt economy
         once instead of re-reading config.yaml per cell.
+    risk_floor: optional ``(filename matcher, tier)`` from ``risk_floor_enabled`` /
+        ``risk_floor_tier``. Passed in rather than loaded here so the caller reads
+        config once; ``None`` disables the floor.
+    workspace_root: the resolved handoff root, used for the changed-line diff.
+        Falls back to the process cwd.
     """
     if not entries:
         return {
@@ -1196,6 +1444,12 @@ def build_review_subtasks(
     task_force_high = _task_requests_high_tier(task)
     requested = _requested_dimensions(task)
     requested_keys = set(requested)
+    # Everything the caller wrote past the file list. Previously discarded: the
+    # planner lexed paths out of the task string and threw the rest away, so a
+    # stated threat model reached no agent and every prompt came out generic.
+    focus = extract_task_focus(task, [path for path, _ in entries])
+    tier_floor = requested_tier_floor(task)
+    _declared, added_files = partition_declared_paths(task, [path for path, _ in entries])
     # Prompt economy resolved once per run, not per cell — from_yaml() re-reads and
     # re-parses config.yaml on every call.
     cfg = _load_config(config)
@@ -1212,15 +1466,27 @@ def build_review_subtasks(
     _diff_ref: str | None = None
     _diff_ref_resolved = False
     _changed_lines_cache: dict[str, str] = {}
+    delta_review = wants_delta_review(task)
+    # The rest of the handoff resolves the workspace with resolve_workspace_root;
+    # using Path.cwd() here meant that whenever the two disagreed, every cell
+    # silently degraded to whole-file with nothing reporting why.
+    diff_root = str(workspace_root or Path.cwd())
 
     def _changed_lines_for(path: str) -> str:
         nonlocal _diff_ref, _diff_ref_resolved
+        # Only when the caller actually asked about changes. Emitting merge-base
+        # ranges on a plain "review this code" told agents to prioritize a branch
+        # delta nobody asked about, and only for the files that happened to be in
+        # it — the untouched ones read the whole file, so the same run mixed two
+        # different review scopes with no signal saying so.
+        if not delta_review:
+            return ""
         if not _diff_ref_resolved:
             _diff_ref_resolved = True
             try:
                 from .verify import resolve_baseline_ref
 
-                _diff_ref = resolve_baseline_ref(str(Path.cwd()))
+                _diff_ref = resolve_baseline_ref(diff_root)
             except Exception:
                 log.debug("review_fanout: baseline ref resolution failed", exc_info=True)
                 _diff_ref = None
@@ -1229,7 +1495,7 @@ def build_review_subtasks(
         if path not in _changed_lines_cache:
             try:
                 _changed_lines_cache[path] = _changed_line_ranges(
-                    path, _diff_ref, str(Path.cwd())
+                    path, _diff_ref, diff_root
                 )
             except Exception:
                 log.debug("review_fanout: changed-line lookup failed for %s", path, exc_info=True)
@@ -1271,7 +1537,12 @@ def build_review_subtasks(
     # reviewed at an equal-or-stronger tier, and replay their stored findings into
     # synthesis instead of re-spawning the agent.
     all_cells, replayed = _apply_review_memory(
-        all_cells, db, task_force_high=task_force_high, tier_bias=tier_bias
+        all_cells,
+        db,
+        task_force_high=task_force_high,
+        tier_bias=tier_bias,
+        risk_floor=risk_floor,
+        tier_floor=tier_floor,
     )
 
     # Resolve the synthesis mode BEFORE the agent cap, from the review as requested.
@@ -1326,7 +1597,13 @@ def build_review_subtasks(
 
     for idx, (path, dim, prof) in enumerate(all_cells, start=1):
         t, dim_smells = _cell_tier(
-            path, dim, prof, task_force_high=task_force_high, tier_bias=tier_bias
+            path,
+            dim,
+            prof,
+            task_force_high=task_force_high,
+            tier_bias=tier_bias,
+            risk_floor=risk_floor,
+            tier_floor=tier_floor,
         )
         subtasks.append({
             "id": idx,
@@ -1334,6 +1611,7 @@ def build_review_subtasks(
                 path, dim, dim_smells, db,
                 mode=boilerplate, budget=prompt_char_budget,
                 changed_lines=_changed_lines_for(path),
+                focus=focus,
             ),
             "tier": t,
             "target_file": path,
@@ -1377,6 +1655,11 @@ def build_review_subtasks(
             "description": (
                 _SYNTHESIS_PROMPT
                 + f"\n\nFiles reviewed: {', '.join(reviewed_files)}"
+                + (
+                    f"\n\nCaller focus — weight findings that bear on this:\n{focus}"
+                    if focus
+                    else ""
+                )
                 + _format_replay(replayed)
             ),
             "tier": synthesis_tier(review_requires_high, len(all_cells), has_high_risk_files),
@@ -1431,6 +1714,10 @@ def build_review_subtasks(
             "dimensions_planned": planned_by_file,
             "dropped_cells": dropped_labels,
             "skipped_prior_review": skipped_prior_review,
+            # Files the extractor picked out of the task's prose rather than the
+            # caller's list. Reported, not suppressed: the discovery is often the
+            # useful part, but scope must never widen silently.
+            "added_files": added_files,
         },
     }
 
@@ -1448,12 +1735,17 @@ def build_fast_review_subtasks(
     broad review sweeps where per-file parallelism matters more than per-dimension
     depth.
     """
-    file_entries = list(entries)
+    all_entries = list(entries)
+    file_entries = list(all_entries)
     dropped = 0
+    dropped_cells: list[str] = []
     if max_agents is not None and max_agents > 0:
         review_cap = max(1, max_agents - 1)
         if len(file_entries) > review_cap:
             dropped = len(file_entries) - review_cap
+            dropped_cells = [
+                f"{path}:{FAST_REVIEW_DIMENSION}" for path, _ in file_entries[review_cap:]
+            ]
             file_entries = file_entries[:review_cap]
 
     subtasks: list[dict] = []
@@ -1478,6 +1770,7 @@ def build_fast_review_subtasks(
             "read_only": True,
             "depends_on": [],
             "single_file_insertion": False,
+            "review_dimension": FAST_REVIEW_DIMENSION,
         })
         review_ids.append(idx)
 
@@ -1507,6 +1800,21 @@ def build_fast_review_subtasks(
         "topology": "dag",
         "review_mode": "fast_file",
         "dropped_file_count": dropped,
+        # Same shape the per-dimension path emits, with one synthetic "all"
+        # dimension per file. Without it the contract builder falls through to
+        # the write-path branch and reports `dropped: []` for a run that just
+        # capped away files — the fast path's version of the same blind spot.
+        "coverage": {
+            "files": [path for path, _ in all_entries],
+            "dimensions_expected": {
+                path: [FAST_REVIEW_DIMENSION] for path, _ in all_entries
+            },
+            "dimensions_planned": {
+                path: [FAST_REVIEW_DIMENSION] for path, _ in file_entries
+            },
+            "dropped_cells": dropped_cells,
+            "skipped_prior_review": [],
+        },
     }
 
 

@@ -112,6 +112,19 @@ def _is_within_root(path: str, root: str) -> bool:
         return False
 
 
+def _run_dir_for(run_id: object) -> str:
+    """Absolute path of this run's own log directory, or ``""``."""
+    if not isinstance(run_id, str) or not run_id:
+        return ""
+    try:
+        from . import run_log
+
+        return str(run_log.run_log_dir(run_id))
+    except Exception:  # pragma: no cover - never block a PostToolUse hook
+        log.debug("learning_hook: run dir resolution failed", exc_info=True)
+        return ""
+
+
 def capture_edit(fields: dict[str, Any]) -> dict[str, Any]:
     """Append one run-log record for a file-edit event. Best-effort, never raises."""
     from . import run_log
@@ -133,7 +146,21 @@ def capture_edit(fields: dict[str, Any]) -> dict[str, Any]:
         # is what stops a concurrent session's edits (a different cwd, hence a
         # different active-run pointer file) from ever reaching this run's log
         # even if the two pointer lookups somehow raced onto the same run_id.
-        targets = [t for t in targets if _is_within_root(t, cwd)]
+        #
+        # The run's OWN directory counts as in-scope even though it sits outside
+        # the workspace. Review agents are read-only: the single write they ever
+        # make is their findings/artifact file under runs/<run_id>/, so filtering
+        # on cwd alone discarded every record they produced and left REVIEW:
+        # swarms with an empty run log — no rows in review_tier_bias,
+        # review_scans, review_findings or model_quality_events, ever. It is not
+        # a widening of trust: the path must be inside *this* run's directory,
+        # which is keyed by the same pointer the cwd lookup just resolved.
+        run_dir = _run_dir_for(run_id)
+        targets = [
+            t
+            for t in targets
+            if _is_within_root(t, cwd) or (run_dir and _is_within_root(t, run_dir))
+        ]
     if not targets:
         return {"captured": False, "reason": "no target file"}
 

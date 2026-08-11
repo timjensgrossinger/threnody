@@ -117,8 +117,20 @@ def _write_event(
     sample_meta: dict[str, Any] | None = None,
     task_hash: str | None = None,
     run_id: str | None = None,
+    tier: str | None = None,
+    profile_key: str | None = None,
+    spawn_id: str | None = None,
+    journal: bool = True,
+    event_id: str | None = None,
+    ts: float | None = None,
 ) -> None:
-    """Insert one ledger event. Best-effort — never raises into caller paths."""
+    """Insert one ledger event. Best-effort — never raises into caller paths.
+
+    The event is appended to the durable journal *before* the DB write, so a
+    malformed image (nine quarantines on this install since June) costs a replay
+    rather than the data. ``journal=False`` is for the replay path itself, which
+    is reading the journal and must not write back into it.
+    """
     if source not in VALID_SOURCES:
         log.debug("model_quality: refusing unknown source %r", source)
         return
@@ -133,24 +145,74 @@ def _write_event(
             meta_json = json.dumps(sample_meta, sort_keys=True)
         except (TypeError, ValueError):
             meta_json = None
+
+    row = {
+        "model": _normalize_model(model),
+        "effort": (effort or None),
+        "dimension": str(dimension or DIMENSION_GENERAL),
+        "sub_dimension": (sub_dimension or None),
+        "score_0_10": score,
+        "source": source,
+        "sample_meta": meta_json,
+        "task_hash": (task_hash or None),
+        "run_id": (run_id or None),
+        "tier": (tier or None),
+        "profile_key": (profile_key or None),
+        "spawn_id": (spawn_id or None),
+    }
+    when = float(ts) if ts is not None else time.time()
+    if journal:
+        from .learning_journal import KIND_MODEL_QUALITY, append
+
+        event_id = append(KIND_MODEL_QUALITY, row, ts=when)
+    write_quality_row(db, row, event_id=event_id, ts=when)
+
+
+def write_quality_row(
+    db: Database,
+    row: dict[str, Any],
+    *,
+    event_id: str | None,
+    ts: float,
+) -> None:
+    """Idempotent insert of one prepared ledger row.
+
+    Shared by the live path and the journal replay. ``ON CONFLICT DO NOTHING``
+    over the unique ``event_id`` index is what makes replaying a run — or the
+    warm-path executor retrying a terminal report that failed partway — leave the
+    counts unchanged instead of doubling them.
+    """
     try:
         with db.conn() as conn:
             conn.execute(
                 "INSERT INTO model_quality_events "
                 "(model, effort, dimension, sub_dimension, score_0_10, source, "
-                "sample_meta, task_hash, run_id, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "sample_meta, task_hash, run_id, tier, profile_key, spawn_id, "
+                "event_id, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                # The uniqueness is a PARTIAL index (legacy rows carry no
+                # event_id and must not all collide on NULL), and SQLite only
+                # accepts a partial index as a conflict target when the clause
+                # repeats its predicate verbatim. Without the WHERE this raises
+                # "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
+                # constraint" — swallowed by the best-effort except below, so
+                # every ledger write would silently vanish.
+                "ON CONFLICT (event_id) WHERE event_id IS NOT NULL DO NOTHING",
                 (
-                    _normalize_model(model),
-                    (effort or None),
-                    str(dimension or DIMENSION_GENERAL),
-                    (sub_dimension or None),
-                    score,
-                    source,
-                    meta_json,
-                    (task_hash or None),
-                    (run_id or None),
-                    time.time(),
+                    row.get("model"),
+                    row.get("effort"),
+                    row.get("dimension"),
+                    row.get("sub_dimension"),
+                    row.get("score_0_10"),
+                    row.get("source"),
+                    row.get("sample_meta"),
+                    row.get("task_hash"),
+                    row.get("run_id"),
+                    row.get("tier"),
+                    row.get("profile_key"),
+                    row.get("spawn_id"),
+                    event_id,
+                    ts,
                 ),
             )
     except Exception:  # pragma: no cover - best-effort
@@ -169,6 +231,9 @@ def record_findings_score(
     sub_dimension: str | None = None,
     task_hash: str | None = None,
     run_id: str | None = None,
+    tier: str | None = None,
+    profile_key: str | None = None,
+    spawn_id: str | None = None,
 ) -> None:
     """Score one review agent's findings and record it (source='findings').
 
@@ -196,6 +261,9 @@ def record_findings_score(
         },
         task_hash=task_hash,
         run_id=run_id,
+        tier=tier,
+        profile_key=profile_key,
+        spawn_id=spawn_id,
     )
 
 
@@ -276,6 +344,9 @@ def record_static_recall_score(
     sub_dimension: str | None = None,
     task_hash: str | None = None,
     run_id: str | None = None,
+    tier: str | None = None,
+    profile_key: str | None = None,
+    spawn_id: str | None = None,
 ) -> None:
     """Score a reviewer against the static pre-scan (source='static_recall').
 
@@ -300,6 +371,9 @@ def record_static_recall_score(
         sample_meta=meta,
         task_hash=task_hash,
         run_id=run_id,
+        tier=tier,
+        profile_key=profile_key,
+        spawn_id=spawn_id,
     )
 
 
@@ -314,6 +388,9 @@ def record_verify_gate_score(
     role: str | None = None,
     task_hash: str | None = None,
     run_id: str | None = None,
+    tier: str | None = None,
+    profile_key: str | None = None,
+    spawn_id: str | None = None,
 ) -> None:
     """Record a verify-gate outcome (source='verify_gate').
 
@@ -339,6 +416,9 @@ def record_verify_gate_score(
         },
         task_hash=task_hash,
         run_id=run_id,
+        tier=tier,
+        profile_key=profile_key,
+        spawn_id=spawn_id,
     )
 
 
@@ -352,6 +432,8 @@ def record_ladder_score(
     tier: str | None = None,
     case_id: str | None = None,
     run_id: str | None = None,
+    profile_key: str | None = None,
+    spawn_id: str | None = None,
 ) -> None:
     """Record one graded ladder verdict (source='ladder').
 
@@ -442,6 +524,9 @@ def record_judge_score(
     role: str | None = None,
     task_hash: str | None = None,
     run_id: str | None = None,
+    tier: str | None = None,
+    profile_key: str | None = None,
+    spawn_id: str | None = None,
 ) -> None:
     """Record one warm-path judge score (source='judge').
 
@@ -461,6 +546,9 @@ def record_judge_score(
         sample_meta={"reason": reason} if reason else None,
         task_hash=task_hash,
         run_id=run_id,
+        tier=tier,
+        profile_key=profile_key,
+        spawn_id=spawn_id,
     )
 
 

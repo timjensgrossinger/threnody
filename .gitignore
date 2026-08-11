@@ -14,6 +14,16 @@ cache.db.bak-wal
 cache.db.bak-shm
 cache.db.lock
 cache.db.corrupt.*
+# Preserved original of an in-place salvage (shared/db.py _salvage_db); kept for
+# forensics, deliberately not named .corrupt.* because no data was lost.
+cache.db.presalvage.*
+cache.db.salvage.tmp
+# Single-writer DB daemon (db_daemon.enabled, on by default).
+cache.db.sock
+cache.db.daemon.lock
+# Durable learning journal (shared/learning_journal.py) — the system of record
+# for this install's accumulated learning. Machine-local, never committed.
+journal/
 .runtime/
 audit_secret
 providers.json

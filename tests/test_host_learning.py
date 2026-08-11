@@ -644,7 +644,7 @@ def test_expand_host_plan_adds_parallel_wave(tmp_path: Path) -> None:
         assert isinstance(waves, list) and len(waves) >= 1
         for wave in waves:
             assert wave["parallel_start_required"] is True
-            assert wave["spawn_batch"] == wave["agents"]
+            assert "spawn_batch" not in wave
         agent_count = sum(
             len(w.get("agents", []))
             for w in waves

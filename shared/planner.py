@@ -1285,6 +1285,7 @@ class Planner:
         topology: str | None = None,
         max_agents: int | None = None,
         caller: str | None = None,
+        workspace_root: str | None = None,
     ) -> ExecutionPlan:
         """Decompose a task using local heuristics (no external planner LLM).
 
@@ -1357,6 +1358,7 @@ class Planner:
             intent_templates=intent_templates,
             coupled_strategy=coupled_strategy,
             caller=caller,
+            workspace_root=workspace_root,
         )
         plan = self._build_plan(parsed, task)
         plan.planner_mode = "heuristic"

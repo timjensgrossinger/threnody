@@ -44,15 +44,33 @@ def record_hybrid_outcome(
     profile_key: str,
     delta: int,
     clean: bool,
+    run_id: str | None = None,
+    journal: bool = True,
 ) -> None:
     """EMA-update the split outcome for one profile at the delta that ran.
 
     ``clean`` should be True only when the implementer needed no rework AND the
     verify gate reported no new failures — a genuinely successful discount.
     Best-effort; never raises into finalize.
+
+    Journaled before the write for the same reason as the review-tier EMA: the
+    raw observation is unrecoverable once averaged in. ``journal=False`` is for
+    the rebuild path replaying that journal.
     """
     if not profile_key:
         return
+    if journal:
+        from .learning_journal import KIND_HYBRID, append
+
+        append(
+            KIND_HYBRID,
+            {
+                "run_id": run_id,
+                "profile_key": profile_key,
+                "delta": int(delta),
+                "clean": bool(clean),
+            },
+        )
     try:
         now = time.time()
         obs_rework = 0.0 if clean else 1.0

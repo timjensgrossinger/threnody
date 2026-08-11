@@ -781,6 +781,145 @@ def test_review_run_with_capped_agents_surfaces_coverage_warning(
     assert contract["dropped"]
     assert contract["expected_agents"] > contract["planned_agents"]
     assert contract["warnings"]
+    # planned_agents must be what the host will really spawn, not len(subtasks).
+    # Asserting only the warning is what let the ownership-dedup collapse ship.
+    assert contract["planned_agents"] == _count_manifest_agents(result)
+    _assert_contract_balances(contract)
+    assert all(entry["reason"] for entry in contract["dropped"])
+    db.close()
+
+
+def _count_manifest_agents(result: dict) -> int:
+    """Agents the host is actually told to spawn."""
+    return sum(
+        len(wave.get("agents") or []) for wave in (result.get("host_spawn_waves") or [])
+    )
+
+
+def _assert_contract_balances(contract: dict) -> None:
+    """expected == planned + dropped + skipped, exactly.
+
+    This is the invariant that makes ``contract.dropped`` trustworthy: it is a
+    set difference against the emitted manifest, so no removal channel can go
+    unreported. Counting (the original implementation) read one channel of four.
+    """
+    assert contract["expected_agents"] == (
+        contract["planned_agents"] + len(contract["dropped"]) + len(contract["skipped"])
+    ), contract
+
+
+def test_review_manifest_stays_within_a_byte_budget(monkeypatch, tmp_path: Path) -> None:
+    """A wide review handoff must not overflow the host before the first spawn.
+
+    A 22-agent review returned 55.3 KB and had to be spilled to disk and parsed
+    out with a script. ~93% of that was host_spawn_waves, and exactly half of
+    *that* was `spawn_batch` — a verbatim duplicate of `agents` that the
+    execution note told the host to read instead of, not in addition to.
+    """
+    import json
+    from shared.planner import CLIBackend, Planner
+
+    class _NoBackend(CLIBackend):
+        def call(self, prompt, model=None, timeout=120):  # pragma: no cover
+            raise AssertionError("review heuristic must not call the LLM backend")
+
+    db_path = tmp_path / "review-size.db"
+    cfg = TGsConfig(db_path=db_path)
+    db = Database(db_path=db_path)
+    db._init_schema(db._get_connection())
+    planner = Planner(cfg, _NoBackend())
+
+    body = "\n".join(
+        f"def rule_{i}(x):\n    if x:\n        return x\n    return 0" for i in range(80)
+    )
+    paths = []
+    for i in range(11):
+        f = tmp_path / f"mod_{i}.py"
+        f.write_text(body, encoding="utf-8")
+        paths.append(str(f))
+
+    out = mcp_server._execute_swarm_host_native_response(
+        config=cfg,
+        db=db,
+        planner=planner,
+        router=None,
+        swarm_id="swarm-review-size",
+        task_text="REVIEW: [dims=security,logic] " + " ".join(paths),
+        caller="claude-code",
+        request_meta={
+            "topology": "dag",
+            "workspace_root": str(tmp_path),
+            "effective_agents": 25,
+        },
+        estimated_cost=0.0,
+    )
+    result = out["result"]
+    agents = _count_manifest_agents(result)
+    assert agents >= 22, "the fanout itself must not have collapsed"
+    for wave in result["host_spawn_waves"]:
+        assert "spawn_batch" not in wave
+
+    size = len(json.dumps(result))
+    # Generous ceiling: the point is that per-agent cost stays ~1.5 KB rather
+    # than the ~4.6 KB that made a 22-agent review unreadable in one chunk.
+    assert size < 60_000, f"response is {size} bytes for {agents} agents"
+    assert size / agents < 2_500, f"{size / agents:.0f} bytes per agent"
+    db.close()
+
+
+def test_review_contract_balances_with_every_dimension_emitted(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Uncapped multi-file, multi-dimension review: nothing may go missing.
+
+    Before the read_only exemption in sanitize_plan_for_host, this shape emitted
+    one agent per *file* instead of one per (file x dimension) — 3 files x 2 dims
+    collapsed from 6 review agents to 3, with an empty ``dropped`` list.
+    """
+    from shared.planner import CLIBackend, Planner
+
+    class _NoBackend(CLIBackend):
+        def call(self, prompt, model=None, timeout=120):  # pragma: no cover
+            raise AssertionError("review heuristic must not call the LLM backend")
+
+    db_path = tmp_path / "review-contract-balance.db"
+    cfg = TGsConfig(db_path=db_path)
+    db = Database(db_path=db_path)
+    db._init_schema(db._get_connection())
+    planner = Planner(cfg, _NoBackend())
+
+    paths = []
+    for name in ("alpha.py", "beta.py", "gamma.py"):
+        f = tmp_path / name
+        f.write_text("\n".join(f"line {i}" for i in range(210)), encoding="utf-8")
+        paths.append(str(f))
+
+    task = "REVIEW: [dims=security,logic] " + " ".join(paths)
+    out = mcp_server._execute_swarm_host_native_response(
+        config=cfg,
+        db=db,
+        planner=planner,
+        router=None,
+        swarm_id="swarm-review-contract-balance",
+        task_text=task,
+        caller="claude-code",
+        request_meta={
+            "topology": "dag",
+            "workspace_root": str(tmp_path),
+            "effective_agents": 22,
+        },
+        estimated_cost=0.0,
+    )
+    result = out["result"]
+    contract = result["plan_summary"]["contract"]
+
+    assert contract["dropped"] == []
+    assert contract["planned_agents"] == _count_manifest_agents(result)
+    _assert_contract_balances(contract)
+    # 3 files x 2 dimensions, each with its own agent.
+    planned = result["plan_summary"]["coverage"]["dimensions_planned"]
+    assert {len(v) for v in planned.values()} == {2}
+    assert "coverage_warning" not in result
     db.close()
 
 
