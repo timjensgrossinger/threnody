@@ -12,6 +12,7 @@ the process — but we still avoid arbitrary-object deserialization on principle
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 import socket
 import struct
@@ -29,6 +30,24 @@ class ProtocolError(Exception):
 # ---------------------------------------------------------------------------
 # Type codec — tag the few non-JSON-native types Database uses.
 # ---------------------------------------------------------------------------
+# Dataclasses Database methods return across the RPC boundary. Reconstruction on
+# decode is limited to this whitelist on purpose — the module stays free of
+# arbitrary-object deserialization even though the wire form carries a class name.
+# An unregistered dataclass still crosses (as its field dict, not stringified),
+# it just decodes as a dict instead of its original type.
+_DATACLASS_REGISTRY: dict[str, type] = {}
+
+
+def register_dataclass(cls: type) -> type:
+    """Register a dataclass type so it round-trips through encode/decode intact.
+
+    Without this, ``encode()`` falls back to ``str(value)`` for any type it does
+    not recognize, and a caller on the other side of the daemon RPC gets a string
+    where it expected the dataclass instance (e.g. ``lookup.status`` raising
+    ``AttributeError`` because ``lookup`` decoded to a string).
+    """
+    _DATACLASS_REGISTRY[cls.__name__] = cls
+    return cls
 _TAG = "__tgs_t__"
 
 
@@ -53,6 +72,12 @@ def encode(value: Any) -> Any:
         return {_TAG: "dict", "v": [[encode(k), encode(v)] for k, v in value.items()]}
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            _TAG: "dataclass",
+            "cls": type(value).__name__,
+            "v": {f.name: encode(getattr(value, f.name)) for f in dataclasses.fields(value)},
+        }
     # Fallback: stringify unknown types (e.g. enums) — lossy but safe.
     return str(value)
 
@@ -75,6 +100,10 @@ def decode(value: Any) -> Any:
             if tag == "dict":
                 # Association list → dict, restoring non-string / tag-colliding keys.
                 return {decode(k): decode(v) for k, v in (inner or [])}
+            if tag == "dataclass":
+                fields = {k: decode(v) for k, v in (inner or {}).items()}
+                cls = _DATACLASS_REGISTRY.get(value.get("cls"))
+                return cls(**fields) if cls is not None else fields
             raise ProtocolError(f"unknown type tag: {tag!r}")
         return {k: decode(v) for k, v in value.items()}
     if isinstance(value, list):

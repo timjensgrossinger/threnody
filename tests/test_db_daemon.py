@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import shared.db_client as dc  # noqa: E402
 from shared.config import DbDaemonConfig, TGsConfig  # noqa: E402
-from shared.db import Database  # noqa: E402
+from shared.db import Database, PlanCacheLookup  # noqa: E402
 from shared.db_client import RemoteDatabase, open_database  # noqa: E402
 from shared.db_ipc import decode, encode  # noqa: E402
 
@@ -42,6 +42,27 @@ def test_ipc_codec_round_trip() -> None:
     for v in [None, 1, "x", 3.5, True, [1, "a"], {"k": [1, 2]}, ("a", "b"),
               Path("/tmp/x"), b"\x00\x01", {"n": ("t", 1, Path("/p"))}]:
         assert decode(encode(v)) == v
+
+
+def test_ipc_codec_dataclass_round_trip() -> None:
+    # Regression: a registered dataclass (e.g. PlanCacheLookup) must decode back
+    # into its own type, not the generic "stringify unknown types" fallback — a
+    # caller doing ``lookup.status`` on a stringified lookup raises AttributeError.
+    lookup = PlanCacheLookup(status="hit", plan={"subtasks": []}, plan_schema_version=2)
+    decoded = decode(encode(lookup))
+    assert decoded == lookup
+    assert isinstance(decoded, PlanCacheLookup)
+    assert decoded.status == "hit"
+
+    # An unregistered dataclass still crosses (as its field dict), never stringified.
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Unregistered:
+        x: int
+
+    decoded_unknown = decode(encode(_Unregistered(x=1)))
+    assert decoded_unknown == {"x": 1}
 
 
 def test_ipc_codec_non_string_and_colliding_dict_keys() -> None:
@@ -114,6 +135,21 @@ def test_named_method_parity() -> None:
         summary = rdb.get_swarm_summary("sw1")
         assert summary is not None and summary.get("swarm_id") == "sw1"
         assert rdb.last_integrity_ok is True
+
+        # Regression: plan_lookup() returns a PlanCacheLookup dataclass. Before the
+        # db_ipc codec learned to tag dataclasses, this decoded to a plain string on
+        # the RemoteDatabase side and `lookup.status` raised AttributeError — the
+        # crash any real REVIEW: swarm hit under a claude-code caller with the db
+        # daemon enabled (the live default).
+        miss = rdb.plan_lookup("some task")
+        assert isinstance(miss, PlanCacheLookup)
+        assert miss.status == "miss"
+        rdb.plan_put("some task", {"subtasks": [{"id": "1"}]}, "model-x")
+        hit = rdb.plan_lookup("some task")
+        assert isinstance(hit, PlanCacheLookup)
+        assert hit.status == "hit"
+        assert hit.plan and "subtasks" in hit.plan
+
         rdb.close()
 
 

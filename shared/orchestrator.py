@@ -68,7 +68,7 @@ from .consensus import (
     select_personas,
 )
 from .context import enrich_subtask, make_artifact_envelope, make_compact_summary, make_summary_for_wave
-from .db import Database, DEFAULT_PROJECT_FANOUT_CAP
+from .db import Database, DEFAULT_PROJECT_FANOUT_CAP, parse_compact_summary
 from .eval import (
     WaveFileTracker,
     BackgroundEvaluator,
@@ -3335,7 +3335,7 @@ class Orchestrator:
         for row in rows:
             stable_ref = str(row[6] or "")
             try:
-                compact_summary = self._db._parse_compact_summary(row[5], stable_ref)
+                compact_summary = parse_compact_summary(row[5], stable_ref)
             except Exception:
                 log.debug(
                     "Failed to parse compact artifact summary for %s",
@@ -3393,7 +3393,7 @@ class Orchestrator:
         for row in rows:
             stable_ref = str(row[6] or "")
             try:
-                compact_summary = self._db._parse_compact_summary(row[5], stable_ref)
+                compact_summary = parse_compact_summary(row[5], stable_ref)
             except Exception:
                 log.debug(
                     "Failed to parse compact artifact summary for %s",
@@ -3470,7 +3470,7 @@ class Orchestrator:
         for row in rows:
             stable_ref = str(row[6] or "")
             try:
-                compact_summary = self._db._parse_compact_summary(row[5], stable_ref)
+                compact_summary = parse_compact_summary(row[5], stable_ref)
             except Exception:
                 log.debug(
                     "Failed to parse compact artifact summary for %s",

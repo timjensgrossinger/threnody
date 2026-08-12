@@ -28,7 +28,7 @@ from .discovery import (
     _copilot_subprocess_env,
     _copilot_supports_model_flag,
 )
-from .db import Database
+from .db import Database, task_cache_key
 from .agents import AgentRegistry, build_learned_agent_runtime_context
 from .plan_cache import (
     PLAN_CACHE_EXPIRED,
@@ -1696,7 +1696,7 @@ class Planner:
             return None
         return self._db.log_agent_result(
             session_id="planner",
-            task_hash=self._db._key(task),
+            task_hash=task_cache_key(task),
             agent_id=0,
             tier="medium",
             model=self._planner_model,

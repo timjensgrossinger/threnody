@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .db_ipc import register_dataclass
+
 try:  # POSIX-only; best-effort cross-process lock. No-op where unavailable (e.g. Windows).
     import fcntl as _fcntl
 except ImportError:  # pragma: no cover - non-POSIX platforms
@@ -110,6 +112,7 @@ def _schema_lock_for_path(path: Path) -> threading.Lock:
         return lock
 
 
+@register_dataclass
 @dataclass(frozen=True)
 class PlanCacheLookup:
     """Result of a plan cache lookup with invalidation reason."""
@@ -117,6 +120,74 @@ class PlanCacheLookup:
     status: str  # hit | miss | expired | schema_invalid
     plan: dict | None = None
     plan_schema_version: int | None = None
+
+
+def coerce_length_chars(value: object, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value)
+        except ValueError:
+            return default
+    return default
+
+
+def parse_compact_summary(
+    compact_summary: str | None,
+    stable_ref: str,
+) -> dict[str, object]:
+    """Parse a stored ``compact_summary`` JSON blob back into its dict shape.
+
+    Module-level for the same reason as :func:`task_cache_key`: it is pure (no
+    I/O), but callers that reach it via ``self._db._parse_compact_summary(...)``
+    break under the db daemon, since ``RemoteDatabase`` refuses to proxy private
+    names. Call this directly instead of going through ``self._db``.
+    """
+    if compact_summary is None:
+        return {
+            "summary_text": "",
+            "length_chars": 0,
+            "artifact_ref": stable_ref,
+        }
+    try:
+        parsed = json.loads(compact_summary)
+    except json.JSONDecodeError:
+        summary_text = compact_summary
+        return {
+            "summary_text": summary_text,
+            "length_chars": len(summary_text),
+            "artifact_ref": stable_ref,
+        }
+
+    if isinstance(parsed, dict):
+        summary_text = str(parsed.get("summary_text", ""))
+        raw_length = parsed.get("length_chars", len(summary_text))
+        return {
+            "summary_text": summary_text,
+            "length_chars": coerce_length_chars(raw_length, len(summary_text)),
+            "artifact_ref": str(parsed.get("artifact_ref", stable_ref)),
+        }
+
+    summary_text = str(parsed)
+    return {
+        "summary_text": summary_text,
+        "length_chars": len(summary_text),
+        "artifact_ref": stable_ref,
+    }
+
+
+def task_cache_key(task: str) -> str:
+    """Normalise and hash a task string into its cache key.
+
+    A module-level function, not a ``Database`` method, so callers that only need
+    this pure computation (no I/O) can use it without going through ``self._db`` —
+    which matters when ``self._db`` is a ``RemoteDatabase``: its RPC proxy refuses
+    private names like ``_key`` by design, so a caller reaching for the method
+    directly gets ``AttributeError`` under the db daemon rather than a result.
+    """
+    normalised = " ".join(task.lower().split())
+    return hashlib.sha256(normalised.encode()).hexdigest()[:32]
 
 
 class Database:
@@ -3194,8 +3265,7 @@ class Database:
     @staticmethod
     def _key(task: str) -> str:
         """Normalise and hash a task string."""
-        normalised = " ".join(task.lower().split())
-        return hashlib.sha256(normalised.encode()).hexdigest()[:32]
+        return task_cache_key(task)
 
     def cache_get(self, task: str) -> tuple[str, str] | None:
         """Return (result, model) if cached and not expired."""
@@ -3485,14 +3555,7 @@ class Database:
 
     @staticmethod
     def _coerce_length_chars(value: object, default: int) -> int:
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.strip():
-            try:
-                return int(value)
-            except ValueError:
-                return default
-        return default
+        return coerce_length_chars(value, default)
 
     @staticmethod
     def _coerce_compact_summary(
@@ -3525,37 +3588,7 @@ class Database:
         compact_summary: str | None,
         stable_ref: str,
     ) -> dict[str, object]:
-        if compact_summary is None:
-            return {
-                "summary_text": "",
-                "length_chars": 0,
-                "artifact_ref": stable_ref,
-            }
-        try:
-            parsed = json.loads(compact_summary)
-        except json.JSONDecodeError:
-            summary_text = compact_summary
-            return {
-                "summary_text": summary_text,
-                "length_chars": len(summary_text),
-                "artifact_ref": stable_ref,
-            }
-
-        if isinstance(parsed, dict):
-            summary_text = str(parsed.get("summary_text", ""))
-            raw_length = parsed.get("length_chars", len(summary_text))
-            return {
-                "summary_text": summary_text,
-                "length_chars": Database._coerce_length_chars(raw_length, len(summary_text)),
-                "artifact_ref": str(parsed.get("artifact_ref", stable_ref)),
-            }
-
-        summary_text = str(parsed)
-        return {
-            "summary_text": summary_text,
-            "length_chars": len(summary_text),
-            "artifact_ref": stable_ref,
-        }
+        return parse_compact_summary(compact_summary, stable_ref)
 
     def save_artifact(
         self,
