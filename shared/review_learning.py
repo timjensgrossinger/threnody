@@ -39,7 +39,7 @@ def record_review_tier_outcome(
     tier: str,
     findings_high: int,
     findings_total: int,
-    kept_by_synthesis: bool,
+    kept_by_synthesis: bool | None,
     run_id: str | None = None,
     spawn_id: str | None = None,
     journal: bool = True,
@@ -69,7 +69,9 @@ def record_review_tier_outcome(
                 "tier": tier,
                 "findings_high": int(findings_high),
                 "findings_total": int(findings_total),
-                "kept_by_synthesis": bool(kept_by_synthesis),
+                "kept_by_synthesis": (
+                    None if kept_by_synthesis is None else bool(kept_by_synthesis)
+                ),
             },
         )
     if tier == "high":
@@ -77,7 +79,11 @@ def record_review_tier_outcome(
         obs = 1.0 if findings_total <= 0 else 0.0
     elif tier in ("low", "medium"):
         col = "escalate_ema"
-        obs = 1.0 if (findings_high > 0 and kept_by_synthesis) else 0.0
+        # `kept_by_synthesis is None` means no adjudicator judged this agent, which is
+        # the normal case on the python-synthesis path. Escalating on an unjudged high
+        # finding biases toward over-escalation — more cost, never less review depth —
+        # and keeps the loop accumulating. Only an explicit rejection suppresses it.
+        obs = 1.0 if (findings_high > 0 and kept_by_synthesis is not False) else 0.0
     else:
         return
 

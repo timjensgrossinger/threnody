@@ -72,6 +72,24 @@ def test_high_findings_not_kept_does_not_escalate():
         assert (".py|mid|mid", "logic") not in load_review_tier_bias(db)
 
 
+def test_unadjudicated_high_findings_still_escalate():
+    """`None` means no adjudicator judged this agent — the normal case on the
+    python-synthesis path, where no synthesis agent is planned at all.
+
+    Treating it as a rejection would silence the learner entirely on that path;
+    treating it as evidence biases toward over-escalation, which costs money but
+    never costs review depth. That is the deliberate trade.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _db(tmp)
+        for _ in range(DEFAULT_MIN_SAMPLES + 1):
+            record_review_tier_outcome(
+                db, profile_key=".py|mid|mid", dimension="security",
+                tier="low", findings_high=2, findings_total=2, kept_by_synthesis=None,
+            )
+        assert load_review_tier_bias(db).get((".py|mid|mid", "security")) == 1
+
+
 def test_empty_db_returns_empty_map():
     with tempfile.TemporaryDirectory() as tmp:
         assert load_review_tier_bias(_db(tmp)) == {}

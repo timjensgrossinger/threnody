@@ -197,6 +197,44 @@ def test_salvage_recovers_in_place_without_claiming_a_quarantine(
     recovered.close()
 
 
+def test_rebuild_preserves_an_unadjudicated_verdict(journal_root, tmp_path: Path) -> None:
+    """`kept_by_synthesis=None` must survive a journal rebuild.
+
+    The replay handler coerced it with ``bool(...)``, which turns "no adjudicator
+    judged this" into "synthesis rejected this" — inverting the observation and
+    moving the EMA the opposite way from the live write on every rebuilt run.
+    """
+    db_path = tmp_path / "cache.db"
+    live = Database(db_path=db_path)
+    for i in range(4):
+        rl.record_review_tier_outcome(
+            live,
+            profile_key=".py|low|flat",
+            dimension="security",
+            tier="low",
+            findings_high=1,
+            findings_total=1,
+            kept_by_synthesis=None,
+            run_id=f"run-{i}",
+            spawn_id=str(i),
+        )
+    with live.conn() as conn:
+        expected = conn.execute(
+            "SELECT escalate_ema, sample_count FROM review_tier_bias"
+        ).fetchone()
+    assert expected[0] > 0.0, "an unadjudicated high finding should move the EMA"
+    live.close()
+
+    rebuilt = Database(db_path=tmp_path / "rebuilt.db")
+    rebuilt.replay_learning_journal(rebuild=True)
+    with rebuilt.conn() as conn:
+        actual = conn.execute(
+            "SELECT escalate_ema, sample_count FROM review_tier_bias"
+        ).fetchone()
+    rebuilt.close()
+    assert actual == expected
+
+
 def test_unknown_event_kind_is_counted_not_fatal(journal_root, db) -> None:
     """An older install must be able to read a newer install's journal."""
     learning_journal.append("some_future_kind", {"run_id": "r1", "x": 1})

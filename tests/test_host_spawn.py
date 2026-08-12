@@ -484,6 +484,37 @@ def test_review_cell_has_exactly_one_output_file() -> None:
     assert all("/findings/" in str(u["artifact_path"]) for u in upstream)
 
 
+def test_synthesis_agent_is_told_where_to_persist_its_verdict() -> None:
+    """The adjudicated report is the only evidence of which reviewer produced noise.
+
+    It reaches finalize as a file, not through the reply — the reply goes to the
+    operator and is truncated into an output_excerpt on the way to Threnody.
+    """
+    from shared.findings_merge import synthesis_report_path
+
+    config = TGsConfig()
+    plan = _review_plan()
+    plan["synthesis_mode"] = "llm"
+    plan["subtasks"].append({
+        "id": 2,
+        "description": "Synthesize the review.",
+        "tier": "high",
+        "read_only": True,
+        "review_synthesis": True,
+        "subagent_type": "",
+        "depends_on": [1],
+    })
+    plan["waves"] = [[1], [2]]
+    waves = build_host_spawn_waves(
+        plan, config=config, caller="claude-code", run_id="swarm-adj-test"
+    )
+    synth_prompt = waves[1]["agents"][0]["prompt"]
+    assert str(synthesis_report_path("swarm-adj-test")) in synth_prompt
+    # The review cell keeps its own protocol; the two must not be confused.
+    assert "Write your findings to" not in synth_prompt
+    assert "Write your findings to" in waves[0]["agents"][0]["prompt"]
+
+
 def test_findings_protocol_absent_without_run_id() -> None:
     """The run id names the file; without it there is nothing to write to."""
     config = TGsConfig()

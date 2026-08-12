@@ -64,13 +64,13 @@ def render_quality_markdown(snapshot: dict[str, Any]) -> str:
 
     table = [
         "| Model | Effort | Dimension | Score | n | Objective | Obj.score | Findings | "
-        "Judge | Esc.rate |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        "Unadj. | Judge | Esc.rate |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         table.append(
             "| {model} | {effort} | {dim} | {score:.2f} | {n} | {on} | {oscore} | "
-            "{fn} | {jn} | {esc:.2f} |".format(
+            "{fn} | {un} | {jn} | {esc:.2f} |".format(
                 model=row.get("model", "?"),
                 effort=_fmt_effort(row.get("effort")),
                 dim=_fmt_dim(str(row.get("dimension", "?")), row.get("sub_dimension")),
@@ -83,6 +83,7 @@ def render_quality_markdown(snapshot: dict[str, Any]) -> str:
                     else "—"
                 ),
                 fn=int(row.get("findings_n") or 0),
+                un=int(row.get("unadjudicated_n") or 0),
                 jn=int(row.get("judge_n") or 0),
                 esc=float(row.get("escalation_rate") or 0.0),
             )

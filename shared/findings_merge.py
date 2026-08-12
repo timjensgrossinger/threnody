@@ -22,7 +22,9 @@ accumulating in the parent conversation.
 Public API
 ----------
     findings_dir(run_id) / findings_path(run_id, spawn_id)
+    synthesis_report_path(run_id)
     parse_findings_text(text, ...) -> list[Finding]
+    parse_adjudication(text) -> (kept, dropped) fingerprint sets
     read_run_findings(run_id) -> dict[str, list[Finding]]
     merge(findings) -> MergeResult
     render_report(result, reviewed_files=...) -> str
@@ -39,6 +41,14 @@ from typing import Iterable, NamedTuple
 log = logging.getLogger(__name__)
 
 FINDINGS_SUBDIR = "findings"
+# The synthesis agent's own report. Deliberately a sibling of ``findings/`` rather
+# than a file inside it: ``read_run_findings`` globs ``findings/*.md``, so a report
+# living there would be re-ingested as one more agent's findings and every finding
+# would be counted twice by the merge.
+SYNTHESIS_REPORT_NAME = "synthesis.md"
+# Section header the synthesis agent writes above findings it rejected. Matched
+# case-insensitively at the start of a line; everything after it is the dropped set.
+_DROPPED_HEADER_RE = re.compile(r"^\s*#{1,6}\s*dropped\b.*$", re.IGNORECASE | re.MULTILINE)
 
 # Severity vocabulary, weakest to strongest. Anything unrecognized normalizes to
 # "medium": dropping a finding because its severity word was odd would be worse than
@@ -144,6 +154,13 @@ def findings_path(run_id: str, spawn_id: str) -> Path:
     return findings_dir(run_id) / f"{safe}.md"
 
 
+def synthesis_report_path(run_id: str, *, create: bool = False) -> Path:
+    """``<run_dir>/synthesis.md`` — the synthesis agent's adjudicated report."""
+    from .run_log import run_log_dir
+
+    return run_log_dir(run_id, create=create) / SYNTHESIS_REPORT_NAME
+
+
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
@@ -242,6 +259,101 @@ def read_run_findings(run_id: str) -> dict[str, list[Finding]]:
         spawn_id = path.stem
         out[spawn_id] = parse_findings_text(text, source=spawn_id)
     return out
+
+
+_REASON_SPLIT_RE = re.compile(r"\s+(?:—|–|--+)\s+")
+
+
+def _description_prefixes(description: str) -> list[str]:
+    """Dash-delimited prefixes of *description*, longest first, excluding itself."""
+    parts = _REASON_SPLIT_RE.split(description)
+    if len(parts) < 2:
+        return []
+    return [
+        " — ".join(parts[:n]).strip()
+        for n in range(len(parts) - 1, 0, -1)
+    ]
+
+
+def split_adjudication_sections(text: str) -> tuple[str, str]:
+    """Split a synthesis report into ``(kept_section, dropped_section)`` text.
+
+    Separate from :func:`parse_adjudication` because the two answer different
+    questions: this one is the source for *how many* findings were rejected, while
+    the fingerprint sets are for *matching* and deliberately hold several candidates
+    per rejected finding.
+    """
+    if not text or not text.strip():
+        return "", ""
+    match = _DROPPED_HEADER_RE.search(text)
+    if match is None:
+        return text, ""
+    return text[: match.start()], text[match.end():]
+
+
+def parse_adjudication(text: str) -> tuple[set[str], set[str]]:
+    """Split a synthesis report into ``(kept, dropped)`` finding fingerprints.
+
+    The sets are for membership tests only — ``len(dropped)`` is a count of candidate
+    fingerprints, not of rejected findings, because a rejection carries an appended
+    reason and each is offered under several spellings. Use
+    :func:`split_adjudication_sections` when a count is what you need.
+
+    The synthesis agent is the only reviewer of the reviewers: it is asked to
+    reject findings it judges unsupported and to list them under a ``### Dropped``
+    header. Everything above that header is what it accepted.
+
+    A report with no such header yields an empty dropped set — an agent that found
+    nothing to reject is not a parse failure. Fingerprints come from
+    :func:`review_memory.finding_fingerprint`, so they are line-independent but
+    *not* wording-independent: a paraphrased finding matches neither set and is
+    reported as unknown by :func:`review_meta_for` rather than guessed at.
+    """
+    from .review_memory import finding_fingerprint
+
+    def _fingerprints(chunk: str, *, with_reason: bool = False) -> set[str]:
+        out: set[str] = set()
+        for finding in parse_findings_text(chunk):
+            descriptions = [finding.description]
+            if with_reason:
+                # A rejected finding is copied verbatim and then has "— reason"
+                # appended, which lands inside the description and changes its
+                # fingerprint. Offer every dash-delimited prefix as a candidate so
+                # the original wording still matches; a description containing a
+                # dash of its own is covered because the full text is a candidate too.
+                descriptions.extend(_description_prefixes(finding.description))
+            out.update(
+                finding_fingerprint(finding.dimension, finding.category, description)
+                for description in descriptions
+            )
+        return out
+
+    kept_section, dropped_section = split_adjudication_sections(text)
+    if not kept_section and not dropped_section:
+        return set(), set()
+    kept = _fingerprints(kept_section)
+    dropped = _fingerprints(dropped_section, with_reason=True)
+    # A finding listed in both halves was accepted; the kept section is the report.
+    return kept, dropped - kept
+
+
+def read_synthesis_adjudication(run_id: str) -> tuple[set[str], set[str]] | None:
+    """Adjudication sets from ``<run_dir>/synthesis.md``, or ``None`` if absent.
+
+    ``None`` means no adjudicator ran (python synthesis mode, an older run, or an
+    agent that did not write the file) and must stay distinguishable from "ran and
+    kept everything" — that distinction is the whole point of the tri-state.
+    """
+    if not run_id:
+        return None
+    try:
+        path = synthesis_report_path(run_id)
+        if not path.is_file():
+            return None
+        return parse_adjudication(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        log.debug("findings_merge: unreadable synthesis report for %s", run_id, exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -348,10 +460,26 @@ def render_report(
     return "\n".join(lines)
 
 
+def _aggregate_kept(categories: dict[str, dict[str, int | bool | None]]) -> bool | None:
+    """Roll per-category verdicts up to one agent-level verdict, tri-state.
+
+    Any accepted finding makes the agent's report accepted; failing that, any
+    rejected one makes it rejected; an agent whose findings were all unmatched (or
+    that was never adjudicated) stays ``None``.
+    """
+    verdicts = [bucket.get("kept") for bucket in categories.values()]
+    if any(v is True for v in verdicts):
+        return True
+    if any(v is False for v in verdicts):
+        return False
+    return None
+
+
 def review_meta_for(
     findings: list[Finding],
     *,
     kept_fingerprints: set[str] | None = None,
+    dropped_fingerprints: set[str] | None = None,
 ) -> dict:
     """Build a ``review_meta`` payload for one agent's findings.
 
@@ -359,10 +487,26 @@ def review_meta_for(
     :mod:`shared.model_quality` skips scoring entirely when a host reports findings
     without a category breakdown, so deriving it here converts a silently-dropped
     objective signal into a recorded one.
+
+    ``kept`` is deliberately **tri-state**. ``None`` means no adjudicator judged this
+    finding — either none ran, or it ran and the finding matched neither of its
+    sections (a paraphrase). It must not collapse to ``True``: for most of this
+    module's life it did, and the resulting "every model keeps everything it reports"
+    made the precision proxy unable to observe noise, and made
+    ``review_learning.record_review_tier_outcome`` escalate a cheap tier on any
+    high-severity finding it claimed, real or not.
+
+    A category holding both an accepted and a rejected finding resolves to ``True``:
+    the dimension did surface something real, and scoring it as pure noise would be
+    the harsher error.
     """
     from .review_memory import finding_fingerprint
 
-    categories: dict[str, dict[str, int | bool]] = {}
+    adjudicated = kept_fingerprints is not None or dropped_fingerprints is not None
+    kept_set = kept_fingerprints or set()
+    dropped_set = dropped_fingerprints or set()
+
+    categories: dict[str, dict[str, int | bool | None]] = {}
     total = 0
     high = 0
     for finding in findings:
@@ -375,20 +519,24 @@ def review_meta_for(
             else finding.dimension
         )
         bucket = categories.setdefault(
-            slug, {"findings_total": 0, "findings_high": 0, "kept": False}
+            slug, {"findings_total": 0, "findings_high": 0, "kept": None}
         )
-        bucket["findings_total"] = int(bucket["findings_total"]) + 1
+        bucket["findings_total"] = int(bucket["findings_total"] or 0) + 1
         if finding.is_high:
-            bucket["findings_high"] = int(bucket["findings_high"]) + 1
-        if kept_fingerprints is None:
-            bucket["kept"] = True
-        elif finding_fingerprint(
+            bucket["findings_high"] = int(bucket["findings_high"] or 0) + 1
+        if not adjudicated:
+            continue
+        fingerprint = finding_fingerprint(
             finding.dimension, finding.category, finding.description
-        ) in kept_fingerprints:
+        )
+        if fingerprint in kept_set:
             bucket["kept"] = True
+        elif fingerprint in dropped_set and bucket["kept"] is None:
+            bucket["kept"] = False
     return {
         "findings_total": total,
         "findings_high": high,
+        "kept_by_synthesis": _aggregate_kept(categories),
         "categories": categories,
         "findings": [
             {
@@ -406,13 +554,18 @@ __all__ = [
     "DEFAULT_SEVERITY",
     "FINDINGS_SUBDIR",
     "SEVERITY_ORDER",
+    "SYNTHESIS_REPORT_NAME",
     "Finding",
     "MergeResult",
     "findings_dir",
     "findings_path",
     "merge",
+    "parse_adjudication",
     "parse_findings_text",
     "read_run_findings",
+    "read_synthesis_adjudication",
+    "split_adjudication_sections",
+    "synthesis_report_path",
     "render_report",
     "review_meta_for",
 ]

@@ -640,6 +640,25 @@ def _findings_protocol_block(run_id: str, spawn_id: str, dimension: str) -> str:
     )
 
 
+def _adjudication_block(run_id: str) -> str:
+    """Tell the synthesis agent to also persist its report where finalize can read it.
+
+    The reply stays exactly as before — the report inline — because the host surfaces
+    that to the operator. This is a side channel: the file is what lets
+    ``host_learning`` attribute a rejected finding back to the model that reported
+    it. If the agent skips it, every reviewer in the run is simply scored as
+    unadjudicated, which is the pre-existing behaviour.
+    """
+    from .findings_merge import synthesis_report_path
+
+    path = synthesis_report_path(run_id)
+    return (
+        f"Also write this same report — both the Findings and Dropped sections, "
+        f"verbatim — to {path}, creating parent directories if needed. "
+        "It is read back to record which reviewer produced noise."
+    )
+
+
 # Instruction files each host actually loads into every subagent. Deliberately
 # per-host rather than the union of all known instruction files: reporting a total no
 # single run pays would overstate the tax and cost the number its credibility.
@@ -1022,6 +1041,14 @@ def build_host_spawn_waves(
                 except Exception:
                     log.debug(
                         "host_spawn_waves: findings protocol injection failed",
+                        exc_info=True,
+                    )
+            elif subtask.get("review_synthesis") and run_id:
+                try:
+                    prompt = prompt + "\n\n" + _adjudication_block(run_id)
+                except Exception:
+                    log.debug(
+                        "host_spawn_waves: adjudication block injection failed",
                         exc_info=True,
                     )
             raw_role = subtask.get("role")

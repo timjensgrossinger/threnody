@@ -888,7 +888,9 @@ def _build_review_outcome(
                 categories[key] = {
                     "findings_total": int(cat.get("findings_total") or 0),
                     "findings_high": int(cat.get("findings_high") or 0),
-                    "kept": bool(cat.get("kept", True)),
+                    # Tri-state: None = nothing adjudicated this category. Coercing
+                    # it to True is what made every model look perfectly precise.
+                    "kept": _tri_state(cat.get("kept")),
                 }
             except (TypeError, ValueError):
                 continue
@@ -903,7 +905,9 @@ def _build_review_outcome(
         "effort": (str(agent_spec.get("effort")).strip() or None) if agent_spec.get("effort") else None,
         "findings_total": findings_total,
         "findings_high": findings_high,
-        "kept_by_synthesis": bool(review_meta.get("kept_by_synthesis", True)),
+        # bool | None. None means no adjudicator judged this agent's findings, which
+        # is not the same claim as "synthesis kept them" — see review_meta_for.
+        "kept_by_synthesis": _tri_state(review_meta.get("kept_by_synthesis")),
         "categories": categories,
         # Optional per-finding detail for prior-review memory. Absent → only counts
         # are persisted, which still enables the unchanged-revision skip but leaves
@@ -912,11 +916,35 @@ def _build_review_outcome(
     }
 
 
+# run_id -> (kept, dropped) fingerprints from that run's synthesis report. Cached
+# only once the report exists: under inline reporting wave 1 is ingested before the
+# synthesis agent has run, and a cached "absent" would then outlive the file.
+_RUN_ADJUDICATION: dict[str, tuple[set[str], set[str]]] = {}
+
+
+def _run_adjudication(run_id: str) -> tuple[set[str], set[str]] | None:
+    """Adjudication verdict for *run_id*, read once per run from the run dir."""
+    cached = _RUN_ADJUDICATION.get(run_id)
+    if cached is not None:
+        return cached
+    try:
+        from .findings_merge import read_synthesis_adjudication
+
+        verdict = read_synthesis_adjudication(run_id)
+    except Exception:
+        log.debug("host_learning: adjudication read failed for %s", run_id, exc_info=True)
+        return None
+    if verdict is not None:
+        _RUN_ADJUDICATION[run_id] = verdict
+    return verdict
+
+
 def _backfill_review_meta(
     run_id: str,
     spawn_id: str,
     agent_spec: Mapping[str, Any],
     result: Mapping[str, Any],
+    adjudication: tuple[set[str], set[str]] | None = None,
 ) -> Mapping[str, Any]:
     """Derive ``review_meta`` from this agent's findings file when the host omitted it.
 
@@ -926,6 +954,10 @@ def _backfill_review_meta(
     would silently stop. Parsing the file here also yields the per-category
     breakdown, which is *more* than hosts usually report: the static-recall scorer
     skips scoring entirely when categories are absent.
+
+    When this run's synthesis agent wrote an adjudicated report, its verdict is
+    applied here so ``kept_by_synthesis`` reflects a real judgement. Without one the
+    flag stays ``None`` — unknown, not kept.
 
     Returns *result* unchanged when the host already reported ``review_meta``, when
     this is not a review agent, or when no findings file exists.
@@ -945,8 +977,12 @@ def _backfill_review_meta(
         findings = parse_findings_text(
             path.read_text(encoding="utf-8", errors="replace"), source=spawn_id
         )
+        verdict = adjudication if adjudication is not None else _run_adjudication(run_id)
+        kept, dropped = verdict if verdict is not None else (None, None)
         merged = dict(result)
-        merged["review_meta"] = review_meta_for(findings)
+        merged["review_meta"] = review_meta_for(
+            findings, kept_fingerprints=kept, dropped_fingerprints=dropped
+        )
         return merged
     except Exception:
         log.debug(
@@ -1050,6 +1086,17 @@ def _record_static_recall(
         log.debug("model-quality static-recall capture failed", exc_info=True)
 
 
+def _tri_state(value: Any) -> bool | None:
+    """Preserve ``None`` through a bool coercion.
+
+    Every learning consumer of ``kept_by_synthesis`` used to write
+    ``bool(x)`` or ``bool(x, True)``, which erases the only state that says "no
+    adjudicator judged this" — and defaulting it to True is what let the precision
+    proxy report a keep rate it had never observed.
+    """
+    return None if value is None else bool(value)
+
+
 def _profile_key_for_outcome(outcome: Mapping[str, Any], prof: Any) -> str | None:
     """``ext|loc_bucket|density_bucket`` for this reviewed file, or None."""
     target = str(outcome.get("target_file") or "").strip()
@@ -1092,7 +1139,7 @@ def _record_review_outcome(
             tier=str(outcome["tier"]),
             findings_high=int(outcome["findings_high"]),
             findings_total=int(outcome["findings_total"]),
-            kept_by_synthesis=bool(outcome["kept_by_synthesis"]),
+            kept_by_synthesis=_tri_state(outcome.get("kept_by_synthesis")),
         )
     except Exception:  # pragma: no cover - best-effort learning
         log.debug("review-tier outcome capture failed", exc_info=True)
@@ -1124,7 +1171,7 @@ def _record_review_outcome(
             dimension=dimension,
             findings_high=int(outcome["findings_high"]),
             findings_total=int(outcome["findings_total"]),
-            kept_by_synthesis=bool(outcome["kept_by_synthesis"]),
+            kept_by_synthesis=_tri_state(outcome.get("kept_by_synthesis")),
             task_hash=task_hash,
             run_id=run_id,
             # The join axes. Without them the ledger knows which model scored
@@ -1149,7 +1196,7 @@ def _record_review_outcome(
                     sub_dimension=str(slug),
                     findings_high=int(cat.get("findings_high") or 0),
                     findings_total=int(cat.get("findings_total") or 0),
-                    kept_by_synthesis=bool(cat.get("kept", True)),
+                    kept_by_synthesis=_tri_state(cat.get("kept")),
                     task_hash=task_hash,
                     run_id=run_id,
                     tier=str(outcome.get("tier") or "") or None,
@@ -2210,6 +2257,7 @@ def finalize_host_swarm(
 
     _HOST_WAVE_TRACKERS.pop(run_id, None)
     _HOST_RUN_META.pop(run_id, None)
+    _RUN_ADJUDICATION.pop(run_id, None)
 
     result: dict[str, Any] = {
         "run_id": run_id,
@@ -2244,15 +2292,37 @@ def finalize_host_swarm(
 def _build_python_review_report(run_id: str) -> dict[str, Any] | None:
     """Merge this run's findings files into one ranked report, in-process.
 
-    Returns ``None`` when the run wrote no findings files — i.e. it was not a review
-    run, or it ran with ``synthesis_mode=llm`` and a synthesis agent produced the
-    report instead. Never raises: a merge failure must not fail the terminal report,
-    and the individual findings files remain on disk either way.
+    When the synthesis agent wrote an adjudicated report, that report wins: it is the
+    only version whose findings were judged, and reporting the raw pre-adjudication
+    merge instead would hand the operator findings synthesis had already rejected.
+
+    Returns ``None`` when the run produced neither — i.e. it was not a review run.
+    Never raises: a merge failure must not fail the terminal report, and the
+    individual findings files remain on disk either way.
     """
     if not run_id:
         return None
     try:
-        from .findings_merge import merge, read_run_findings, render_report
+        from .findings_merge import (
+            merge,
+            parse_findings_text,
+            read_run_findings,
+            render_report,
+            split_adjudication_sections,
+            synthesis_report_path,
+        )
+
+        adjudicated = synthesis_report_path(run_id)
+        if adjudicated.is_file():
+            text = adjudicated.read_text(encoding="utf-8", errors="replace")
+            kept_section, dropped_section = split_adjudication_sections(text)
+            return {
+                "source": "llm",
+                "adjudicated": True,
+                "findings_total": len(parse_findings_text(kept_section)),
+                "findings_dropped": len(parse_findings_text(dropped_section)),
+                "report": text,
+            }
 
         per_agent = read_run_findings(run_id)
         if not per_agent:

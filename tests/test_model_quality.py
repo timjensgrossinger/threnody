@@ -34,6 +34,33 @@ def test_findings_to_score_precision_proxy() -> None:
     assert mq.findings_to_score(findings_high=3, findings_total=3, kept_by_synthesis=False) == 3.0
     # no findings -> no signal (None, so the ledger is not diluted)
     assert mq.findings_to_score(findings_high=0, findings_total=0, kept_by_synthesis=True) is None
+    # unadjudicated (None) is NOT a rejection: nothing judged these findings, so they
+    # score as yield. Only an explicit False is evidence of noise.
+    assert mq.findings_to_score(findings_high=1, findings_total=1, kept_by_synthesis=None) == 10.0
+    assert mq.findings_to_score(findings_high=0, findings_total=1, kept_by_synthesis=None) == 7.0
+
+
+def test_unadjudicated_rows_are_tagged(db: Database) -> None:
+    """Without this flag the ledger cannot tell "a judge accepted it" from "no judge
+    ran", which is how the proxy came to report a precision it never measured."""
+    import json
+
+    for kept in (None, True, False):
+        mq.record_findings_score(
+            db, model="m", effort=None, dimension="security",
+            sub_dimension=f"security/{kept}",
+            findings_high=1, findings_total=1, kept_by_synthesis=kept,
+        )
+    with db.conn() as conn:
+        rows = conn.execute(
+            "SELECT sub_dimension, score_0_10, sample_meta FROM model_quality_events"
+        ).fetchall()
+    by_sub = {sub: (score, json.loads(meta)) for sub, score, meta in rows}
+    assert by_sub["security/None"][1]["adjudicated"] is False
+    assert by_sub["security/True"][1]["adjudicated"] is True
+    assert by_sub["security/False"][1]["adjudicated"] is True
+    # The noise branch is now reachable — it never fired before adjudication existed.
+    assert by_sub["security/False"][0] == 3.0
 
 
 # ---------------------------------------------------------------------------

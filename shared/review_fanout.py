@@ -230,7 +230,10 @@ def dimension_for_subagent_type(subagent_type: object) -> str:
 _SYNTHESIS_PROMPT = """\
 You are the synthesis agent for a multi-dimension code review swarm.
 Your context contains output_excerpt summaries from each review agent that ran in prior waves.
-Collect all reported findings and produce a unified ranked report.
+Collect the reported findings, ADJUDICATE them, and produce a unified ranked report.
+
+You are the only reviewer of the reviewers. A finding you cannot substantiate from the
+code is noise, and reporting it costs the operator more than missing it would.
 
 ## Format
 
@@ -241,7 +244,15 @@ N critical, N high, N medium, N low issues across N files.
 
 ⚠️ [SEVERITY] category — file:line — description [(CWE-XXX)]
 
+### Dropped
+⚠️ [SEVERITY] category — file:line — description — reason for rejecting it
+
 Deduplicate: if the same issue appears in multiple dimension reviews, keep the highest severity instance.
+A duplicate is NOT a drop — list it nowhere; only findings you reject belong under "### Dropped".
+Reject a finding when the cited code does not support it, the described condition cannot occur,
+or the severity claimed is not defensible. Copy rejected findings VERBATIM from the agent that
+reported them, then append the reason — the wording is how the run attributes precision to a model.
+Omit the "### Dropped" section entirely if you rejected nothing.
 Output "No issues found." if all dimension agents reported clean.
 """
 
@@ -1666,6 +1677,10 @@ def build_review_subtasks(
             "depends_on": review_ids,
             "subagent_type": "",  # empty → resolved to threnody-high by tier in host_spawn
             "read_only": True,
+            # Marks this as the adjudicating agent so host_spawn can tell it where to
+            # write its report. Its verdict is what makes `kept_by_synthesis` mean
+            # anything — without a written report the flag stays unknown.
+            "review_synthesis": True,
         })
 
     n_files = len(entries)

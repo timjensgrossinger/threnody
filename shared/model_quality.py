@@ -75,7 +75,7 @@ def findings_to_score(
     *,
     findings_high: int,
     findings_total: int,
-    kept_by_synthesis: bool,
+    kept_by_synthesis: bool | None,
 ) -> float | None:
     """Map review findings to a 0-10 quality score (precision proxy).
 
@@ -85,6 +85,12 @@ def findings_to_score(
     findings the synthesis KEPT (true positives) and penalises findings it dropped
     (noise / false positives). Heuristic and intentionally coarse — tunable.
 
+    ``kept_by_synthesis`` is tri-state. ``None`` — no adjudicator ran — scores as
+    yield, identically to an accepted finding, because refusing to score would leave
+    the review-learning loop with nothing on the python-synthesis path. The caller
+    tags such rows ``adjudicated=false``; only an explicit ``False`` is precision
+    evidence.
+
     Validity caveat: because clean reviews earn no signal and any dropped finding
     scores low (even a correct high-severity one synthesis chose to drop), this
     signal skews toward models that surface *kept* findings on dirty code. Treat it
@@ -93,7 +99,7 @@ def findings_to_score(
     """
     if findings_total <= 0:
         return None
-    if not kept_by_synthesis:
+    if kept_by_synthesis is False:
         return 3.0  # findings dropped by synthesis -> noisy / low precision
     if findings_high > 0:
         return 10.0  # kept a real high-severity finding
@@ -227,7 +233,7 @@ def record_findings_score(
     dimension: str,
     findings_high: int,
     findings_total: int,
-    kept_by_synthesis: bool,
+    kept_by_synthesis: bool | None,
     sub_dimension: str | None = None,
     task_hash: str | None = None,
     run_id: str | None = None,
@@ -238,6 +244,12 @@ def record_findings_score(
     """Score one review agent's findings and record it (source='findings').
 
     No-op when the findings carry no signal (see :func:`findings_to_score`).
+
+    ``kept_by_synthesis=None`` means nothing adjudicated these findings. The row is
+    still written — yield is real information — but ``sample_meta.adjudicated`` marks
+    it so a reader can separate "a judge accepted this" from "no judge ran". Without
+    that flag the two are indistinguishable in the ledger, which is how the proxy came
+    to report precision it had never measured.
     """
     score = findings_to_score(
         findings_high=findings_high,
@@ -257,7 +269,10 @@ def record_findings_score(
         sample_meta={
             "findings_high": int(findings_high),
             "findings_total": int(findings_total),
-            "kept_by_synthesis": bool(kept_by_synthesis),
+            "kept_by_synthesis": (
+                None if kept_by_synthesis is None else bool(kept_by_synthesis)
+            ),
+            "adjudicated": kept_by_synthesis is not None,
         },
         task_hash=task_hash,
         run_id=run_id,
@@ -621,7 +636,12 @@ def build_quality_snapshot(
                 "SUM(CASE WHEN source IN ('static_recall', 'verify_gate', 'ladder') "
                 "THEN 1 ELSE 0 END), "
                 "AVG(CASE WHEN source IN ('static_recall', 'verify_gate', 'ladder') "
-                "THEN score_0_10 END) "
+                "THEN score_0_10 END), "
+                # Findings rows nothing adjudicated. They measure yield, not
+                # precision: no judge ever saw them, so they cannot score below 7.
+                "SUM(CASE WHEN source='findings' "
+                "AND json_extract(sample_meta, '$.adjudicated') IS NOT 1 "
+                "THEN 1 ELSE 0 END) "
                 "FROM model_quality_events WHERE ts >= ? "
                 "GROUP BY model, effort, dimension, sub_dimension "
                 "ORDER BY model, dimension, sub_dimension",
@@ -645,6 +665,7 @@ def build_quality_snapshot(
         judge_n,
         objective_n,
         objective_avg,
+        unadjudicated_n,
     ) in grouped:
         n = int(n or 0)
         total_events += n
@@ -667,6 +688,9 @@ def build_quality_snapshot(
             "objective_avg": (
                 round(float(objective_avg), 2) if objective_avg is not None else None
             ),
+            # Of findings_n, how many no adjudicator judged. A row where this equals
+            # findings_n reports how much a model found, never how much of it was real.
+            "unadjudicated_n": int(unadjudicated_n or 0),
             "escalation_rate": esc_rates.get((str(model), effort), 0.0),
         })
 
@@ -683,8 +707,9 @@ def build_quality_snapshot(
             "and an opt-out LLM judge (source='judge'); those two are relative "
             "learning signals, not an absolute model benchmark. objective_avg covers "
             "only the ground-truth sources (static_recall, verify_gate, ladder) and "
-            "is the column to trust when objective_n is non-zero. escalation_rate is "
-            "approximate."
+            "is the column to trust when objective_n is non-zero. unadjudicated_n "
+            "counts findings rows no synthesis agent judged — those measure yield, "
+            "not precision, and cannot score below 7. escalation_rate is approximate."
         ),
         "cli_hint": f"threnody quality --since {window_label}",
     }

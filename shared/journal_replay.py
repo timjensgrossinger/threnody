@@ -79,7 +79,13 @@ def _replay_review_tier(db: Any, event: dict[str, Any]) -> None:
         tier=str(event.get("tier") or ""),
         findings_high=int(event.get("findings_high") or 0),
         findings_total=int(event.get("findings_total") or 0),
-        kept_by_synthesis=bool(event.get("kept_by_synthesis")),
+        # Tri-state: a missing/None verdict must NOT collapse to False here, or the
+        # rebuild would invert every unadjudicated observation the live path recorded.
+        kept_by_synthesis=(
+            None
+            if event.get("kept_by_synthesis") is None
+            else bool(event.get("kept_by_synthesis"))
+        ),
         journal=False,  # we are reading the journal; re-appending would grow it
     )
 
