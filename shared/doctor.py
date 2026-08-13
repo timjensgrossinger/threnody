@@ -329,7 +329,7 @@ def main(argv: list[str] | None = None) -> None:
     if db_path.exists():
         try:
             from .db import Database
-            db = Database(str(db_path))
+            db = Database(db_path)
         except Exception as exc:
             print(f"warning: could not open DB — {exc}", file=sys.stderr)
 
