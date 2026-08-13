@@ -28,7 +28,7 @@ from .discovery import (
     _copilot_subprocess_env,
     _copilot_supports_model_flag,
 )
-from .db import Database, task_cache_key
+from .db import Database, PlanCacheLookup, task_cache_key
 from .agents import AgentRegistry, build_learned_agent_runtime_context
 from .plan_cache import (
     PLAN_CACHE_EXPIRED,
@@ -737,6 +737,13 @@ class ClaudeCodeBackend(CLIBackend):
         except subprocess.TimeoutExpired:
             log.warning("claude CLI timed out after %ds", timeout)
             return None
+        except (OSError, RuntimeError) as exc:
+            # Same class GhCopilotBackend already handles (PermissionError on a
+            # non-executable claude, ENOMEM/EAGAIN on fork, BrokenPipeError
+            # writing input=prompt) — without this it propagated out of the
+            # backend instead of letting the planner report planner_no_output.
+            log.warning("claude CLI setup failed: %s", exc)
+            return None
 
 
 class ProviderAgnosticBackend(CLIBackend):
@@ -808,11 +815,19 @@ def parse_planner_output(raw: str) -> dict:
         raise PlannerParseError("Planner output contained an empty plan payload")
 
     try:
-        return json.loads(payload)
+        parsed = json.loads(payload)
     except json.JSONDecodeError as exc:
         raise PlannerParseError(
             f"Invalid planner JSON at line {exc.lineno} column {exc.colno}: {exc.msg}"
         ) from exc
+    if not isinstance(parsed, dict):
+        # A bare `null`/number/string top-level value used to reach `plan()`'s
+        # `"subtasks" not in parsed` check and raise TypeError there instead of
+        # PlannerParseError — the only exception type callers catch to fall back.
+        raise PlannerParseError(
+            f"Planner JSON must be an object, got {type(parsed).__name__}"
+        )
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -1133,7 +1148,7 @@ class Planner:
 
         # 1. Check plan cache
         if not skip_cache and self._db:
-            lookup = self._db.plan_lookup(cache_key)
+            lookup = self._safe_plan_lookup(cache_key)
             if lookup.status == "hit" and lookup.plan and "subtasks" in lookup.plan:
                 log.info("Plan cache hit — reusing cached decomposition")
                 plan = self._build_plan(lookup.plan, task)
@@ -1256,6 +1271,22 @@ class Planner:
                 "Planner output omitted required 'subtasks' field",
                 diagnostics_id,
             )
+        if not isinstance(parsed["subtasks"], list):
+            diagnostics_id = self._log_planner_telemetry(
+                task,
+                planner_tokens=planner_tokens,
+                estimated_tokens=planner_tokens.total_tokens,
+                actual_tokens=self._backend_actual_tokens(planner_tokens.total_tokens),
+                timing_ms=int((time.monotonic() - started_at) * 1000),
+                success=False,
+                parse_diagnostics=_sanitize_parse_diagnostics(raw),
+                reason="planner_subtasks_not_list",
+            )
+            raise PlannerParseError(
+                f"Planner 'subtasks' must be a list, got "
+                f"{type(parsed['subtasks']).__name__}",
+                diagnostics_id,
+            )
 
         plan = self._build_plan(parsed, task)
         plan.planner_tokens = planner_tokens
@@ -1272,7 +1303,7 @@ class Planner:
 
         # 3. Cache the plan
         if self._db:
-            self._db.plan_put(cache_key, self.plan_to_dict(plan), self._planner_model)
+            self._safe_plan_put(cache_key, self.plan_to_dict(plan), self._planner_model)
 
         return plan
 
@@ -1310,7 +1341,7 @@ class Planner:
             cache_key += f"\n\nCALLER: {caller}"
 
         if not skip_cache and self._db:
-            lookup = self._db.plan_lookup(cache_key)
+            lookup = self._safe_plan_lookup(cache_key)
             if lookup.status == "hit" and lookup.plan and "subtasks" in lookup.plan:
                 log.info("Plan cache hit — reusing cached heuristic decomposition")
                 plan = self._build_plan(lookup.plan, task)
@@ -1374,7 +1405,7 @@ class Planner:
             reason="planner_heuristic",
         )
         if self._db:
-            self._db.plan_put(cache_key, self.plan_to_dict(plan), self._planner_model)
+            self._safe_plan_put(cache_key, self.plan_to_dict(plan), self._planner_model)
         return plan
 
     def _build_plan(self, parsed: dict, original_task: str) -> ExecutionPlan:
@@ -1399,7 +1430,20 @@ class Planner:
                     log.warning("Ignoring non-positive max_rounds value: %r", raw_max_rounds)
         stable_id_prefix = self._stable_id_prefix(parsed)
 
-        for i, raw_subtask in enumerate(parsed.get("subtasks", [])):
+        raw_subtasks = parsed.get("subtasks", [])
+        if not isinstance(raw_subtasks, list):
+            # Defensive: plan() validates this for the LLM-output path, but
+            # plan_heuristic() also reaches here with a cached plan dict read
+            # straight from the plan_cache table — a corrupted/tampered row
+            # should degrade to an empty plan, not raise TypeError from
+            # enumerate(None) deep inside plan building.
+            log.warning(
+                "_build_plan: 'subtasks' is not a list (got %s) — treating as empty",
+                type(raw_subtasks).__name__,
+            )
+            raw_subtasks = []
+        id_remap: dict[int, int] = {}
+        for i, raw_subtask in enumerate(raw_subtasks):
             st_data = raw_subtask if isinstance(raw_subtask, dict) else {}
             raw_id = st_data.get("id", i + 1)
             try:
@@ -1407,9 +1451,14 @@ class Planner:
             except (TypeError, ValueError):
                 log.warning("Invalid subtask id %r; using fallback id %d", raw_id, i + 1)
                 st_id = i + 1
+            declared_id = st_id
             if st_id in seen_ids:
                 st_id = max(seen_ids) + 1
             seen_ids.add(st_id)
+            # Every declared id maps to its final id (identity when unchanged) so
+            # a later subtask's depends_on can be resolved against where a
+            # duplicate actually ended up, not the id it was renamed away from.
+            id_remap[declared_id] = st_id
 
             raw_tier = st_data.get("tier", "medium")
             tier = raw_tier.lower() if isinstance(raw_tier, str) else "medium"
@@ -1420,7 +1469,25 @@ class Planner:
             deps = st_data.get("depends_on", [])
             if not isinstance(deps, list):
                 deps = []
-            deps = [d for d in deps if isinstance(d, int) and d != st_id]
+            # Coerce numeric-looking values (LLM planners routinely emit "1" or
+            # 1.0) instead of silently dropping every non-int entry — a plan
+            # can otherwise collapse from dag/sequential to fully parallel with
+            # only a log line to explain it.
+            coerced_deps = []
+            for d in deps:
+                if isinstance(d, bool):
+                    continue
+                if isinstance(d, int):
+                    coerced_deps.append(d)
+                    continue
+                try:
+                    coerced_deps.append(int(d))
+                except (TypeError, ValueError):
+                    continue
+            # Self-reference and id-remap resolution happen in a second pass
+            # below, once every subtask's final id is known — depends_on here
+            # is still in ORIGINAL declared-id space.
+            deps = coerced_deps
 
             raw_description = st_data.get("description", original_task)
             if isinstance(raw_description, str) and raw_description.strip():
@@ -1447,11 +1514,14 @@ class Planner:
             target_files = self._coerce_target_files(
                 st_data.get("target_files"), primary=target_file
             )
-            single_file_insertion = bool(st_data.get("single_file_insertion", False))
+            single_file_insertion = self._coerce_bool(st_data.get("single_file_insertion"))
 
             raw_subagent_type = self._coerce_optional_text(st_data.get("subagent_type"))
             subagent_type: str | None = raw_subagent_type.strip() if raw_subagent_type else None
-            read_only = bool(st_data.get("read_only", False))
+            # _coerce_bool, not bare bool(): a write subtask arriving with the
+            # JSON string "false"/"no"/"0" must not be marked read-only and
+            # silently skip its target_file write.
+            read_only = self._coerce_bool(st_data.get("read_only"))
             raw_role = self._coerce_optional_text(st_data.get("role"))
             if raw_role and raw_role.strip():
                 subtask_role: str | None = raw_role.strip()
@@ -1527,6 +1597,24 @@ class Planner:
 
         if not subtasks:
             return self._single_agent_fallback(original_task)
+
+        if any(declared != final for declared, final in id_remap.items()):
+            # A duplicate id got renamed during the build above; depends_on was
+            # left in original declared-id space until now (id_remap wasn't
+            # complete until every subtask had been scanned) — resolve it here
+            # so a dependency on a since-renamed duplicate lands on where that
+            # duplicate actually ended up, not on whichever subtask now holds
+            # its old id.
+            remapped_subtasks = []
+            for st in subtasks:
+                new_deps = [
+                    d for d in (id_remap.get(dep, dep) for dep in st.depends_on)
+                    if d != st.id
+                ]
+                remapped_subtasks.append(
+                    st if new_deps == st.depends_on else replace(st, depends_on=new_deps)
+                )
+            subtasks = remapped_subtasks
 
         waves = build_waves(subtasks)
         # D-01/D-02: reject static plans with multiple same-wave coordinators
@@ -1616,7 +1704,7 @@ class Planner:
                     )
                     log.debug(f"Matched agent {matched_agent.get('agent_id', '?')} to subtask: {st.description[:50]}...")
                     continue
-            except (AttributeError, Exception) as e:
+            except Exception as e:
                 log.debug(f"match_agent_to_subtask failed: {e}, falling back to find_match")
             
             # Fallback to existing find_match for backward compatibility
@@ -1633,9 +1721,12 @@ class Planner:
                             "Auto-assigned agent %s to subtask %d (score=%.2f)",
                             match.agent.pattern_hash[:8], st.id, match.score,
                         )
-            except (AttributeError, Exception):
-                # find_match not available, continue without agent matching
-                pass
+            except Exception as exc:
+                # find_match not available (or itself broken) — continue without
+                # agent matching, but visibly: a silent `pass` here previously
+                # made a broken/partially-migrated registry indistinguishable
+                # from "method not available" for every subtask.
+                log.debug("find_match failed: %s", exc, exc_info=True)
         
         return subtasks
 
@@ -1680,6 +1771,27 @@ class Planner:
                 return value
         return fallback
 
+    def _safe_plan_lookup(self, cache_key: str) -> PlanCacheLookup:
+        """``self._db.plan_lookup`` that degrades to a cache miss on failure.
+
+        The plan cache is pure best-effort — a sqlite failure here (this
+        install's recurring ``database disk image is malformed``, in
+        particular) must not block planning entirely; it should look
+        exactly like an ordinary cache miss to the caller.
+        """
+        try:
+            return self._db.plan_lookup(cache_key)
+        except Exception:
+            log.debug("plan_lookup failed — treating as cache miss", exc_info=True)
+            return PlanCacheLookup(status="miss")
+
+    def _safe_plan_put(self, cache_key: str, plan_dict: dict, model: str) -> None:
+        """``self._db.plan_put`` that never discards an already-built plan on failure."""
+        try:
+            self._db.plan_put(cache_key, plan_dict, model)
+        except Exception:
+            log.debug("plan_put failed — plan not cached", exc_info=True)
+
     def _log_planner_telemetry(
         self,
         task: str,
@@ -1694,25 +1806,34 @@ class Planner:
     ) -> int | None:
         if not self._db:
             return None
-        return self._db.log_agent_result(
-            session_id="planner",
-            task_hash=task_cache_key(task),
-            agent_id=0,
-            tier="medium",
-            model=self._planner_model,
-            success=success,
-            tokens_used=planner_tokens.total_tokens,
-            provider_name=self._backend.__class__.__name__,
-            used_fallback=False,
-            used_speculation=False,
-            estimated_tokens=estimated_tokens,
-            actual_tokens=actual_tokens,
-            timing_ms=timing_ms,
-            rework_count=0,
-            parse_diagnostics=parse_diagnostics,
-            reason=reason,
-            version="planner",
-        )
+        try:
+            return self._db.log_agent_result(
+                session_id="planner",
+                task_hash=task_cache_key(task),
+                agent_id=0,
+                tier="medium",
+                model=self._planner_model,
+                success=success,
+                tokens_used=planner_tokens.total_tokens,
+                provider_name=self._backend.__class__.__name__,
+                used_fallback=False,
+                used_speculation=False,
+                estimated_tokens=estimated_tokens,
+                actual_tokens=actual_tokens,
+                timing_ms=timing_ms,
+                rework_count=0,
+                parse_diagnostics=parse_diagnostics,
+                reason=reason,
+                version="planner",
+            )
+        except Exception:
+            # Never let telemetry break the caller (mirrors
+            # evaluate_fanout._log_decision) — on the no-output/parse-failure
+            # paths this used to replace a real PlannerParseError with a
+            # DatabaseError, and on the success path it discarded an
+            # already-built plan.
+            log.debug("planner telemetry logging failed", exc_info=True)
+            return None
 
     @staticmethod
     def _coerce_artifact_types(value: object) -> list[str]:

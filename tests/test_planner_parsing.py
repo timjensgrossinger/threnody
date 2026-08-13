@@ -120,6 +120,76 @@ def test_build_plan_falls_back_for_non_string_subtask_fields(tmp_path: Path) -> 
     assert plan.subtasks[0].depends_on == []
 
 
+def test_parse_planner_output_rejects_non_dict_top_level() -> None:
+    """A bare JSON null/number/string top-level value must raise
+    PlannerParseError, not let TypeError/AttributeError escape from plan()."""
+    for payload in ("null", "42", '"just a string"', "[1, 2, 3]"):
+        raw = f"<PLAN_JSON>\n{payload}\n</PLAN_JSON>"
+        with pytest.raises(PlannerParseError):
+            parse_planner_output(raw)
+
+
+def test_build_plan_coerces_bool_strings_for_read_only_and_single_file(tmp_path: Path) -> None:
+    """Regression: bare bool() on a JSON string made "false"/"no"/"0" all
+    evaluate True — a write subtask arriving with read_only: "false" was
+    marked read-only and silently never wrote its target_file."""
+    db_path = tmp_path / "planner.db"
+    planner = Planner(
+        TGsConfig(db_path=db_path),
+        MockPlannerBackend(None),
+        Database(db_path=db_path),
+    )
+
+    plan = planner._build_plan({
+        "subtasks": [
+            {
+                "id": 1,
+                "description": "write it",
+                "read_only": "false",
+                "single_file_insertion": "no",
+            },
+            {
+                "id": 2,
+                "description": "actually read only",
+                "read_only": "true",
+                "single_file_insertion": "1",
+            },
+        ],
+    }, "task")
+
+    st1, st2 = plan.subtasks
+    assert st1.read_only is False
+    assert st1.single_file_insertion is False
+    assert st2.read_only is True
+    assert st2.single_file_insertion is True
+
+
+def test_build_plan_rewrites_depends_on_after_duplicate_id_rekey(tmp_path: Path) -> None:
+    """Regression: ids [1, 1, 2] used to rename the second subtask to 2 and the
+    third (declared id 2) to 3 — so depends_on: [2] resolved to the wrong
+    subtask (the renamed duplicate) instead of the one that declared id 2."""
+    db_path = tmp_path / "planner.db"
+    planner = Planner(
+        TGsConfig(db_path=db_path),
+        MockPlannerBackend(None),
+        Database(db_path=db_path),
+    )
+
+    plan = planner._build_plan({
+        "subtasks": [
+            {"id": 1, "description": "first"},
+            {"id": 1, "description": "duplicate of first"},
+            {"id": 2, "description": "declared id 2"},
+            {"id": 3, "description": "depends on declared id 2", "depends_on": [2]},
+        ],
+    }, "task")
+
+    by_description = {st.description: st for st in plan.subtasks}
+    declared_two = by_description["declared id 2"]
+    dependent = by_description["depends on declared id 2"]
+    assert dependent.depends_on == [declared_two.id]
+
+
 # ---------------------------------------------------------------------------
 # From test_planner_host_native.py
 # ---------------------------------------------------------------------------
