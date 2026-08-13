@@ -93,6 +93,7 @@ from .swarm import (
 )
 
 if TYPE_CHECKING:
+    from .consensus import ConsensusResult
     from .router import TaskRouter
 
 log = logging.getLogger(__name__)
@@ -444,7 +445,7 @@ class WorkerSession:
                         f"Policy denied session_send: {verdict.reason}"
                     )
             except ImportError:
-                pass
+                log.debug("session_send policy evaluation unavailable — failing open", exc_info=True)
         with self._lock:
             proc = self._proc
             if proc is None or proc.poll() is not None:
@@ -458,16 +459,24 @@ class WorkerSession:
                 output_lines: list[str] = []
                 deadline = time.monotonic() + timeout
                 assert proc.stdout is not None
+                got_sentinel = False
+                eof = False
                 while time.monotonic() < deadline:
                     ready, _, _ = _select.select([proc.stdout], [], [], 1.0)
                     if ready:
                         line = proc.stdout.readline()
                         if not line:
+                            eof = True
                             break
                         output_lines.append(line)
                         if line.strip() == "<<END>>":
+                            got_sentinel = True
                             break
-                output = "".join(output_lines).replace("<<END>>\n", "")
+                # Strip the sentinel whether or not it carried a trailing newline
+                # (readline() at true EOF can return it bare).
+                output = (
+                    "".join(output_lines).replace("<<END>>\n", "").replace("<<END>>", "")
+                )
                 if self._db is not None:
                     try:
                         self._db.update_worker_session(
@@ -475,8 +484,22 @@ class WorkerSession:
                             token_count_delta=len(output.split()),
                         )
                     except Exception:
-                        pass
-                return {"output": output, "session_id": self.session_id}
+                        log.debug(
+                            "update_worker_session token_count_delta failed for %s",
+                            self.session_id, exc_info=True,
+                        )
+                result: dict = {"output": output, "session_id": self.session_id}
+                if not got_sentinel and not eof:
+                    # Deadline reached with no <<END>> sentinel and no EOF: the
+                    # buffer is a partial read, not a complete response — the
+                    # caller must not treat this as a normal successful result.
+                    result["truncated"] = True
+                    log.warning(
+                        "Session %s: send() timed out after %ds waiting for "
+                        "<<END>> — returning a truncated response",
+                        self.session_id, timeout,
+                    )
+                return result
             except Exception as exc:
                 raise RuntimeError(f"Session {self.session_id} send failed: {exc}") from exc
 
@@ -509,7 +532,13 @@ class WorkerSession:
             try:
                 self._db.update_worker_session(self.session_id, status="closed", touch=False)
             except Exception:
-                pass
+                # Silent here previously left a session marked "active" in the
+                # DB with nothing in the log to explain why reap_idle's TTL
+                # logic never saw it close.
+                log.debug(
+                    "update_worker_session status=closed failed for %s",
+                    self.session_id, exc_info=True,
+                )
 
     @property
     def is_alive(self) -> bool:
@@ -588,7 +617,6 @@ class SessionManager:
 
     def reap_idle(self, idle_ttl_seconds: float) -> list[str]:
         """Close sessions that have been idle past ttl. Returns closed session_ids."""
-        cutoff = time.monotonic() - idle_ttl_seconds
         reaped: list[str] = []
         with self._lock:
             stale = [
@@ -597,15 +625,20 @@ class SessionManager:
             ]
             for sid in stale:
                 self._sessions.pop(sid, None)
+        # Report these now — previously they were popped but never added to the
+        # returned list, so a caller driving a reap loop off this value
+        # concluded nothing was reaped even though registry entries were dropped.
+        reaped.extend(stale)
         # DB reap via last_used_at timestamp
         if self._db is not None:
             try:
-                reaped = self._db.reap_idle_sessions(idle_ttl_seconds)
-                for sid in reaped:
+                db_reaped = self._db.reap_idle_sessions(idle_ttl_seconds)
+                for sid in db_reaped:
                     with self._lock:
                         session = self._sessions.pop(sid, None)
                     if session is not None:
                         session.close()
+                reaped.extend(sid for sid in db_reaped if sid not in reaped)
             except Exception:
                 log.debug("reap_idle_sessions failed", exc_info=True)
         return reaped
@@ -1143,13 +1176,35 @@ class Orchestrator:
             subtask.id, current_tier, next_tier, reason, token_count, next_model,
         )
         retry_subtask = replace(subtask, tier=next_tier)
-        try:
-            output = chosen_provider.execute(retry_subtask, next_model, timeout)
-        except TypeError:
-            output = chosen_provider.execute(retry_subtask, next_model)
+        output = self._call_provider_execute(chosen_provider, retry_subtask, next_model, timeout)
         if output is None:
             output = "(no output)"
         return output, next_tier, next_model
+
+    @staticmethod
+    def _call_provider_execute(
+        provider: "Provider", subtask: Subtask, model: str, timeout: int,
+    ) -> str | None:
+        """Call ``provider.execute`` with or without ``timeout``, matching its real signature.
+
+        Probing via ``inspect.signature`` — rather than calling with ``timeout``
+        and catching ``TypeError`` on arity mismatch — means a TypeError raised
+        from inside the provider's own logic (bad kwarg, ``None`` in a
+        format/join, an adapter bug) is no longer indistinguishable from "this
+        provider doesn't take a timeout arg". The old except-and-retry pattern
+        silently re-ran the whole subtask a second time on ANY TypeError, which
+        is a duplicate side-effecting run for anything with a ``target_file``.
+        """
+        try:
+            params = inspect.signature(provider.execute).parameters
+            accepts_timeout = "timeout" in params or any(
+                p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values()
+            )
+        except (TypeError, ValueError):
+            accepts_timeout = True  # introspection failed — assume the common case
+        if accepts_timeout:
+            return provider.execute(subtask, model, timeout)
+        return provider.execute(subtask, model)
 
     def _check_output_quality_for_retry(self, output: str) -> str | None:
         """Return a failure reason string if *output* fails quality checks, else ``None``."""
@@ -1174,7 +1229,12 @@ class Orchestrator:
 
         # (c) Mid-sentence ending (gated by config flag)
         if self._config.quality_check_incomplete_output:
-            if not re.search(r'[.?!}\]`\'"]', output[-20:]) if len(output) >= 20 else False:
+            # `output[-20:]` is already safe on a string shorter than 20 chars
+            # (slicing just returns the whole thing) — the removed length guard
+            # made this a no-op ternary that evaluated to `False` for every
+            # short output, which is exactly the class of truncation this check
+            # exists to catch.
+            if not re.search(r'[.?!}\]`\'"]', output[-20:]):
                 return "incomplete_output"
 
         return None
@@ -1387,13 +1447,13 @@ class Orchestrator:
 
         chosen_provider = provider_override or self._provider
         # Provider.execute may accept different signatures depending on adapter
-        try:
-            output = chosen_provider.execute(enriched, model, timeout)
-        except TypeError:
-            # Fallback: some Provider implementations expect (prompt, model)
-            output = chosen_provider.execute(enriched, model)
+        output = self._call_provider_execute(chosen_provider, enriched, model, timeout)
 
-        success_actual = output is not None
+        # Meaningfully empty (None or whitespace-only) counts as failure too —
+        # an empty string used to read as success (token_count=0, no ceiling
+        # escalation, no quality retry) and still got persisted as a
+        # "completed" artifact and learning pattern.
+        success_actual = output is not None and output.strip() != ""
         if output is None:
             output = "(no output)"
 
@@ -1593,22 +1653,23 @@ class Orchestrator:
                     full_payload=output,
                     compact_summary=make_compact_summary(output),
                 )
-                # Increment publish counter for this execution / task
+                # Increment publish counter for this execution / task. self._db
+                # and execution_id are already known non-None by this point (the
+                # function-level guard above returns early otherwise) — no need
+                # to re-check them, and the inner except already handles every
+                # failure this can raise, so there is nothing left for an outer
+                # wrapper to catch.
                 try:
-                    if self._db is not None and execution_id is not None:
-                        try:
-                            self._db.write_telemetry_row(
-                                session_id=str(id(self)),
-                                task_hash=execution_id,
-                                agent_id=int(subtask.id) if hasattr(subtask, 'id') else 0,
-                                tier=subtask.tier if hasattr(subtask, 'tier') else "",
-                                model="",
-                                artifact_publish_count=1,
-                            )
-                        except Exception:
-                            log.debug("orchestrator: failed to write artifact_publish telemetry", exc_info=True)
+                    self._db.write_telemetry_row(
+                        session_id=str(id(self)),
+                        task_hash=execution_id,
+                        agent_id=int(subtask.id) if hasattr(subtask, 'id') else 0,
+                        tier=subtask.tier if hasattr(subtask, 'tier') else "",
+                        model="",
+                        artifact_publish_count=1,
+                    )
                 except Exception:
-                    pass
+                    log.debug("orchestrator: failed to write artifact_publish telemetry", exc_info=True)
             except Exception:
                 log.warning(
                     "Failed to persist artifact '%s' for subtask %d",
@@ -1911,8 +1972,13 @@ class Orchestrator:
         )
         rounds_data: list[dict] = []
         current_subtask = subtask
+        # ConvergenceTarget validates nothing on construction; max_rounds <= 0
+        # would make range() empty, the loop body would never run, and `result`
+        # below would be referenced unbound. The MCP surface already clamps with
+        # max(1, ...) — this function must not depend on every caller doing so.
+        effective_max_rounds = max(1, ct.max_rounds)
 
-        for round_n in range(1, ct.max_rounds + 1):
+        for round_n in range(1, effective_max_rounds + 1):
             if round_n > 1 and rounds_data:
                 prior_out = rounds_data[-1].get("output", "")
                 augmented = (
@@ -1939,13 +2005,13 @@ class Orchestrator:
             })
             log.debug(
                 "Convergence round %d/%d subtask %d: score=%.2f threshold=%.2f",
-                round_n, ct.max_rounds, subtask.id, gate_score, ct.min_score,
+                round_n, effective_max_rounds, subtask.id, gate_score, ct.min_score,
             )
 
             if gate_score >= ct.min_score:
                 break
 
-            if round_n < ct.max_rounds and ct.backoff_seconds > 0:
+            if round_n < effective_max_rounds and ct.backoff_seconds > 0:
                 _time_mod.sleep(ct.backoff_seconds)
 
         result.convergence_rounds_data = rounds_data
@@ -1987,7 +2053,10 @@ class Orchestrator:
         failures: list[dict] = []
 
         def run_item(item: str) -> dict:
-            item_hash = hashlib.sha256(item.encode()).hexdigest()[:16]
+            # Hash node_id + item (matching the docstring's stated formula) so two
+            # different foreach nodes sharing an execution_id never collide on the
+            # same item string.
+            item_hash = hashlib.sha256(f"{node.node_id}:{item}".encode()).hexdigest()[:16]
             idem_key = f"foreach:{node.node_id}:{item_hash}"
             description = tmpl.description_template.replace("{item}", item)
             target_file = (
@@ -1995,28 +2064,31 @@ class Orchestrator:
                 if tmpl.target_file_template else None
             )
             subtask = Subtask(
-                id=0,
+                # _execute_subtask_with_prefetch derives its OWN idempotency key
+                # as f"{execution_id}:{subtask.id}" — it takes no idempotency_key
+                # parameter, so a fixed id=0 here made every item in this node
+                # share one idempotency key and replay-dedup never distinguished
+                # them. Deriving the id from the same hash keeps it unique per
+                # item and stable across retries.
+                id=int(item_hash[:8], 16) % 2_147_483_647,
                 description=description,
                 tier=tmpl.tier or "low",
                 model=tmpl.model or "",
                 target_file=target_file,
                 op_class="side_effecting" if target_file else "replayable",
             )
-            kwargs: dict[str, object] = {
-                "score": None,
-                "execution_id": execution_id,
-                "plan_revision": plan_revision,
-                "current_wave": wave,
-                "idempotency_key": idem_key,
-            }
             try:
+                # Note: this calls _execute_subtask_with_prefetch, not
+                # _execute_subtask_with_gate — no verify gate runs for foreach
+                # items, so gate_verdict below is always None by construction.
                 result = self._execute_subtask_with_prefetch(
                     subtask, timeout,
+                    score=None,
+                    execution_id=execution_id,
+                    plan_revision=plan_revision,
+                    current_wave=wave,
                     prefetched_artifacts=None,
-                    **{k: v for k, v in kwargs.items()
-                       if k in ("score", "execution_id", "plan_revision", "current_wave")},
                 )
-                result.gate_verdict = result.gate_verdict  # preserve gate
                 return {"item": item, "success": result.success, "output": result.output,
                         "idem_key": idem_key, "gate_verdict": result.gate_verdict}
             except Exception as exc:
@@ -4309,19 +4381,20 @@ class Orchestrator:
                 current_round=current_round,
             )
             proposal["persona"] = persona_id
-            try:
-                self._db.log_swarm_event(
-                    execution_id or "",
-                    "queen_proposal",
-                    {
-                        "queen_idx": idx,
-                        "persona": persona_id,
-                        "verdict": proposal.get("verdict"),
-                        "round": current_round,
-                    },
-                )
-            except Exception:
-                pass
+            if self._db is not None:
+                try:
+                    self._db.log_swarm_event(
+                        execution_id or "",
+                        "queen_proposal",
+                        {
+                            "queen_idx": idx,
+                            "persona": persona_id,
+                            "verdict": proposal.get("verdict"),
+                            "round": current_round,
+                        },
+                    )
+                except Exception:
+                    log.debug("queen_proposal event log failed", exc_info=True)
             return proposal
 
         # Collect in submission order so the judge's selected index is deterministic.
@@ -4413,20 +4486,21 @@ class Orchestrator:
             "winner_persona": winner.get("persona"),
             "personas": list(tally.personas),
         }
-        try:
-            self._db.log_swarm_event(
-                execution_id or "", "consensus_vote",
-                {
-                    "queens": n_queens,
-                    "valid": len(valid),
-                    "selected": selected_idx,
-                    "judge_used": judge_used,
-                    "selected_persona": winner.get("persona"),
-                    "round": current_round,
-                },
-            )
-        except Exception:
-            pass
+        if self._db is not None:
+            try:
+                self._db.log_swarm_event(
+                    execution_id or "", "consensus_vote",
+                    {
+                        "queens": n_queens,
+                        "valid": len(valid),
+                        "selected": selected_idx,
+                        "judge_used": judge_used,
+                        "selected_persona": winner.get("persona"),
+                        "round": current_round,
+                    },
+                )
+            except Exception:
+                log.debug("consensus_vote event log failed", exc_info=True)
         return winner
 
     @staticmethod
@@ -4802,12 +4876,28 @@ class Orchestrator:
 
         updated_waves = build_waves(updated_subtasks)
         validate_single_coordinator_per_wave(updated_subtasks, updated_waves)
+        # Coerce rather than bare int(): an explicit "max_rounds": null (or any
+        # non-numeric) raises TypeError, not ValueError — the only exception
+        # apply_coordinator_amendment_tx's caller catches — and aborted the
+        # whole star/linear run instead of falling back to the current plan's
+        # max_rounds, the way the validated `patch` branch above already does.
+        raw_max_rounds = amendment.get("max_rounds", current_plan.max_rounds)
+        try:
+            new_max_rounds = (
+                int(raw_max_rounds) if raw_max_rounds is not None
+                else current_plan.max_rounds
+            )
+        except (TypeError, ValueError):
+            log.warning("Ignoring invalid amendment max_rounds=%r", raw_max_rounds)
+            new_max_rounds = current_plan.max_rounds
+        if new_max_rounds < 1:
+            new_max_rounds = current_plan.max_rounds
         updated_plan = replace(
             current_plan,
             subtasks=updated_subtasks,
             waves=updated_waves,
             total_agents=len(updated_subtasks),
-            max_rounds=int(amendment.get("max_rounds", current_plan.max_rounds)),
+            max_rounds=new_max_rounds,
         )
         validate_plan(updated_plan)
         return updated_plan
@@ -5328,7 +5418,10 @@ def fan_out_task(
         try:
             project_id = str(Path(project_id).expanduser().resolve())
         except (OSError, RuntimeError, ValueError):
-            pass
+            # Silent here previously meant a path that fails to resolve reads
+            # another project's fan-out cap/budget via get_project_settings,
+            # keyed on the unresolved raw string, with no log line to explain it.
+            log.debug("project_id path resolve failed for %r", project_id, exc_info=True)
     prompt_router_limit = _extract_requested_parallel_limit(
         task_description,
         subjects=("sub-?agents?", "agents?", "routers?", "domains?"),
