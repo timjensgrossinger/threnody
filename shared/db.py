@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -120,6 +121,27 @@ class PlanCacheLookup:
     status: str  # hit | miss | expired | schema_invalid
     plan: dict | None = None
     plan_schema_version: int | None = None
+
+
+_SECRET_LIKE_RE = re.compile(
+    r"(?i)(bearer\s+[a-z0-9\-_.=]+"
+    r"|(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+"
+    r"|://[^/\s:@]+:[^/\s@]+@)"
+)
+
+
+def redact_secret_like(text: str | None) -> str | None:
+    """Best-effort redaction of tokens/keys/credentialed URLs in free-form text.
+
+    Provider CLI stderr routinely echoes bearer tokens, API keys, and
+    credentialed URLs on auth failure; this text is persisted (and later
+    surfaced via inspect-status, telemetry, and DB backups), so it must not
+    carry those verbatim. Not a guarantee against every secret shape — a
+    pattern-based best effort, applied before the text is ever stored.
+    """
+    if not text:
+        return text
+    return _SECRET_LIKE_RE.sub("[redacted]", text)
 
 
 def coerce_length_chars(value: object, default: int) -> int:
@@ -1404,24 +1426,39 @@ class Database:
 
     @staticmethod
     def _ensure_memory_fts_table(conn: sqlite3.Connection) -> None:
-        """Add FTS5 search index for memory values."""
+        """Add FTS5 search index for memory values.
+
+        This runs inside ``_init_schema``, which every connection open goes
+        through — an unsupported SQLite build (compiled without FTS5) must not
+        take down routing cache, telemetry, and learning along with memory
+        search. Only memory search/set (``shared/memory.py``, which references
+        ``memory_fts`` directly) is affected if this table never gets created;
+        that is a narrow, expected failure on such a build, not a schema-init one.
+        """
         fts_exists = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_fts'"
         ).fetchone()
         if fts_exists is not None:
             return
-        conn.execute(
-            """
-            CREATE VIRTUAL TABLE memory_fts USING fts5(
-                scope UNINDEXED,
-                project_id UNINDEXED,
-                task_id UNINDEXED,
-                key UNINDEXED,
-                value_text,
-                tokenize='porter'
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE memory_fts USING fts5(
+                    scope UNINDEXED,
+                    project_id UNINDEXED,
+                    task_id UNINDEXED,
+                    key UNINDEXED,
+                    value_text,
+                    tokenize='porter'
+                )
+                """
             )
-            """
-        )
+        except sqlite3.OperationalError:
+            log.warning(
+                "FTS5 unavailable in this SQLite build — memory_fts not created; "
+                "memory search/set will fail, but the rest of the database is unaffected",
+                exc_info=True,
+            )
 
     def rebuild_memory_fts(self) -> int:
         """Rebuild the memory FTS index from authoritative memory rows."""
@@ -2271,6 +2308,9 @@ class Database:
                 "budget_hard_cap_tokens": int(cfg.budgets.default_hard_cap_tokens),
                 "fanout_cap": int(DEFAULT_PROJECT_FANOUT_CAP),
                 "pending_approval_limit": DEFAULT_PROJECT_PENDING_APPROVAL_LIMIT,
+                # Every key in PROJECT_SETTING_KEYS needs a default here — this one
+                # was missing, so tune_reset/get_project_settings raised KeyError.
+                "allow_out_of_workspace_writes": False,
             }
         return dict(_PROJECT_SETTING_DEFAULTS_CACHE)
 
@@ -2525,12 +2565,22 @@ class Database:
             yield
             return
         fd = None
+        # Acquisition and the with-body are two separate try blocks on purpose:
+        # if this except also wrapped ``yield``, an OSError raised by the
+        # with-body would be caught here and a second ``yield`` attempted,
+        # which breaks the generator's throw/stop protocol and destroys the
+        # original exception.
         try:
-            fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            fd = os.open(
+                str(self._lock_path),
+                os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
             _fcntl.flock(fd, _fcntl.LOCK_EX)
-            yield
         except OSError:
             log.debug("process lock unavailable; proceeding without it", exc_info=True)
+            fd = None
+        try:
             yield
         finally:
             if fd is not None:
@@ -5510,9 +5560,15 @@ class Database:
             }
             try:
                 details = _json.loads(row[2] or "{}")
-                entry.update(details)
+                if isinstance(details, dict):
+                    entry.update(details)
+                else:
+                    log.debug(
+                        "write_audit details for %s is not a dict (%r) — skipping",
+                        row[0], type(details).__name__,
+                    )
             except Exception:
-                pass
+                log.debug("write_audit details JSON decode failed for %s", row[0], exc_info=True)
             result.append(entry)
         return result
 
@@ -6399,22 +6455,64 @@ class Database:
     }
 
     def _get_audit_secret(self) -> bytes:
-        """Load or generate the 32-byte audit HMAC secret (perms 0600)."""
+        """Load or generate the 32-byte audit HMAC secret (perms 0600).
+
+        Never raises: every failure mode below still returns a usable secret, but
+        a lost or regenerated on-disk secret orphans every chain_hmac written
+        before it, so these paths log at WARNING rather than debug — a caller
+        (verify_audit_chain in particular) has no way to see this otherwise.
+        """
         secret_path = self._db_path.parent / "audit_secret"
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
         if secret_path.exists():
-            with open(str(secret_path), "rb") as fh:
-                data = fh.read(32)
-            if len(data) == 32:
-                return data
+            try:
+                fd = os.open(str(secret_path), os.O_RDONLY | nofollow)
+                try:
+                    data = os.read(fd, 32)
+                finally:
+                    os.close(fd)
+                if len(data) == 32:
+                    return data
+                log.warning(
+                    "audit_secret at %s is not 32 bytes (truncated/corrupt) — "
+                    "regenerating, which invalidates every previously stored chain_hmac",
+                    secret_path,
+                )
+            except OSError:
+                log.warning(
+                    "Could not read audit_secret at %s — regenerating", secret_path,
+                    exc_info=True,
+                )
         new_secret = secrets.token_bytes(32)
         tmp_path = secret_path.with_suffix(".tmp")
         try:
-            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            if tmp_path.is_symlink():
+                log.warning(
+                    "audit_secret.tmp at %s is a symlink — refusing to write "
+                    "through it; secret will not be persisted this call",
+                    tmp_path,
+                )
+                return new_secret
+            try:
+                fd = os.open(
+                    str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600
+                )
+            except FileExistsError:
+                # Stale leftover from a crashed prior write, not a symlink (checked
+                # above) — safe to clear and retry once.
+                os.unlink(str(tmp_path))
+                fd = os.open(
+                    str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600
+                )
             with os.fdopen(fd, "wb") as fh:
                 fh.write(new_secret)
             os.rename(str(tmp_path), str(secret_path))
         except OSError:
-            log.debug("Could not persist audit_secret", exc_info=True)
+            log.warning(
+                "Could not persist audit_secret at %s — every subsequent call in "
+                "this process regenerates a new one, invalidating the audit chain",
+                secret_path, exc_info=True,
+            )
         return new_secret
 
     @staticmethod
@@ -6445,18 +6543,44 @@ class Database:
         select_map = {
             "swarm_events": "SELECT id, chain_hmac, payload FROM swarm_events ORDER BY id",
             "agent_audit": "SELECT id, chain_hmac, details_json FROM agent_audit ORDER BY id",
-            "file_writes": "SELECT id, chain_hmac, target_path FROM file_writes ORDER BY id",
+            # scope + idempotency_key + target_path, not target_path alone: this
+            # must match record_file_write's payload exactly, or the chain never
+            # verifies for a single genuinely-unmodified row. (It didn't, before
+            # this fix — target_path alone was never what got hashed at write
+            # time, even pre-dating the CWE-345 escaping fix above.)
+            "file_writes": (
+                "SELECT id, chain_hmac, scope, idempotency_key, target_path "
+                "FROM file_writes ORDER BY id"
+            ),
         }
         query = select_map[table]
         with self.conn() as conn:
             rows = conn.execute(query).fetchall()
         breaks: list[dict] = []
         prev_hmac = ""
+        seen_audited = False
         for row in rows:
-            row_id, stored_hmac, payload = row
+            if table == "file_writes":
+                row_id, stored_hmac, scope, idem_key, target_path = row
+                payload = json.dumps(
+                    [scope, idem_key, target_path], separators=(",", ":")
+                )
+            else:
+                row_id, stored_hmac, payload = row
             if not stored_hmac:
+                if seen_audited:
+                    # A blank chain_hmac after audited rows have already started is
+                    # not a legitimate pre-audit gap — it is indistinguishable from
+                    # an attacker blanking the field to make tampering look like an
+                    # old, unaudited row. Report it rather than silently resetting.
+                    breaks.append({
+                        "id": row_id,
+                        "expected_hmac": None,
+                        "stored_hmac": stored_hmac,
+                    })
                 prev_hmac = ""
-                continue  # pre-audit row; skip
+                continue  # genuine pre-audit row (before this table's chain started)
+            seen_audited = True
             expected = self._compute_chain_hmac(secret, prev_hmac, payload or "")
             if expected != stored_hmac:
                 breaks.append({
@@ -6511,7 +6635,12 @@ class Database:
             _secret = self._get_audit_secret()
         except Exception:
             _secret = b""
-        payload_text = f"{scope}:{idempotency_key}:{target_path}"
+        # JSON, not an f-string join: field boundaries must be unambiguous or
+        # distinct (scope, key, path) triples can hash to the same chain_hmac
+        # payload and a stored target_path could be rewritten undetected.
+        payload_text = json.dumps(
+            [scope, idempotency_key, target_path], separators=(",", ":")
+        )
         with self.conn() as conn:
             _prev = self.get_prev_chain_hmac(conn, "file_writes")
             _chain = self._compute_chain_hmac(_secret, _prev, payload_text) if _secret else ""
@@ -6539,34 +6668,25 @@ class Database:
         }
 
     def acquire_lease(self, task_id: str, worker_id: str, ttl_seconds: float = 60.0) -> bool:
-        """Claim a worker lease for task_id. Returns True if acquired, False if already held."""
+        """Claim a worker lease for task_id. Returns True if acquired, False if already held.
+
+        The read-decide-write sequence runs inside one ``BEGIN IMMEDIATE``
+        transaction: that lock is taken up front, so no other connection can
+        insert/delete this task's lease between our SELECT and our write — the
+        previous version's separate SELECT-then-INSERT let two callers both
+        observe "no row" and both report success.
+        """
         import time as _time
         now = _time.time()
         expires_at = now + ttl_seconds
-        with self.conn() as conn:
-            row = conn.execute(
-                "SELECT worker_id, status, expires_at FROM worker_leases WHERE task_id=?",
-                (task_id,),
-            ).fetchone()
-            if row is None:
-                # No existing lease — insert fresh
-                try:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO worker_leases"
-                        " (task_id, worker_id, acquired_at, expires_at, last_heartbeat, attempt, status)"
-                        " VALUES (?, ?, ?, ?, ?, 0, 'active')",
-                        (task_id, worker_id, now, expires_at, now),
-                    )
-                    return True
-                except Exception:
-                    return False
-            existing_worker, status, existing_expires = row
-            if existing_worker == worker_id and status == "active":
-                return True  # same worker re-acquires
-            if existing_expires < now:
-                # Expired — delete and re-insert
-                conn.execute("DELETE FROM worker_leases WHERE task_id=?", (task_id,))
-                try:
+        try:
+            with self.conn() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT worker_id, status, expires_at FROM worker_leases WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+                if row is None:
                     conn.execute(
                         "INSERT INTO worker_leases"
                         " (task_id, worker_id, acquired_at, expires_at, last_heartbeat, attempt, status)"
@@ -6574,9 +6694,23 @@ class Database:
                         (task_id, worker_id, now, expires_at, now),
                     )
                     return True
-                except Exception:
-                    return False
-            return False  # held by another worker
+                existing_worker, status, existing_expires = row
+                if existing_worker == worker_id and status == "active":
+                    return True  # same worker re-acquires
+                if existing_expires < now:
+                    # Expired — delete and re-insert, still inside the same lock.
+                    conn.execute("DELETE FROM worker_leases WHERE task_id=?", (task_id,))
+                    conn.execute(
+                        "INSERT INTO worker_leases"
+                        " (task_id, worker_id, acquired_at, expires_at, last_heartbeat, attempt, status)"
+                        " VALUES (?, ?, ?, ?, ?, 0, 'active')",
+                        (task_id, worker_id, now, expires_at, now),
+                    )
+                    return True
+                return False  # held by another worker
+        except sqlite3.Error:
+            log.warning("acquire_lease failed for task_id=%s", task_id, exc_info=True)
+            return False
 
     def heartbeat(self, task_id: str, worker_id: str) -> bool:
         """Extend the lease for (task_id, worker_id). Returns True if lease still active."""
@@ -7267,7 +7401,8 @@ class Database:
             "consecutive_failures": row[2],
             "last_failure_ts": row[3],
             "last_failure_category": row[4],
-            "last_failure_stderr": row[5],
+            # Defensive re-redaction for rows written before this filter existed.
+            "last_failure_stderr": redact_secret_like(row[5]),
             "quarantine_until_ts": row[6],
             "last_probe_ts": row[7],
             "last_probe_ok": bool(row[8]) if row[8] is not None else None,
@@ -7290,7 +7425,7 @@ class Database:
                 "consecutive_failures": row[2],
                 "last_failure_ts": row[3],
                 "last_failure_category": row[4],
-                "last_failure_stderr": row[5],
+                "last_failure_stderr": redact_secret_like(row[5]),
                 "quarantine_until_ts": row[6],
                 "last_probe_ts": row[7],
                 "last_probe_ok": bool(row[8]) if row[8] is not None else None,
@@ -7314,6 +7449,7 @@ class Database:
     ) -> None:
         """Upsert the health state for a provider."""
         now = time.time()
+        last_failure_stderr = redact_secret_like(last_failure_stderr)
         with self.conn() as conn:
             existing = conn.execute(
                 "SELECT consecutive_failures FROM provider_health WHERE provider_id = ?",

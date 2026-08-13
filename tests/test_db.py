@@ -1085,6 +1085,57 @@ def test_integrity_reprobe_config_default_agrees_with_database_default() -> None
     assert params["integrity_reprobe_interval_hours"].default == DB_INTEGRITY_REPROBE_INTERVAL_HOURS
 
 
+def test_reset_allow_out_of_workspace_writes_does_not_raise() -> None:
+    """Regression: reset_project_setting("allow_out_of_workspace_writes") used to
+    raise KeyError — the key was in PROJECT_SETTING_KEYS but had no entry in
+    _project_setting_defaults()."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        db = Database(Path(f.name))
+        db.set_project_setting("/tmp/proj", "allow_out_of_workspace_writes", True)
+        settings = db.get_project_settings("/tmp/proj")
+        assert settings["allow_out_of_workspace_writes"] is True
+
+        result = db.reset_project_setting("/tmp/proj", "allow_out_of_workspace_writes")
+        assert result["allow_out_of_workspace_writes"] is False
+
+        # No prior row at all — get_project_settings must still carry the key.
+        defaults = db.get_project_settings("/tmp/new-proj")
+        assert defaults["allow_out_of_workspace_writes"] is False
+        db.close()
+
+
+def test_verify_audit_chain_flags_blanked_hmac_after_audited_rows() -> None:
+    """Regression: a blank chain_hmac after real audited rows must be reported
+    as a break, not silently treated as a legitimate pre-audit gap — the old
+    behavior let an attacker blank a chain_hmac to make tampering look old."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        db = Database(Path(f.name))
+        db.record_file_write("scope-a", "key-1", "/tmp/a.txt")
+        db.record_file_write("scope-a", "key-2", "/tmp/b.txt")
+        # No breaks yet — chain is intact.
+        assert db.verify_audit_chain("file_writes") == []
+
+        with db.conn() as conn:
+            conn.execute(
+                "UPDATE file_writes SET chain_hmac = '' WHERE idempotency_key = 'key-2'"
+            )
+        breaks = db.verify_audit_chain("file_writes")
+        assert len(breaks) == 1
+        assert breaks[0]["stored_hmac"] == ""
+        db.close()
+
+
+def test_acquire_lease_rejects_concurrent_duplicate() -> None:
+    """Regression: the old SELECT-then-INSERT (no shared lock) let two callers
+    both observe "no row" and both report True. BEGIN IMMEDIATE closes that."""
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        db = Database(Path(f.name))
+        assert db.acquire_lease("task-1", "worker-a") is True
+        assert db.acquire_lease("task-1", "worker-b") is False
+        assert db.acquire_lease("task-1", "worker-a") is True  # same worker re-acquires
+        db.close()
+
+
 if __name__ == "__main__":
     tests = [
         test_cache_put_and_get,
@@ -1094,6 +1145,9 @@ if __name__ == "__main__":
         test_plan_cache_rejects_non_serializable_payloads,
         test_artifact_persistence,
         test_routing_outcomes_schema,
+        test_reset_allow_out_of_workspace_writes_does_not_raise,
+        test_verify_audit_chain_flags_blanked_hmac_after_audited_rows,
+        test_acquire_lease_rejects_concurrent_duplicate,
         test_cache_stats,
         test_escalation_logging,
         test_concurrent_db_writes_via_threads,
