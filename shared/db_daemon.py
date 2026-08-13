@@ -70,6 +70,7 @@ class DBDaemon:
         # transparently on next use (db_client retries a stale socket).
         self._client_idle_reap_s = client_idle_reap_s
         self._lock_fd: int | None = None
+        self._lock_ino: int | None = None
         self._srv: socket.socket | None = None
         self._db = None  # lazy — created after election
         self._clients = 0
@@ -82,14 +83,41 @@ class DBDaemon:
         """Acquire the exclusive daemon lock. False if another daemon owns it."""
         if _fcntl is None:
             return True  # best-effort: no election off-POSIX
-        self._lock_fd = os.open(_lock_path_for(self._db_path), os.O_CREAT | os.O_RDWR, 0o600)
+        lock_path = _lock_path_for(self._db_path)
+        self._lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             _fcntl.flock(self._lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-            return True
         except OSError:
             os.close(self._lock_fd)
             self._lock_fd = None
             return False
+        # Record which inode we actually hold the flock on. If the lock file at
+        # this path is ever deleted and recreated while we hold it (observed live:
+        # cause not fully pinned, but the effect is reproducible), a second
+        # process can independently flock() the NEW inode and also believe it won
+        # election — the exact bug that let two daemons serve the same DB file
+        # concurrently. `_lock_still_current` (polled from `_idle_watch`) detects
+        # this after the fact; this immediate check catches the narrower race
+        # where the swap already happened between our open() and flock().
+        self._lock_ino = os.fstat(self._lock_fd).st_ino
+        if not self._lock_still_current():
+            try:
+                _fcntl.flock(self._lock_fd, _fcntl.LOCK_UN)
+            finally:
+                os.close(self._lock_fd)
+            self._lock_fd = None
+            self._lock_ino = None
+            return False
+        return True
+
+    def _lock_still_current(self) -> bool:
+        """True if the lock path still refers to the inode we hold the flock on."""
+        if self._lock_fd is None or self._lock_ino is None:
+            return True  # no election in effect (off-POSIX) — nothing to check
+        try:
+            return os.stat(_lock_path_for(self._db_path)).st_ino == self._lock_ino
+        except OSError:
+            return False  # lock file gone entirely — treat as lost ownership
 
     def _bind(self) -> None:
         # Winner of the election owns the socket; clear any stale one first.
@@ -142,9 +170,26 @@ class DBDaemon:
         return 0
 
     def _idle_watch(self) -> None:
-        if self._idle_timeout_s <= 0:
-            return
-        while not self._stop.wait(min(30.0, self._idle_timeout_s)):
+        # Runs regardless of idle_timeout_s: the lock-currency check is a safety
+        # invariant, not an idle-exit feature, so it must not be skippable by
+        # disabling idle timeout.
+        check_interval = min(30.0, self._idle_timeout_s) if self._idle_timeout_s > 0 else 30.0
+        while not self._stop.wait(check_interval):
+            if not self._lock_still_current():
+                log.warning(
+                    "db daemon lock file %s was replaced by another process — "
+                    "no longer the sole owner of %s, shutting down",
+                    _lock_path_for(self._db_path), self._db_path,
+                )
+                self._stop.set()
+                try:
+                    if self._srv:
+                        self._srv.close()
+                except Exception:
+                    pass
+                return
+            if self._idle_timeout_s <= 0:
+                continue
             with self._clients_lock:
                 idle = self._clients == 0 and (time.monotonic() - self._last_active) > self._idle_timeout_s
             if idle:
@@ -211,6 +256,9 @@ class DBDaemon:
                 try:
                     resp, session_seq = self._dispatch(req, sessions, session_seq)
                 except Exception as exc:  # any handler failure → structured error
+                    # Previously unlogged: the daemon itself had no record of a
+                    # handler failure, only whatever the peer chose to do with it.
+                    log.warning("db_daemon: handler failed: %s", exc, exc_info=True)
                     resp = make_err(type(exc).__name__, str(exc))
                 try:
                     send_frame(client, resp)

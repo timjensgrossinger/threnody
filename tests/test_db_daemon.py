@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import multiprocessing
+import os
 import sys
 import tempfile
 import time
@@ -63,6 +64,45 @@ def test_ipc_codec_dataclass_round_trip() -> None:
 
     decoded_unknown = decode(encode(_Unregistered(x=1)))
     assert decoded_unknown == {"x": 1}
+
+
+def test_ipc_codec_decode_filters_unknown_dataclass_keys() -> None:
+    # Regression: decode() used to pass every key in the wire payload straight
+    # to cls(**fields). A peer forging an extra field crashed the codec with an
+    # uncaught TypeError instead of the registry constraining what comes back.
+    from shared.db_ipc import _TAG
+
+    forged = {
+        _TAG: "dataclass",
+        "cls": "PlanCacheLookup",
+        "v": {"status": "hit", "plan": None, "plan_schema_version": 1, "evil": "x"},
+    }
+    decoded = decode(forged)
+    assert isinstance(decoded, PlanCacheLookup)
+    assert decoded.status == "hit"
+    assert not hasattr(decoded, "evil")
+
+
+def test_daemon_lock_currency_detects_replaced_lock_file() -> None:
+    # Regression: the live bug this session found — cache.db.daemon.lock got
+    # deleted and recreated with a fresh inode while a daemon still held its
+    # flock on the old one, letting a second process independently win
+    # election and both serve the same DB file concurrently.
+    import shared.db_daemon as dd
+
+    with tempfile.TemporaryDirectory() as d:
+        db_path = str(Path(d) / "cache.db")
+        daemon = dd.DBDaemon(db_path, socket_path=str(Path(d) / "cache.db.sock"))
+        assert daemon._elect() is True
+        assert daemon._lock_still_current() is True
+
+        # Simulate the lock file being deleted and recreated at the same path.
+        os.unlink(dd._lock_path_for(db_path))
+        fresh_fd = os.open(dd._lock_path_for(db_path), os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fresh_fd)
+
+        assert daemon._lock_still_current() is False
+        os.close(daemon._lock_fd)
 
 
 def test_ipc_codec_non_string_and_colliding_dict_keys() -> None:

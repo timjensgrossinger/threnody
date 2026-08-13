@@ -101,9 +101,18 @@ def decode(value: Any) -> Any:
                 # Association list → dict, restoring non-string / tag-colliding keys.
                 return {decode(k): decode(v) for k, v in (inner or [])}
             if tag == "dataclass":
-                fields = {k: decode(v) for k, v in (inner or {}).items()}
                 cls = _DATACLASS_REGISTRY.get(value.get("cls"))
-                return cls(**fields) if cls is not None else fields
+                if cls is None:
+                    return {k: decode(v) for k, v in (inner or {}).items()}
+                # Filter to the class's own field names: the registry constrains
+                # WHICH class gets reconstructed, but nothing else validated the
+                # keys, so a peer could otherwise forge extra fields or crash the
+                # codec with an uncaught TypeError from an unknown kwarg.
+                valid = {f.name for f in dataclasses.fields(cls)}
+                fields = {
+                    k: decode(v) for k, v in (inner or {}).items() if k in valid
+                }
+                return cls(**fields)
             raise ProtocolError(f"unknown type tag: {tag!r}")
         return {k: decode(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -145,6 +154,12 @@ def recv_frame(sock: socket.socket) -> dict:
         return json.loads(body.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ProtocolError(f"invalid frame body: {exc}") from exc
+    except RecursionError as exc:
+        # A deeply nested peer JSON body raises RecursionError, not a decode
+        # error — normalize it too, or it escapes the daemon's
+        # ``except (ConnectionError, ProtocolError)`` guard and kills the
+        # handler thread before dispatch ever sees the malformed frame.
+        raise ProtocolError(f"frame body too deeply nested: {exc}") from exc
 
 
 def make_request(kind: str, **fields: Any) -> dict:
