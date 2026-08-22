@@ -95,19 +95,26 @@ BOOTSTRAP_REGISTRY: dict[str, tuple[DiscoveredModel, ...]] = {
     "github-copilot": (
         _model("gpt-5-mini", "low", request_multiplier=0.0),
         _model("gpt-5.4", "medium", request_multiplier=1.0),
-        _model("claude-opus-4.6", "high", request_multiplier=3.0),
+        _model("claude-opus-5", "high", aliases=("claude-opus-4.6",), request_multiplier=3.0),
     ),
     "claude-code": (
-        _model("haiku", "low", aliases=("claude-haiku-4.5",)),
-        _model("sonnet", "medium", aliases=("claude-sonnet-4.6",)),
-        _model("opus", "high", aliases=("claude-opus-4.6",)),
+        _model("haiku", "low", aliases=("claude-haiku-5", "claude-haiku-4.5")),
+        _model("sonnet", "medium", aliases=("claude-sonnet-5", "claude-sonnet-4.6")),
+        _model("opus", "high", aliases=("claude-opus-5", "claude-opus-4.6")),
     ),
     "codex": (
         _model(
-            "gpt-5.5",
+            "gpt-5.6-terra",
             "medium",
+            aliases=("gpt-5.5",),
             capabilities=("text", "tools", "reasoning"),
-            eligible_tiers=("low", "medium", "high"),
+            eligible_tiers=("low", "medium"),
+        ),
+        _model(
+            "gpt-5.6-sol",
+            "high",
+            capabilities=("text", "tools", "reasoning"),
+            eligible_tiers=("high",),
         ),
     ),
     "opencode": (
@@ -122,7 +129,7 @@ BOOTSTRAP_REGISTRY: dict[str, tuple[DiscoveredModel, ...]] = {
     "cursor": (
         _model("composer-2.5-fast", "low"),
         _model("composer-2.5", "medium"),
-        _model("claude-opus-4-8-thinking-high", "high"),
+        _model("claude-opus-5-thinking-high", "high", aliases=("claude-opus-4-8-thinking-high",)),
     ),
     "amazon-q": (
         _model("claude-haiku", "low"),
@@ -135,8 +142,8 @@ BOOTSTRAP_REGISTRY: dict[str, tuple[DiscoveredModel, ...]] = {
     ),
     "blackbox-ai": (
         _model("blackboxai", "low"),
-        _model("claude-sonnet-4.6", "medium"),
-        _model("claude-opus-4.6", "high"),
+        _model("claude-sonnet-5", "medium", aliases=("claude-sonnet-4.6",)),
+        _model("claude-opus-5", "high", aliases=("claude-opus-4.6",)),
     ),
 }
 
@@ -391,4 +398,23 @@ def normalize_copilot_catalog(payload: dict[str, Any] | list[Any]) -> DiscoveryR
             source="live_provider_catalog",
         ),
         source="live_provider_catalog",
+    )
+
+
+def load_claude_cache(path: Path | None = None) -> DiscoveryResult | None:
+    """Load discovered models from official Claude Code cache if present."""
+    cache_path = path or Path.home() / ".claude" / "models_cache.json"
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    entries = raw.get("models") or raw.get("availableModels") if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        return None
+    timestamp = cache_path.stat().st_mtime
+    return DiscoveryResult(
+        provider_id="claude-code",
+        models=normalize_models("claude-code", entries, source="official_cli_cache", discovered_at=timestamp),
+        source="official_cli_cache",
+        discovered_at=timestamp,
     )

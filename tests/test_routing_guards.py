@@ -324,14 +324,14 @@ def test_route_task_keeps_codex_host_native_metadata_separate_from_provider_sele
         _assert_host_native_route(
             result,
             host_provider="codex",
-            expected_host_model="gpt-5.5",
+            expected_host_model="gpt-5.6-terra",
         )
         row = db._conn.execute(
             "SELECT model, provider_name FROM telemetry WHERE task_hash = ?",
             (result["task_id"],),
         ).fetchone()
         assert row is not None
-        assert tuple(row) == ("gpt-5.5", "codex")
+        assert tuple(row) == ("gpt-5.6-terra", "codex")
 
 
 @pytest.mark.parametrize("caller", ["github-copilot", "cursor", "junie", "opencode"])
@@ -865,7 +865,7 @@ def test_route_task_active_handoff_keeps_codex_host_native_metadata(
         _assert_host_native_route(
             routed,
             host_provider="codex",
-            expected_host_model="gpt-5.5",
+            expected_host_model="gpt-5.6-terra",
         )
         assert routed["execution_hint"].get("active_handoff") is True
         assert routed["execution_hint"].get("host_native_method") == "host_task"

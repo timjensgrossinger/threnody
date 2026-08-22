@@ -51,7 +51,7 @@ _URGENCY_WORDS = re.compile(
 )
 
 _COMPLEXITY_WORDS = re.compile(
-    r"\b(refactor|rewrite|architecture|design|migrate|implement|complex|distributed)\b",
+    r"\b(refactor|rewrite|architecture|design|migrate|implement|complex|distributed|reasoning|consensus|proof|audit|security|concurrency)\b",
     re.I,
 )
 

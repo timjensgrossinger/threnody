@@ -57,6 +57,8 @@ class RoutingDecision:
     # hybrid diagnose->implement hop is worth its extra latency.
     expected_duration_bucket: str = "medium"
     expected_file_count: int = 0
+    reasoning_effort: str = "medium"
+    thinking_budget: int = 2048
 
 
 # Score nudge applied when a low-tier override keyword dominates a single-concern
@@ -121,6 +123,15 @@ def duration_bucket_for(
     if score <= thresholds.low_max and file_count <= 1:
         return DURATION_SHORT
     return DURATION_MEDIUM
+
+
+def reasoning_params_for(duration_bucket: str, tier: str = "medium") -> tuple[str, int]:
+    """Derive reasoning_effort and thinking_budget token allocation."""
+    if duration_bucket == DURATION_SHORT or tier == "low":
+        return "low", 0
+    if duration_bucket == DURATION_LONG or tier == "high":
+        return "high", 8192
+    return "medium", 2048
 
 
 def _compile_risk_floor_re(patterns: list[str]) -> "re.Pattern[str] | None":
@@ -253,6 +264,10 @@ class TaskRouter:
         for kw in self._overrides.get("high", []):
             if re.search(rf"\b{re.escape(kw)}\b", task_lower):
                 file_count = count_task_files(task_lower)
+                dur_bucket = (
+                    DURATION_LONG if file_count >= _DURATION_LONG_FILES else DURATION_MEDIUM
+                )
+                r_effort, t_budget = reasoning_params_for(dur_bucket, "high")
                 return RoutingDecision(
                     tier="high",
                     score=0.90,
@@ -262,10 +277,10 @@ class TaskRouter:
                     # A hard high override is complex by definition, so it is never
                     # 'short' — the duration axis must stay populated on this early
                     # return or downstream gating would silently see the default.
-                    expected_duration_bucket=(
-                        DURATION_LONG if file_count >= _DURATION_LONG_FILES else DURATION_MEDIUM
-                    ),
+                    expected_duration_bucket=dur_bucket,
                     expected_file_count=file_count,
+                    reasoning_effort=r_effort,
+                    thinking_budget=t_budget,
                 )
         return None
 
@@ -797,6 +812,7 @@ class TaskRouter:
         )
 
         agents = 2 if tier != "high" else 1
+        r_effort, t_budget = reasoning_params_for(duration_bucket, tier)
         decision = RoutingDecision(
             tier=tier,
             score=final_score,
@@ -808,6 +824,8 @@ class TaskRouter:
             matched_urgency_signals=urgency_matched,
             expected_duration_bucket=duration_bucket,
             expected_file_count=file_count,
+            reasoning_effort=r_effort,
+            thinking_budget=t_budget,
         )
         bandit_decision = self._log_bandit_decision(
             task, decision, project_path=project_path

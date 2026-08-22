@@ -670,12 +670,14 @@ class Orchestrator:
                  project_root: str | None = None,
                  provider_registry: object | None = None,
                  providers_map: dict[str, Provider] | None = None,
-                 caller: str | None = None) -> None:
+                 caller: str | None = None,
+                 progress_callback: "Callable[[float, float | None, str], None] | None" = None) -> None:
         self._config = config
         self._provider = provider
         self._planner = planner
         self._db = db
         self._project_root = project_root
+        self._progress_callback = progress_callback
         # Optional discovery registry and concrete provider map for spillover
         # When provided, orchestrator will consult the registry to plan
         # spillover allocation and will dispatch subtasks to providers found
@@ -1910,6 +1912,7 @@ class Orchestrator:
             project_root=self._project_root or "",
             run_id=getattr(self, "_session_id", None),
             command_resolver=self._detect_gate_command,
+            progress_callback=getattr(self, "_progress_callback", None),
         )
         result.gate_verdict = report.verdict
         result.gate_signals = report.signals
