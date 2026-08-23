@@ -33,53 +33,27 @@ def _extract_target_files(raw: dict[str, Any]) -> list[str]:
     """Resolve edited file path(s) across host CLI payload shapes.
 
     Handles: Claude (`tool_input.file_path`), Cursor (top-level `file_path`),
-    Copilot (`toolArgs.*`), Codex (`tool_input.command` apply_patch text), and
-    Antigravity (`tool_input.TargetFile`, `tool_input.AbsolutePath`).
+    Copilot (`toolArgs.*`), and Codex (`tool_input.command` apply_patch text).
     """
     files: list[str] = []
 
     # Top-level (Cursor afterFileEdit) + explicit hint.
-    for key in (
-        "file_path",
-        "filePath",
-        "path",
-        "target_file",
-        "TargetFile",
-        "targetFile",
-        "AbsolutePath",
-    ):
+    for key in ("file_path", "filePath", "path", "target_file"):
         val = raw.get(key)
         if isinstance(val, str) and val.strip():
             files.append(val.strip())
 
-    tool_input = (
-        raw.get("tool_input")
-        or raw.get("toolInput")
-        or raw.get("input")
-        or raw.get("arguments")
-        or raw.get("tool_args")
-        or raw.get("parameters")
-        or {}
-    )
+    tool_input = raw.get("tool_input") or raw.get("toolInput") or {}
     tool_args = raw.get("toolArgs") or raw.get("tool_args") or {}
     for src in (tool_input, tool_args):
         if not isinstance(src, dict):
             continue
-        for key in (
-            "file_path",
-            "filePath",
-            "path",
-            "file",
-            "target_file",
-            "TargetFile",
-            "targetFile",
-            "AbsolutePath",
-        ):
+        for key in ("file_path", "filePath", "path", "file", "target_file"):
             val = src.get(key)
             if isinstance(val, str) and val.strip():
                 files.append(val.strip())
         # Codex apply_patch: paths are embedded in the command text.
-        cmd = src.get("command") or src.get("CommandLine")
+        cmd = src.get("command")
         if isinstance(cmd, str) and "*** " in cmd:
             files.extend(m.strip() for m in _APPLY_PATCH_FILE.findall(cmd))
 
@@ -95,20 +69,9 @@ def _extract_target_files(raw: dict[str, Any]) -> list[str]:
 
 def _extract_success(raw: dict[str, Any]) -> bool:
     """Resolve success across shapes; default True (notification hooks omit it)."""
-    tr = (
-        raw.get("tool_response")
-        or raw.get("toolResponse")
-        or raw.get("result")
-        or raw.get("output")
-        or raw.get("tool_result")
-    )
-    if isinstance(tr, dict):
-        if "success" in tr:
-            return bool(tr.get("success"))
-        if "error" in tr or tr.get("status") == "ERROR":
-            return False
-    if isinstance(tr, str) and tr.startswith("Encountered error"):
-        return False
+    tr = raw.get("tool_response") or raw.get("toolResponse")
+    if isinstance(tr, dict) and "success" in tr:
+        return bool(tr.get("success"))
     # Copilot: toolResult.resultType == "success".
     tres = raw.get("toolResult") or raw.get("tool_result")
     if isinstance(tres, dict) and tres.get("resultType"):
@@ -116,7 +79,6 @@ def _extract_success(raw: dict[str, Any]) -> bool:
     if isinstance(tr, bool):
         return tr
     return True
-
 
 
 def parse_hook_payload(raw: dict[str, Any]) -> dict[str, Any]:
@@ -282,18 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         payload.get("tool_name") or payload.get("toolName")
         or payload.get("hook_event_name") or ""
     ).lower()
-    _EDIT_TOKENS = (
-        "edit",
-        "write",
-        "create",
-        "apply_patch",
-        "patch",
-        "afterfileedit",
-        "notebook",
-        "replace_file_content",
-        "write_to_file",
-        "write_file",
-    )
+    _EDIT_TOKENS = ("edit", "write", "create", "apply_patch", "patch", "afterfileedit", "notebook")
     try:
         fields = parse_hook_payload(payload)
         if not any(tok in name for tok in _EDIT_TOKENS) and not fields.get("target_files"):

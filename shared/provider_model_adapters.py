@@ -49,7 +49,6 @@ class CommandModelDiscoveryAdapter:
     def discover_live(self) -> DiscoveryResult | None:
         completed = subprocess.run(
             list(self.command),
-            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=15,

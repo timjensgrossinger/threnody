@@ -16,7 +16,6 @@ SHELL_LABELS = {
     "codex": "OpenAI Codex",
     "junie": "JetBrains Junie",
     "opencode": "OpenCode",
-    "antigravity": "Google Antigravity",
 }
 
 
@@ -223,7 +222,7 @@ def render_shell_instructions(
         "subagent tool from `host_spawn`; do not use `execute_subtask` to route between host CLIs."
     )
 
-    host_tool = "Agent" if profile.shell_id == "claude-code" else ("invoke_subagent" if profile.shell_id == "antigravity" else "Task")
+    host_tool = "Agent" if profile.shell_id == "claude-code" else "Task"
     lines.extend(
         [
             "",
@@ -249,14 +248,6 @@ def render_shell_instructions(
                 "",
                 "Claude Code uses the **`Agent`** tool for medium/high subtasks (`Task` is an alias when available).",
                 "Subprocess `claude -p` via `execute_subtask` requires `providers.router_only_allow_execution` and carries Anthropic subscription/OAuth policy risk — see docs/LEGAL.md.",
-            ]
-        )
-    elif profile.shell_id == "antigravity":
-        lines.extend(
-            [
-                "",
-                "Antigravity uses `invoke_subagent` for subagent spawning with tier agents: `threnody-agy-low`, `threnody-agy-medium`, `threnody-agy-high`.",
-                "Headless delegation uses `agy -p` with `--output-format json` for structured output.",
             ]
         )
 

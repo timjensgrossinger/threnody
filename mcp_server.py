@@ -12552,39 +12552,7 @@ def _parent_death_watchdog(poll: float = _WATCHDOG_POLL_SECONDS) -> None:
             os._exit(0)
 
 
-def _handle_hook_cli(argv: list[str]) -> int:
-    """Handle CLI hook invocations (e.g. --hook routing-guard or --hook learning-capture)."""
-    idx = argv.index("--hook")
-    hook_name = argv[idx + 1] if len(argv) > idx + 1 else ""
-    remaining = argv[:idx] + argv[idx + 2:]
-    if hook_name in ("routing-guard", "routing_guard", "routing", "pre_tool_use"):
-        from shared import routing_hook
-        if not remaining:
-            remaining = ["validate", "--stdin"]
-        elif remaining[0] not in ("validate", "-h", "--help"):
-            remaining = ["validate"] + remaining
-        return routing_hook.main(remaining)
-    elif hook_name in ("learning-capture", "learning_capture", "learning", "post_tool_use"):
-        from shared import learning_hook
-        if not remaining:
-            remaining = ["capture", "--stdin", "--hook-response"]
-        elif remaining[0] not in ("capture", "-h", "--help"):
-            remaining = ["capture"] + remaining
-        return learning_hook.main(remaining)
-    else:
-        sys.stderr.write(f"Unknown hook: {hook_name}\n")
-        return 1
-
-
 def main() -> None:
-    if len(sys.argv) > 1:
-        if "--hook" in sys.argv:
-            sys.exit(_handle_hook_cli(sys.argv[1:]))
-        if sys.argv[1] in ("-h", "--help"):
-            print(f"Threnody MCP Server {get_display_version()}")
-            print("Usage: python3 mcp_server.py [--hook routing-guard|learning-capture]")
-            sys.exit(0)
-
     log.info(
         "Threnody MCP server %s — cross-provider orchestrator",
         get_display_version(),
@@ -12652,4 +12620,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

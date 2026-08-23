@@ -12,24 +12,10 @@ log = logging.getLogger(__name__)
 
 
 def parse_hook_payload(raw: dict[str, Any]) -> dict[str, Any]:
-    """Extract validation fields from a PreToolUse hook JSON payload."""
-    tool_name = (
-        raw.get("tool_name")
-        or raw.get("toolName")
-        or raw.get("name")
-        or raw.get("tool")
-        or raw.get("toolAction")
-    )
-    cwd = raw.get("cwd") or raw.get("Cwd") or raw.get("workspace")
-    tool_input = (
-        raw.get("tool_input")
-        or raw.get("toolInput")
-        or raw.get("input")
-        or raw.get("arguments")
-        or raw.get("tool_args")
-        or raw.get("parameters")
-        or {}
-    )
+    """Extract validation fields from a Claude PreToolUse hook JSON payload."""
+    tool_name = raw.get("tool_name") or raw.get("toolName")
+    cwd = raw.get("cwd")
+    tool_input = raw.get("tool_input") or raw.get("toolInput") or {}
     if not isinstance(tool_input, dict):
         tool_input = {}
 
@@ -37,31 +23,15 @@ def parse_hook_payload(raw: dict[str, Any]) -> dict[str, Any]:
         tool_input.get("file_path")
         or tool_input.get("filePath")
         or tool_input.get("path")
-        or tool_input.get("TargetFile")
-        or tool_input.get("target_file")
-        or tool_input.get("targetFile")
-        or tool_input.get("AbsolutePath")
         or raw.get("target_file")
-        or raw.get("TargetFile")
     )
-    caller = raw.get("caller")
-    if not caller:
-        if (
-            "TargetFile" in tool_input
-            or "AbsolutePath" in tool_input
-            or str(tool_name or "") in ("write_to_file", "replace_file_content", "view_file", "run_command")
-        ):
-            caller = "antigravity"
-        else:
-            caller = "claude-code"
     return {
         "tool_name": tool_name,
         "cwd": cwd,
         "target_file": target_file,
-        "caller": caller,
+        "caller": raw.get("caller") or "claude-code",
         "skill": raw.get("skill"),
     }
-
 
 
 def validate_routing_guard(

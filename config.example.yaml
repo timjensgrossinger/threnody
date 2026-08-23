@@ -122,10 +122,6 @@ providers:
       low: minimal
       medium: medium
       high: xhigh
-    antigravity:
-      low: low
-      medium: high
-      high: high
   timeouts:
     low: 120
     medium: 120
@@ -134,19 +130,7 @@ providers:
 routing_policy:
   # default → advisory for all shells | guarded | advisory | custom  (strict is deprecated → guarded)
   mode: default
-  shells:
-    # antigravity:
-    #   mode: advisory
-    #   tier_model_mapping:
-    #     low: gemini-3.5-flash
-    #     medium: gemini-3.5-flash
-    #     high: gemini-3.1-pro
-    #   consensus:
-    #     enabled: true
-    #     queens: 3
-    #     queen_tier: low
-    #     judge_tier: high
-    #     quorum: 2
+  shells: {}
 
 # When true, low-tier delegate guards hard-block Edit/Write until execute_subtask runs.
 # Default false — guarded mode allows host-native edits after route_task.
@@ -219,6 +203,5 @@ learning:
       # - cursor              # writes to .cursor/skills/<slug>/SKILL.md
       # - github-copilot-cli   # writes to .github/agents/<slug>.md
       # - opencode             # writes to .opencode/agent/<slug>.md
-      # - antigravity          # writes to .gemini/antigravity-cli/plugins/threnody/skills/<slug>.md
     promotion_threshold: 10    # match_count before promoting to user-global skills dir
     auto_promote: false        # promote automatically on threshold hit; default: manual via CLI

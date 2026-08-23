@@ -63,8 +63,6 @@ class HostSpawnSpec:
     # and so the routing guard can tell a review target (named to be READ) apart
     # from a write target instead of issuing a write guard for every review run.
     read_only: bool = False
-    workspace: str | None = None
-    effort: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -98,74 +96,13 @@ class HostSpawnSpec:
             payload["role"] = self.role
         if self.read_only:
             payload["read_only"] = True
-        if self.workspace:
-            payload["workspace"] = self.workspace
-        if self.effort:
-            payload["effort"] = self.effort
         return payload
-
-    def to_agy_dict(self) -> dict[str, Any]:
-        """Output agy-native format: array of subagent configs."""
-        config: dict[str, Any] = {
-            "TypeName": self.subagent_type.replace("threnody-", "") if self.subagent_type else self.tier,
-            "Role": self.role or "Implementer",
-            "Prompt": self.prompt,
-            "Workspace": self.workspace or determine_workspace_mode({
-                "target_files": self.target_files,
-                "read_only": self.method == "host_task" and not self.target_files,
-            }),
-        }
-        if self.model:
-            config["Model"] = self.model
-        if self.effort:
-            config["Effort"] = self.effort
-        if self.id:
-            config["Id"] = self.id
-        return config
-
-    def to_claude_dict(self) -> dict[str, Any]:
-        """Translate to Claude Code Agent tool format."""
-        return {
-            "tool": "Agent",
-            "subagent_type": self.subagent_type,
-            "prompt": self.prompt,
-            "model": self.model,
-            "tier": self.tier,
-        }
-
-    def to_copilot_dict(self) -> dict[str, Any]:
-        """Translate to GitHub Copilot Task format."""
-        return {
-            "tool": "Task",
-            "subagent_type": self.subagent_type,
-            "prompt": self.prompt,
-            "model": self.model,
-            "tier": self.tier,
-        }
-
-    def to_codex_dict(self) -> dict[str, Any]:
-        """Translate to OpenAI Codex Task format."""
-        return self.to_copilot_dict()
-
-    def to_cursor_dict(self) -> dict[str, Any]:
-        """Translate to Cursor Task format."""
-        return self.to_copilot_dict()
-
-    def to_junie_dict(self) -> dict[str, Any]:
-        """Translate to JetBrains Junie Task format."""
-        return self.to_copilot_dict()
-
-    def to_opencode_dict(self) -> dict[str, Any]:
-        """Translate to OpenCode Task format."""
-        return self.to_copilot_dict()
 
 
 def host_tool_for_caller(caller: str | None) -> str:
     normalized = normalize_caller_id(caller)
     if normalized == "claude-code":
         return "Agent"
-    if normalized == "antigravity":
-        return "invoke_subagent"
     return "Task"
 
 
@@ -268,28 +205,6 @@ def subagent_type_for_tier(tier: str) -> str:
     return "generalPurpose"
 
 
-def determine_workspace_mode(task: Mapping[str, Any]) -> str:
-    """Auto-pick workspace isolation mode based on task characteristics.
-    
-    Returns:
-        "branch" — isolated git branch (safest, for multi-file writes)
-        "share" — light worktree (middle ground, for read-only reviews)
-        "inherit" — shared workspace (fastest, for simple edits)
-    """
-    target_files = list(task.get("target_files") or [])
-    read_only = bool(task.get("read_only", False))
-    
-    if read_only:
-        return "share"
-    if len(target_files) > 3:
-        return "branch"
-    if any("*" in f or "?" in f for f in target_files):
-        return "branch"
-    if len(target_files) == 0:
-        return "inherit"
-    return "inherit"
-
-
 def named_subagent_types_supported(config: TGsConfig, caller: str | None) -> bool:
     """True when *caller* resolves a named ``subagent_type`` to a real definition.
 
@@ -342,22 +257,10 @@ def build_host_spawn(
     )
     # read_only tasks must never use direct_edit — they read source context only.
     method = "host_task" if read_only else host_native_method_for_tier(tier)
-
-    # Smart workspace picker
-    workspace = determine_workspace_mode({
-        "target_files": list(target_files or []),
-        "read_only": read_only,
-    })
-
-    # Map effort from tier (agy-specific)
-    effort_map = {"low": "low", "medium": "high", "high": "high"}
-    effort = effort_map.get(tier, "medium")
-
     resolved_role = role or derive_role_from_task(prompt)
     enriched_prompt = prompt
     if resolved_role and not prompt.startswith("["):
         enriched_prompt = f"[{resolved_role}] {prompt}"
-
     return HostSpawnSpec(
         tool=host_tool_for_caller(caller),
         method=method,
@@ -369,8 +272,6 @@ def build_host_spawn(
         wave_id=wave_id,
         target_files=list(target_files or []),
         id=spawn_id,
-        workspace=workspace,
-        effort=effort,
         pattern_hash=pattern_hash,
         artifact_path=artifact_path,
         upstream=list(upstream or []),
