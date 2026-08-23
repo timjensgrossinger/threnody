@@ -28,6 +28,35 @@
 
 A local-first **MCP meta-harness** for developer workflows — small, auditable, and host-native, not a hosted swarm platform. Register it in Claude Code, Copilot CLI, Codex, Cursor, Junie, or OpenCode: Threnody **plans and routes** in MCP; the **host shell executes** via `host_spawn` / `host_spawn_waves` (Agent or Task subagents). When a handoff includes `host_spawn_waves`, spawn subagents — do not substitute direct edits on planned files.
 
+## Disclaimer — Google Antigravity Integration
+
+> **This is a community project. Not affiliated with, endorsed by, or supported by Google.**
+>
+> "Antigravity", "Gemini", and "agy" are trademarks of Google LLC.
+>
+> **What this adds to agy:**
+> Antigravity CLI already has powerful native orchestration (subagents, swarms, planning,
+> skills, hooks, MCP). This plugin extends agy with:
+> - **Complexity-based tier routing** — auto-picks the right model (flash vs pro) based on task complexity
+> - **Multi-queen consensus review** — 3 parallel reviewers with persona diversity for quality gates
+> - **Cross-session memory** — SQLite-backed persistent state across sessions
+> - **Learning loop** — tracks patterns over time, suggests specialized agents for recurring tasks
+> - **Verify gate** — baseline-diff lint/type/test against merge base
+> - **Cost tracking** — token-savings receipts and spend analytics
+>
+> **For pure agy users:** Most orchestration capabilities already exist natively. This plugin
+> is most useful for teams using multiple AI tools (agy + Claude + Codex) or optimizing for
+> cost/quality across sessions.
+>
+> **Integration approach:** This plugin uses only agy's official extension points (plugins,
+> skills, hooks, MCP, agents) and does not call Google's APIs directly or handle OAuth tokens.
+> Optionally, the `google-antigravity` Python SDK can be used for programmatic agent spawning.
+>
+> Google's [Antigravity Terms of Service](https://antigravity.google/terms) prohibit
+> "using third party software to access the Service." This project uses only official
+> extension points. However, Google has not published an official third-party plugin program.
+> Use at your own risk. Contact `antigravity-support@google.com` with concerns.
+
 `execute_subtask` is **utility delegation only** (opt-in): OpenCode, Aider, and local loopback endpoints — never other host CLIs. Same-host work returns `HostNativeRequired` with a spawn payload; host→host delegation returns `HostDelegationBlocked`. Claude Code is a **router-only host** by default.
 
 On Claude Code, an opt-in mode (`routing_policy.shells.claude-code.workflow_emit`) emits **tier-aware [Dynamic Workflow](https://code.claude.com/docs/en/workflows) scripts** for fan-out plans — each `agent()` routes to its Threnody tier model, where a vanilla workflow runs every agent on the session model. Recurring shapes can be approved and saved as permanent `/workflow` commands.

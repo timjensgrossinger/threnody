@@ -145,6 +145,27 @@ BOOTSTRAP_REGISTRY: dict[str, tuple[DiscoveredModel, ...]] = {
         _model("claude-sonnet-5", "medium", aliases=("claude-sonnet-4.6",)),
         _model("claude-opus-5", "high", aliases=("claude-opus-4.6",)),
     ),
+    "antigravity": (
+        _model(
+            "gemini-3.7-flash",
+            "low",
+            aliases=("gemini-flash", "gemini-3.5-flash", "gemini-3.7-flash-low"),
+            request_multiplier=0.5,
+        ),
+        _model(
+            "gemini-3.7-flash",
+            "medium",
+            aliases=("gemini-3.7-flash-medium", "gemini-3.7-flash-high"),
+            eligible_tiers=("medium",),
+            request_multiplier=1.0,
+        ),
+        _model(
+            "gemini-3.1-pro",
+            "high",
+            aliases=("gemini-pro", "gemini-3.1-pro-high", "gemini-3.1-pro-low"),
+            request_multiplier=3.0,
+        ),
+    ),
 }
 
 

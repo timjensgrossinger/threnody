@@ -293,6 +293,8 @@ def caller_from_client_name(client_name: str | None) -> str | None:
         ("cursor", "cursor"),
         ("junie", "junie"),
         ("opencode", "opencode"),
+        ("antigravity", "antigravity"),
+        ("agy", "antigravity"),
     )
     for marker, provider_id in aliases:
         if marker in name_lower:
@@ -323,6 +325,10 @@ def detect_caller() -> str | None:
         os.environ.get("CLAUDE_CODE_SESSION")
     ):
         return "claude-code"
+    if _env_marker_enabled(os.environ.get("ANTIGRAVITY_SESSION")) or _env_marker_enabled(
+        os.environ.get("AGY_SESSION")
+    ):
+        return "antigravity"
     # Claude Code also sets MCP-related env vars when running servers
     if os.environ.get("MCP_TRANSPORT"):
         # Heuristic: check parent process name
@@ -2019,6 +2025,11 @@ def _get_blackbox_hooks():
     from blackbox.providers import _build_blackbox_command, _clean_blackbox_output, _detect_blackbox
     return _build_blackbox_command, _detect_blackbox, _clean_blackbox_output
 
+def _get_agy_hooks():
+    """Lazy import to avoid circular dependency."""
+    from antigravity.providers import _build_agy_command, _clean_agy_output, _detect_agy, _parse_agy_models
+    return _build_agy_command, _detect_agy, _clean_agy_output, _parse_agy_models
+
 def _get_opencode_hooks():
     """Lazy import to avoid circular dependency."""
     hooks = getattr(_get_opencode_hooks, "_cache", None)
@@ -2227,6 +2238,43 @@ def _clean_blackbox_output_safe(raw: str) -> str:
     except Exception:
         logger.debug("Blackbox output cleaner failed; using generic cleaner", exc_info=True)
         return _clean_output(raw)
+
+
+def _build_agy_command_safe(provider, action, model, prompt, effort=None):
+    try:
+        return _get_agy_hooks()[0](provider, action, model, prompt, effort)
+    except Exception:
+        logger.debug("Antigravity command builder failed", exc_info=True)
+        return ["agy", "-p", prompt]
+
+
+def _detect_agy_safe(provider: "CLIProvider") -> ProviderReadiness:
+    try:
+        return _get_agy_hooks()[1](provider)
+    except Exception:
+        logger.exception("Antigravity detect hook failed")
+        return ProviderReadiness(
+            routeable=False,
+            reason=DetectReason.AUTH_UNKNOWN,
+            metadata={"provider": "antigravity", "error": "detect_hook_failed"},
+        )
+
+
+def _clean_agy_output_safe(raw: str) -> str:
+    try:
+        return _get_agy_hooks()[2](raw)
+    except Exception:
+        logger.debug("Antigravity output cleaner failed; using generic cleaner", exc_info=True)
+        return _clean_output(raw)
+
+
+def _parse_agy_models_safe(provider, output: str) -> dict[str, list[str]]:
+    try:
+        return _get_agy_hooks()[3](provider, output)
+    except Exception:
+        logger.debug("Antigravity model parser failed; using empty fallback", exc_info=True)
+        return {}
+
 
 
 def _detect_windsurf(provider: "CLIProvider") -> ProviderReadiness:
@@ -2524,6 +2572,24 @@ BUILTIN_PROVIDERS: list[CLIProvider] = [
         cost_rank={},
         detect_hook=_detect_windsurf,
     ),
+    CLIProvider(
+        name="antigravity",
+        binary="agy",
+        display_name="Google Antigravity",
+        tier_models=bootstrap_tier_map("antigravity"),
+        cost_rank={
+            "low": 1,
+            "medium": 2,
+            "high": 3,
+        },
+        billing_model="subscription",
+        detect_cmd=None,
+        command_builder=_build_agy_command_safe,
+        detect_hook=_detect_agy_safe,
+        output_cleaner=_clean_agy_output_safe,
+        model_discovery_cmd=["agy", "models"],
+        model_discovery_parser=_parse_agy_models_safe,
+    ),
 ]
 
 HOST_PROVIDER_NAMES = frozenset({
@@ -2533,6 +2599,7 @@ HOST_PROVIDER_NAMES = frozenset({
     "cursor",
     "junie",
     "opencode",
+    "antigravity",
 })
 
 # Host CLIs used for MCP coordination; not subprocess execution targets by default.
@@ -2552,6 +2619,8 @@ def _normalize_caller_for_discovery(caller: str | None) -> str | None:
         return "claude-code"
     if normalized == "openai-codex":
         return "codex"
+    if normalized in {"agy", "antigravity-cli"}:
+        return "antigravity"
     return normalized
 
 

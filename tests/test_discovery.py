@@ -1591,8 +1591,9 @@ def test_builtin_providers_count_includes_new_providers():
     - aider, amazon-q (new, Phase 8 Wave 0)
     - windsurf (stub, Phase 9 Wave 1)
     - mistral-vibe, blackbox-ai (new providers)
+    - antigravity (Google Antigravity CLI)
     """
-    assert len(BUILTIN_PROVIDERS) == 11, f"Expected 11 providers, got {len(BUILTIN_PROVIDERS)}"
+    assert len(BUILTIN_PROVIDERS) == 12, f"Expected 12 providers, got {len(BUILTIN_PROVIDERS)}"
 
 
 def test_new_providers_in_builtin():

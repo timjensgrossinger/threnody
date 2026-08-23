@@ -889,8 +889,87 @@ install_provider_skill_targets() {
     # as markdown agents rather than directory-style SKILL.md packages.
     install_threnody_flat_agents "$HOME/.copilot/agents"
     install_threnody_flat_agents "$HOME/.config/opencode/agent"
+    # Antigravity CLI plugin installation
+    install_antigravity_plugin
+
     install_review_definitions
     SYNCED_THRENODY_SKILLS=1
+}
+
+install_antigravity_plugin() {
+    local agy_plugin_dir="$HOME/.gemini/antigravity-cli/plugins/threnody"
+    local agy_config_plugin_dir="$HOME/.gemini/config/plugins/threnody"
+    local agy_agents_dir="$HOME/.gemini/config/agents"
+    if [[ ! -d "$INSTALL_DIR/antigravity-plugin" ]]; then
+        return 0
+    fi
+    for pdir in "$agy_plugin_dir" "$agy_config_plugin_dir"; do
+        mkdir -p "$pdir"
+        mkdir -p "$pdir/skills"
+        mkdir -p "$pdir/rules"
+        cp "$INSTALL_DIR/antigravity-plugin/plugin.json" "$pdir/plugin.json" 2>/dev/null || true
+        cp "$INSTALL_DIR/antigravity-plugin/mcp_config.json" "$pdir/mcp_config.json" 2>/dev/null || true
+        cp "$INSTALL_DIR/antigravity-plugin/hooks.json" "$pdir/hooks.json" 2>/dev/null || true
+        install_threnody_skills "$pdir/skills"
+        if [[ -d "$INSTALL_DIR/antigravity-plugin/skills" ]]; then
+            cp "$INSTALL_DIR/antigravity-plugin/skills/"*.md "$pdir/skills/" 2>/dev/null || true
+        fi
+        if [[ -d "$INSTALL_DIR/antigravity-plugin/rules" ]]; then
+            cp "$INSTALL_DIR/antigravity-plugin/rules/"*.md "$pdir/rules/" 2>/dev/null || true
+        fi
+    done
+    mkdir -p "$agy_agents_dir"
+    for agent_file in "$INSTALL_DIR/shell/agents"/threnody-agy-*.md; do
+        [[ -f "$agent_file" ]] || continue
+        cp "$agent_file" "$agy_agents_dir/" 2>/dev/null || true
+    done
+
+    # Enable plugin in ~/.gemini/config/config.json
+    python3 - <<'PY' 2>/dev/null || true
+import json
+from pathlib import Path
+cfg_path = Path.home() / ".gemini" / "config" / "config.json"
+try:
+    data = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+plugins = data.setdefault("plugins", {})
+plugins["threnody"] = {"enabled": True}
+cfg_path.parent.mkdir(parents=True, exist_ok=True)
+cfg_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+
+    # Register MCP server in ~/.gemini/config/mcp_config.json
+    python3 - "$INSTALL_DIR/mcp_server.py" "$INSTALL_DIR" <<'PY' 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+mcp_path = Path(sys.argv[1]).resolve()
+install_dir = Path(sys.argv[2]).resolve()
+cfg_path = Path.home() / ".gemini" / "config" / "mcp_config.json"
+try:
+    data = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() and cfg_path.stat().st_size > 0 else {}
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+servers = data.setdefault("mcpServers", {})
+servers["threnody"] = {
+    "command": "python3",
+    "args": [str(mcp_path)],
+    "env": {
+        "THRENODY_HOST": "antigravity",
+        "THRENODY_INSTALL_DIR": str(install_dir)
+    }
+}
+cfg_path.parent.mkdir(parents=True, exist_ok=True)
+cfg_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+
+    info "Installed Threnody Antigravity plugin to $agy_config_plugin_dir and $agy_plugin_dir"
+    info "Installed Antigravity agent defs to $agy_agents_dir"
 }
 
 write_managed_file() {

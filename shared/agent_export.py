@@ -57,6 +57,12 @@ _BUILTIN_TARGETS: list[ExportTarget] = [
         global_dir=Path.home() / ".config" / "opencode" / "agent",
         layout="flat_md",
     ),
+    ExportTarget(
+        provider_id="antigravity",
+        project_subdir=".gemini/config/agents",
+        global_dir=Path.home() / ".gemini" / "config" / "agents",
+        layout="flat_md",
+    ),
 ]
 
 _TARGET_BY_PROVIDER: dict[str, ExportTarget] = {t.provider_id: t for t in _BUILTIN_TARGETS}

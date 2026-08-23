@@ -362,6 +362,7 @@ SUPPORTED_ROUTING_POLICY_SHELLS = (
     "codex",
     "junie",
     "opencode",
+    "antigravity",
 )
 ROUTING_POLICY_SHELL_ALIASES = {
     "claude": "claude-code",
@@ -375,6 +376,8 @@ ROUTING_POLICY_SHELL_ALIASES = {
     "openai-codex": "codex",
     "junie": "junie",
     "opencode": "opencode",
+    "antigravity": "antigravity",
+    "agy": "antigravity",
 }
 ROUTING_POLICY_HOOK_CAPABLE_SHELLS = frozenset({"claude-code"})
 # Shells where install.sh registers a PostToolUse-style learning-capture hook.
@@ -382,14 +385,14 @@ ROUTING_POLICY_HOOK_CAPABLE_SHELLS = frozenset({"claude-code"})
 # to `model` capture. Separate from the routing-guard set above — wiring a
 # learning hook must NOT imply routing-guard PreToolUse enforcement.
 LEARNING_HOOK_CAPABLE_SHELLS = frozenset(
-    {"claude-code", "codex", "cursor", "github-copilot-cli"}
+    {"claude-code", "codex", "cursor", "github-copilot-cli", "antigravity"}
 )
 # Shells whose native agent/skill directory `agent_export` can write to, so a
 # pre-registered definition carries the static instruction text and the per-agent
 # prompt only needs the variable part. Junie has no such directory, so it keeps
 # the full inline prompt. Kept in sync with `agent_export._BUILTIN_TARGETS`.
 NAMED_SUBAGENT_TYPE_SHELLS = frozenset(
-    {"claude-code", "github-copilot-cli", "codex", "cursor", "opencode"}
+    {"claude-code", "github-copilot-cli", "codex", "cursor", "opencode", "antigravity"}
 )
 # Shells whose definition format Threnody can express a read-only tool list in.
 # Deliberately narrower than NAMED_SUBAGENT_TYPE_SHELLS: a shell can resolve a named
@@ -403,6 +406,7 @@ ROUTING_POLICY_SHELL_BOOTSTRAP_IDS = {
     "codex": "codex",
     "junie": "junie",
     "opencode": "opencode",
+    "antigravity": "antigravity",
 }
 DEFAULT_ROUTING_TIER_MODELS = {
     "low": "gpt-5-mini",

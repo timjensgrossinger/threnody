@@ -231,7 +231,7 @@ class Database:
         integrity_reprobe_interval_hours: float = DB_INTEGRITY_REPROBE_INTERVAL_HOURS,
         synchronous: str = DB_SYNCHRONOUS_DEFAULT,
     ) -> None:
-        self._db_path = (db_path or DB_PATH).expanduser() if db_path else DB_PATH
+        self._db_path = Path(db_path or DB_PATH).expanduser() if db_path else DB_PATH
         self._result_ttl = result_ttl_hours * 3600
         self._plan_ttl = plan_ttl_hours * 3600
         self._backup_keep = backup_keep
