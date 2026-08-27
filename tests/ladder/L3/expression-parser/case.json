@@ -1,6 +1,7 @@
 {
   "id": "l3-expression-parser",
   "level": 3,
+  "kind": "algorithm",
   "prompt": "Create a Python module with a function `evaluate(expr)` that evaluates an arithmetic expression string containing non-negative integers, + - * /, and parentheses, with correct precedence and left associativity. Division is floating point. Raise ValueError on malformed input. Do NOT use eval or exec.",
   "target_file": "solution.py",
   "grader": "python3 -m pytest -q --tb=short",

@@ -1,0 +1,10 @@
+{
+  "id": "l3-fix-interval-overlap",
+  "level": 3,
+  "kind": "bugfix",
+  "prompt": "`booking.py` decides whether a new reservation conflicts with existing ones. It has a bug: some genuinely conflicting bookings are accepted and some non-conflicting ones are rejected. `repro.py` in this directory reproduces the failures — read it. Fix `booking.py` so all of them pass. Intervals are half-open [start, end): a booking ending exactly when another begins does NOT conflict. Keep the existing function names and signatures.",
+  "target_file": "booking.py",
+  "grader": "python3 -m pytest -q --tb=short",
+  "timeout_seconds": 300,
+  "grader_timeout_seconds": 120
+}

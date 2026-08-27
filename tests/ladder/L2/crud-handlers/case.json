@@ -1,0 +1,10 @@
+{
+  "id": "l2-crud-handlers",
+  "level": 2,
+  "kind": "boilerplate-crud",
+  "prompt": "Create a Python module exposing an in-memory CRUD store for `task` records via a class `TaskStore`. Methods: `create(title, done=False)` returns the new record as a dict with an auto-incrementing integer `id` starting at 1, plus `title` and `done`; `get(task_id)` returns the record or None; `list(done=None)` returns all records in insertion order, filtered by `done` when it is not None; `update(task_id, **fields)` updates only the given `title`/`done` fields and returns the updated record, or None if absent; `delete(task_id)` returns True if a record was removed else False. Reject an empty or whitespace-only title with ValueError. An unknown field name in `update` raises KeyError. Records returned to callers must not alias internal state.",
+  "target_file": "store.py",
+  "grader": "python3 -m pytest -q --tb=short",
+  "timeout_seconds": 300,
+  "grader_timeout_seconds": 120
+}

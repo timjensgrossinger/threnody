@@ -131,7 +131,7 @@ Host shell (Claude / Copilot / Codex / Cursor / …)
 | 🪄 | **Hybrid diagnose→implement** | One read-only high-tier diagnosis produces a change-spec, cheaper implementers execute it. Emits tiers only; the discount is learned per work profile, never hardcoded |
 | ✅ | **Baseline-diff verify gate** | Lint/type/test graded against the merge base, so pre-existing red never blocks and only real regressions get a fix pass (in-process, zero tokens on the host path) |
 | 📚 | **Repo beliefs** | Each run leaves a free `pattern`/`constraint` lesson; later runs get the most relevant ones injected, ranked by SQLite FTS × recency × recurrence (no embeddings) |
-| 🪜 | **Graded task ladder** | `threnody ladder run` executes L0–L6 benchmark cases with deterministic graders, deriving the **minimum passing tier per model** instead of a hand-maintained mapping |
+| 🪜 | **Graded task ladder** | `threnody ladder run` executes benchmark cases with deterministic graders on two axes: **difficulty** (L0–L6) and **task kind** (`xss-fix`, `boilerplate-crud`, `refactor`, …). Derives the minimum passing tier per model on each — so "which model is good at what" comes from graded outcomes rather than a hand-maintained mapping. Security cases use exploit-style graders that feed real payloads |
 | 💾 | **Cross-session memory** | `memory_*` MCP tools backed by local SQLite, shared across all MCP hosts |
 | 🔌 | **MCP-native** | 53 published tools over stdio JSON-RPC; works with any MCP-compatible host |
 | 📈 | **Adaptive thresholds** | EMA threshold learning from `record_outcome` (per-project, opt-in) |
@@ -213,6 +213,7 @@ ghcs "how to list files recursively in python"        # quick routed call
 threnody inspect status --project . --details         # provider readiness
 threnody quality --since 7d                           # model quality ledger
 threnody ladder run --tier low,medium,high            # graded ground truth (spends tokens)
+threnody ladder run --stale                           # re-grade only tiers whose model changed
 threnody db learn status                              # durable learning journal + table counts
 threnody db learn rebuild                             # rebuild the DB's learning tables from the journal
 threnody-watch                                        # live TUI monitor

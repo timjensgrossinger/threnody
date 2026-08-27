@@ -85,11 +85,15 @@ def findings_to_score(
     findings the synthesis KEPT (true positives) and penalises findings it dropped
     (noise / false positives). Heuristic and intentionally coarse — tunable.
 
-    ``kept_by_synthesis`` is tri-state. ``None`` — no adjudicator ran — scores as
-    yield, identically to an accepted finding, because refusing to score would leave
-    the review-learning loop with nothing on the python-synthesis path. The caller
-    tags such rows ``adjudicated=false``; only an explicit ``False`` is precision
-    evidence.
+    ``kept_by_synthesis`` is tri-state, and ``None`` — no adjudicator ran — also
+    returns ``None``. Nobody judged those findings, so there is no evidence about
+    precision, only about yield; scoring them anyway is what made 7.0 the modal
+    value of the entire ledger and made ``avg_score`` report a precision that was
+    never measured. This does NOT starve the review-learning loop:
+    ``review_learning.record_review_tier_outcome`` reads ``findings_high`` and the
+    tri-state directly and keeps its own EMA, independent of this function. And
+    because ``findings`` is excluded from ``OBJECTIVE_SOURCES``, no routing
+    decision loses an input either.
 
     Validity caveat: because clean reviews earn no signal and any dropped finding
     scores low (even a correct high-severity one synthesis chose to drop), this
@@ -99,6 +103,8 @@ def findings_to_score(
     """
     if findings_total <= 0:
         return None
+    if kept_by_synthesis is None:
+        return None  # no adjudicator ran -> yield only, not precision evidence
     if kept_by_synthesis is False:
         return 3.0  # findings dropped by synthesis -> noisy / low precision
     if findings_high > 0:
@@ -126,6 +132,7 @@ def _write_event(
     tier: str | None = None,
     profile_key: str | None = None,
     spawn_id: str | None = None,
+    kind: str | None = None,
     journal: bool = True,
     event_id: str | None = None,
     ts: float | None = None,
@@ -165,6 +172,11 @@ def _write_event(
         "tier": (tier or None),
         "profile_key": (profile_key or None),
         "spawn_id": (spawn_id or None),
+        # NOT "kind": the journal record is {"event_id", "kind", "ts", **body} and
+        # its `kind` is the EVENT kind ("model_quality"). A payload key of the same
+        # name silently overwrote it, so every quality event replayed as `unknown`
+        # and could not be restored after a recovery.
+        "task_kind": (kind or None),
     }
     when = float(ts) if ts is not None else time.time()
     if journal:
@@ -194,8 +206,8 @@ def write_quality_row(
                 "INSERT INTO model_quality_events "
                 "(model, effort, dimension, sub_dimension, score_0_10, source, "
                 "sample_meta, task_hash, run_id, tier, profile_key, spawn_id, "
-                "event_id, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "kind, event_id, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 # The uniqueness is a PARTIAL index (legacy rows carry no
                 # event_id and must not all collide on NULL), and SQLite only
                 # accepts a partial index as a conflict target when the clause
@@ -217,6 +229,7 @@ def write_quality_row(
                     row.get("tier"),
                     row.get("profile_key"),
                     row.get("spawn_id"),
+                    row.get("task_kind"),
                     event_id,
                     ts,
                 ),
@@ -245,11 +258,12 @@ def record_findings_score(
 
     No-op when the findings carry no signal (see :func:`findings_to_score`).
 
-    ``kept_by_synthesis=None`` means nothing adjudicated these findings. The row is
-    still written — yield is real information — but ``sample_meta.adjudicated`` marks
-    it so a reader can separate "a judge accepted this" from "no judge ran". Without
-    that flag the two are indistinguishable in the ledger, which is how the proxy came
-    to report precision it had never measured.
+    ``kept_by_synthesis=None`` means nothing adjudicated these findings, and no row
+    is written at all — see :func:`findings_to_score`. Yield without a verdict is
+    not precision evidence, and recording it is how the proxy came to report a
+    precision it had never measured. Rows that ARE written still carry
+    ``sample_meta.adjudicated`` so a reader can tell "a judge accepted this" from
+    "a judge rejected this".
     """
     score = findings_to_score(
         findings_high=findings_high,
@@ -449,12 +463,22 @@ def record_ladder_score(
     run_id: str | None = None,
     profile_key: str | None = None,
     spawn_id: str | None = None,
+    kind: str | None = None,
 ) -> None:
     """Record one graded ladder verdict (source='ladder').
 
     Pass/fail only — a benchmark that partially credits broken code is not ground
     truth. ``sub_dimension`` is the level label (``L0``..``L6``) so
     ``build_quality_snapshot`` groups a model's results per difficulty rung.
+
+    ``tier`` and ``case_id`` are written to real columns, not only into
+    ``sample_meta``: together with ``run_id`` they are what make one graded verdict
+    distinguishable from another. A sweep grades every case at every tier, so
+    without them two cases at the same level — or two tiers that resolve to the
+    same model — share an ``event_id`` and the second is discarded by
+    ``ON CONFLICT DO NOTHING``. ``build_min_passing_tier_map`` credits a tier only
+    when it swept *every* case at a level, so a silent drop does not merely lose a
+    row, it withholds the level entirely.
     """
     _write_event(
         db,
@@ -469,44 +493,58 @@ def record_ladder_score(
             "tier": (tier or None),
             "case_id": (case_id or None),
         },
+        # The case is the task being graded, so it belongs in task_hash — which is
+        # part of the journal's identity tuple for this kind.
+        task_hash=(case_id or None),
         run_id=run_id,
+        tier=(tier or None),
+        profile_key=profile_key,
+        spawn_id=spawn_id,
+        # `dimension` stays DIMENSION_GENERAL for backwards compatibility; `kind`
+        # is the axis a consumer can actually match on.
+        kind=kind,
     )
 
 
-def build_min_passing_tier_map(
-    db: Database, *, since: str = "all"
+def _min_passing_tier_grouped(
+    db: Database, *, group_column: str, since: str
 ) -> dict[str, dict[str, str]]:
-    """Return ``{model: {level_label: cheapest_passing_tier}}`` from ladder events.
+    """``{model: {group: cheapest_passing_tier}}`` over ladder events.
 
-    This is the auto-detected "which model is good at what" — derived from graded
-    outcomes rather than a hand-maintained table, and intended to inform
-    ``preferred_routing``. A level appears for a model only when that tier passed
-    *every* case attempted at that level, so one lucky pass is not evidence.
+    *group_column* is the axis to bucket by — ``sub_dimension`` for the difficulty
+    level (``L0``..``L6``) or ``kind`` for the task kind. The all-or-nothing rule is
+    the point: a tier is credited for a group only when it passed *every* case
+    attempted in it, so one lucky pass is never evidence.
+
+    ``tier``/``case_id`` are read from their real columns with a ``sample_meta``
+    fallback, so rows written before those columns existed still count.
     """
+    if group_column not in ("sub_dimension", "kind"):
+        raise ValueError(f"unsupported group column: {group_column!r}")
     since_ts, _ = parse_quality_window(since)
     attempted: dict[tuple[str, str, str], set[str]] = {}
     passed: dict[tuple[str, str, str], set[str]] = {}
     try:
         with db.conn() as conn:
             rows = conn.execute(
-                "SELECT model, sub_dimension, sample_meta, score_0_10 "
+                f"SELECT model, {group_column}, sample_meta, score_0_10, tier, task_hash "
                 "FROM model_quality_events "
-                "WHERE source = ? AND ts >= ? AND sub_dimension IS NOT NULL",
+                f"WHERE source = ? AND ts >= ? AND {group_column} IS NOT NULL",
                 (SOURCE_LADDER, since_ts),
             ).fetchall()
     except Exception:  # pragma: no cover - best-effort read
         log.debug("model_quality: ladder query failed", exc_info=True)
         return {}
-    for model, level, meta_json, score in rows:
+    for model, group, meta_json, score, tier_col, task_hash in rows:
         try:
             meta = json.loads(meta_json) if meta_json else {}
         except (TypeError, ValueError):
             meta = {}
-        tier = str(meta.get("tier") or "")
-        case_id = str(meta.get("case_id") or "")
+        tier = str(tier_col or meta.get("tier") or "")
+        case_id = str(task_hash or meta.get("case_id") or "")
         if not tier or not case_id:
             continue
-        key = (str(model), str(level), tier)
+        key = (str(model), str(group), tier)
         attempted.setdefault(key, set()).add(case_id)
         if float(score or 0.0) >= 10.0:
             passed.setdefault(key, set()).add(case_id)
@@ -514,17 +552,77 @@ def build_min_passing_tier_map(
     out: dict[str, dict[str, str]] = {}
     tier_order = ("low", "medium", "high")
     models = {m for m, _, _ in attempted}
-    levels = {lvl for _, lvl, _ in attempted}
+    groups = {g for _, g, _ in attempted}
     for model in sorted(models):
-        for level in sorted(levels):
+        for group in sorted(groups):
             for tier in tier_order:
-                key = (model, level, tier)
+                key = (model, group, tier)
                 if key not in attempted:
                     continue
                 if passed.get(key, set()) == attempted[key]:
-                    out.setdefault(model, {})[level] = tier
+                    out.setdefault(model, {})[group] = tier
                     break
     return out
+
+
+def graded_models_by_tier(
+    db: Database, *, since: str = "all"
+) -> dict[str, set[str]]:
+    """``{tier: {models graded at that tier}}`` from ladder events.
+
+    The ledger already records which model produced each graded verdict, so
+    "which model was this tier's evidence collected on" needs no extra storage.
+    That is what makes staleness detectable: a tier whose current model is not
+    among the graded ones has no ground truth that applies to it any more, and
+    `preferred_routing` advice derived from the old model is misleading rather
+    than merely out of date.
+    """
+    since_ts, _ = parse_quality_window(since)
+    out: dict[str, set[str]] = {}
+    try:
+        with db.conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT tier, model, sample_meta FROM model_quality_events "
+                "WHERE source = ? AND ts >= ?",
+                (SOURCE_LADDER, since_ts),
+            ).fetchall()
+    except Exception:  # pragma: no cover - best-effort read
+        log.debug("graded_models_by_tier failed", exc_info=True)
+        return {}
+    for tier_col, model, meta_json in rows:
+        tier = str(tier_col or "")
+        if not tier:
+            try:
+                meta = json.loads(meta_json) if meta_json else {}
+            except (TypeError, ValueError):
+                meta = {}
+            tier = str(meta.get("tier") or "")
+        if not tier or not model:
+            continue
+        out.setdefault(tier, set()).add(str(model))
+    return out
+
+
+def build_min_passing_tier_map(
+    db: Database, *, since: str = "all"
+) -> dict[str, dict[str, str]]:
+    """Return ``{model: {level_label: cheapest_passing_tier}}`` from ladder events.
+
+    Difficulty axis: how *hard* a case a model can carry at a given tier.
+    """
+    return _min_passing_tier_grouped(db, group_column="sub_dimension", since=since)
+
+
+def build_min_passing_tier_by_kind(
+    db: Database, *, since: str = "all"
+) -> dict[str, dict[str, str]]:
+    """Return ``{model: {kind: cheapest_passing_tier}}`` from ladder events.
+
+    Subject-matter axis, and the one that answers the question the level axis
+    cannot: "is this model good at fixing XSS" / "can the cheap tier handle
+    boilerplate". Populated only for cases whose ``case.json`` declares a ``kind``.
+    """
+    return _min_passing_tier_grouped(db, group_column="kind", since=since)
 
 
 def record_judge_score(

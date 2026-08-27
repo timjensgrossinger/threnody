@@ -817,6 +817,14 @@ class Database:
                 -- the model but no profile, so the two could never be joined.
                 profile_key   TEXT,
                 spawn_id      TEXT,
+                -- The TASK KIND this score is about (xss-fix, boilerplate-crud,
+                -- refactor, bugfix, ...). `dimension` cannot carry it: it is
+                -- already overloaded three ways -- a review dimension from
+                -- static_recall, a roles.py role from verify_gate, and the literal
+                -- 'general' from ladder/judge. That last one matches no consumer,
+                -- which is why the graded ladder -- the only source with a real
+                -- reference solution -- could never move a routing decision.
+                kind          TEXT,
                 -- Idempotency key from shared/learning_journal.py. Makes a replay
                 -- (or a retried terminal report) a no-op instead of a double count.
                 event_id      TEXT,
@@ -1111,6 +1119,14 @@ class Database:
                 -- the model but no profile, so the two could never be joined.
                 profile_key   TEXT,
                 spawn_id      TEXT,
+                -- The TASK KIND this score is about (xss-fix, boilerplate-crud,
+                -- refactor, bugfix, ...). `dimension` cannot carry it: it is
+                -- already overloaded three ways -- a review dimension from
+                -- static_recall, a roles.py role from verify_gate, and the literal
+                -- 'general' from ladder/judge. That last one matches no consumer,
+                -- which is why the graded ladder -- the only source with a real
+                -- reference solution -- could never move a routing decision.
+                kind          TEXT,
                 -- Idempotency key from shared/learning_journal.py. Makes a replay
                 -- (or a retried terminal report) a no-op instead of a double count.
                 event_id      TEXT,
@@ -1131,13 +1147,15 @@ class Database:
 
         ``tier``/``profile_key`` are what let the ledger answer "which model, at
         which tier, on which shape of file"; ``event_id`` is what makes a journal
-        replay or a retried terminal report a no-op instead of a double count.
+        replay or a retried terminal report a no-op instead of a double count;
+        ``kind`` is the task kind, which nothing could express while ``dimension``
+        was carrying three unrelated meanings.
         """
         existing = {
             str(row[1])
             for row in conn.execute("PRAGMA table_info(model_quality_events)").fetchall()
         }
-        for column in ("tier", "profile_key", "spawn_id", "event_id"):
+        for column in ("tier", "profile_key", "spawn_id", "event_id", "kind"):
             if column not in existing:
                 conn.execute(
                     f"ALTER TABLE model_quality_events ADD COLUMN {column} TEXT"
@@ -1150,6 +1168,10 @@ class Database:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_model_quality_events_tier_profile "
             "ON model_quality_events (model, tier, profile_key, dimension)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_quality_events_kind "
+            "ON model_quality_events (kind, model, source, ts)"
         )
 
     @staticmethod

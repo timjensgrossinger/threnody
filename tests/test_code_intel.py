@@ -440,3 +440,252 @@ class TestScanAndCache:
                     )
                 n = conn.execute("SELECT COUNT(*) FROM model_quality_events").fetchone()[0]
             assert n == len(mq.VALID_SOURCES)
+
+
+# ---------------------------------------------------------------------------
+# Rules added to make `logic` and `types` gradable at all
+# ---------------------------------------------------------------------------
+#
+# `expected_findings` filters to SEVERITY_HIGH, and `record_static_recall_score`
+# early-returns on an empty expected set — so before these rules existed, a logic
+# reviewer and a types reviewer could never be graded against anything.
+#
+# Precision matters more than recall here in a way that is easy to get backwards:
+# this scan is the yardstick reviewers are graded against, so a false positive does
+# not merely add noise, it marks a CORRECT reviewer as having missed a defect that
+# was never there. Every negative case below is therefore as load-bearing as the
+# positive ones.
+
+
+class TestAddedHighSeverityRules:
+    @staticmethod
+    def _high(code: str) -> set[str]:
+        from shared.code_intel import expected_findings, scan_smells
+
+        return {s.rule_id for s in expected_findings(scan_smells("t.py", code))}
+
+    # --- logic: unreachable_code ------------------------------------------------
+
+    def test_return_then_statement_in_same_block(self):
+        assert "unreachable_code" in self._high(
+            "def f(x):\n    return x\n    y = 1\n"
+        )
+
+    def test_break_then_statement_in_loop_body(self):
+        assert "unreachable_code" in self._high(
+            "def f(xs):\n    for x in xs:\n        break\n        print(x)\n"
+        )
+
+    def test_raise_then_statement_inside_try(self):
+        assert "unreachable_code" in self._high(
+            "def f():\n"
+            "    try:\n"
+            "        raise ValueError('x')\n"
+            "        print('dead')\n"
+            "    except ValueError:\n"
+            "        pass\n"
+        )
+
+    def test_return_inside_if_does_not_condemn_later_code(self):
+        """Only the SAME block is examined — an early return is not a defect."""
+        assert "unreachable_code" not in self._high(
+            "def f(x):\n"
+            "    if x:\n"
+                "        return 1\n"
+            "    y = x + 1\n"
+            "    return y\n"
+        )
+
+    # --- logic: duplicate_branch_condition --------------------------------------
+
+    def test_repeated_elif_condition(self):
+        assert "duplicate_branch_condition" in self._high(
+            "def f(x):\n"
+            "    if x > 1:\n"
+            "        return 'a'\n"
+            "    elif x > 1:\n"
+            "        return 'b'\n"
+            "    return 'c'\n"
+        )
+
+    def test_distinct_elif_conditions_are_fine(self):
+        assert "duplicate_branch_condition" not in self._high(
+            "def f(x):\n"
+            "    if x > 1:\n"
+            "        return 'a'\n"
+            "    elif x > 2:\n"
+            "        return 'b'\n"
+            "    return 'c'\n"
+        )
+
+    # --- types: none_annotated_returns_value ------------------------------------
+
+    def test_none_annotated_returning_a_value(self):
+        assert "none_annotated_returns_value" in self._high(
+            "def f(x) -> None:\n    return x\n"
+        )
+
+    def test_bare_return_under_none_annotation_is_fine(self):
+        assert "none_annotated_returns_value" not in self._high(
+            "def f(x) -> None:\n    if x:\n        return\n    return\n"
+        )
+
+    def test_explicit_return_none_is_fine(self):
+        assert "none_annotated_returns_value" not in self._high(
+            "def f() -> None:\n    return None\n"
+        )
+
+    def test_nested_function_return_is_not_blamed_on_the_outer(self):
+        """A closure's return says nothing about the enclosing signature."""
+        assert "none_annotated_returns_value" not in self._high(
+            "def outer() -> None:\n"
+            "    def inner():\n"
+            "        return 42\n"
+            "    inner()\n"
+        )
+
+    def test_nested_class_method_return_is_not_blamed(self):
+        assert "none_annotated_returns_value" not in self._high(
+            "def outer() -> None:\n"
+            "    class C:\n"
+            "        def m(self):\n"
+            "            return 1\n"
+            "    C()\n"
+        )
+
+    # --- security ---------------------------------------------------------------
+
+    def test_unverified_tls_context(self):
+        assert "tls_verify_disabled" in self._high(
+            "import ssl\nctx = ssl._create_unverified_context()\n"
+        )
+
+    def test_verify_false_keyword(self):
+        assert "tls_verify_disabled" in self._high(
+            "import requests\nrequests.get('https://x', verify=False)\n"
+        )
+
+    def test_verify_true_is_not_flagged(self):
+        assert "tls_verify_disabled" not in self._high(
+            "import requests\nrequests.get('https://x', verify=True)\n"
+        )
+
+    def test_extractall_without_filtering(self):
+        assert "unsafe_archive_extract" in self._high(
+            "import tarfile\n"
+            "def go(p):\n"
+            "    with tarfile.open(p) as t:\n"
+            "        t.extractall('/tmp/out')\n"
+        )
+
+    def test_extractall_with_members_is_not_flagged(self):
+        assert "unsafe_archive_extract" not in self._high(
+            "import tarfile\n"
+            "def go(p, names):\n"
+            "    with tarfile.open(p) as t:\n"
+            "        t.extractall('/tmp/out', members=names)\n"
+        )
+
+    def test_mark_safe_on_a_non_literal(self):
+        assert "unescaped_html_output" in self._high(
+            "from django.utils.safestring import mark_safe\n"
+            "def r(v):\n    return mark_safe(v)\n"
+        )
+
+    def test_mark_safe_on_a_literal_is_not_flagged(self):
+        """A string literal is developer-controlled, not attacker-controlled."""
+        assert "unescaped_html_output" not in self._high(
+            "from django.utils.safestring import mark_safe\n"
+            "def r():\n    return mark_safe('<b>static</b>')\n"
+        )
+
+    def test_csrf_exempt_decorator(self):
+        assert "csrf_exempt" in self._high(
+            "@csrf_exempt\ndef view(request):\n    return None\n"
+        )
+
+    # --- non-Python side --------------------------------------------------------
+
+    def test_js_inner_html_from_a_variable(self):
+        from shared.code_intel import expected_findings, scan_smells
+
+        hits = {
+            s.rule_id
+            for s in expected_findings(
+                scan_smells("a.js", "function show(el, v) { el.innerHTML = v; }")
+            )
+        }
+        assert "unescaped_html_output" in hits
+
+    def test_js_inner_html_cleared_with_empty_string_is_not_flagged(self):
+        """`el.innerHTML = ""` is the ordinary clear-the-node idiom."""
+        from shared.code_intel import expected_findings, scan_smells
+
+        hits = {
+            s.rule_id
+            for s in expected_findings(
+                scan_smells("a.js", 'function clear(el) { el.innerHTML = ""; }')
+            )
+        }
+        assert "unescaped_html_output" not in hits
+
+    def test_js_reject_unauthorized_false(self):
+        from shared.code_intel import expected_findings, scan_smells
+
+        hits = {
+            s.rule_id
+            for s in expected_findings(
+                scan_smells("a.js", "const o = { rejectUnauthorized: false };")
+            )
+        }
+        assert "tls_verify_disabled" in hits
+
+    # --- precision at repo scale -------------------------------------------------
+
+    def test_added_rules_are_silent_on_this_repository(self):
+        """Zero false positives across the repo's own source.
+
+        A regression here means a reviewer of one of these files would be graded as
+        having missed a defect that does not exist.
+        """
+        from pathlib import Path as _Path
+
+        from shared.code_intel import expected_findings, scan_smells
+
+        added = {
+            "tls_verify_disabled",
+            "unsafe_archive_extract",
+            "unescaped_html_output",
+            "csrf_exempt",
+            "unreachable_code",
+            "duplicate_branch_condition",
+            "none_annotated_returns_value",
+        }
+        root = _Path(__file__).resolve().parent.parent
+        hits: list[str] = []
+        for path in sorted((root / "shared").glob("*.py")):
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:  # pragma: no cover
+                continue
+            for smell in expected_findings(scan_smells(str(path), content)):
+                if smell.rule_id in added:
+                    hits.append(f"{path.name}:{smell.line} {smell.rule_id}")
+        assert not hits, "added rules fired on repo source: " + "; ".join(hits)
+
+    def test_every_added_rule_has_category_aliases(self):
+        """Recall matching goes through the alias map, so a rule without entries can
+        only be credited if the reviewer happens to echo the rule id verbatim."""
+        from shared.code_intel import RULE_CATEGORY_ALIASES
+
+        for rule_id in (
+            "tls_verify_disabled",
+            "unsafe_archive_extract",
+            "unescaped_html_output",
+            "csrf_exempt",
+            "unreachable_code",
+            "duplicate_branch_condition",
+            "none_annotated_returns_value",
+        ):
+            assert rule_id in RULE_CATEGORY_ALIASES, f"{rule_id} has no aliases"
+            assert RULE_CATEGORY_ALIASES[rule_id], f"{rule_id} alias set is empty"

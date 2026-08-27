@@ -1119,6 +1119,152 @@ def test_record_verify_quality_attributes_hook_record_via_handoff(
     db.close()
 
 
+def _verify_quality_rows(tmp_path: Path, report: dict) -> list[tuple]:
+    """Run _record_verify_quality against *report* and return the ledger rows."""
+    from shared.host_learning import _record_verify_quality
+
+    db = Database(tmp_path / f"vq-{abs(hash(repr(sorted(report.items()))))}.db")
+    db._init_schema(db._get_connection())
+    try:
+        _record_verify_quality(
+            db,
+            "swarm-vq",
+            report,
+            config=TGsConfig(),
+            workspace_root=str(tmp_path),
+        )
+        with db.conn() as conn:
+            return conn.execute(
+                "SELECT model, dimension, score_0_10, source FROM model_quality_events"
+            ).fetchall()
+    finally:
+        db.close()
+
+
+def test_verify_quality_refuses_to_score_when_no_check_actually_ran(
+    tmp_path: Path,
+) -> None:
+    """A signal whose command does not exist proves nothing — it must not score 10.
+
+    `run_signal` marks a missing command `unavailable=True` and `run_verify_gate`
+    keeps it out of `any_required_new`, so the verdict comes back "pass" with no
+    failures. Scoring that wrote a PERFECT objective row for a run where zero checks
+    executed, indistinguishable from a genuine lint+types+tests pass. Because
+    `detect_gate_command` resolves by `shutil.which` alone, it was the default
+    outcome on any repo without ruff/mypy/pytest — making "write boilerplate" a
+    guaranteed 10.0 generator, and four such rows enough to DE-escalate that model.
+    """
+    rows = _verify_quality_rows(
+        tmp_path,
+        {
+            "new_failures": [],
+            "preexisting_failures": [],
+            "baseline_used": False,
+            "degraded_signals": ["types", "tests"],
+        },
+    )
+    assert rows == [], f"expected no ledger row, got {rows}"
+
+
+def test_verify_quality_scores_a_genuinely_clean_run(tmp_path: Path) -> None:
+    """Checks ran and found nothing new — that is real ground truth."""
+    rows = _verify_quality_rows(
+        tmp_path,
+        {
+            "new_failures": [],
+            "preexisting_failures": [],
+            "baseline_used": True,
+            "degraded_signals": [],
+        },
+    )
+    assert len(rows) == 1
+    assert rows[0][2] == 10.0
+    assert rows[0][3] == "verify_gate"
+
+
+def test_verify_quality_scores_a_clean_run_without_a_baseline(tmp_path: Path) -> None:
+    """No merge base is fine for a CLEAN result.
+
+    "No failures at all" is an absolute statement about the tree; the baseline only
+    matters for deciding whether a FAILURE predates the run. Discarding clean
+    results here would throw away legitimate evidence from exactly the repos that
+    have no merge base.
+    """
+    rows = _verify_quality_rows(
+        tmp_path,
+        {
+            "new_failures": [],
+            "preexisting_failures": [],
+            "baseline_used": False,
+            "degraded_signals": [],
+        },
+    )
+    assert len(rows) == 1
+    assert rows[0][2] == 10.0
+
+
+def test_verify_quality_skips_unbaselined_failures(tmp_path: Path) -> None:
+    """Without a baseline a failure cannot be attributed to this run."""
+    rows = _verify_quality_rows(
+        tmp_path,
+        {
+            "new_failures": ["tests:test_a"],
+            "preexisting_failures": [],
+            "baseline_used": False,
+            "degraded_signals": [],
+        },
+    )
+    assert rows == []
+
+
+def test_verify_quality_degrades_score_with_new_failures(tmp_path: Path) -> None:
+    rows = _verify_quality_rows(
+        tmp_path,
+        {
+            "new_failures": ["tests:test_a", "tests:test_b"],
+            "preexisting_failures": ["tests:test_old"],
+            "baseline_used": True,
+            "degraded_signals": [],
+        },
+    )
+    assert len(rows) == 1
+    assert rows[0][2] == 5.0  # 10 - 2.5 * 2
+
+
+class TestSubDimensionFromSlug:
+    """`review_meta.categories` slugs are `dimension/category`, and storing one
+    verbatim as `sub_dimension` recorded the dimension twice — both renderers then
+    join the two again, so `security/sql-injection` displayed as
+    `security/security/sql-injection`."""
+
+    @staticmethod
+    def _f(slug: str, dimension: str):
+        from shared.host_learning import _sub_dimension_from_slug
+
+        return _sub_dimension_from_slug(slug, dimension)
+
+    def test_prefix_is_stripped(self):
+        assert self._f("security/sql-injection", "security") == "sql-injection"
+
+    def test_slug_equal_to_dimension_yields_none(self):
+        """The caller skips the row entirely — it would duplicate the top-level one."""
+        assert self._f("security", "security") is None
+
+    def test_bare_category_passes_through(self):
+        """Agents in practice write a bare token like `edge_case`."""
+        assert self._f("edge_case", "edge") == "edge_case"
+
+    def test_mismatched_prefix_is_kept_whole(self):
+        assert self._f("logic/command-injection", "security") == "logic/command-injection"
+
+    def test_case_is_normalised(self):
+        assert self._f("SECURITY/XSS", "security") == "xss"
+
+    def test_empty_and_trailing_slash_yield_none(self):
+        assert self._f("", "security") is None
+        assert self._f("security/", "security") is None
+
+
 def test_unmatched_hook_record_stays_on_wave_one(tmp_path: Path, monkeypatch) -> None:
     """A touched file nobody planned must not be attributed to a random agent."""
     from shared import run_log

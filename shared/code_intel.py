@@ -442,6 +442,92 @@ def _is_interpolated(node: ast.AST) -> bool:
     return False
 
 
+# Calls that unconditionally produce an unverified TLS context.
+_TLS_UNVERIFIED_CALLS = frozenset({
+    "ssl._create_unverified_context",
+    "ssl._https_verify_certificates",
+})
+# Functions whose contract is "trust this string as markup". Passing a non-literal
+# is the canonical stored/reflected XSS shape in Python web code.
+_HTML_SAFE_MARKERS = frozenset({"mark_safe", "Markup"})
+# Decorators that switch off CSRF protection for a view.
+_CSRF_EXEMPT_DECORATORS = frozenset({"csrf_exempt", "csrf.exempt", "exempt"})
+
+
+def _own_statements(node: ast.AST) -> "list[ast.stmt]":
+    """Statements belonging to *node*, not descending into nested functions/classes.
+
+    Needed so a rule about one function's returns is not triggered by a closure
+    defined inside it.
+    """
+    out: list[ast.stmt] = []
+    for field in ("body", "orelse", "finalbody"):
+        for stmt in getattr(node, field, []) or []:
+            out.append(stmt)
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            out.extend(_own_statements(stmt))
+    for handler in getattr(node, "handlers", []) or []:
+        for stmt in handler.body:
+            out.append(stmt)
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            out.extend(_own_statements(stmt))
+    return out
+
+
+def _statement_blocks(node: ast.AST) -> "list[list[ast.stmt]]":
+    """The straight-line statement lists directly owned by *node*."""
+    blocks: list[list[ast.stmt]] = []
+    for field in ("body", "orelse", "finalbody"):
+        block = getattr(node, field, None)
+        if isinstance(block, list) and len(block) > 1:
+            blocks.append(block)
+    for handler in getattr(node, "handlers", []) or []:
+        if isinstance(handler.body, list) and len(handler.body) > 1:
+            blocks.append(handler.body)
+    return blocks
+
+
+def _elif_chain_tests(node: ast.If) -> "list[ast.expr]":
+    """Every test in one if/elif chain, in source order."""
+    tests: list[ast.expr] = [node.test]
+    current = node
+    while (
+        len(current.orelse) == 1
+        and isinstance(current.orelse[0], ast.If)
+    ):
+        current = current.orelse[0]
+        tests.append(current.test)
+    return tests
+
+
+def _dump_test(test: ast.expr) -> str:
+    """Stable textual key for a branch test, or '' if it cannot be dumped."""
+    try:
+        return ast.dump(test, annotate_fields=False)
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
+def _is_constant_none(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+def _keyword_is_true_value(call: ast.Call, name: str, expected: object) -> bool:
+    """True when keyword *name* is present as the literal constant *expected*."""
+    for kw in call.keywords:
+        if kw.arg == name and isinstance(kw.value, ast.Constant):
+            if kw.value.value is expected:
+                return True
+    return False
+
+
+def _is_constant_str(node: ast.AST) -> bool:
+    """True for a plain string literal — the safe argument to a mark-safe call."""
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
 def _body_is_silent(body: list[ast.stmt]) -> bool:
     """True when an except body swallows the error with no handling at all."""
     if len(body) != 1:
@@ -474,6 +560,42 @@ def _scan_smells_ast(tree: ast.AST) -> list[Smell]:
     async_ranges = _async_function_ranges(tree)
 
     for node in ast.walk(tree):
+        # --- unreachable code ---
+        # A statement that can never execute is a defect by construction, not a
+        # style opinion: either the guard above it is wrong or the statement is
+        # dead. Only the *same* block is examined, so a return inside an if does
+        # not condemn the code after the if.
+        if isinstance(node, (ast.Module, ast.If, ast.For, ast.While, ast.With,
+                             ast.Try, ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.AsyncFor, ast.AsyncWith)):
+            for block in _statement_blocks(node):
+                for index, stmt in enumerate(block[:-1]):
+                    if isinstance(stmt, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+                        nxt = block[index + 1]
+                        add(Smell(
+                            "unreachable_code", DIM_LOGIC, SEVERITY_HIGH, nxt.lineno,
+                            f"statement is unreachable: preceded by "
+                            f"{type(stmt).__name__.lower()} in the same block",
+                        ))
+                        break
+
+        # --- duplicated branch condition ---
+        # `if x: ... elif x: ...` means the second body is dead. Compared by
+        # normalised source, so only a genuine textual duplicate matches.
+        if isinstance(node, ast.If):
+            seen: set[str] = set()
+            for test in _elif_chain_tests(node):
+                key = _dump_test(test)
+                if key and key in seen:
+                    add(Smell(
+                        "duplicate_branch_condition", DIM_LOGIC, SEVERITY_HIGH,
+                        test.lineno,
+                        "branch condition repeats an earlier one, so this body is dead",
+                    ))
+                    break
+                if key:
+                    seen.add(key)
+
         # --- exception handling ---
         if isinstance(node, ast.ExceptHandler):
             if _body_is_silent(node.body):
@@ -488,7 +610,7 @@ def _scan_smells_ast(tree: ast.AST) -> list[Smell]:
                 ))
             continue
 
-        # --- mutable default argument ---
+        # --- function-level rules ---
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             defaults = list(node.args.defaults) + [
                 d for d in node.args.kw_defaults if d is not None
@@ -498,6 +620,38 @@ def _scan_smells_ast(tree: ast.AST) -> list[Smell]:
                     "mutable_default_arg", DIM_LOGIC, SEVERITY_MEDIUM, node.lineno,
                     f"{node.name} has a mutable default argument shared across calls",
                 ))
+
+            # CSRF protection switched off for a view. Unambiguous from the
+            # decorator alone.
+            for deco in node.decorator_list:
+                deco_name = _dotted_name(deco.func if isinstance(deco, ast.Call) else deco)
+                if deco_name.rsplit(".", 1)[-1] in _CSRF_EXEMPT_DECORATORS:
+                    add(Smell(
+                        "csrf_exempt", DIM_SECURITY, SEVERITY_HIGH, node.lineno,
+                        f"{node.name} disables CSRF protection via @{deco_name}",
+                    ))
+                    break
+
+            # `-> None` but a value is returned. The annotation and the return are
+            # in direct contradiction, so this needs no inference to call a defect
+            # — which is what makes it safe as a high-severity `types` rule. Nested
+            # functions are skipped so an inner def's return is not blamed here.
+            returns = node.returns
+            if (
+                isinstance(returns, ast.Constant) and returns.value is None
+            ) or (
+                isinstance(returns, ast.Name) and returns.id == "None"
+            ):
+                for inner in _own_statements(node):
+                    if isinstance(inner, ast.Return) and inner.value is not None:
+                        if _is_constant_none(inner.value):
+                            continue
+                        add(Smell(
+                            "none_annotated_returns_value", DIM_TYPES, SEVERITY_HIGH,
+                            inner.lineno,
+                            f"{node.name} is annotated -> None but returns a value",
+                        ))
+                        break
             continue
 
         # --- unbounded loop ---
@@ -590,6 +744,38 @@ def _scan_smells_ast(tree: ast.AST) -> list[Smell]:
                     f"{name}() blocks the event loop inside an async function",
                 ))
 
+        # --- added rules -------------------------------------------------------
+        # Every one of these is chosen to be UNAMBIGUOUS from the call site alone,
+        # because static_recall grades reviewers against the high-severity set: a
+        # false positive here does not merely add noise, it marks a correct reviewer
+        # as having missed something that was never a defect. Anything needing taint
+        # analysis to be certain (SSRF, most path traversal) is deliberately absent
+        # rather than approximated.
+        if name in _TLS_UNVERIFIED_CALLS or _keyword_is_true_value(node, "verify", False):
+            add(Smell(
+                "tls_verify_disabled", DIM_SECURITY, SEVERITY_HIGH, node.lineno,
+                f"{name or 'call'}() disables TLS certificate verification",
+            ))
+
+        if short == "extractall" and not _has_keyword(node, "members") \
+                and not _has_keyword(node, "filter"):
+            add(Smell(
+                "unsafe_archive_extract", DIM_SECURITY, SEVERITY_HIGH, node.lineno,
+                f"{short}() extracts an archive without path filtering "
+                "(entries may escape the destination)",
+            ))
+
+        if short in _HTML_SAFE_MARKERS and node.args and not _is_constant_str(node.args[0]):
+            add(Smell(
+                "unescaped_html_output", DIM_SECURITY, SEVERITY_HIGH, node.lineno,
+                f"{short}() marks a non-literal value as trusted HTML",
+            ))
+        elif short == "render_template_string" and node.args and _is_interpolated(node.args[0]):
+            add(Smell(
+                "unescaped_html_output", DIM_SECURITY, SEVERITY_HIGH, node.lineno,
+                "render_template_string() receives an interpolated template",
+            ))
+
     out.sort(key=lambda s: (s.line, s.rule_id))
     return out
 
@@ -633,6 +819,37 @@ _REGEX_RULES: tuple[tuple[str, str, str, "re.Pattern[str]", str], ...] = (
         "suppressed_type_error", DIM_TYPES, SEVERITY_LOW,
         re.compile(r"@ts-ignore|@ts-expect-error|\bas\s+any\b|#\s*type:\s*ignore"),
         "type error suppressed rather than resolved",
+    ),
+    (
+        # Assigning to innerHTML/outerHTML from anything other than a literal, plus
+        # the two React/DOM escape hatches. Restricted to an assignment from a
+        # non-literal so `el.innerHTML = ""` (the common clear-the-node idiom) does
+        # not register.
+        "unescaped_html_output", DIM_SECURITY, SEVERITY_HIGH,
+        re.compile(
+            # Only an assignment from an identifier, call, or template literal.
+            # A plain quoted literal is developer-controlled, and `el.innerHTML = ""`
+            # is the ordinary clear-the-node idiom.
+            r"\.(?:inner|outer)HTML\s*=\s*(?:[A-Za-z_$(]|`)"
+            # Split so this rule definition does not match itself: a self-hit would
+            # make `expected_findings` demand an XSS report from anyone reviewing
+            # THIS file, marking a correct reviewer as having missed a non-defect.
+            r"|dangerouslySetInner" r"HTML"
+            r"|document\.write\s*\("
+            r"|\.insertAdjacentHTML\s*\("
+        ),
+        "value written to the DOM as markup without escaping",
+    ),
+    (
+        "tls_verify_disabled", DIM_SECURITY, SEVERITY_HIGH,
+        re.compile(
+            r"rejectUnauthorized\s*:\s*false"
+            r"|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*[\"']?0"
+            r"|InsecureSkipVerify\s*:\s*true"
+            r"|curl_setopt\s*\([^)]*CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)",
+            re.IGNORECASE,
+        ),
+        "TLS certificate verification disabled",
     ),
 )
 
@@ -748,6 +965,32 @@ RULE_CATEGORY_ALIASES: dict[str, frozenset[str]] = {
     }),
     "suppressed_type_error": frozenset({
         "suppressed-type", "type-ignore", "unsafe-cast", "any",
+    }),
+    "tls_verify_disabled": frozenset({
+        "tls", "ssl", "certificate-validation", "cert-validation",
+        "insecure-transport", "mitm", "weak-crypto", "verify-disabled",
+    }),
+    "unsafe_archive_extract": frozenset({
+        "path-traversal", "zip-slip", "tar-slip", "directory-traversal",
+        "arbitrary-file-write", "archive",
+    }),
+    "unescaped_html_output": frozenset({
+        "xss", "cross-site-scripting", "html-injection", "unescaped-output",
+        "template-injection", "output-encoding",
+    }),
+    "csrf_exempt": frozenset({
+        "csrf", "cross-site-request-forgery", "csrf-exempt", "state-changing-get",
+    }),
+    "unreachable_code": frozenset({
+        "unreachable", "unreachable-code", "dead-code", "control-flow",
+    }),
+    "duplicate_branch_condition": frozenset({
+        "duplicate-condition", "duplicate-branch", "dead-branch", "dead-code",
+        "wrong-condition", "control-flow",
+    }),
+    "none_annotated_returns_value": frozenset({
+        "return-type", "incompatible-return", "type-mismatch", "annotation-mismatch",
+        "wrong-return-type",
     }),
 }
 

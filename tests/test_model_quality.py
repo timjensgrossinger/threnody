@@ -34,21 +34,32 @@ def test_findings_to_score_precision_proxy() -> None:
     assert mq.findings_to_score(findings_high=3, findings_total=3, kept_by_synthesis=False) == 3.0
     # no findings -> no signal (None, so the ledger is not diluted)
     assert mq.findings_to_score(findings_high=0, findings_total=0, kept_by_synthesis=True) is None
-    # unadjudicated (None) is NOT a rejection: nothing judged these findings, so they
-    # score as yield. Only an explicit False is evidence of noise.
-    assert mq.findings_to_score(findings_high=1, findings_total=1, kept_by_synthesis=None) == 10.0
-    assert mq.findings_to_score(findings_high=0, findings_total=1, kept_by_synthesis=None) == 7.0
+    # unadjudicated (None) yields NO row: nothing judged these findings, so there is
+    # evidence of yield but none of precision. Scoring it anyway is what made 7.0 the
+    # modal value of the ledger and reported a precision never measured. Only an
+    # explicit True/False is evidence either way.
+    assert mq.findings_to_score(findings_high=1, findings_total=1, kept_by_synthesis=None) is None
+    assert mq.findings_to_score(findings_high=0, findings_total=1, kept_by_synthesis=None) is None
 
 
-def test_unadjudicated_rows_are_tagged(db: Database) -> None:
-    """Without this flag the ledger cannot tell "a judge accepted it" from "no judge
-    ran", which is how the proxy came to report a precision it never measured."""
+def test_unadjudicated_findings_write_no_row(db: Database) -> None:
+    """An unjudged review is yield evidence only, so it must not enter the ledger.
+
+    Recording it is how the proxy came to report a precision it never measured: for
+    most of this module's life `None` scored identically to an accepted finding, so
+    7.0 became the modal value of the whole table.
+    """
     import json
 
-    for kept in (None, True, False):
+    # One distinct *category* per case, never the tri-state itself: interpolating
+    # `kept` produced real `security/None|True|False` sub_dimensions, and because
+    # every recorder journals before its DB write those strings reached the
+    # operator's live ledger and rendered as `security/security/None`.
+    cases = {None: "unjudged", True: "kept", False: "dropped"}
+    for kept, category in cases.items():
         mq.record_findings_score(
             db, model="m", effort=None, dimension="security",
-            sub_dimension=f"security/{kept}",
+            sub_dimension=category,
             findings_high=1, findings_total=1, kept_by_synthesis=kept,
         )
     with db.conn() as conn:
@@ -56,11 +67,15 @@ def test_unadjudicated_rows_are_tagged(db: Database) -> None:
             "SELECT sub_dimension, score_0_10, sample_meta FROM model_quality_events"
         ).fetchall()
     by_sub = {sub: (score, json.loads(meta)) for sub, score, meta in rows}
-    assert by_sub["security/None"][1]["adjudicated"] is False
-    assert by_sub["security/True"][1]["adjudicated"] is True
-    assert by_sub["security/False"][1]["adjudicated"] is True
-    # The noise branch is now reachable — it never fired before adjudication existed.
-    assert by_sub["security/False"][0] == 3.0
+
+    # The unadjudicated case is absent entirely — not merely tagged.
+    assert "unjudged" not in by_sub
+    # Adjudicated verdicts still record, and still carry the flag that distinguishes
+    # "a judge accepted it" from "no judge ran".
+    assert by_sub["kept"][1]["adjudicated"] is True
+    assert by_sub["dropped"][1]["adjudicated"] is True
+    # The noise branch is reachable — it never fired before adjudication existed.
+    assert by_sub["dropped"][0] == 3.0
 
 
 # ---------------------------------------------------------------------------

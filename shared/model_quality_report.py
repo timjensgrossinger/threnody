@@ -15,7 +15,11 @@ from typing import Any
 
 from shared.config import TGsConfig
 from shared.db import Database
-from shared.model_quality import build_min_passing_tier_map, build_quality_snapshot
+from shared.model_quality import (
+    build_min_passing_tier_by_kind,
+    build_min_passing_tier_map,
+    build_quality_snapshot,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DOC_PATH = REPO_ROOT / "docs" / "MODEL_QUALITY.md"
@@ -94,6 +98,15 @@ def render_quality_markdown(snapshot: dict[str, Any]) -> str:
         "",
     ]
     footer.extend(render_min_passing_tier_section(snapshot.get("min_passing_tier") or {}))
+    footer.extend(
+        render_competence_by_kind_section(snapshot.get("competence_by_kind") or {})
+    )
+    footer.extend(
+        render_staleness_section(
+            list(snapshot.get("stale_tiers") or []),
+            dict(snapshot.get("tier_models") or {}),
+        )
+    )
     footer.extend([
         "## How to refresh",
         "",
@@ -106,36 +119,113 @@ def render_quality_markdown(snapshot: dict[str, Any]) -> str:
     return "\n".join(header + table + footer) + "\n"
 
 
-def render_min_passing_tier_section(min_map: dict[str, dict[str, str]]) -> list[str]:
-    """Render the graded ladder's minimum-passing-tier table.
-
-    This is the auto-detected "which model is good at what": for each model, the
-    cheapest tier observed to pass every case at a difficulty level. Empty until
-    `threnody ladder run` has been executed.
-    """
+def _render_min_tier_table(
+    min_map: dict[str, dict[str, str]], *, title: str, blurb: str
+) -> list[str]:
+    """Shared renderer for a ``{model: {group: tier}}`` competence table."""
     if not min_map:
         return [
-            "## Minimum passing tier (graded ladder)",
+            f"## {title}",
             "",
             "_No graded ladder results yet — run `threnody ladder run` to populate "
             "the ground-truth signal._",
             "",
         ]
-    levels = sorted({lvl for per_model in min_map.values() for lvl in per_model})
+    groups = sorted({g for per_model in min_map.values() for g in per_model})
     lines = [
-        "## Minimum passing tier (graded ladder)",
+        f"## {title}",
         "",
-        "Cheapest tier observed to pass **every** case at each level. Derived from "
-        "graded outcomes, not hand-maintained — use it to inform `preferred_routing`.",
+        blurb,
         "",
-        "| Model | " + " | ".join(levels) + " |",
-        "|---" * (len(levels) + 1) + "|",
+        "| Model | " + " | ".join(groups) + " |",
+        "|---" * (len(groups) + 1) + "|",
     ]
     for model in sorted(min_map):
-        cells = [min_map[model].get(level, "—") for level in levels]
+        cells = [min_map[model].get(g, "—") for g in groups]
         lines.append(f"| {model} | " + " | ".join(cells) + " |")
     lines.append("")
     return lines
+
+
+def render_min_passing_tier_section(min_map: dict[str, dict[str, str]]) -> list[str]:
+    """Render the graded ladder's minimum-passing-tier table (difficulty axis).
+
+    For each model, the cheapest tier observed to pass every case at a difficulty
+    level. Empty until `threnody ladder run` has been executed.
+    """
+    return _render_min_tier_table(
+        min_map,
+        title="Minimum passing tier by difficulty (graded ladder)",
+        blurb=(
+            "Cheapest tier observed to pass **every** case at each level. Derived from "
+            "graded outcomes, not hand-maintained — use it to inform `preferred_routing`. "
+            "This is the *how hard* axis; see the next table for *what about*."
+        ),
+    )
+
+
+def render_competence_by_kind_section(kind_map: dict[str, dict[str, str]]) -> list[str]:
+    """Render per-task-kind competence — the "good at what" table.
+
+    The difficulty axis cannot answer "is this model good at fixing XSS" or "can
+    the cheap tier handle boilerplate", because a level says how hard a case is and
+    not what it is about. This one keys on each case's declared ``kind``.
+    """
+    return _render_min_tier_table(
+        kind_map,
+        title="Competence by task kind (graded ladder)",
+        blurb=(
+            "Cheapest tier observed to pass **every** graded case of each task kind. "
+            "This is the direct answer to \"which model is good at what\": read a row as "
+            "\"this model handles this kind of work from this tier upward\". A dash means "
+            "no tier swept every case of that kind — not that the model failed."
+        ),
+    )
+
+
+def _attach_staleness(snapshot: dict[str, Any], db: Database) -> None:
+    """Add ``stale_tiers``/``tier_models`` to *snapshot*, best-effort.
+
+    Read-only and non-fatal: a report must still render when provider discovery is
+    unavailable (headless, no CLIs installed), so a failure leaves the keys absent
+    and the staleness section simply does not appear.
+    """
+    try:
+        from shared.ladder import TIERS, _current_tier_models, stale_tiers
+
+        mapping = _current_tier_models(TIERS)
+        if not mapping:
+            return
+        snapshot["tier_models"] = mapping
+        snapshot["stale_tiers"] = stale_tiers(db, mapping)
+    except Exception:
+        pass
+
+
+def render_staleness_section(stale: list[str], mapping: dict[str, str]) -> list[str]:
+    """Warn when a tier's current model is not the one its results were graded on.
+
+    Without this the two competence tables read as current when they may describe a
+    model the tier no longer resolves to — which is worse than having no data,
+    because it looks authoritative.
+    """
+    if not stale:
+        return []
+    detail = ", ".join(f"`{t}` → `{mapping.get(t, '?')}`" for t in stale)
+    return [
+        "## ⚠️ Stale graded evidence",
+        "",
+        f"These tiers now resolve to a model that has **no graded results of its own**: {detail}.",
+        "",
+        "The competence tables above still describe whichever model the tier used to "
+        "resolve to, so treat those rows as historical. Re-grade just the affected "
+        "tiers with:",
+        "",
+        "```bash",
+        "threnody ladder run --stale",
+        "```",
+        "",
+    ]
 
 
 def _open_db(db_path: Path | None, config: TGsConfig | None = None) -> Database:
@@ -157,6 +247,8 @@ def write_quality_doc(
     db = _open_db(db_path, config)
     snapshot = build_quality_snapshot(db, since=since, config=config)
     snapshot["min_passing_tier"] = build_min_passing_tier_map(db, since=since)
+    snapshot["competence_by_kind"] = build_min_passing_tier_by_kind(db, since=since)
+    _attach_staleness(snapshot, db)
     target = path or DEFAULT_DOC_PATH
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(render_quality_markdown(snapshot), encoding="utf-8")
@@ -191,6 +283,8 @@ def main(argv: list[str] | None = None) -> int:
     db = _open_db(args.db, config)
     snapshot = build_quality_snapshot(db, since=args.since, config=config)
     snapshot["min_passing_tier"] = build_min_passing_tier_map(db, since=args.since)
+    snapshot["competence_by_kind"] = build_min_passing_tier_by_kind(db, since=args.since)
+    _attach_staleness(snapshot, db)
     if args.json:
         print(json.dumps(snapshot, indent=2, sort_keys=True))
     else:

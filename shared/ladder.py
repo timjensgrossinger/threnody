@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
 import shutil
 import subprocess
@@ -42,6 +43,20 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 LADDER_DIR = Path(__file__).parent.parent / "tests" / "ladder"
+
+# Env override for the case root, resolved at call time. The repo-relative default
+# is right for the bundled cases, but an operator grading a private set (proprietary
+# code, house style, a defect class specific to their stack) should not have to
+# vendor it into this tree.
+_LADDER_DIR_ENV = "THRENODY_LADDER_DIR"
+
+
+def ladder_dir() -> Path:
+    """Resolve the ladder case root now, not at import time."""
+    override = os.environ.get(_LADDER_DIR_ENV)
+    if override and override.strip():
+        return Path(override).expanduser()
+    return LADDER_DIR
 TIERS = ("low", "medium", "high")
 _TIER_RANK = {tier: idx for idx, tier in enumerate(TIERS)}
 
@@ -65,6 +80,11 @@ class LadderCase(NamedTuple):
     timeout_seconds: int
     grader_timeout_seconds: int
     source: str
+    # The TASK KIND this case measures (xss-fix, boilerplate-crud, refactor, ...).
+    # The level says how *hard* a case is; the kind says what it is *about*, and
+    # only the second can answer "is this model good at fixing XSS". Optional so a
+    # case.json written before the field existed still loads.
+    kind: str = ""
 
     @property
     def level_label(self) -> str:
@@ -77,6 +97,7 @@ class LadderResult:
     level: int
     tier: str
     passed: bool
+    kind: str = ""
     model: str = ""
     provider: str = ""
     effort: str | None = None
@@ -167,17 +188,23 @@ def load_case(case_dir: str | Path) -> LadderCase:
             payload.get("grader_timeout_seconds") or DEFAULT_GRADER_TIMEOUT
         ),
         source=str(case_dir),
+        kind=str(payload.get("kind") or "").strip().lower(),
     )
 
 
 def load_cases(
-    root: str | Path = LADDER_DIR,
+    root: "str | Path | None" = None,
     *,
     levels: "Iterable[int] | None" = None,
     case_ids: "Iterable[str] | None" = None,
 ) -> list[LadderCase]:
-    """Load all cases under ``root``, optionally filtered by level or id."""
-    root = Path(root)
+    """Load all cases under ``root``, optionally filtered by level or id.
+
+    ``root=None`` resolves ``ladder_dir()`` at call time so a
+    ``THRENODY_LADDER_DIR`` override applies; binding the module constant as a
+    default argument would freeze it at import.
+    """
+    root = Path(root) if root is not None else ladder_dir()
     if not root.is_dir():
         return []
     wanted_levels = {int(v) for v in levels} if levels is not None else None
@@ -337,6 +364,7 @@ def run_case(
         if output.error or not output.content.strip():
             return LadderResult(
                 case_id=case.case_id, level=case.level, tier=tier, passed=False,
+                kind=case.kind,
                 model=output.model, provider=output.provider, effort=output.effort,
                 error=output.error or "empty output",
                 duration_ms=int((time.monotonic() - started) * 1000),
@@ -347,6 +375,7 @@ def run_case(
         passed, grader_output = grade(case, sandbox)
         return LadderResult(
             case_id=case.case_id, level=case.level, tier=tier, passed=passed,
+            kind=case.kind,
             model=output.model, provider=output.provider, effort=output.effort,
             grader_output="" if passed else grader_output,
             duration_ms=int((time.monotonic() - started) * 1000),
@@ -365,10 +394,18 @@ def run_ladder(
     db: "Database | None" = None,
     levels: "Iterable[int] | None" = None,
     case_ids: "Iterable[str] | None" = None,
+    run_id: "str | None" = None,
 ) -> list[LadderResult]:
     """Run every (case x tier) combination, recording each verdict in the ledger."""
     resolved = cases if cases is not None else load_cases(levels=levels, case_ids=case_ids)
     ordered_tiers = [t for t in tiers if t in _TIER_RANK]
+    # One id for the whole sweep. A sweep IS a real run, and ledger rows without a
+    # run_id are ignored by ``quality_bias.load_model_quality_bias``, which treats
+    # missing provenance as "cannot have come from a real run". Without this the
+    # graded ladder — the only source with a reference solution — would keep being
+    # unable to influence a routing decision, for a second reason on top of the
+    # dimension mismatch.
+    sweep_id = run_id or f"ladder-{int(time.time())}"
     results: list[LadderResult] = []
     for case in resolved:
         for tier in ordered_tiers:
@@ -380,11 +417,13 @@ def run_ladder(
                 "PASS" if result.passed else "FAIL",
             )
             if db is not None:
-                record_ladder_result(db, result)
+                record_ladder_result(db, result, run_id=sweep_id)
     return results
 
 
-def record_ladder_result(db: "Database", result: LadderResult) -> None:
+def record_ladder_result(
+    db: "Database", result: LadderResult, *, run_id: "str | None" = None
+) -> None:
     """Write one graded verdict into ``model_quality_events`` (source='ladder')."""
     try:
         from . import model_quality
@@ -397,6 +436,8 @@ def record_ladder_result(db: "Database", result: LadderResult) -> None:
             passed=result.passed,
             tier=result.tier,
             case_id=result.case_id,
+            run_id=run_id,
+            kind=result.kind or None,
         )
     except Exception:  # pragma: no cover - best-effort ledger write
         log.debug("ladder: ledger write failed for %s", result.case_id, exc_info=True)
@@ -405,6 +446,67 @@ def record_ladder_result(db: "Database", result: LadderResult) -> None:
 # ---------------------------------------------------------------------------
 # Derived: minimum passing tier
 # ---------------------------------------------------------------------------
+
+
+def _current_tier_models(tiers: "Iterable[str]") -> dict[str, str]:
+    """Best-effort ``{tier: model}`` the registry would use right now.
+
+    Read-only: it must never execute anything, because the whole point is to
+    decide whether spending tokens is warranted. Returns ``{}`` when the mapping
+    cannot be resolved, and the caller then declines rather than guessing.
+    """
+    out: dict[str, str] = {}
+    try:
+        from .discovery import get_registry
+
+        registry = get_registry()
+    except Exception:  # pragma: no cover - discovery is environment-dependent
+        log.debug("ladder: registry unavailable for staleness check", exc_info=True)
+        return {}
+    for tier in tiers:
+        model = ""
+        try:
+            providers = registry.get_providers_for_tier(tier)
+            for provider in providers or []:
+                candidate = (getattr(provider, "tier_models", {}) or {}).get(tier)
+                if candidate:
+                    model = str(candidate)
+                    break
+        except Exception:  # pragma: no cover - best effort
+            log.debug("ladder: tier %s model unresolved", tier, exc_info=True)
+        if model:
+            out[tier] = model
+    return out
+
+
+def stale_tiers(
+    db: "Database", current_models: dict[str, str], *, since: str = "all"
+) -> list[str]:
+    """Tiers whose current model has no graded evidence of its own.
+
+    A tier→model mapping change silently invalidates that tier's ladder results:
+    the rows still say "medium passed every xss-fix case", but they were graded on
+    the model medium used to resolve to. Reporting that is the honest alternative
+    to either trusting stale evidence or discarding it.
+
+    Returns tiers present in *current_models* whose model is absent from the graded
+    set. A tier with no graded rows at all is NOT reported — it was never fresh, so
+    "stale" is the wrong word; `min_passing_tier` already shows it as absent.
+    """
+    from .model_quality import graded_models_by_tier
+
+    graded = graded_models_by_tier(db, since=since)
+    out: list[str] = []
+    for tier in TIERS:
+        model = str(current_models.get(tier) or "").strip()
+        if not model:
+            continue
+        seen = graded.get(tier)
+        if not seen:
+            continue
+        if model not in seen:
+            out.append(tier)
+    return out
 
 
 def min_passing_tier_by_level(results: "Iterable[LadderResult]") -> dict[int, str]:
@@ -522,6 +624,14 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--case", default=None, help="Comma list of case ids")
     run_p.add_argument("--json", action="store_true", help="Print the JSON summary")
     run_p.add_argument(
+        "--stale",
+        action="store_true",
+        help=(
+            "Only re-grade tiers whose current model differs from the one their "
+            "existing ladder results were graded on"
+        ),
+    )
+    run_p.add_argument(
         "--no-record", action="store_true", help="Do not write to the quality ledger"
     )
 
@@ -534,7 +644,7 @@ def main(argv: list[str] | None = None) -> int:
     if command == "list":
         cases = load_cases(levels=_parse_int_list(getattr(args, "level", None)))
         if not cases:
-            print(f"no ladder cases found under {LADDER_DIR}")
+            print(f"no ladder cases found under {ladder_dir()}")
             return 0
         for case in cases:
             print(f"{case.level_label:<3} {case.case_id:<28} -> {case.target_file}")
@@ -567,6 +677,51 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"WARNING: quality ledger unavailable ({exc}); running without recording")
 
+    if getattr(args, "stale", False):
+        if db is None:
+            print("ERROR: --stale needs the quality ledger; cannot combine with --no-record")
+            return 1
+        current = _current_tier_models(tiers)
+        if not current:
+            print(
+                "ERROR: could not resolve the current tier -> model mapping, so "
+                "staleness cannot be determined"
+            )
+            return 1
+        from .model_quality import graded_models_by_tier
+
+        graded = graded_models_by_tier(db)
+        mapping = ", ".join(f"{t}={m}" for t, m in sorted(current.items()))
+        if not graded:
+            # "Stale" presupposes something was once fresh. An empty ledger is a
+            # different situation and needs a different instruction, or the
+            # operator reads "nothing to do" as "already covered".
+            print(
+                "No graded ladder results exist yet, so nothing can be stale.\n"
+                f"  current mapping: {mapping}\n"
+                "  run `threnody ladder run` (without --stale) to establish a baseline."
+            )
+            return 0
+        stale = stale_tiers(db, current)
+        if not stale:
+            ungraded = [t for t in tiers if t not in graded]
+            print(
+                "Nothing stale: every requested tier's current model already has "
+                "graded results.\n"
+                f"  current mapping: {mapping}"
+            )
+            if ungraded:
+                print(
+                    "  never graded (not stale, just absent): "
+                    + ", ".join(sorted(ungraded))
+                )
+            return 0
+        print(
+            "Re-grading stale tier(s): "
+            + ", ".join(f"{t} (now {current[t]})" for t in stale)
+        )
+        tiers = [t for t in tiers if t in stale]
+
     results = run_ladder(cases=cases, tiers=tiers, config=config, db=db)
     summary = summarize(results)
     if args.json:
@@ -578,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "LADDER_DIR",
+    "ladder_dir",
+    "stale_tiers",
     "TIERS",
     "LadderCase",
     "LadderResult",

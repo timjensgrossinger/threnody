@@ -1,6 +1,7 @@
 {
   "id": "l1-word-frequency",
   "level": 1,
+  "kind": "algorithm",
   "prompt": "Create a Python module with a function `word_counts(text)` that returns a dict mapping each lowercased word to how many times it appears. Split on whitespace and strip surrounding punctuation (.,!?;:'\") from each word. Ignore empty tokens.",
   "target_file": "solution.py",
   "grader": "python3 -m pytest -q --tb=short",

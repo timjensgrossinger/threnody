@@ -1111,6 +1111,35 @@ def _profile_key_for_outcome(outcome: Mapping[str, Any], prof: Any) -> str | Non
         return None
 
 
+def _sub_dimension_from_slug(slug: str, dimension: str) -> str | None:
+    """Bare category from a ``review_meta.categories`` slug, or None if there is none.
+
+    ``findings_merge.review_meta_for`` builds each slug as ``dimension/category``
+    (falling back to the bare dimension when the agent reported no category),
+    because that mapping is a host-facing wire contract that ``static_recall``
+    also grades against. Storing the slug verbatim as ``sub_dimension`` beside a
+    separate ``dimension`` column meant the dimension was recorded twice, and both
+    renderers (``status._fmt_dim``, ``model_quality_report._fmt_dim``) join the two
+    again — so a compliant finding ``security/sql-injection`` displayed as
+    ``security/security/sql-injection``.
+
+    Returns ``None`` when the slug adds nothing to the dimension, so the caller can
+    skip a row that would duplicate the top-level one. A slug that is neither
+    prefixed nor equal to the dimension is passed through: agents in practice write
+    a bare category token (``edge_case`` under dimension ``edge``), and that is
+    still the category.
+    """
+    cleaned = (slug or "").strip().lower()
+    dim = (dimension or "").strip().lower()
+    if not cleaned or cleaned == dim:
+        return None
+    prefix = f"{dim}/"
+    if dim and cleaned.startswith(prefix):
+        remainder = cleaned[len(prefix):].strip("/").strip()
+        return remainder or None
+    return cleaned
+
+
 def _record_review_outcome(
     db: Database,
     outcome: Mapping[str, Any],
@@ -1140,6 +1169,16 @@ def _record_review_outcome(
             findings_high=int(outcome["findings_high"]),
             findings_total=int(outcome["findings_total"]),
             kept_by_synthesis=_tri_state(outcome.get("kept_by_synthesis")),
+            # Provenance. Both parameters existed and were never passed, so every
+            # `review_tier_outcome` event ever journaled had an empty run_id —
+            # which makes the event unaddressable (see
+            # ``learning_journal._ADDRESSABLE_FIELDS``, so it can never be
+            # deduplicated) and, worse, makes a real observation
+            # indistinguishable from a test fixture. ``review_tier_bias`` feeds
+            # ``review_fanout._cell_tier``, so that is a routing input with no
+            # provenance at all.
+            run_id=str(outcome.get("run_id") or "") or None,
+            spawn_id=str(outcome.get("spawn_id") or "") or None,
         )
     except Exception:  # pragma: no cover - best-effort learning
         log.debug("review-tier outcome capture failed", exc_info=True)
@@ -1188,12 +1227,18 @@ def _record_review_outcome(
             for slug, cat in categories.items():
                 if not isinstance(cat, Mapping):
                     continue
+                sub = _sub_dimension_from_slug(str(slug), dimension)
+                if sub is None:
+                    # The slug carried no category beyond the dimension itself, so
+                    # this row would duplicate the top-level dimension row written
+                    # above and double-count one reviewed output. Skip it.
+                    continue
                 model_quality.record_findings_score(
                     db,
                     model=model,
                     effort=effort,
                     dimension=dimension,
-                    sub_dimension=str(slug),
+                    sub_dimension=sub,
                     findings_high=int(cat.get("findings_high") or 0),
                     findings_total=int(cat.get("findings_total") or 0),
                     kept_by_synthesis=_tri_state(cat.get("kept")),
@@ -1917,10 +1962,38 @@ def _record_verify_quality(
     if mq_cfg is None or not getattr(mq_cfg, "enabled", True):
         return
     new_failures = list(verify_report.get("new_failures") or [])
-    # Without a baseline the pass/fail is not trustworthy enough to be called
-    # ground truth, so it is left out of the objective ledger entirely.
+
+    # A signal that could not run proves nothing, and a clean-looking report made
+    # entirely of such signals is the single most dangerous row this ledger can
+    # hold. `verify.run_signal` marks an unavailable command `unavailable=True`
+    # and `run_verify_gate` deliberately keeps it out of `any_required_new`, so
+    # the verdict comes back "pass" with `new_failures` empty — previously scoring
+    # a perfect 10.0 for a run where ZERO checks executed, indistinguishable from
+    # a genuine lint+types+tests pass.
+    #
+    # `detect_gate_command` resolves commands by `shutil.which` alone, so this is
+    # the default outcome for any non-Python repo, and "write boilerplate" became a
+    # guaranteed 10.0 generator: four such rows clear quality_bias's
+    # DEFAULT_MIN_SAMPLES=4 and DEFAULT_HIGH_THRESHOLD=8.5 and emit a -1
+    # de-escalation for that model's role — punishing a model because trivial work
+    # did not break anything.
+    degraded = [str(s) for s in (verify_report.get("degraded_signals") or [])]
+    if degraded:
+        log.debug(
+            "verify-gate quality skipped for %s: signals unavailable (%s)",
+            run_id, ", ".join(degraded),
+        )
+        return
+
+    # Without a baseline a *failure* cannot be attributed to this run — the repo
+    # may have arrived broken — so those are left out of the objective ledger.
+    # A clean result needs no baseline: with the degraded check above guaranteeing
+    # the required signals actually ran, "no failures at all" is an absolute
+    # statement about the tree, not a relative one, and discarding it would throw
+    # away legitimate ground truth from exactly the repos that have no merge base.
     if not verify_report.get("baseline_used") and new_failures:
         return
+
     score = 10.0 if not new_failures else max(0.0, 10.0 - 2.5 * len(new_failures))
     try:
         from . import model_quality, run_log
@@ -2036,6 +2109,7 @@ def _record_hybrid_split_outcome(
     db: Database,
     meta: Mapping[str, Any],
     *,
+    run_id: str | None = None,
     success: bool,
     rework_events: list[dict[str, Any]] | None,
     config: TGsConfig | None,
@@ -2069,6 +2143,12 @@ def _record_hybrid_split_outcome(
             profile_key=profile_key,
             delta=int(split.get("delta") or -1),
             clean=clean,
+            # See the note on ``record_review_tier_outcome`` above: the parameter
+            # existed and was never passed, so all 3852 journaled hybrid events
+            # are unattributable. ``hybrid_tier_bias`` adjusts the diagnose→
+            # implement tier discount, so this too was a routing input with no
+            # provenance.
+            run_id=str(run_id or "") or None,
         )
     except Exception:  # pragma: no cover - learning is best-effort
         log.debug("hybrid split outcome capture failed", exc_info=True)
@@ -2228,7 +2308,7 @@ def finalize_host_swarm(
         _record_verify_quality(db, run_id, verify_report, config=config, workspace_root=effective_root)
 
     _record_hybrid_split_outcome(
-        db, meta, success=success, rework_events=rework_events, config=config
+        db, meta, run_id=run_id, success=success, rework_events=rework_events, config=config
     )
     _record_run_belief(
         db,

@@ -1916,7 +1916,50 @@ class Orchestrator:
         result.gate_degraded_signals = report.degraded_signals
         if report.verdict == "rejected":
             result.success = False
+        self._record_verify_quality(report, result)
         return result
+
+    def _record_verify_quality(self, report: object, result: AgentResult) -> None:
+        """Record the gate verdict as an objective quality event (source='verify_gate').
+
+        This path used to compute a full ``VerifyReport`` and throw the objective
+        signal away: ``record_verify_gate_score`` had exactly one caller, on the
+        host-native path. Since ``verify_gate`` is the only task-agnostic objective
+        source in the system — ``findings``/``static_recall`` fire only for
+        ``REVIEW:`` swarms — that meant no ordinary subprocess write/implement work
+        ever produced a quality row.
+
+        Guards match ``host_learning._record_verify_quality`` deliberately: a
+        signal whose command does not exist proves nothing (and a "pass" made
+        entirely of such signals would score a perfect 10.0 for zero checks), and
+        an unbaselined failure cannot be attributed to this run.
+        """
+        try:
+            mq_cfg = getattr(self._config, "model_quality", None)
+            if mq_cfg is None or not getattr(mq_cfg, "enabled", True):
+                return
+            if getattr(report, "degraded_signals", None):
+                return
+            new_failures = list(getattr(report, "new_failures", None) or [])
+            if not getattr(report, "baseline_used", False) and new_failures:
+                return
+            score = 10.0 if not new_failures else max(0.0, 10.0 - 2.5 * len(new_failures))
+
+            from . import model_quality
+
+            model_quality.record_verify_gate_score(
+                self._db,
+                model=result.model or None,
+                effort=result.effort,
+                role=result.role,
+                score_0_10=score,
+                new_failure_count=len(new_failures),
+                preexisting_count=len(getattr(report, "preexisting_failures", None) or []),
+                run_id=getattr(self, "_session_id", None),
+                tier=result.tier,
+            )
+        except Exception:  # pragma: no cover - best-effort learning
+            log.debug("verify-gate quality capture failed (subprocess path)", exc_info=True)
 
     @staticmethod
     def _detect_gate_command(signal: str, project_root: str) -> str:

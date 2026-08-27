@@ -53,6 +53,46 @@ log = logging.getLogger(__name__)
 
 JOURNAL_ROOT = BASE_DIR / "journal"
 
+# Env override for the journal root, honoured at *call* time.
+#
+# ``BASE_DIR`` is resolved from ``THRENODY_INSTALL_DIR`` when ``config`` is
+# imported, which is far too early for a test to influence: by the time a test
+# body runs, ``shared.config`` is long since imported. That is not a theoretical
+# gap — it is how the reference install's entire learning ledger came to be test
+# fixtures. Every recorder appends here *before* its DB write, so a test that
+# correctly isolates its ``Database`` to a tmp_path still wrote its fixtures into
+# the operator's real journal, and the next ``replay_learning_journal(rebuild=True)``
+# faithfully reconstructed them into the live tables.
+#
+# Resolving at call time closes that. ``JOURNAL_ROOT`` stays a writable module
+# attribute so the existing ``monkeypatch.setattr(learning_journal,
+# "JOURNAL_ROOT", ...)`` form keeps working unchanged.
+_JOURNAL_ROOT_ENV = "THRENODY_JOURNAL_ROOT"
+_DEFAULT_JOURNAL_ROOT = JOURNAL_ROOT
+
+
+def journal_root() -> Path:
+    """Resolve the journal root now, not at import time.
+
+    Precedence, most specific first:
+
+    1. ``JOURNAL_ROOT`` if it has been reassigned away from its import-time
+       default — an explicit in-process override (a test monkeypatching the
+       attribute) is the most specific statement of intent there is, so it must
+       win over an ambient env var set by a broader fixture.
+    2. ``THRENODY_JOURNAL_ROOT``, which also reaches subprocesses.
+    3. The import-time default under ``BASE_DIR``.
+
+    Never cached — a caller may redirect it between calls.
+    """
+    if JOURNAL_ROOT != _DEFAULT_JOURNAL_ROOT:
+        return JOURNAL_ROOT
+    override = os.environ.get(_JOURNAL_ROOT_ENV)
+    if override and override.strip():
+        return Path(override).expanduser()
+    return JOURNAL_ROOT
+
+
 # Event kinds. Adding one is additive: an unknown kind is skipped by replay and
 # counted under `unknown`, never an error — an older install must be able to read
 # a journal written by a newer one.
@@ -74,6 +114,13 @@ _IDENTITY: dict[str, tuple[str, ...]] = {
         "dimension",
         "sub_dimension",
         "task_hash",
+        # Tier is a genuine distinguishing axis, not decoration: the same model can
+        # be graded at two tiers in one run (a ladder sweep does exactly that, and
+        # two tiers can resolve to the same model). Without it those are one event
+        # and ``ON CONFLICT DO NOTHING`` silently keeps only the first — which would
+        # leave ``build_min_passing_tier_map`` looking at a partial sweep and, by
+        # its all-or-nothing rule, crediting no tier at all.
+        "tier",
     ),
     KIND_REVIEW_TIER: ("run_id", "spawn_id", "profile_key", "dimension", "tier"),
     KIND_HYBRID: ("run_id", "profile_key", "delta"),
@@ -86,6 +133,9 @@ _IDENTITY: dict[str, tuple[str, ...]] = {
 # dimension are indistinguishable, and deduping them would silently discard real
 # data — the opposite of the problem idempotency exists to solve.
 _ADDRESSABLE_FIELDS = ("run_id", "spawn_id", "task_hash")
+
+# Keys the record envelope owns. A payload must never use them — see append().
+_RESERVED_RECORD_KEYS = ("event_id", "kind", "ts")
 _unaddressable_counter = itertools.count()
 
 
@@ -113,7 +163,7 @@ def event_id(kind: str, payload: Mapping[str, Any]) -> str:
 def journal_path(ts: float | None = None) -> Path:
     """Month-sharded journal file. Sharding keeps any single file scannable."""
     stamp = time.strftime("%Y-%m", time.localtime(ts if ts is not None else time.time()))
-    return JOURNAL_ROOT / f"{stamp}.jsonl"
+    return journal_root() / f"{stamp}.jsonl"
 
 
 def append(kind: str, payload: Mapping[str, Any], *, ts: float | None = None) -> str:
@@ -124,12 +174,24 @@ def append(kind: str, payload: Mapping[str, Any], *, ts: float | None = None) ->
     the event id, so the caller can stamp its DB row with it either way.
     """
     body = dict(payload)
+    # The record shape is {"event_id", "kind", "ts", **body}, so a payload key with
+    # one of those names silently wins over the real value — and a clobbered `kind`
+    # makes the event replay as `unknown`, i.e. unrecoverable. Drop and log rather
+    # than corrupt the record; a payload cannot legitimately own these names.
+    shadowed = [k for k in _RESERVED_RECORD_KEYS if k in body]
+    if shadowed:
+        log.warning(
+            "learning_journal: payload for kind=%s shadows reserved key(s) %s — dropping them",
+            kind, ", ".join(sorted(shadowed)),
+        )
+        for key in shadowed:
+            body.pop(key, None)
     when = float(ts if ts is not None else time.time())
     eid = event_id(kind, body)
     record = {"event_id": eid, "kind": kind, "ts": when, **body}
     line = json.dumps(record, default=str, ensure_ascii=False) + "\n"
     try:
-        JOURNAL_ROOT.mkdir(parents=True, exist_ok=True)
+        journal_root().mkdir(parents=True, exist_ok=True)
         path = journal_path(when)
         # O_APPEND makes concurrent writers safe for lines under PIPE_BUF, and
         # the fsync is the whole point: an event that is not on disk before the
@@ -152,9 +214,10 @@ def iter_events(since: float | None = None) -> Iterator[dict[str, Any]]:
     ``run_log.read_run_log``'s tolerance — a partial record must never make the
     whole journal unreadable.
     """
-    if not JOURNAL_ROOT.exists():
+    root = journal_root()
+    if not root.exists():
         return
-    for path in sorted(JOURNAL_ROOT.glob("*.jsonl")):
+    for path in sorted(root.glob("*.jsonl")):
         try:
             with path.open("r", encoding="utf-8") as fh:
                 for line in fh:
@@ -251,7 +314,8 @@ def replay(
 
 def stats() -> dict[str, Any]:
     """Operator summary: shard count, bytes, event count, newest timestamp."""
-    shards = sorted(JOURNAL_ROOT.glob("*.jsonl")) if JOURNAL_ROOT.exists() else []
+    root = journal_root()
+    shards = sorted(root.glob("*.jsonl")) if root.exists() else []
     total_bytes = 0
     events = 0
     newest = 0.0
@@ -267,7 +331,7 @@ def stats() -> dict[str, Any]:
         by_kind[kind] = by_kind.get(kind, 0) + 1
         newest = max(newest, float(event.get("ts") or 0.0))
     return {
-        "root": str(JOURNAL_ROOT),
+        "root": str(root),
         "shards": [p.name for p in shards],
         "bytes": total_bytes,
         "events": events,

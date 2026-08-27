@@ -17,6 +17,8 @@ cache.db.corrupt.*
 # Preserved original of an in-place salvage (shared/db.py _salvage_db); kept for
 # forensics, deliberately not named .corrupt.* because no data was lost.
 cache.db.presalvage.*
+# Pre-purge snapshot taken before a deliberate learning-table reset.
+cache.db.prepurge.*
 cache.db.salvage.tmp
 # Single-writer DB daemon (db_daemon.enabled, on by default).
 cache.db.sock

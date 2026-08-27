@@ -1,0 +1,10 @@
+{
+  "id": "l2-fix-xss",
+  "level": 2,
+  "kind": "xss-fix",
+  "prompt": "The module `render.py` builds HTML for a comment feed by interpolating user-supplied values directly into markup, so any attacker-controlled text is injected as live HTML. Close the injection while keeping the rendered output otherwise identical: the same tags, the same structure, and legitimate text (including apostrophes and accented characters) must still display as the user typed it. Do not simply strip or reject input, and do not delete functionality.",
+  "target_file": "render.py",
+  "grader": "python3 -m pytest -q --tb=short",
+  "timeout_seconds": 300,
+  "grader_timeout_seconds": 120
+}

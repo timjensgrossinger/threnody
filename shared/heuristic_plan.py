@@ -728,20 +728,34 @@ def _finalize_subtasks(subtasks: list[dict[str, object]]) -> list[dict[str, obje
     quality bias recorded for that role (see ``_load_role_quality_bias``).
     """
     from .roles import derive_role_from_task, DEFAULT_ROLE
+    from .task_kinds import derive_kind_from_task
 
     role_bias = _load_role_quality_bias()
+    kind_bias = _load_kind_quality_bias()
 
     def _apply_role(st: dict[str, object], role: str) -> None:
-        if role == DEFAULT_ROLE:
-            return
-        if "role" not in st:
+        if "role" not in st and role != DEFAULT_ROLE:
             st["role"] = role
-        if not role_bias:
+        if not role_bias and not kind_bias:
             return
-        step = role_bias.get(role.lower())
+
+        description = str(st.get("description", ""))
+        step = 0
+        if role != DEFAULT_ROLE and role_bias:
+            step += int(role_bias.get(role.lower()) or 0)
+        if kind_bias:
+            kind = derive_kind_from_task(description)
+            if kind:
+                step += int(kind_bias.get(kind) or 0)
+
         tier = st.get("tier")
         if step and isinstance(tier, str) and tier in _TIER_ORDER:
-            st["tier"] = _tier_step(tier, step)
+            # Sum first, then clamp to a SINGLE tier move — mirroring
+            # ``review_fanout._cell_tier``, where two learners also share one
+            # decision. Applying each step in turn would let the role learner and
+            # the kind learner compound into a two-tier jump, which is exactly the
+            # failure the review path's clamp exists to prevent.
+            st["tier"] = _tier_step(tier, max(-1, min(1, step)))
 
     for st in subtasks:
         tfs = st.get("target_files")
@@ -1520,6 +1534,46 @@ def _load_quality_tier_bias() -> dict[tuple[str, str], int]:
     return {
         (GLOBAL_PROFILE_KEY, dimension): steps.pop()
         for dimension, steps in by_dimension.items()
+        if len(steps) == 1
+    }
+
+
+def _load_kind_quality_bias() -> dict[str, int]:
+    """Objective model-quality bias on the TASK-KIND axis → ``{kind: step}``.
+
+    The third sibling of ``_load_quality_tier_bias`` (review dimension) and
+    ``_load_role_quality_bias`` (semantic role). This one is what lets graded
+    ladder evidence reach a routing decision at all: ladder rows write
+    ``dimension='general'``, which neither of the other two readers can match, so
+    until the ``kind`` column existed the only source with a real reference
+    solution could never move a tier.
+
+    Same opt-in, same "act only when every model agrees" collapse, same
+    empty-on-failure fallback.
+    """
+    try:
+        from .config import TGsConfig
+
+        mq_cfg = getattr(TGsConfig.from_yaml(), "model_quality", None)
+        if mq_cfg is None or not getattr(mq_cfg, "enabled", True):
+            return {}
+        if not getattr(mq_cfg, "routing_bias_enabled", False):
+            return {}
+        from .agents import _get_agent_db
+        from .quality_bias import apply_quality_floor, load_kind_quality_bias
+
+        db = _get_agent_db()
+        raw = apply_quality_floor(db, load_kind_quality_bias(db))
+    except Exception:  # pragma: no cover - learning read is best-effort
+        return {}
+
+    by_kind: dict[str, set[int]] = {}
+    for (_model, kind), step in raw.items():
+        by_kind.setdefault(kind, set()).add(step)
+
+    return {
+        kind: steps.pop()
+        for kind, steps in by_kind.items()
         if len(steps) == 1
     }
 

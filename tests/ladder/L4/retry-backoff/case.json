@@ -1,6 +1,7 @@
 {
   "id": "l4-retry-backoff",
   "level": 4,
+  "kind": "api-design",
   "prompt": "Create a Python module with a decorator factory `retry(attempts, exceptions=(Exception,), on_retry=None)`. The decorated function is retried up to `attempts` total calls when it raises one of `exceptions`. If it still fails, the last exception propagates. Exceptions not listed propagate immediately without retrying. `on_retry`, when given, is called with (attempt_number, exception) before each retry. attempts must be >= 1, else raise ValueError at decoration time. Preserve the wrapped function's __name__ and __doc__.",
   "target_file": "solution.py",
   "grader": "python3 -m pytest -q --tb=short",

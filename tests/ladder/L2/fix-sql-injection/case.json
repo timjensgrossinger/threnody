@@ -1,0 +1,10 @@
+{
+  "id": "l2-fix-sql-injection",
+  "level": 2,
+  "kind": "sql-injection-fix",
+  "prompt": "The module `repo.py` builds SQL by string-formatting caller-supplied values, so a crafted value can change the query. Close the injection using parameterised queries while preserving every function's existing signature and return value. Do not blocklist characters, do not quote values by hand, and do not remove functionality.",
+  "target_file": "repo.py",
+  "grader": "python3 -m pytest -q --tb=short",
+  "timeout_seconds": 300,
+  "grader_timeout_seconds": 120
+}

@@ -1,6 +1,7 @@
 {
   "id": "l5-refactor-validator",
   "level": 5,
+  "kind": "refactor",
   "prompt": "`validator.py` validates records but duplicates logic and swallows errors. Rewrite it so `validate(record)` returns a list of error strings (empty when valid), keeping the exact messages the tests expect. Preserve the public function name and behavior, remove the duplicated branches, and never swallow an exception silently.",
   "target_file": "validator.py",
   "grader": "python3 -m pytest -q --tb=short",

@@ -1,0 +1,10 @@
+{
+  "id": "l3-type-hardening",
+  "level": 3,
+  "kind": "type-hardening",
+  "prompt": "The module `config.py` parses a settings mapping but has no type annotations and silently accepts wrong types, producing confusing failures later. Add complete PEP 604 type hints (`X | None`, not `Optional[X]`) to every function and validate inputs: a value of the wrong type must raise TypeError naming the offending key, and an out-of-range port must raise ValueError. Preserve every existing function name, parameter name and successful return value.",
+  "target_file": "config.py",
+  "grader": "python3 -m pytest -q --tb=short",
+  "timeout_seconds": 300,
+  "grader_timeout_seconds": 120
+}

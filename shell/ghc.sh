@@ -9,6 +9,10 @@
 #
 # No API keys — everything goes through `gh copilot`.
 
+# Absolute path to this file, so a function defined here can re-source it. See
+# the bootstrap guard in threnody() for why that is necessary.
+_GHC_SH_SELF="${${(%):-%x}:A}"
+
 _ROUTER_DIR="$HOME/.local/lib/threnody"
 if [[ ! -d "$_ROUTER_DIR" && -d "$HOME/.local/lib/switchyard" ]]; then
     _ROUTER_DIR="$HOME/.local/lib/switchyard"
@@ -1121,6 +1125,23 @@ PY
 threnody() {
     local area="${1:-}"
     shift || true
+
+    # Self-heal when this function has been separated from its helpers.
+    #
+    # `threnody` is a shell function, so it shadows the ~/.local/bin/threnody
+    # symlink. Some tools serialize an interactive shell into a snapshot and
+    # re-source that snapshot per command; at least one keeps top-level functions
+    # but drops every single-underscore-prefixed name and emits no shell-variable
+    # section. The result is this function surviving with all of its callees
+    # removed, failing as `threnody:NNN: command not found: _tgs_python` on the
+    # first subcommand -- every subcommand, not just one. `_ROUTER_DIR` is lost
+    # the same way, which would silently `cd ""`, so both are checked.
+    if ! typeset -f _tgs_python >/dev/null 2>&1 || [[ -z "$_ROUTER_DIR" ]]; then
+        source "${_GHC_SH_SELF:-$HOME/.local/lib/threnody/shell/ghc.sh}" || {
+            echo "threnody: cannot restore helper functions (tried ${_GHC_SH_SELF:-$HOME/.local/lib/threnody/shell/ghc.sh})" >&2
+            return 1
+        }
+    fi
 
 _tgs_inspect_write_audit() {
     local limit=50

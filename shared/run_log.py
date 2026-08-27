@@ -31,6 +31,35 @@ from .config import BASE_DIR
 log = logging.getLogger(__name__)
 
 RUNS_ROOT = BASE_DIR / "runs"
+
+# Env override for the runs root, honoured at *call* time — the sibling of
+# ``learning_journal.journal_root()`` and the same defect.
+#
+# ``BASE_DIR`` is fixed when ``config`` is imported, so nothing downstream can
+# redirect this, and the test suite had no isolation for it at all. The result on
+# the reference install: ``runs/active.json`` — the pointer the PostToolUse
+# learning hook and the terminal ``import_run_log`` follow — was left pointing at
+# a deleted pytest temp dir by a test run. That silently breaks learning capture
+# for real runs, which is the likely reason a real 14-agent review swarm left
+# handoff snapshots but not one ``model_quality_events`` row.
+_RUNS_ROOT_ENV = "THRENODY_RUNS_ROOT"
+_DEFAULT_RUNS_ROOT = RUNS_ROOT
+
+
+def runs_root() -> Path:
+    """Resolve the runs root now, not at import time.
+
+    Precedence matches ``learning_journal.journal_root()``: an explicitly
+    reassigned ``RUNS_ROOT`` module attribute wins over the ambient
+    ``THRENODY_RUNS_ROOT`` env var, which in turn wins over the import-time
+    default. Never cached.
+    """
+    if RUNS_ROOT != _DEFAULT_RUNS_ROOT:
+        return RUNS_ROOT
+    override = os.environ.get(_RUNS_ROOT_ENV)
+    if override and override.strip():
+        return Path(override).expanduser()
+    return RUNS_ROOT
 _LOG_NAME = "wave.jsonl"
 _META_NAME = "meta.json"
 # Where an agent leaves output that its dependents read. Without this, a plan can
@@ -59,8 +88,8 @@ def _safe_run_id(run_id: str) -> str:
 
 
 def run_log_dir(run_id: str, *, create: bool = False) -> Path:
-    """Return ``RUNS_ROOT / <run_id>``; optionally create it."""
-    d = RUNS_ROOT / _safe_run_id(run_id)
+    """Return ``runs_root() / <run_id>``; optionally create it."""
+    d = runs_root() / _safe_run_id(run_id)
     if create:
         d.mkdir(parents=True, exist_ok=True)
     return d
@@ -170,11 +199,12 @@ def is_imported(run_id: str) -> bool:
 
 def iter_pending_runs() -> list[str]:
     """Run ids with a log present but not yet imported — for the warm-path daemon."""
-    if not RUNS_ROOT.exists():
+    root = runs_root()
+    if not root.exists():
         return []
     pending: list[str] = []
     try:
-        for child in RUNS_ROOT.iterdir():
+        for child in root.iterdir():
             if not child.is_dir():
                 continue
             if not (child / _LOG_NAME).exists():
@@ -192,10 +222,11 @@ def prune_runs(keep: int = 20) -> None:
 
     Mirrors the backup-rotation policy in ``db`` (``cache.backup_keep``).
     """
-    if not RUNS_ROOT.exists() or keep < 0:
+    root = runs_root()
+    if not root.exists() or keep < 0:
         return
     try:
-        dirs = [c for c in RUNS_ROOT.iterdir() if c.is_dir()]
+        dirs = [c for c in root.iterdir() if c.is_dir()]
     except OSError:
         return
     if len(dirs) <= keep:
@@ -225,17 +256,17 @@ def _active_pointer_path(workspace_root: str | None) -> Path:
     fallback for the rare caller that genuinely has no workspace to scope by.
     """
     if not workspace_root:
-        return RUNS_ROOT / "active.json"
+        return runs_root() / "active.json"
     digest = hashlib.sha256(
         _normalize_workspace_root(workspace_root).encode("utf-8")
     ).hexdigest()[:12]
-    return RUNS_ROOT / f"active-{digest}.json"
+    return runs_root() / f"active-{digest}.json"
 
 
 def set_active_run(run_id: str, *, workspace_root: str | None = None) -> None:
     """Mark *run_id* as the run the PostToolUse learning hook should append to."""
     try:
-        RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+        runs_root().mkdir(parents=True, exist_ok=True)
         payload = {"run_id": _safe_run_id(run_id), "ts": time.time()}
         if workspace_root:
             payload["workspace_root"] = _normalize_workspace_root(workspace_root)

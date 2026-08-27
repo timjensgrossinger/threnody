@@ -1,6 +1,7 @@
 {
   "id": "l6-event-store",
   "level": 6,
+  "kind": "implementation",
   "prompt": "Implement `store.py` providing an append-only `EventStore` that satisfies the existing tests and the `Event` dataclass in `models.py`. It must support `append(event)`, `replay(aggregate_id)` returning that aggregate's events in insertion order, `version(aggregate_id)` returning the count, and optimistic concurrency: `append` raises `ConcurrencyError` when the event's `expected_version` does not match the aggregate's current version. Define `ConcurrencyError` in store.py.",
   "target_file": "store.py",
   "grader": "python3 -m pytest -q --tb=short",

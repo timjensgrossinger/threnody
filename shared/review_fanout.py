@@ -242,10 +242,16 @@ N critical, N high, N medium, N low issues across N files.
 
 ### Findings (ranked: critical → high → medium → low; then security > logic > edge > types > performance)
 
-⚠️ [SEVERITY] category — file:line — description [(CWE-XXX)]
+⚠️ [SEVERITY] dimension/category — file:line — description [(CWE-XXX)]
 
 ### Dropped
-⚠️ [SEVERITY] category — file:line — description — reason for rejecting it
+⚠️ [SEVERITY] dimension/category — file:line — description — reason for rejecting it
+
+Use the same dimension/category form the dimension agents were given — dimension is one of
+security, logic, edge, types, performance; category is the specific defect class
+(e.g. security/xss, security/sql-injection, logic/off-by-one). The dimension prefix is
+load-bearing: it is how a finding is attributed in the quality ledger, and a bare
+category token is read as the dimension itself.
 
 Deduplicate: if the same issue appears in multiple dimension reviews, keep the highest severity instance.
 A duplicate is NOT a drop — list it nowhere; only findings you reject belong under "### Dropped".
@@ -1776,7 +1782,8 @@ def build_fast_review_subtasks(
             "description": (
                 f"Fast full-file review of {path}: check logic, security, edge/null cases, "
                 "type safety, and performance. Report only concrete findings as: "
-                "⚠️ [SEVERITY] category — file:line — description [(CWE-XXX)]. "
+                "⚠️ [SEVERITY] dimension/category — file:line — description [(CWE-XXX)], "
+                "where dimension is one of security, logic, edge, types, performance. "
                 "Output nothing if no issues found."
             ),
             "tier": tier,

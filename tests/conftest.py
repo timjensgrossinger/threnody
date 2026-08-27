@@ -42,6 +42,97 @@ from shared.config import TGsConfig
 
 
 # ============================================================================
+# FIXTURE 0: _isolate_learning_state  (autouse — do not make opt-in)
+# ============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _isolate_learning_state(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """Point the learning journal AND the run-log root at scratch dirs for **every** test.
+
+    This must be autouse, and it must live here rather than in one test module.
+
+    Isolating ``Database`` is not sufficient. Every learning recorder appends to
+    the journal *before* its DB write — ``model_quality.record_*``,
+    ``review_learning.record_review_tier_outcome``,
+    ``hybrid_learning.record_hybrid_outcome``, ``host_learning``'s handoff
+    snapshots — and the journal root came from a module-level constant derived
+    from the install path. So a test that correctly used a ``tmp_path`` DB still
+    wrote its fixtures into the operator's real journal, and the next
+    ``replay_learning_journal(rebuild=True)`` reconstructed them faithfully into
+    the live tables.
+
+    That is not hypothetical: it is how the reference install's entire ledger —
+    all 467 ``model_quality_events`` rows and both EMA bias tables — came to be
+    test fixtures with zero rows of production origin. Journal events lacking a
+    ``run_id``/``spawn_id``/``task_hash`` are deliberately non-deduplicable
+    (``learning_journal.event_id``), so every suite run appended more.
+
+    Both the env override and the module attribute are set: the env var covers
+    subprocesses and any module holding its own reference, while the attribute
+    keeps a direct ``monkeypatch.setattr(learning_journal, "JOURNAL_ROOT", ...)``
+    in an individual test consistent with what this fixture reports.
+
+    Also isolates ``run_log.RUNS_ROOT``, which has the identical defect. Tests
+    wrote into the operator's ``runs/`` and left ``runs/active.json`` — the
+    pointer the PostToolUse learning hook and the terminal ``import_run_log``
+    follow — aimed at a deleted pytest temp dir. That breaks learning capture for
+    real runs, so it belongs in the same guard rather than a separate one.
+
+    Finally, redirects the DEFAULT database path. There are at least seven
+    zero-argument ``open_database()`` / ``Database()`` call sites in library code
+    (``swarm``, ``memory``, ``agents``, ``model_catalog``, ``orchestrator``,
+    ``ladder``, and ``heuristic_plan._intel_db`` via ``agents._get_agent_db``), so
+    clearing a cached handle is not enough — the next call simply reopens the live
+    path. Two consequences were observed: plan-building tests read the operator's
+    accumulated ``hybrid_tier_bias`` and failed non-deterministically on it, and a
+    test that triggered ``Database``'s recovery path ran
+    ``replay_learning_journal(rebuild=True)`` against the *live* tables, which is
+    data loss rather than mere pollution. Patching the module-level names is what
+    makes those call sites land in a scratch file; ``TGsConfig.db_path``'s
+    ``default_factory`` closes over ``shared.config.DB_PATH``, so it follows too.
+    """
+    from shared import config as config_mod
+    from shared import db as db_mod
+    from shared import learning_journal, run_log
+
+    journal = tmp_path_factory.mktemp("journal")
+    runs = tmp_path_factory.mktemp("runs")
+    db_path = tmp_path_factory.mktemp("db") / "cache.db"
+
+    saved = {
+        "journal_attr": learning_journal.JOURNAL_ROOT,
+        "runs_attr": run_log.RUNS_ROOT,
+        "journal_env": os.environ.get("THRENODY_JOURNAL_ROOT"),
+        "runs_env": os.environ.get("THRENODY_RUNS_ROOT"),
+        "config_db": config_mod.DB_PATH,
+        "db_db": db_mod.DB_PATH,
+    }
+
+    learning_journal.JOURNAL_ROOT = journal
+    run_log.RUNS_ROOT = runs
+    config_mod.DB_PATH = db_path
+    db_mod.DB_PATH = db_path
+    os.environ["THRENODY_JOURNAL_ROOT"] = str(journal)
+    os.environ["THRENODY_RUNS_ROOT"] = str(runs)
+    try:
+        yield journal
+    finally:
+        learning_journal.JOURNAL_ROOT = saved["journal_attr"]
+        run_log.RUNS_ROOT = saved["runs_attr"]
+        config_mod.DB_PATH = saved["config_db"]
+        db_mod.DB_PATH = saved["db_db"]
+        for env_key, saved_key in (
+            ("THRENODY_JOURNAL_ROOT", "journal_env"),
+            ("THRENODY_RUNS_ROOT", "runs_env"),
+        ):
+            if saved[saved_key] is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = saved[saved_key]
+
+
+# ============================================================================
 # FIXTURE 1: temp_db_fixture
 # ============================================================================
 
@@ -172,8 +263,14 @@ def test_config_fixture() -> Iterator[TGsConfig]:
     test_project_root.mkdir(parents=True, exist_ok=True)
     
     # Create config with Phase 5 test defaults
+    # ``TGsConfig.db_path`` defaults to the INSTALLED cache.db, so a bare
+    # ``TGsConfig(...)`` hands any consumer a handle to the operator's live
+    # database. Point it at a scratch file instead.
     parallelism = ParallelismConfig(enabled=True, max_workers=4)
-    config = TGsConfig(parallelism=parallelism)
+    config = TGsConfig(
+        parallelism=parallelism,
+        db_path=test_project_root / "test-cache.db",
+    )
     
     # Store test project root as an attribute for test access
     config.write_safety_trusted_bases = [test_project_root]
@@ -218,6 +315,18 @@ def _auto_reset_singletons():
     saved_opencode_host = os.environ.get("OPENCODE_HOST")
     saved_opencode_session = os.environ.get("OPENCODE_SESSION")
 
+    # ``shared.agents`` caches a Database in a module-level ``_DEFAULT_DB`` via
+    # ``_get_agent_db()``, which opens the DEFAULT (live) path when given no
+    # injection. ``heuristic_plan._intel_db()`` reaches it, so the learned
+    # hybrid/review bias a plan-building test sees comes from the operator's real
+    # cache.db and survives into the next test. Clearing it here is what makes
+    # nulling ``mcp._db`` actually mean "no database handle carries over".
+    try:
+        import shared.agents as _agents_mod
+        _agents_mod._DEFAULT_DB = None
+    except Exception:
+        _agents_mod = None
+
     # Reset singletons and strip provider env markers for a clean slate
     mod._registry = None
     mcp._config = None
@@ -249,6 +358,8 @@ def _auto_reset_singletons():
     mcp._planner = None
     mcp._orchestrator = None
     mcp._client_name = None
+    if _agents_mod is not None:
+        _agents_mod._DEFAULT_DB = None
 
 
 # ============================================================================
