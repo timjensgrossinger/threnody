@@ -240,3 +240,31 @@ def test_record_outcome_rejects_invalid_gate_verdict(db):
             "SELECT gate_verdict FROM routing_outcomes WHERE task_id='task-gv-003'"
         ).fetchone()
     assert row[0] is None
+
+
+def test_verify_gate_progress_callback():
+    from shared.verify import run_verify_gate, SignalOutcome
+    cfg = VerifyGateConfig(
+        enabled=True,
+        signals={
+            "lint": VerifyGateSignalConfig(command="true", required=True),
+            "tests": VerifyGateSignalConfig(command="true", required=True),
+        },
+    )
+    progress_ticks = []
+
+    def _callback(curr, total, msg):
+        progress_ticks.append((curr, total, msg))
+
+    with patch("shared.verify.run_signal", return_value=SignalOutcome(name="lint", passed=True)):
+        report = run_verify_gate(
+            cfg,
+            project_root="/tmp",
+            baseline=False,
+            progress_callback=_callback,
+        )
+    assert report.verdict == "pass"
+    assert len(progress_ticks) == 2
+    assert progress_ticks[0][0] == 1
+    assert progress_ticks[1][0] == 2
+

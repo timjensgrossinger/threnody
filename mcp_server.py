@@ -5114,7 +5114,10 @@ def handle_route_task(args: dict) -> dict:
         "agents": decision.agents,
         "task_id": task_id,
         "cache_hit": cached is not None,
-        "override": decision.override,
+        "override": getattr(decision, "override", False),
+        "expected_duration_bucket": getattr(decision, "expected_duration_bucket", "medium"),
+        "reasoning_effort": getattr(decision, "reasoning_effort", "medium"),
+        "thinking_budget": getattr(decision, "thinking_budget", 2048),
         "execution_hint": execution_hint,
     }
     if host_model and execution_mode == "host_native":
@@ -9146,10 +9149,16 @@ def handle_memory_list(args: dict) -> dict | list[dict[str, Any]]:
         return {"error": "database unavailable — route_task still works", "code": "DB_UNAVAILABLE"}
     try:
         normalized = _normalize_memory_request(args)
+        raw_limit = args.get("limit")
+        limit = int(raw_limit) if raw_limit is not None else None
+        raw_offset = args.get("offset")
+        offset = int(raw_offset) if raw_offset is not None else None
         return memory_list(
             normalized.get("scope"),
             project_id=normalized.get("project_id"),
             task_id=normalized.get("task_id"),
+            limit=limit,
+            offset=offset,
             db=db,
         )
     except (MemoryNotFoundError, MemoryRequestError) as exc:
@@ -9695,6 +9704,16 @@ def handle_routing_exception_remove(args: dict) -> dict:
 def handle_routing_exception_list(args: dict) -> dict:
     _config, db, *_ = _ensure_init()
     rows = db.routing_exception_list()
+    raw_limit = args.get("limit")
+    raw_offset = args.get("offset")
+    if raw_limit is not None or raw_offset is not None:
+        try:
+            offset = max(0, int(raw_offset)) if raw_offset is not None else 0
+            limit = max(1, int(raw_limit)) if raw_limit is not None else len(rows)
+            sliced = rows[offset : offset + limit]
+            return {"exceptions": sliced, "count": len(sliced), "total": len(rows)}
+        except (TypeError, ValueError):
+            pass
     return {"exceptions": rows, "count": len(rows)}
 
 

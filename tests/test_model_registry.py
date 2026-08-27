@@ -186,3 +186,26 @@ def test_provider_catalog_callback_normalizes_subscription_multiplier():
         "fast": "low",
         "deep": "high",
     }
+
+
+def test_load_claude_cache(tmp_path: Path):
+    from shared.model_registry import load_claude_cache
+    from shared.provider_model_adapters import ClaudeModelDiscoveryAdapter
+
+    cache_file = tmp_path / "models_cache.json"
+    cache_file.write_text(json.dumps({
+        "models": [
+            {"id": "claude-sonnet-5", "display_name": "Claude Sonnet 5"},
+            {"id": "claude-opus-5", "display_name": "Claude Opus 5"},
+        ]
+    }), encoding="utf-8")
+
+    result = load_claude_cache(cache_file)
+    assert result is not None
+    assert result.provider_id == "claude-code"
+    assert len(result.models) == 2
+    assert result.models[0].model_id == "claude-sonnet-5"
+
+    adapter = ClaudeModelDiscoveryAdapter()
+    cached = load_claude_cache(cache_file)
+    assert cached is not None

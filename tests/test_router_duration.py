@@ -160,6 +160,15 @@ class TestClassifyPopulatesDuration:
         assert one.tier == router._tier_from_score(one.score)
         assert many.tier == router._tier_from_score(many.score)
 
+    def test_reasoning_effort_and_thinking_budget_populated(self, router: TaskRouter):
+        short_task = router.classify("Add a docstring to utils/strings.py")
+        assert short_task.reasoning_effort == "low"
+        assert short_task.thinking_budget == 0
+
+        long_task = router.classify("Refactor auth/mw.py auth/tokens.py auth/store.py auth/policy.py")
+        assert long_task.reasoning_effort == "high"
+        assert long_task.thinking_budget == 8192
+
 
 # ---------------------------------------------------------------------------
 # Gating the hybrid split

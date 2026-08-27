@@ -9,6 +9,7 @@ from typing import Any
 
 from .model_registry import (
     DiscoveryResult,
+    load_claude_cache,
     load_codex_cache,
     normalize_claude_agent_sdk_models,
     normalize_models,
@@ -48,6 +49,7 @@ class CommandModelDiscoveryAdapter:
     def discover_live(self) -> DiscoveryResult | None:
         completed = subprocess.run(
             list(self.command),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=15,
@@ -137,4 +139,4 @@ class ClaudeModelDiscoveryAdapter:
         return normalize_claude_agent_sdk_models(payload) if isinstance(payload, dict) else None
 
     def discover_official_cache(self) -> DiscoveryResult | None:
-        return None
+        return load_claude_cache()

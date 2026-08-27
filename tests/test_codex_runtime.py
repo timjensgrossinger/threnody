@@ -39,7 +39,7 @@ def test_codex_adapter_builds_concrete_provider() -> None:
     provider = adapter_from_legacy().invoke("build_provider")
 
     assert isinstance(provider, CodexProvider)
-    assert provider.resolve_model("low") == "gpt-5.5"
+    assert provider.resolve_model("low") == "gpt-5.6-terra"
 
 
 def test_codex_provider_raises_on_cli_failure(monkeypatch) -> None:

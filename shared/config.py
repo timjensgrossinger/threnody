@@ -406,8 +406,8 @@ ROUTING_POLICY_SHELL_BOOTSTRAP_IDS = {
 }
 DEFAULT_ROUTING_TIER_MODELS = {
     "low": "gpt-5-mini",
-    "medium": "claude-sonnet-4.6",
-    "high": "claude-opus-4.6",
+    "medium": "claude-sonnet-5",
+    "high": "claude-opus-5",
 }
 
 
@@ -457,7 +457,7 @@ DEFAULT_OVERRIDES: dict[str, list[str]] = {
 # ---------------------------------------------------------------------------
 # Orchestrator defaults
 # ---------------------------------------------------------------------------
-DEFAULT_PLANNER_MODEL = "claude-sonnet-4-6"
+DEFAULT_PLANNER_MODEL = "claude-sonnet-5"
 DEFAULT_PLANNER_TIMEOUT = 120
 
 DEFAULT_DELEGATION_UTILITIES: tuple[str, ...] = ("opencode", "aider")

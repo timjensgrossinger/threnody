@@ -98,7 +98,7 @@ def test_default_config() -> None:
     cfg.thresholds.clamp()
     assert cfg.thresholds.low_max >= LOW_TIER_FLOOR
     assert cfg.thresholds.medium_max <= MEDIUM_HIGH_BOUNDARY_CEILING
-    assert cfg.planner_model == "claude-sonnet-4-6"
+    assert cfg.planner_model == DEFAULT_PLANNER_MODEL
 
 
 def test_legacy_dict_format() -> None:
@@ -351,7 +351,7 @@ def test_routing_policy_custom_shell_overrides() -> None:
         assert copilot.agent_transparency_required is True
         assert copilot.direct_edit_hooks is False
         assert copilot.tier_model_mapping["low"] == "custom-low"
-        assert copilot.tier_model_mapping["medium"] == "claude-sonnet-4.6"
+        assert copilot.tier_model_mapping["medium"] == "claude-sonnet-5"
 
 
 def test_basic_yaml_fallback_parses_floats_lists_and_policy(monkeypatch: pytest.MonkeyPatch) -> None:

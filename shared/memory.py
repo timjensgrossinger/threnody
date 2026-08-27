@@ -446,6 +446,8 @@ def memory_list(
     project_id: str | None = None,
     task_id: str | None = None,
     *,
+    limit: int | None = None,
+    offset: int | None = None,
     db: Database | None = None,
 ) -> list[dict[str, Any]]:
     """List keys and compact metadata for one explicit scope."""
@@ -457,16 +459,22 @@ def memory_list(
     )
     database = _get_db(db)
 
+    sql = """
+        SELECT key, scope, value_type, value_size, updated_at
+        FROM memory
+        WHERE scope = ? AND project_id = ? AND task_id = ?
+        ORDER BY key
+    """
+    params: list[Any] = [normalized_scope, normalized_project_id, normalized_task_id]
+    if limit is not None and isinstance(limit, int) and limit > 0:
+        sql += " LIMIT ?"
+        params.append(limit)
+        if offset is not None and isinstance(offset, int) and offset > 0:
+            sql += " OFFSET ?"
+            params.append(offset)
+
     with database.conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT key, scope, value_type, value_size, updated_at
-            FROM memory
-            WHERE scope = ? AND project_id = ? AND task_id = ?
-            ORDER BY key
-            """,
-            (normalized_scope, normalized_project_id, normalized_task_id),
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
 
     return [
         {

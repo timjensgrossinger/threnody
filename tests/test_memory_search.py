@@ -61,3 +61,21 @@ def test_rebuild_memory_fts(db) -> None:
     assert rebuilt >= 1
     hits = memory_search("discipline", scope="global", db=db)
     assert len(hits) == 1
+
+
+def test_memory_list_pagination(db) -> None:
+    from shared.memory import memory_list
+
+    for i in range(10):
+        memory_set("global", f"item_{i:02d}", f"val_{i}", db=db)
+
+    all_items = memory_list("global", db=db)
+    assert len(all_items) == 10
+
+    page1 = memory_list("global", limit=3, offset=0, db=db)
+    assert len(page1) == 3
+    assert [x["key"] for x in page1] == ["item_00", "item_01", "item_02"]
+
+    page2 = memory_list("global", limit=3, offset=3, db=db)
+    assert len(page2) == 3
+    assert [x["key"] for x in page2] == ["item_03", "item_04", "item_05"]

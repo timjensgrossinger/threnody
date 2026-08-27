@@ -28,10 +28,15 @@ from pathlib import Path
 
 from .db_ipc import register_dataclass
 
-try:  # POSIX-only; best-effort cross-process lock. No-op where unavailable (e.g. Windows).
+try:  # POSIX-only; best-effort cross-process lock.
     import fcntl as _fcntl
 except ImportError:  # pragma: no cover - non-POSIX platforms
     _fcntl = None
+
+try:  # Windows cross-process file locking
+    import msvcrt as _msvcrt
+except ImportError:
+    _msvcrt = None
 
 from .resilience import (
     ErrorCategory,
@@ -2583,7 +2588,7 @@ class Database:
         what prevents concurrent recoveries from corrupting each other. Best-effort
         no-op where ``fcntl`` is unavailable.
         """
-        if _fcntl is None:
+        if _fcntl is None and _msvcrt is None:
             yield
             return
         fd = None
@@ -2598,7 +2603,13 @@ class Database:
                 os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
             )
-            _fcntl.flock(fd, _fcntl.LOCK_EX)
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            elif _msvcrt is not None:
+                try:
+                    _msvcrt.locking(fd, _msvcrt.LK_LOCK, 1)
+                except OSError:
+                    pass
         except OSError:
             log.debug("process lock unavailable; proceeding without it", exc_info=True)
             fd = None
@@ -2607,7 +2618,13 @@ class Database:
         finally:
             if fd is not None:
                 try:
-                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                    if _fcntl is not None:
+                        _fcntl.flock(fd, _fcntl.LOCK_UN)
+                    elif _msvcrt is not None:
+                        try:
+                            _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+                        except OSError:
+                            pass
                 finally:
                     os.close(fd)
 

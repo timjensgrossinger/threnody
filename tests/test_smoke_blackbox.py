@@ -175,6 +175,6 @@ def test_provider_metadata():
     assert p.name == "blackbox-ai"
     assert p.binary == "blackbox"
     assert p.tier_models["low"] == "blackboxai"
-    assert p.tier_models["medium"] == "claude-sonnet-4.6"
-    assert p.tier_models["high"] == "claude-opus-4.6"
+    assert p.tier_models["medium"] == "claude-sonnet-5"
+    assert p.tier_models["high"] == "claude-opus-5"
     assert p.billing_model == "metered"

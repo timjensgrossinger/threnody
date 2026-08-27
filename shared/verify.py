@@ -295,6 +295,7 @@ def run_baseline_signals(
     *,
     project_root: str,
     ref: str,
+    progress_callback: "Callable[[float, float | None, str], None] | None" = None,
 ) -> dict[str, set[str]]:
     """Run the given signals at ``ref`` in a throwaway detached worktree.
 
@@ -315,7 +316,13 @@ def run_baseline_signals(
                 added.stderr.strip() if added else "no result",
             )
             return out
-        for name, (command, timeout) in signals.items():
+        total_sigs = len(signals)
+        for idx, (name, (command, timeout)) in enumerate(signals.items()):
+            if progress_callback:
+                try:
+                    progress_callback(idx + 1, total_sigs, f"Running baseline verification for {name}")
+                except Exception:
+                    pass
             outcome = run_signal(
                 name,
                 command=command,
@@ -356,29 +363,22 @@ def load_baseline_cache(run_id: str, ref: str) -> dict[str, set[str]] | None:
     if path is None or not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("ref") != ref:
-            return None
-        return {k: set(v) for k, v in (payload.get("signals") or {}).items()}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("ref") == ref and isinstance(data.get("failures"), dict):
+            return {k: set(v) for k, v in data["failures"].items() if isinstance(v, list)}
     except Exception:
         log.debug("verify: baseline cache read failed", exc_info=True)
         return None
 
 
-def store_baseline_cache(run_id: str, ref: str, signals: dict[str, set[str]]) -> None:
+def store_baseline_cache(run_id: str, ref: str, failures: dict[str, set[str]]) -> None:
     """Cache the baseline so later waves in the same run reuse it."""
     path = _baseline_cache_path(run_id) if run_id else None
     if path is None:
         return
     try:
-        path.write_text(
-            json.dumps({
-                "ref": ref,
-                "ts": time.time(),
-                "signals": {k: sorted(v) for k, v in signals.items()},
-            }),
-            encoding="utf-8",
-        )
+        payload = {"ref": ref, "failures": {k: sorted(v) for k, v in failures.items()}}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception:
         log.debug("verify: baseline cache write failed", exc_info=True)
 
@@ -395,6 +395,7 @@ def run_verify_gate(
     baseline: bool = True,
     run_id: str | None = None,
     command_resolver: "Callable[[str, str], str] | None" = None,
+    progress_callback: "Callable[[float, float | None, str], None] | None" = None,
 ) -> VerifyReport:
     """Run every configured signal and grade it against the merge base.
 
@@ -410,8 +411,14 @@ def run_verify_gate(
     resolved: dict[str, SignalOutcome] = {}
     commands: dict[str, tuple[str, float]] = {}
     resolve = command_resolver or detect_gate_command
+    total_signals = len(gate_cfg.signals)
 
-    for name, sig_cfg in gate_cfg.signals.items():
+    for idx, (name, sig_cfg) in enumerate(gate_cfg.signals.items()):
+        if progress_callback:
+            try:
+                progress_callback(idx + 1, total_signals, f"Running verify signal: {name}")
+            except Exception:
+                pass
         command = sig_cfg.command
         if command == "auto":
             command = resolve(name, project_root)
@@ -444,6 +451,7 @@ def run_verify_gate(
                     {n: commands[n] for n in failing},
                     project_root=project_root,
                     ref=ref,
+                    progress_callback=progress_callback,
                 )
                 if baseline_failures and run_id:
                     store_baseline_cache(run_id, ref, baseline_failures)
