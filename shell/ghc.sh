@@ -9,9 +9,17 @@
 #
 # No API keys — everything goes through `gh copilot`.
 
-# Absolute path to this file, so a function defined here can re-source it. See
-# the bootstrap guard in threnody() for why that is necessary.
-_GHC_SH_SELF="${${(%):-%x}:A}"
+# Path to this file, so a function defined here can re-source it. See the
+# bootstrap guard in threnody() for why that is necessary.
+#
+# Portable across both shells that source this file: bash exposes the sourced
+# path as BASH_SOURCE[0], zsh leaves that unset and puts it in $0. Deliberately
+# NOT zsh's ${${(%):-%x}:A} — that would be the only zsh-only construct in an
+# otherwise bash-compatible file, and shellcheck (which CI runs against the bash
+# shebang) rejects it outright. Every real entry point sources this file by
+# absolute path (install.sh writes one into the rc file; shell/ghc and
+# shell/threnody use "$SCRIPT_DIR/ghc.sh"), so no absolutisation is needed.
+_GHC_SH_SELF="${BASH_SOURCE[0]:-$0}"
 
 _ROUTER_DIR="$HOME/.local/lib/threnody"
 if [[ ! -d "$_ROUTER_DIR" && -d "$HOME/.local/lib/switchyard" ]]; then
@@ -1137,6 +1145,7 @@ threnody() {
     # first subcommand -- every subcommand, not just one. `_ROUTER_DIR` is lost
     # the same way, which would silently `cd ""`, so both are checked.
     if ! typeset -f _tgs_python >/dev/null 2>&1 || [[ -z "$_ROUTER_DIR" ]]; then
+        # shellcheck disable=SC1090  # path is resolved at runtime by design
         source "${_GHC_SH_SELF:-$HOME/.local/lib/threnody/shell/ghc.sh}" || {
             echo "threnody: cannot restore helper functions (tried ${_GHC_SH_SELF:-$HOME/.local/lib/threnody/shell/ghc.sh})" >&2
             return 1
