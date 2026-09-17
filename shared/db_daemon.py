@@ -21,6 +21,8 @@ Wire protocol: see shared/db_ipc.py. Requests (``kind``):
 from __future__ import annotations
 
 import argparse
+import signal
+import atexit
 import logging
 import os
 import socket
@@ -72,6 +74,9 @@ class DBDaemon:
         self._lock_fd: int | None = None
         self._lock_ino: int | None = None
         self._srv: socket.socket | None = None
+        # True only between a successful bind() and cleanup. Gates the socket
+        # unlink so an election loser cannot remove the winner's socket.
+        self._owns_socket = False
         self._db = None  # lazy — created after election
         self._clients = 0
         self._clients_lock = threading.Lock()
@@ -127,6 +132,10 @@ class DBDaemon:
             pass
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._srv.bind(self._socket_path)
+        # Only a daemon that actually bound may ever unlink this path. See
+        # _cleanup: a process that lost the election must not delete the winner's
+        # socket, and _cleanup now runs from atexit in every daemon process.
+        self._owns_socket = True
         os.chmod(self._socket_path, 0o600)
         self._srv.listen(128)
         self._srv.settimeout(1.0)  # so accept() polls _stop / idle
@@ -144,6 +153,14 @@ class DBDaemon:
         # the DB is never quiescent and -shm is never re-truncated underneath us.
         self._keeper = db._connect()
         return db
+
+    def request_stop(self) -> None:
+        """Signal-safe stop request: sets the flag the accept loop polls.
+
+        Only touches an Event, so it is safe from a signal handler. The 1.0s
+        accept() timeout bounds how long the loop takes to notice.
+        """
+        self._stop.set()
 
     def serve(self) -> int:
         if not self._elect():
@@ -203,17 +220,26 @@ class DBDaemon:
                 return
 
     def _cleanup(self) -> None:
+        """Release this daemon's resources. Idempotent; safe from atexit.
+
+        The socket is unlinked **only if this process bound it**. Every daemon
+        process runs this at exit, and a process that lost the flock election
+        never binds — unlinking unconditionally there deletes the *winner's*
+        live socket, after which clients find nothing, spawn again, and race.
+        """
         try:
             if self._srv:
                 self._srv.close()
         except Exception:
             pass
-        try:
-            os.unlink(self._socket_path)
-        except FileNotFoundError:
-            pass
-        except Exception:
-            log.debug("socket unlink failed", exc_info=True)
+        if self._owns_socket:
+            self._owns_socket = False  # idempotent: never unlink twice
+            try:
+                os.unlink(self._socket_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                log.debug("socket unlink failed", exc_info=True)
         try:
             if self._db is not None:
                 self._db.close()
@@ -350,6 +376,33 @@ class DBDaemon:
         raise ProtocolError(f"unknown request kind: {kind!r}")
 
 
+def _install_signal_handlers(daemon: "DBDaemon") -> None:
+    """Ask the accept loop to stop on SIGTERM/SIGINT so ``_cleanup`` runs.
+
+    Without this the socket file survives every termination that is not an idle
+    exit — a machine sleeping, a reboot, a session teardown, ``pkill``. That
+    leftover file used to be unrecoverable: the client skipped spawning whenever
+    the path existed, so the daemon could never come back and every process fell
+    back to its own direct connection over one DB file.
+
+    The client no longer trusts the file's existence (``_daemon_is_live``), so a
+    stale socket is now merely wasteful rather than fatal — but not creating one
+    is still strictly better, and it keeps ``db check`` from reporting a socket
+    for a daemon that is gone. SIGKILL cannot be handled; that case is exactly
+    what the client-side probe covers.
+    """
+    def _handle(signum, _frame):  # pragma: no cover - signal path
+        log.info("db daemon received signal %s; shutting down", signum)
+        daemon.request_stop()
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _handle)
+        except (OSError, ValueError):
+            # Not all signals exist or are settable on every platform/thread.
+            log.debug("could not install handler for %s", sig, exc_info=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Threnody single-writer DB daemon")
     parser.add_argument("db_path")
@@ -361,6 +414,10 @@ def main(argv: list[str] | None = None) -> int:
     daemon = DBDaemon(
         args.db_path, socket_path=args.socket, idle_timeout_s=args.idle_timeout
     )
+    _install_signal_handlers(daemon)
+    # Belt and braces: _cleanup is idempotent, and an unhandled exit path that
+    # bypasses serve()'s finally still needs the socket gone.
+    atexit.register(daemon._cleanup)
     return daemon.serve()
 
 

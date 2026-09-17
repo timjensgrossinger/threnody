@@ -333,3 +333,161 @@ def test_many_processes_through_daemon_no_sigbus() -> None:
             total = c.execute("SELECT COUNT(*) FROM swarm_runs").fetchone()[0]
         db.close()
         assert total == n_procs * writes
+
+
+# --- stale socket recovery --------------------------------------------------
+#
+# The daemon exists to stop many processes mmap'ing their own -shm over one DB
+# file. A stale socket used to defeat it permanently: the client skipped spawning
+# whenever the socket *path* existed, so a daemon killed without cleanup could
+# never come back and every process silently fell back to a direct connection.
+
+def _leave_stale_socket(path: str) -> None:
+    """Bind and close without unlinking — what an unclean daemon exit leaves."""
+    import socket as _s
+
+    sock = _s.socket(_s.AF_UNIX, _s.SOCK_STREAM)
+    sock.bind(path)
+    sock.close()
+
+
+def test_daemon_is_live_rejects_a_stale_socket_file() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "cache.db"
+        rdb = _remote(p)
+        assert rdb._daemon_is_live() is False, "no socket file at all"
+        _leave_stale_socket(rdb._socket_path)
+        assert os.path.exists(rdb._socket_path), "stale file must be on disk"
+        assert rdb._daemon_is_live() is False, "existence is not liveness"
+
+
+def test_stale_socket_still_spawns_a_daemon() -> None:
+    """The regression: a leftover socket must not make the daemon unspawnable."""
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "cache.db"
+        rdb = _remote(p)
+        _leave_stale_socket(rdb._socket_path)
+        rdb.ping()  # would raise ConnectionError before the fix
+        assert rdb._daemon_is_live() is True
+        rdb.cache_put("t", "r", "m")
+        assert rdb.cache_get("t") == ("r", "m")
+        rdb.close()
+
+
+def test_spawn_is_skipped_while_a_daemon_is_actually_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard must still prevent redundant spawns — that was its whole point."""
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "cache.db"
+        rdb = _remote(p)
+        rdb.ping()  # brings a real daemon up
+        assert rdb._daemon_is_live() is True
+
+        spawns: list[int] = []
+        real_popen = dc.subprocess.Popen
+
+        def counting_popen(*a, **kw):
+            spawns.append(1)
+            return real_popen(*a, **kw)
+
+        monkeypatch.setattr(dc.subprocess, "Popen", counting_popen)
+        rdb._spawn_daemon()
+        assert spawns == [], "a live daemon must not be respawned"
+        rdb.close()
+
+
+def test_daemon_removes_its_socket_on_sigterm() -> None:
+    """`_cleanup` unlinks the socket, but only ran on a clean idle exit.
+
+    Nothing handled SIGTERM, so every termination that was not an idle timeout
+    (sleep, reboot, session teardown, pkill) left a stale socket behind — the
+    condition the bug above turned into a permanent outage. SIGKILL still cannot
+    be handled; the client-side liveness probe is what covers that.
+    """
+    import signal
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "cache.db"
+        sock = str(p) + ".sock"
+        root = str(Path(__file__).resolve().parent.parent)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "shared.db_daemon", str(p),
+             "--socket", sock, "--idle-timeout", "60"],
+            cwd=root,
+            env={**os.environ, "PYTHONPATH": root},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not os.path.exists(sock):
+                time.sleep(0.05)
+            assert os.path.exists(sock), "daemon never bound its socket"
+
+            proc.send_signal(signal.SIGTERM)
+            assert proc.wait(timeout=20) == 0
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and os.path.exists(sock):
+                time.sleep(0.05)
+            assert not os.path.exists(sock), "SIGTERM left a stale socket"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+
+def test_request_stop_only_sets_the_event() -> None:
+    """Signal handlers may only touch async-safe state."""
+    from shared.db_daemon import DBDaemon
+
+    with tempfile.TemporaryDirectory() as d:
+        daemon = DBDaemon(str(Path(d) / "cache.db"))
+        assert not daemon._stop.is_set()
+        daemon.request_stop()
+        assert daemon._stop.is_set()
+
+
+def test_election_loser_does_not_unlink_the_winners_socket() -> None:
+    """`_cleanup` runs from atexit in *every* daemon process, including losers.
+
+    A loser never binds, so unlinking unconditionally deleted the live socket out
+    from under the winner — clients then found nothing, spawned again, and raced,
+    surfacing as `disk I/O error` under concurrency. Only the binder may unlink.
+    """
+    from shared.db_daemon import DBDaemon
+
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "cache.db"
+        sock = str(db) + ".sock"
+
+        winner = DBDaemon(str(db), socket_path=sock)
+        assert winner._elect() is True
+        winner._bind()
+        assert winner._owns_socket is True
+        assert os.path.exists(sock)
+
+        loser = DBDaemon(str(db), socket_path=sock)
+        assert loser._elect() is False, "flock election must reject the second daemon"
+        assert loser._owns_socket is False
+        loser._cleanup()
+        assert os.path.exists(sock), "loser must not unlink the winner's socket"
+
+        winner._cleanup()
+        assert not os.path.exists(sock), "the binder must clean up after itself"
+
+
+def test_cleanup_is_idempotent() -> None:
+    """atexit plus serve()'s finally means cleanup can run twice."""
+    from shared.db_daemon import DBDaemon
+
+    with tempfile.TemporaryDirectory() as d:
+        db = Path(d) / "cache.db"
+        sock = str(db) + ".sock"
+        daemon = DBDaemon(str(db), socket_path=sock)
+        assert daemon._elect() is True
+        daemon._bind()
+        daemon._cleanup()
+        daemon._cleanup()  # must not raise
+        assert daemon._owns_socket is False

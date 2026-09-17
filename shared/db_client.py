@@ -154,10 +154,45 @@ class RemoteDatabase:
         self._direct = None  # lazily-created fallback Database if the daemon dies
 
     # -- socket / spawn -------------------------------------------------
+    def _daemon_is_live(self) -> bool:
+        """True only when something is actually accepting on the socket.
+
+        Existence of the socket *file* proves nothing: a daemon that was
+        terminated rather than idling out leaves the file behind (``_cleanup``
+        unlinks it, but nothing runs on SIGTERM/SIGKILL). The probe is a
+        connect() with a short timeout — a stale path answers ECONNREFUSED
+        immediately, so this costs microseconds in the common case.
+        """
+        if not os.path.exists(self._socket_path):
+            return False
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.25)
+        try:
+            probe.connect(self._socket_path)
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
     def _spawn_daemon(self) -> None:
         with self._spawn_lock:
-            # Another thread may have spawned + connected already.
-            if os.path.exists(self._socket_path):
+            # Another thread may have spawned + connected already. This probes
+            # rather than stat()ing the path, because os.path.exists() cannot
+            # tell a live listener from a leftover file — and skipping the spawn
+            # on mere existence made a stale socket *permanently* unspawnable:
+            # connect refuses, _connect asks us to spawn, we see the file and
+            # return, the retry refuses again, and the client falls back to a
+            # direct connection forever. Every process then mmap'd its own -shm
+            # over one DB file, which is precisely the corruption hazard the
+            # daemon exists to remove. Observed live: nine quarantined images in
+            # five weeks with the daemon down and a stale socket on disk.
+            #
+            # Spawning while a stale file is present is safe: DBDaemon._bind()
+            # unlinks the path before binding, and _elect()'s flock means a
+            # redundant spawn loses the election and exits rather than serving a
+            # second writer.
+            if self._daemon_is_live():
                 return
             import sys as _sys
             # Spawn from the package root (where `shared/` lives), not the DB dir —
