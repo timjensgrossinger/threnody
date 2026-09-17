@@ -8,7 +8,7 @@
   "expected": {
     "tier": "low",
     "score_min": 0.0,
-    "score_max": 0.16,
+    "score_max": 0.04,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   }

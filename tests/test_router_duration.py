@@ -67,8 +67,10 @@ class TestCountTaskFiles:
 
 
 class TestDurationBucketFor:
-    # ThresholdConfig clamps to hard bounds (low_max >= 0.50), so read the real
-    # values back rather than assuming the requested ones took effect.
+    # ThresholdConfig clamps to the hard bounds in shared/config.py, so read the
+    # real values back rather than assuming the requested ones took effect. The
+    # bounds were re-derived with the scoring rebuild, which is exactly why this
+    # reads them instead of naming a number.
     TH = ThresholdConfig()
     LOW_MAX = TH.low_max
     MED_MAX = TH.medium_max

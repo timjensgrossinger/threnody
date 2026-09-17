@@ -621,11 +621,21 @@ def test_run_eval_tolerates_missing_yaml_support_in_test_mode(monkeypatch, tmp_p
 
 
 class _SwarmEvalRouter:
+    """Deterministic stand-in for TaskRouter over the four swarm fixtures.
+
+    The scores here MUST mirror what the real router produces for those prompts,
+    because the fixtures' own score windows are derived from it — this table is a
+    hand-maintained copy and the only thing keeping the two in step is that they
+    are updated together. Verify with::
+
+        python3 -m shared.routing_eval --filter fanout
+    """
+
     _TABLE = {
         "Production incident blocking release today": FakeDecision(
             tier="medium",
-            score=0.6,
-            urgency_score=0.9,
+            score=0.54,
+            urgency_score=0.2,
             agents=2,
         ),
         "Design a hierarchical swarm plan": FakeDecision(
@@ -642,7 +652,7 @@ class _SwarmEvalRouter:
         ),
         "Implement authentication middleware across auth_login.py": FakeDecision(
             tier="medium",
-            score=0.68,
+            score=0.49,
             urgency_score=0.0,
             agents=2,
         ),

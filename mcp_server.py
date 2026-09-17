@@ -48,6 +48,7 @@ from shared.config import CONFIG_YAML, TGsConfig, DEFAULT_ROUTING_EXCEPTION_FILE
 from shared.claude_compat import load_claude_module
 from shared.version import get_display_version, get_version
 from shared.context import is_within_repo, normalize_target_path
+from shared.risk_signals import TaskRiskEvidence, collect_task_evidence
 from shared.router import TaskRouter
 from shared.planner import (
     ExecutionPlan,
@@ -1258,7 +1259,10 @@ TOOLS = [
         "description": (
             "Quick heuristic classification of a task — no LLM call.\n"
             "Returns model, score, reason, agents. Use for simple tasks "
-            "or when speed matters more than accuracy."
+            "or when speed matters more than accuracy.\n"
+            "Pass target_files whenever you know which files the work touches: "
+            "the tier is then driven by the risk and size of that code rather "
+            "than by the wording of the task."
         ),
         "inputSchema": {
             "type": "object",
@@ -1267,6 +1271,15 @@ TOOLS = [
                 "cwd": {
                     "type": "string",
                     "description": "Caller working directory for routing guard scoping",
+                },
+                "target_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Files this task will read or modify, relative to cwd or absolute. "
+                        "Scanned for security risk and size to set a tier floor. "
+                        "Omit and paths named in the task text are used instead."
+                    ),
                 },
             },
             "required": ["task"],
@@ -2072,14 +2085,35 @@ TOOLS = [
     },
     {
         "name": "record_outcome",
-        "description": "Record an explicit routed-task outcome and persist the latest task snapshot. operator_id must match the authenticated caller when provided; omitted values are stored as anonymous.",
+        "description": (
+            "Record an explicit routed-task outcome and persist the latest task snapshot. "
+            "operator_id must match the authenticated caller when provided; omitted values "
+            "are stored as anonymous.\n"
+            "Report outcome='tier_overridden' with routed_tier and actual_tier whenever you "
+            "run a task on a different tier than route_task returned. That disagreement is "
+            "the strongest signal the router can learn from, and it is otherwise invisible."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "task_id": {"type": "string"},
-                "outcome": {"type": "string"},
+                "task_id": {"type": "string", "description": "task_id returned by route_task"},
+                "outcome": {
+                    "type": "string",
+                    "enum": ["accepted", "revised", "rejected", "reworked", "tier_overridden"],
+                    "description": "Use 'tier_overridden' when the tier was wrong rather than the output",
+                },
                 "operator_id": {"type": "string"},
                 "note": {"type": "string"},
+                "routed_tier": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "The tier route_task returned",
+                },
+                "actual_tier": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "The tier the work actually ran on",
+                },
             },
             "required": ["task_id", "outcome"],
         },
@@ -3264,6 +3298,61 @@ def _extract_route_file_hints(task: str, cwd: str) -> list[str]:
         if is_within_repo(normalized, base):
             hints.append(str(normalized))
     return hints
+
+
+def _resolve_route_target_files(
+    raw_target_files: object,
+    task: str,
+    cwd: str,
+) -> list[str]:
+    """Resolve the files a route_task call will touch, to in-repo absolute paths.
+
+    Prefers what the caller declared in ``target_files``; falls back to the paths
+    named in the task text via :func:`_extract_route_file_hints`, which already
+    applies ``normalize_target_path`` / ``is_within_repo``.
+
+    The fallback is the important half. A host that never passes ``target_files``
+    still gets file-aware routing, which is what the original misroute needed:
+    the task named its target in prose and the router scored the prose instead.
+    """
+    base = Path(cwd).expanduser().resolve()
+    declared: list[str] = []
+    if isinstance(raw_target_files, (list, tuple)):
+        for raw in raw_target_files:
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            try:
+                normalized = normalize_target_path(raw.strip(), base)
+            except ValueError:
+                log.debug("route_task target_file skipped for %r", raw, exc_info=True)
+                continue
+            if is_within_repo(normalized, base):
+                declared.append(str(normalized))
+    if declared:
+        # Preserve caller order, drop duplicates.
+        return list(dict.fromkeys(declared))
+    return _extract_route_file_hints(task, cwd)
+
+
+def _route_risk_evidence(
+    task: str,
+    cwd: str,
+    raw_target_files: object,
+    db: Any,
+) -> "TaskRiskEvidence | None":
+    """Collect risk evidence for a route_task call. Never raises.
+
+    Returns None when no file could be resolved, which keeps the router on its
+    prose-only path — the pre-existing behaviour.
+    """
+    try:
+        paths = _resolve_route_target_files(raw_target_files, task, cwd)
+        if not paths:
+            return None
+        return collect_task_evidence(paths, db=db)
+    except Exception:
+        log.debug("route_task risk evidence collection failed", exc_info=True)
+        return None
 
 
 def _routing_profile_for_caller(config: TGsConfig, caller: str | None) -> Any:
@@ -4584,6 +4673,68 @@ def _validate_routing_guard(
     tool_name: object | None,
     skill: str | None = None,
 ) -> dict[str, object]:
+    """Validate a direct edit against the routing guard, recording disagreements.
+
+    Thin wrapper over :func:`_validate_routing_guard_core`. The core has many
+    early returns; centralising the recording here means every denial path is
+    covered by one edit rather than each remembering to opt in.
+
+    A denial that carries a guard is a routed decision the host chose not to
+    follow — the strongest signal the router can get, and previously invisible
+    because advisory mode installs no hook. A denial with *no* guard is unrouted
+    work: there is no task to attribute an outcome to, so it is deliberately not
+    recorded as one.
+    """
+    result = _validate_routing_guard_core(
+        db,
+        caller=caller,
+        cwd=cwd,
+        target_file=target_file,
+        tool_name=tool_name,
+        skill=skill,
+    )
+    if not result.get("valid"):
+        _record_guard_override(db, result)
+    return result
+
+
+def _record_guard_override(db: Database, result: Mapping[str, object]) -> None:
+    """Record a guard denial as a tier override. Best-effort, never raises."""
+    guard = result.get("routing_guard")
+    if not isinstance(guard, Mapping):
+        return
+    routed_tier = str(guard.get("tier") or "").strip().lower()
+    if routed_tier not in ("low", "medium", "high"):
+        return
+    # routing_guards stores task_text, not a task id. route_task_id() is the same
+    # deterministic hash route_task, persist_route_telemetry and record_outcome
+    # already correlate on, so deriving it here joins the guard to the routed
+    # decision without a schema change.
+    task_text = str(guard.get("task_text") or "").strip()
+    if not task_text:
+        return
+    task_id = shared_outcomes.route_task_id(task_text)
+    try:
+        shared_outcomes.record_outcome(
+            db,
+            task_id,
+            "tier_overridden",
+            routed_tier=routed_tier,
+            note=f"direct edit despite routing guard: {result.get('reason')}",
+        )
+    except Exception:
+        log.debug("guard override record failed for %s", task_id, exc_info=True)
+
+
+def _validate_routing_guard_core(
+    db: Database,
+    *,
+    caller: str | None,
+    cwd: object | None,
+    target_file: object | None,
+    tool_name: object | None,
+    skill: str | None = None,
+) -> dict[str, object]:
     config = _ensure_init()[0]
     _cwd_str = _routing_guard_cwd(cwd)
     _explicit_cwd = _normalized_cwd_or_none(cwd)
@@ -5045,7 +5196,11 @@ def handle_route_task(args: dict) -> dict:
     config, db, router, planner, orchestrator = _ensure_init()
     task = args.get("task", "")
     project_path = _routing_guard_cwd(args.get("cwd"))
-    decision = router.classify(task, project_path=project_path)
+    # Risk evidence about the files the task touches. Without it the router can
+    # only score the caller's prose, which is how security-critical work with no
+    # matching keyword routed to the cheapest tier.
+    evidence = _route_risk_evidence(task, project_path, args.get("target_files"), db)
+    decision = router.classify(task, project_path=project_path, evidence=evidence)
     task_id = shared_outcomes.route_task_id(task)
 
     # Only preview the raw file-generation path when the task itself looks like
@@ -5120,6 +5275,14 @@ def handle_route_task(args: dict) -> dict:
         "thinking_budget": getattr(decision, "thinking_budget", 2048),
         "execution_hint": execution_hint,
     }
+    if evidence is not None and evidence.files:
+        result["risk_evidence"] = {
+            "files_scanned": len(evidence.files),
+            "risk_files": evidence.risk_files,
+            "security_smells": evidence.security_smells,
+            "max_loc": evidence.max_loc,
+            "paths": [f.path for f in evidence.files],
+        }
     if host_model and execution_mode == "host_native":
         result["host_model"] = host_model
     if delegate_model is not None:
@@ -9304,6 +9467,8 @@ def handle_record_outcome(args: dict) -> dict:
             operator_id=operator_id,
             note=note,
             project_id=str(_active_workspace_root()),
+            routed_tier=args.get("routed_tier"),
+            actual_tier=args.get("actual_tier"),
         )
     except shared_outcomes.OutcomeReadonlyWindowError as exc:
         return {"error": "readonly_window_expired", "details": str(exc)}

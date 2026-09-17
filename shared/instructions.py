@@ -70,6 +70,19 @@ def _render_claude_pointer_block(
         "| Large parallel / swarm | `execute_swarm` | `/threnody-swarm` skill |",
         "| Fullstack (fe + be + api) | `fleet_plan` | `/threnody-fullstack` skill |",
         "",
+        "Pass `target_files: [...]` to `route_task` whenever you know which files the work "
+        "touches: the tier is then driven by the risk and size of that code rather than by the "
+        "wording of the task. Omit it and paths named in the task text are used instead. "
+        "Security-sensitive work is floored to `medium`, and a target holding a high-severity "
+        "security defect to `high`.",
+        "",
+        "Tier overrides are detected automatically on swarm, subtask and workflow paths — "
+        "report the tier each agent actually ran at and Threnody records the rest. Call "
+        "`record_outcome(task_id, outcome=\"tier_overridden\", actual_tier=...)` only for a "
+        "sanctioned direct edit run on a different model than the routed tier: the PreToolUse "
+        "hook carries no model, so that case is invisible otherwise. `routed_tier` is derived "
+        "and never needs to be supplied.",
+        "",
         "Typed subagents per tier (Claude Code only):",
         "",
         "| Tier | Subagent type | Default model |",

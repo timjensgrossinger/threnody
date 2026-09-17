@@ -1,10 +1,19 @@
 ### Host-native execution (default for MCP host shells)
 
-1. Call `route_task` or `plan_task` / `decompose_task`.
+1. Call `route_task` or `plan_task` / `decompose_task`. Pass `target_files: [...]` to
+   `route_task` whenever you know which files the work touches — the tier is then driven by the
+   risk and size of that code instead of the wording of the task. Omit it and paths named in the
+   task text are resolved and used instead.
 2. Consume `host_spawn` or `host_spawn_waves` from the response.
 3. When `host_spawn_waves` or `host_execution_contract: spawn_subagents` is present, spawn one **Agent** or **Task** subagent per agent entry — do not use direct Write/Edit on planned `target_files`.
 4. For lone `route_task` results without a pending handoff, direct edits are allowed when `host_native_method` is `direct_edit`.
 5. Use `execute_subtask(provider_id=...)` only for utility backends when `delegation_utilities_enabled` is true.
+5a. Tier overrides on swarm, subtask and workflow paths are detected automatically — report the
+   tier each agent actually ran at and Threnody does the rest. You only need
+   `record_outcome(task_id, outcome="tier_overridden", actual_tier="high")` when you run a
+   *sanctioned direct edit* on a different model than the routed tier: the PreToolUse hook
+   carries no model, so that one case is invisible to Threnody. `routed_tier` is derived from
+   the routing decision and never needs to be supplied.
 6. `execute_swarm` defaults to `host_native` — run returned waves in the host; no subprocess fanout.
 7. Host-native heuristic planning fans out **one agent per file** for webapp/fullstack intent or listed paths (`orchestrator.heuristic_intent_templates`, default true).
 8. After scaffold waves, call `expand_host_plan(discovered_files=[...])` or `report_host_wave(expand_plan=true)` for additional file agents.

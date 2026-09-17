@@ -689,3 +689,76 @@ class TestAddedHighSeverityRules:
         ):
             assert rule_id in RULE_CATEGORY_ALIASES, f"{rule_id} has no aliases"
             assert RULE_CATEGORY_ALIASES[rule_id], f"{rule_id} alias set is empty"
+
+
+class TestSqlInterpolationPrecision:
+    """`sql_interpolation` must not fire on constructs that cannot be defects.
+
+    `record_static_recall_score` grades reviewers against the high-severity set,
+    so a false positive here marks a correct reviewer as having missed a defect
+    that never existed. Three shapes are decidable as safe from the call site.
+    """
+
+    @staticmethod
+    def _flags(src: str) -> bool:
+        return any(s.rule_id == "sql_interpolation" for s in ci.scan_smells("x.py", src))
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            # SQLite accepts no bound parameters in a PRAGMA at all, so
+            # interpolation is the only way to write one.
+            'conn.execute(f"PRAGMA busy_timeout = {int(x)}")',
+            'conn.execute(f"  pragma synchronous={mode}")',
+            'conn.execute(f"PRAGMA table_info({table})")',
+            # A number cannot carry SQL syntax.
+            'conn.execute(f"SELECT * FROM t LIMIT {int(n)}")',
+            'conn.execute(f"SELECT * FROM t LIMIT {float(n)}")',
+            'conn.execute(f"SELECT * FROM t LIMIT {5}")',
+            # Interpolating "?" placeholders IS the bound-parameter idiom.
+            'conn.execute(f"SELECT * FROM t WHERE id IN ({\', \'.join([\'?\'] * n)})")',
+            'conn.execute(f"SELECT * FROM t WHERE id IN ({\',\'.join(\'?\' for _ in ids)})")',
+            'conn.execute(f"SELECT * FROM t WHERE id IN ({\', \'.join([\'?\', \'?\'])})")',
+        ],
+    )
+    def test_provably_safe_shapes_do_not_flag(self, src: str) -> None:
+        assert not self._flags(src)
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            # Identifiers cannot be bound, so the construct is unavoidable — but
+            # it is genuinely injectable when the value is untrusted, and proving
+            # otherwise needs taint analysis. Stays high.
+            'conn.execute(f"SELECT * FROM {table}")',
+            'conn.execute(f"ALTER TABLE {table} ADD COLUMN role TEXT")',
+            'conn.execute(f"UPDATE t SET {column} = ?")',
+            'conn.execute(f"SELECT * FROM t {where}")',
+            # The canonical value-interpolation shapes.
+            'conn.execute(f"SELECT * FROM t WHERE id={uid}")',
+            'conn.execute("SELECT * FROM t WHERE id=" + uid)',
+            'cur.execute("SELECT * FROM t WHERE id=%s" % uid)',
+            'cur.execute("SELECT {}".format(x))',
+        ],
+    )
+    def test_injectable_shapes_still_flag(self, src: str) -> None:
+        assert self._flags(src)
+
+    def test_one_unsafe_interpolation_defeats_the_exclusion(self) -> None:
+        """Safety is `all()`, not `any()` — a single raw identifier is enough."""
+        assert self._flags('conn.execute(f"SELECT * FROM {t} LIMIT {int(n)}")')
+
+    def test_a_placeholder_variable_is_not_proof(self) -> None:
+        """Only the inline join is decidable; a *name* proves nothing.
+
+        `f"... IN ({placeholders})"` may well be safe, but nothing at the call
+        site says so, and guessing is what this module refuses to do.
+        """
+        assert self._flags('conn.execute(f"SELECT * FROM t WHERE id IN ({placeholders})")')
+
+    def test_a_non_placeholder_join_still_flags(self) -> None:
+        assert self._flags('conn.execute(f"SELECT * FROM t WHERE x IN ({\', \'.join(vals)})")')
+
+    def test_pragma_prefix_must_be_the_statement_not_a_substring(self) -> None:
+        """"PRAGMA" has to start the statement, not merely appear in it."""
+        assert self._flags('conn.execute(f"SELECT * FROM pragma_settings WHERE k={k}")')

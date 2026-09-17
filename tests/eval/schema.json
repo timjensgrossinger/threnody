@@ -103,6 +103,21 @@
           "description": "Expected RoutingDecision.expected_file_count value."
         }
       }
+    },
+    "seed_files": {
+      "type": "object",
+      "description": "Optional inline files the task targets, written to a temp dir and scanned for risk evidence before routing. Keys are relative paths, values are file content. Inlined rather than pointing at repo paths so fixtures stay hermetic and do not drift as the repo changes.",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "test_mode": {
+      "type": "string",
+      "description": "Environment variable to set to '1' for the duration of the fixture."
+    },
+    "simulated_result": {
+      "type": "object",
+      "description": "Swarm fixture metadata consumed by tests/test_routing_eval.py."
     }
   }
 }

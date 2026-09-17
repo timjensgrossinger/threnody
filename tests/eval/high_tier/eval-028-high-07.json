@@ -7,8 +7,8 @@
   "prompt": "Design whether a shared job runner should stay synchronous or move to queued retries across two modules.",
   "expected": {
     "tier": "high",
-    "score_min": 0.85,
-    "score_max": 0.95,
+    "score_min": 0.86,
+    "score_max": 0.94,
     "urgency_expected": false,
     "fanout_expected": "none"
   }

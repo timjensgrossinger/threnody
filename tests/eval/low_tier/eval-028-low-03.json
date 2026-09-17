@@ -7,8 +7,8 @@
   "prompt": "Add type hints to the load_settings helper.",
   "expected": {
     "tier": "low",
-    "score_min": 0.14,
-    "score_max": 0.16,
+    "score_min": 0.06,
+    "score_max": 0.14,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   }

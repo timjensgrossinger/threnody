@@ -8,8 +8,8 @@
   "prompt": "Refactor the authentication and authorization architecture across auth/mw.py auth/tokens.py auth/store.py auth/policy.py",
   "expected": {
     "tier": "high",
-    "score_min": 0.66,
-    "score_max": 1.0,
+    "score_min": 0.86,
+    "score_max": 0.94,
     "duration_expected": "long",
     "file_count_expected": 4
   }

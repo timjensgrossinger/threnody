@@ -7,8 +7,8 @@
   "prompt": "Implement authentication middleware for a single-host Ansible nginx rollout, validate the config, and migrate the host to the managed template workflow.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.59,
-    "score_max": 0.67,
+    "score_min": 0.35,
+    "score_max": 0.43,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   }

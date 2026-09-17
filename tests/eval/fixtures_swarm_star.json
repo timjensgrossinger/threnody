@@ -1,13 +1,16 @@
 {
   "id": "fixtures-swarm-star",
   "category": "urgency",
-  "tags": ["stable", "swarm"],
+  "tags": [
+    "stable",
+    "swarm"
+  ],
   "test_mode": "THRENODY_TEST_MODE",
   "prompt": "Production incident blocking release today: coordinate a swarm-style authentication middleware fix across auth, api, and session layers, synthesize worker output, and define a rollback threshold.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.58,
-    "score_max": 0.62,
+    "score_min": 0.5,
+    "score_max": 0.58,
     "urgency_expected": true,
     "fanout_expected": "favor_parallel"
   },
@@ -19,13 +22,27 @@
       "route_task_baseline_id": "eval-028-urg-01",
       "plan_task": {
         "analysis": "swarm star plan",
-        "subtasks": [{"id": "coord-1"}],
-        "waves": [[1]],
+        "subtasks": [
+          {
+            "id": "coord-1"
+          }
+        ],
+        "waves": [
+          [
+            1
+          ]
+        ],
         "strategy": "parallel"
       },
       "fleet_plan": {
-        "plan": {"topology": "star"},
-        "fleet_waves": [{"wave_number": 1}],
+        "plan": {
+          "topology": "star"
+        },
+        "fleet_waves": [
+          {
+            "wave_number": 1
+          }
+        ],
         "execution_note": "star coordinator wave"
       },
       "execute_subtask": {

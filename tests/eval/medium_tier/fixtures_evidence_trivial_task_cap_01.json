@@ -1,0 +1,19 @@
+{
+  "id": "evidence-trivial-task-cap-01",
+  "category": "medium_tier",
+  "tags": [
+    "stable",
+    "evidence"
+  ],
+  "prompt": "add a docstring",
+  "seed_files": {
+    "store.py": "def q(conn, uid):\n    return conn.execute(f'SELECT * FROM t WHERE id={uid}').fetchall()\n"
+  },
+  "expected": {
+    "tier": "medium",
+    "score_min": 0.16,
+    "score_max": 0.24,
+    "urgency_expected": false,
+    "fanout_expected": "favor_parallel"
+  }
+}

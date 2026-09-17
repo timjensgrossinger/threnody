@@ -649,3 +649,38 @@ def test_integration_outcome_to_adaptive_update():
         assert threshold_entry[1] == 1, f"sample_count should be 1, got {threshold_entry[1]}"
 
 
+
+
+def test_cold_path_high_rework_lowers_low_max_not_raises_it():
+    """Regression: the clamp must come from config, never a repeated literal.
+
+    `max(low_max - 0.02, 0.50)` was a no-op only while 0.50 happened to equal
+    LOW_TIER_FLOOR. Once the bounds were re-derived it returned the larger value
+    and clamp() pulled it to the ceiling, so a high rework rate *raised* the
+    boundary — the inverse of the stated intent.
+    """
+    import time
+    from shared.config import LOW_TIER_FLOOR
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(db_path=Path(td) / "cold-path.db")
+        cfg = TGsConfig()
+        before = cfg.thresholds.low_max
+        for i in range(10):
+            db._conn.execute(
+                "INSERT INTO telemetry (session_id, task_hash, agent_id, tier, model, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (f"s{i}", f"h{i}", i, "low", "gpt-5-mini", time.time()),
+            )
+        for i in range(5):
+            db._conn.execute(
+                "INSERT INTO rework_events (session_id, wave_n, wave_n1, file_path, scope_match, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (f"s{i}", 0, 1, f"file{i}.py", 1, time.time()),
+            )
+        db._conn.commit()
+
+        assert cold_path_adjust(db, cfg, every_n_tasks=10) is True
+        assert cfg.thresholds.low_max < before, "high rework must tighten, not loosen"
+        assert cfg.thresholds.low_max >= LOW_TIER_FLOOR
+        db.close()

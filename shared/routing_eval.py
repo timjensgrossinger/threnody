@@ -9,7 +9,9 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import os
-from pathlib import Path
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 EVAL_DIR = Path(__file__).parent.parent / "tests" / "eval"
@@ -27,7 +29,10 @@ VALID_DURATION = ("short", "medium", "long")
 # shared.routing_eval._TaskRouter before calling run_eval().
 _TaskRouter = None
 
-_OPTIONAL_TOP_LEVEL_KEYS = {"test_mode", "simulated_result"}
+# Kept in sync with tests/eval/schema.json — that file documents the contract,
+# this set enforces it (the hand-rolled validator exists so the suite needs no
+# jsonschema dependency).
+_OPTIONAL_TOP_LEVEL_KEYS = {"test_mode", "simulated_result", "seed_files"}
 
 
 def _agents_to_fanout(n: int) -> str:
@@ -76,6 +81,23 @@ def _validate_fixture(fixture: dict[str, Any]) -> list[str]:
     prompt = fixture["prompt"]
     if not isinstance(prompt, str) or len(prompt) < 5:
         errors.append("'prompt' must be a string of at least 5 characters")
+
+    seed_files = fixture.get("seed_files")
+    if seed_files is not None:
+        if not isinstance(seed_files, dict):
+            errors.append("'seed_files' must be an object of {path: content}")
+        else:
+            for rel, content in seed_files.items():
+                if not isinstance(rel, str) or not rel.strip():
+                    errors.append("'seed_files' keys must be non-empty strings")
+                    continue
+                if not isinstance(content, str):
+                    errors.append(f"'seed_files[{rel}]' must be a string")
+                # Fixtures are materialised into a temp dir; a path that escapes it
+                # would write into the repo when the suite runs.
+                candidate = PurePosixPath(rel)
+                if candidate.is_absolute() or ".." in candidate.parts:
+                    errors.append(f"'seed_files[{rel}]' must be a relative path without '..'")
 
     expected = fixture["expected"]
     if not isinstance(expected, dict):
@@ -382,6 +404,35 @@ def compare_to_baseline(
     return regressions
 
 
+@contextmanager
+def _fixture_evidence(fixture: dict[str, Any]):
+    """Materialise ``seed_files`` and yield the risk evidence they imply.
+
+    Yields ``None`` when the fixture declares no files, which keeps every
+    existing fixture on the exact prose-only path it was calibrated against.
+
+    Files are inlined in the fixture and written to a throwaway directory rather
+    than pointing at real repo paths: a fixture that read the repo would change
+    its own expected score every time the file it names is edited.
+    """
+    seed_files = fixture.get("seed_files")
+    if not isinstance(seed_files, dict) or not seed_files:
+        yield None
+        return
+
+    from shared.risk_signals import collect_task_evidence
+
+    with tempfile.TemporaryDirectory(prefix="threnody-eval-") as td:
+        root = Path(td)
+        written: list[str] = []
+        for rel, content in seed_files.items():
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(content), encoding="utf-8")
+            written.append(str(target))
+        yield collect_task_evidence(written)
+
+
 def _evaluate_fixture(
     fixture: dict[str, Any],
     router: Any,
@@ -419,7 +470,21 @@ def _evaluate_fixture(
         os.environ[test_mode_var.strip()] = "1"
 
     try:
-        decision = router.classify(fixture_data["prompt"])
+        with _fixture_evidence(fixture_data) as evidence:
+            decision = router.classify(fixture_data["prompt"], evidence=evidence)
+    except TypeError:
+        # A stubbed router (tests/test_routing_eval.py) may not accept evidence.
+        # Fixtures without seed_files must keep working against those.
+        try:
+            decision = router.classify(fixture_data["prompt"])
+        except Exception as exc:
+            return {
+                "status": "fail",
+                "id": fixture_id,
+                "category": category,
+                "reason": f"classify error: {type(exc).__name__}: {exc}",
+                "regressions": [],
+            }
     except Exception as exc:
         reason = f"classify error: {type(exc).__name__}: {exc}"
         return {

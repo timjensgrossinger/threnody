@@ -1,0 +1,18 @@
+{
+  "id": "prose-security-sparse-01",
+  "category": "medium_tier",
+  "tags": [
+    "stable",
+    "prose",
+    "risk-floor"
+  ],
+  "prompt": "Harden the prompt injection surface in the browser page scanner.",
+  "expected": {
+    "tier": "medium",
+    "score_min": 0.18,
+    "score_max": 0.26,
+    "urgency_expected": false,
+    "fanout_expected": "favor_parallel",
+    "duration_expected": "medium"
+  }
+}

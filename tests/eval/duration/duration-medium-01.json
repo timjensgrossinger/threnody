@@ -8,8 +8,8 @@
   "prompt": "Update core/parser.py and core/lexer.py to share a token table",
   "expected": {
     "tier": "medium",
-    "score_min": 0.17,
-    "score_max": 0.65,
+    "score_min": 0.26,
+    "score_max": 0.34,
     "duration_expected": "medium",
     "file_count_expected": 2
   }

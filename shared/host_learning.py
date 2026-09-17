@@ -462,6 +462,13 @@ def _enrich_agent_from_handoff(
         snap = snapshots_by_wave_agent.get((wave_index, agent_index))
     if snap is None:
         return merged
+    # Record what was *planned* before the gap-fill below, so a tier the host
+    # actually reported can be compared against it. The loop only fills empty
+    # keys, so merged["tier"] ends up as the reported tier when there is one and
+    # the planned tier otherwise — indistinguishable without this.
+    planned_tier = snap.get("tier")
+    if isinstance(planned_tier, str) and planned_tier.strip():
+        merged["planned_tier"] = planned_tier.strip()
     for key in ("prompt", "tier", "model", "task_id", "spawn_id", "subagent_type", "role"):
         if not merged.get(key) and snap.get(key):
             merged[key] = snap[key]
@@ -475,6 +482,38 @@ def _enrich_agent_from_handoff(
     if not merged.get("target_file") and isinstance(target_files, list) and target_files:
         merged["target_file"] = target_files[0]
     return merged
+
+
+def _record_tier_override(db: Database, enriched: Mapping[str, Any]) -> bool:
+    """Record a tier override when the host ran an agent at a tier we did not plan.
+
+    This is the half of override reporting that needs no host cooperation: the
+    wave report already carries the tier each agent actually ran at, and the
+    handoff snapshot carries the tier Threnody planned. Comparing them is free.
+
+    Best-effort — a failure here must never break wave ingest, which is the path
+    that carries all the other learning for the run.
+    """
+    planned = str(enriched.get("planned_tier") or "").strip().lower()
+    actual = str(enriched.get("tier") or "").strip().lower()
+    task_id = str(enriched.get("task_id") or "").strip()
+    if not planned or not actual or planned == actual or not task_id:
+        return False
+    try:
+        from .outcomes import record_outcome
+
+        record_outcome(
+            db,
+            task_id,
+            "tier_overridden",
+            routed_tier=planned,
+            actual_tier=actual,
+            note=f"host ran {actual} where {planned} was planned",
+        )
+        return True
+    except Exception:
+        log.debug("tier override record failed for %s", task_id, exc_info=True)
+        return False
 
 
 def register_host_run_handoff(
@@ -1469,6 +1508,7 @@ def ingest_host_wave(
     routing_guard_buffer: list[dict[str, Any]] = []
     draft_projects_by_hash: dict[str, str] = {}
     processed_agents = 0
+    tier_overrides = 0
 
     for agent_index, agent in enumerate(agents):
         if not isinstance(agent, Mapping):
@@ -1483,6 +1523,8 @@ def ingest_host_wave(
             snapshots_by_target_file=by_target_file,
             workspace_root=effective_root,
         )
+        if _record_tier_override(db, enriched):
+            tier_overrides += 1
         spawn_id = str(enriched.get("spawn_id") or enriched.get("id") or "")
         spec = {
             "spawn_id": spawn_id,
@@ -1697,6 +1739,10 @@ def ingest_host_wave(
         "rework_events": rework_events,
         "terminal": terminal,
     }
+    if tier_overrides:
+        # Surfaced so an operator can see the router being disagreed with without
+        # querying routing_outcomes. The rows are what feed the adaptive bands.
+        response["tier_overrides"] = tier_overrides
     if effective_root or auto_excerpt_count or files_read:
         response["learning_enrichment"] = {
             "workspace_root": effective_root,

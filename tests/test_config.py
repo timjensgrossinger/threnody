@@ -34,11 +34,20 @@ from shared.config import (
 
 
 def test_hard_bounds_constants() -> None:
-    """Hard bound constants should be reasonable."""
-    assert LOW_TIER_FLOOR == 0.50
-    assert LOW_TIER_CEILING == 0.75
-    assert MEDIUM_HIGH_BOUNDARY_FLOOR == 0.75
-    assert MEDIUM_HIGH_BOUNDARY_CEILING == 0.95
+    """Hard bound constants should be reasonable.
+
+    Re-derived with the scoring rebuild. The old floor of 0.50 was itself a
+    defect: compute_thresholds clamps to it and adjusts by at most 0.10, so a
+    task scoring 0.32 could never be learned out of the low tier no matter how
+    many failures accumulated against it.
+    """
+    assert LOW_TIER_FLOOR == 0.12
+    assert LOW_TIER_CEILING == 0.30
+    assert MEDIUM_HIGH_BOUNDARY_FLOOR == 0.45
+    assert MEDIUM_HIGH_BOUNDARY_CEILING == 0.75
+    # The invariant that actually matters: the bands are ordered and non-empty.
+    assert LOW_TIER_FLOOR < LOW_TIER_CEILING <= MEDIUM_HIGH_BOUNDARY_FLOOR
+    assert MEDIUM_HIGH_BOUNDARY_FLOOR < MEDIUM_HIGH_BOUNDARY_CEILING
 
 
 def test_threshold_clamp_low() -> None:
@@ -361,8 +370,8 @@ def test_basic_yaml_fallback_parses_floats_lists_and_policy(monkeypatch: pytest.
             "\n".join(
                 [
                     "thresholds:",
-                    "  mini_max: 0.55",
-                    "  sonnet_max: 0.8",
+                    "  mini_max: 0.25",
+                    "  sonnet_max: 0.7",
                     "providers:",
                     "  disabled:",
                     "    - windsurf",
@@ -379,8 +388,8 @@ def test_basic_yaml_fallback_parses_floats_lists_and_policy(monkeypatch: pytest.
 
         cfg = TGsConfig.from_yaml(config_path)
 
-        assert cfg.thresholds.low_max == 0.55
-        assert cfg.thresholds.medium_max == 0.8
+        assert cfg.thresholds.low_max == 0.25
+        assert cfg.thresholds.medium_max == 0.7
         assert cfg.disabled_providers == ["windsurf"]
         assert cfg.routing_policy.effective_profile("github-copilot-cli").route_task_mandatory is True
 

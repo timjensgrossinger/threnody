@@ -1,0 +1,18 @@
+{
+  "id": "prose-scale-verb-01",
+  "category": "medium_tier",
+  "tags": [
+    "stable",
+    "prose",
+    "scale-verb"
+  ],
+  "prompt": "Rewrite the pagination helper to page from the end instead.",
+  "expected": {
+    "tier": "medium",
+    "score_min": 0.18,
+    "score_max": 0.26,
+    "urgency_expected": false,
+    "fanout_expected": "favor_parallel",
+    "duration_expected": "medium"
+  }
+}

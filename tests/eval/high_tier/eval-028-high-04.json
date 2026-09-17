@@ -7,8 +7,8 @@
   "prompt": "Design a system design proposal for cross-service event delivery with rollback strategy.",
   "expected": {
     "tier": "high",
-    "score_min": 0.85,
-    "score_max": 0.95,
+    "score_min": 0.86,
+    "score_max": 0.94,
     "urgency_expected": false,
     "fanout_expected": "none"
   }

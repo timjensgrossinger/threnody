@@ -1,0 +1,17 @@
+{
+  "id": "prose-trivial-02",
+  "category": "low_tier",
+  "tags": [
+    "stable",
+    "prose"
+  ],
+  "prompt": "Tidy up the spacing in the settings panel.",
+  "expected": {
+    "tier": "low",
+    "score_min": 0.06,
+    "score_max": 0.14,
+    "urgency_expected": false,
+    "fanout_expected": "favor_parallel",
+    "duration_expected": "short"
+  }
+}

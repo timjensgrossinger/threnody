@@ -1147,7 +1147,7 @@ def test_handle_route_task_prefers_free_low_tier_metadata(monkeypatch) -> None:
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1185,7 +1185,7 @@ def test_handle_route_task_execution_hint_host_native_for_claude(monkeypatch) ->
         cfg = TGsConfig(db_path=db_path)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="medium",
                 score=0.55,
                 reason="medium-tier task",
@@ -1226,7 +1226,7 @@ def test_handle_route_task_passes_cwd_and_persists_telemetry(monkeypatch, tmp_pa
     cfg = TGsConfig(db_path=db_path)
     db = Database(db_path=db_path)
 
-    def classify(task, project_path=None):
+    def classify(task, project_path=None, evidence=None):
         captured["project_path"] = project_path
         return SimpleNamespace(
             tier="low",
@@ -1293,7 +1293,7 @@ def test_delegation_targets_filter_host_clis_when_utilities_disabled(monkeypatch
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=False)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.2,
                 reason="low-tier task",
@@ -1328,7 +1328,7 @@ def test_delegation_targets_allow_utilities_only_when_enabled(monkeypatch) -> No
         )
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.2,
                 reason="low-tier task",
@@ -1359,7 +1359,7 @@ def test_handle_route_task_execution_hint_delegate_for_copilot(monkeypatch) -> N
             cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
             db = Database(db_path=db_path)
             router = SimpleNamespace(
-                classify=lambda _task, project_path=None: SimpleNamespace(
+                classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                     tier="low",
                     score=0.2,
                     reason="low-tier task",
@@ -1732,7 +1732,7 @@ def test_handle_route_task_uses_code_only_hint_for_write_tasks(monkeypatch) -> N
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1792,7 +1792,7 @@ def test_handle_route_task_avoids_code_only_for_plain_text_tasks(monkeypatch) ->
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1836,7 +1836,7 @@ def test_handle_route_task_does_not_fabricate_provider_metadata(monkeypatch) -> 
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -2149,7 +2149,7 @@ def test_handle_route_task_ignores_invalid_model_from_selection(monkeypatch) -> 
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -3041,7 +3041,8 @@ def test_mcp_record_outcome(monkeypatch) -> None:
             lambda: (cfg, db, None, None, None),
         )
 
-        def stub_record_outcome(db_arg, task_id, outcome, operator_id=None, note=None, project_id=None):
+        def stub_record_outcome(db_arg, task_id, outcome, operator_id=None, note=None,
+                                project_id=None, routed_tier=None, actual_tier=None):
             calls.append((db_arg, task_id, outcome, operator_id, note))
             return {"stored": True, "task_id": task_id}
 
@@ -3076,7 +3077,8 @@ def test_mcp_record_outcome_records_anonymous_when_operator_missing(monkeypatch)
             lambda: (cfg, db, None, None, None),
         )
 
-        def stub_record_outcome(db_arg, task_id, outcome, operator_id=None, note=None, project_id=None):
+        def stub_record_outcome(db_arg, task_id, outcome, operator_id=None, note=None,
+                                project_id=None, routed_tier=None, actual_tier=None):
             calls.append((db_arg, task_id, outcome, operator_id, note))
             return {"stored": True, "task_id": task_id}
 
@@ -3129,10 +3131,13 @@ def test_mcp_record_outcome_rejects_invalid_enum() -> None:
         "outcome": "bad",
     })
 
+    # Derived from the allowlist rather than restated, so adding an outcome does
+    # not silently make this test assert a stale contract.
     assert result == {
         "error": "invalid_outcome",
-        "allowed": ["accepted", "revised", "rejected", "reworked"],
+        "allowed": list(mcp_server.shared_outcomes.OUTCOME_VALUES),
     }
+    assert "tier_overridden" in result["allowed"]
 
 
 def test_mcp_record_outcome_surfaces_readonly_window(monkeypatch) -> None:
@@ -3437,7 +3442,7 @@ def test_handle_route_task_includes_host_spawn_for_claude_host(monkeypatch) -> N
         cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
         db = Database(db_path=db_path)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="medium",
                 score=0.55,
                 reason="medium-tier task",

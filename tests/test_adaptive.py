@@ -15,7 +15,13 @@ from shared.adaptive import (
     EMA_ALPHA, SUCCESS_THRESHOLD, BANDS, PROJECT_SAMPLE_MIN,
     get_project_sample_count, register_observation, should_apply_adaptive_thresholds,
 )
-from shared.config import TGsConfig, ThresholdConfig, LOW_TIER_FLOOR, LOW_TIER_CEILING
+from shared.config import (
+    TGsConfig,
+    ThresholdConfig,
+    LOW_TIER_FLOOR,
+    LOW_TIER_CEILING,
+    MEDIUM_HIGH_BOUNDARY_FLOOR,
+)
 from shared.db import Database
 from shared.router import TaskRouter
 
@@ -124,7 +130,7 @@ def test_compute_thresholds_respects_hard_bounds():
             update_band(db, score=0.7, tier="medium", success=False)
         tc = compute_thresholds(db, min_samples=5)
         assert tc.low_max >= LOW_TIER_FLOOR
-        assert tc.medium_max >= 0.75  # MEDIUM_HIGH_BOUNDARY_FLOOR
+        assert tc.medium_max >= MEDIUM_HIGH_BOUNDARY_FLOOR
         db.close()
 
 

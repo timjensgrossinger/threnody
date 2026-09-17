@@ -7,8 +7,8 @@
   "prompt": "Integrate error handling across api.py service.py cli.py and add a validation-focused test suite for the new responses.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.63,
-    "score_max": 0.71,
+    "score_min": 0.45,
+    "score_max": 0.53,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   }

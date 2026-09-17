@@ -7,8 +7,8 @@
   "prompt": "Implement authentication validation for a new Python module across parser.py runner.py config.py and integrate the execution path with shared middleware.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.69,
-    "score_max": 0.77,
+    "score_min": 0.45,
+    "score_max": 0.53,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   }

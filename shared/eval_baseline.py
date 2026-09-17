@@ -62,8 +62,13 @@ def _compute_config_hash() -> str:
 
 
 def _fixture_to_baseline_entry(fixture: dict[str, Any], router) -> dict[str, Any]:
-    # Use router.classify to obtain a RoutingDecision
-    decision = router.classify(fixture.get("prompt", ""))
+    # Reuse routing_eval's evidence context manager rather than calling classify
+    # bare. This module used to hold its own copy of "what does the router say
+    # about this fixture", so when fixtures gained seed_files the baseline kept
+    # recording the prose-only answer and every evidence fixture failed against
+    # a baseline that disagreed with the eval it was supposed to describe.
+    with routing_eval._fixture_evidence(fixture) as evidence:
+        decision = router.classify(fixture.get("prompt", ""), evidence=evidence)
     entry = {
         "id": fixture.get("id"),
         "category": fixture.get("category"),

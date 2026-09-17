@@ -990,6 +990,7 @@ class Database:
         self._ensure_worker_sessions_schema(conn)
         self._ensure_bandit_schema(conn)
         self._ensure_convergence_schema(conn)
+        self._ensure_tier_override_schema(conn)
         self._ensure_compression_schema(conn)
         self._ensure_agent_export_columns(conn)
         self._record_swarm_schema_version(conn)
@@ -2178,6 +2179,27 @@ class Database:
             conn.execute(
                 "ALTER TABLE routing_outcomes ADD COLUMN gate_verdict TEXT"
             )
+
+    @staticmethod
+    def _ensure_tier_override_schema(conn: sqlite3.Connection) -> None:
+        """Add routed_tier/actual_tier to routing_outcomes.
+
+        Without both, an operator cannot tell an escalation from a
+        de-escalation — which is exactly the diagnostic that would have surfaced
+        security-critical work being routed to the cheapest tier. The learning
+        loop itself only needs the ``tier_overridden`` outcome (it reads the
+        routed tier back from ``telemetry``); these columns are what make the
+        override *legible*.
+        """
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(routing_outcomes)").fetchall()
+        }
+        for column in ("routed_tier", "actual_tier"):
+            if column not in cols:
+                conn.execute(
+                    f"ALTER TABLE routing_outcomes ADD COLUMN {column} TEXT"
+                )
 
     @staticmethod
     def _ensure_convergence_schema(conn: sqlite3.Connection) -> None:

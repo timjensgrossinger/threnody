@@ -7,8 +7,8 @@
   "prompt": "Production incident today: implement authentication middleware fix for blocked logins.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.62,
-    "score_max": 0.72,
+    "score_min": 0.45,
+    "score_max": 0.53,
     "urgency_expected": true,
     "fanout_expected": "favor_parallel"
   }

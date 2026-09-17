@@ -216,8 +216,8 @@ def compute_thresholds(
         tier_samples[tier] = total_samples
 
     # Start from defaults
-    low_max = (LOW_TIER_FLOOR + LOW_TIER_CEILING) / 2   # 0.625
-    medium_max = (MEDIUM_HIGH_BOUNDARY_FLOOR + MEDIUM_HIGH_BOUNDARY_CEILING) / 2  # 0.85
+    low_max = (LOW_TIER_FLOOR + LOW_TIER_CEILING) / 2   # 0.21
+    medium_max = (MEDIUM_HIGH_BOUNDARY_FLOOR + MEDIUM_HIGH_BOUNDARY_CEILING) / 2  # 0.60
 
     # If low tier success is poor, shrink its range (lower low_max)
     low_ema = tier_ema.get("low", 0.90)

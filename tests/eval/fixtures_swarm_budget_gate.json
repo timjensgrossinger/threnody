@@ -1,13 +1,16 @@
 {
   "id": "fixtures-swarm-budget-gate",
   "category": "high_tier",
-  "tags": ["stable", "swarm"],
+  "tags": [
+    "stable",
+    "swarm"
+  ],
   "test_mode": "THRENODY_TEST_MODE",
   "prompt": "Design a system plan for a budget-limited swarm execution that coordinates cross-service rollout and pauses for operator confirmation when token estimates exceed the budget ceiling.",
   "expected": {
     "tier": "high",
-    "score_min": 0.85,
-    "score_max": 0.95,
+    "score_min": 0.86,
+    "score_max": 0.94,
     "urgency_expected": false,
     "fanout_expected": "none"
   },
@@ -19,13 +22,27 @@
       "route_task_baseline_id": "eval-028-high-04",
       "plan_task": {
         "analysis": "budget preview plan",
-        "subtasks": [{"id": "preview-1"}],
-        "waves": [[1]],
+        "subtasks": [
+          {
+            "id": "preview-1"
+          }
+        ],
+        "waves": [
+          [
+            1
+          ]
+        ],
         "strategy": "sequential"
       },
       "fleet_plan": {
-        "plan": {"topology": "dag"},
-        "fleet_waves": [{"wave_number": 1}],
+        "plan": {
+          "topology": "dag"
+        },
+        "fleet_waves": [
+          {
+            "wave_number": 1
+          }
+        ],
         "execution_note": "budget preview required"
       },
       "execute_subtask": {

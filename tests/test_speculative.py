@@ -77,38 +77,55 @@ class BarrierHigherTierProvider(MockProvider):
 
 class TestIsBorderline(unittest.TestCase):
     def setUp(self):
-        self.thresholds = ThresholdConfig(low_max=0.55, medium_max=0.80)
+        # ThresholdConfig.__post_init__ clamps to the hard bounds in
+        # shared/config.py, so read the boundaries back and derive every probe
+        # from them. Naming literal scores encoded one particular set of bounds:
+        # when they were re-derived, every probe silently stopped sitting where
+        # the test name claimed it did.
+        self.thresholds = ThresholdConfig()
+        self.low_max = self.thresholds.low_max
+        self.medium_max = self.thresholds.medium_max
+        # A score far enough from both boundaries to be comfortably interior.
+        self.interior = (self.low_max + self.medium_max) / 2
+        assert self.medium_max - self.low_max > 4 * SPECULATION_MARGIN, (
+            "the bands must be wider than the speculation margin for an "
+            "interior score to exist at all"
+        )
 
     def test_well_below_low_max(self):
-        result = is_borderline(0.30, self.thresholds)
+        result = is_borderline(max(0.0, self.low_max - 4 * SPECULATION_MARGIN),
+                               self.thresholds)
         self.assertIsNone(result)
 
     def test_exactly_at_low_max(self):
-        result = is_borderline(0.55, self.thresholds)
+        result = is_borderline(self.low_max, self.thresholds)
         self.assertIsNotNone(result)
         self.assertEqual(result, (True, "low", "medium"))
 
     def test_within_margin_above_low_max(self):
-        result = is_borderline(0.55 + SPECULATION_MARGIN * 0.5, self.thresholds)
+        result = is_borderline(self.low_max + SPECULATION_MARGIN * 0.5,
+                               self.thresholds)
         self.assertIsNotNone(result)
         self.assertEqual(result[1:], ("low", "medium"))
 
     def test_within_margin_below_low_max(self):
-        result = is_borderline(0.55 - SPECULATION_MARGIN * 0.5, self.thresholds)
+        result = is_borderline(self.low_max - SPECULATION_MARGIN * 0.5,
+                               self.thresholds)
         self.assertIsNotNone(result)
         self.assertEqual(result[1:], ("low", "medium"))
 
     def test_at_medium_max(self):
-        result = is_borderline(0.80, self.thresholds)
+        result = is_borderline(self.medium_max, self.thresholds)
         self.assertIsNotNone(result)
         self.assertEqual(result, (True, "medium", "high"))
 
     def test_well_above_medium_max(self):
-        result = is_borderline(0.95, self.thresholds)
+        result = is_borderline(min(1.0, self.medium_max + 4 * SPECULATION_MARGIN),
+                               self.thresholds)
         self.assertIsNone(result)
 
     def test_between_boundaries_not_near_either(self):
-        result = is_borderline(0.67, self.thresholds)
+        result = is_borderline(self.interior, self.thresholds)
         self.assertIsNone(result)
 
 
@@ -149,12 +166,19 @@ class TestCheckOutputQuality(unittest.TestCase):
 class TestSpeculativeExecutor(unittest.TestCase):
     def setUp(self):
         self.config = TGsConfig()
-        self.config.thresholds = ThresholdConfig(low_max=0.55, medium_max=0.80)
+        # Derived, not literal — see TestIsBorderline.setUp. BORDERLINE sits on
+        # the low/medium boundary and INTERIOR comfortably inside a band, so
+        # these stay meaningful across a bounds change.
+        self.config.thresholds = ThresholdConfig()
+        self.BORDERLINE = self.config.thresholds.low_max
+        self.INTERIOR = (
+            self.config.thresholds.low_max + self.config.thresholds.medium_max
+        ) / 2
 
     def test_can_speculate_true_with_mini(self):
         provider = MockProvider()
         with SpeculativeExecutor(provider, self.config) as ex:
-            self.assertTrue(ex.can_speculate(0.55, "low"))
+            self.assertTrue(ex.can_speculate(self.BORDERLINE, "low"))
 
     def test_can_speculate_false_without_mini(self):
         provider = MockProvider(models={
@@ -163,18 +187,18 @@ class TestSpeculativeExecutor(unittest.TestCase):
             "high": "claude-opus-4.6",
         })
         with SpeculativeExecutor(provider, self.config) as ex:
-            self.assertFalse(ex.can_speculate(0.55, "low"))
+            self.assertFalse(ex.can_speculate(self.BORDERLINE, "low"))
 
     def test_can_speculate_false_tier_not_available(self):
         provider = MockProvider(tiers=["medium", "high"])
         with SpeculativeExecutor(provider, self.config) as ex:
-            self.assertFalse(ex.can_speculate(0.55, "low"))
+            self.assertFalse(ex.can_speculate(self.BORDERLINE, "low"))
 
     def test_not_borderline_returns_none(self):
         provider = MockProvider()
         subtask = Subtask(id=1, description="test", tier="low")
         with SpeculativeExecutor(provider, self.config) as ex:
-            result = ex.execute_speculative(subtask, 0.30)
+            result = ex.execute_speculative(subtask, self.INTERIOR)
         self.assertIsNone(result)
 
     def test_borderline_returns_result(self):
@@ -184,7 +208,7 @@ class TestSpeculativeExecutor(unittest.TestCase):
         })
         subtask = Subtask(id=1, description="test", tier="medium")
         with SpeculativeExecutor(provider, self.config) as ex:
-            result = ex.execute_speculative(subtask, 0.55)
+            result = ex.execute_speculative(subtask, self.BORDERLINE)
         self.assertIsNotNone(result)
         self.assertIsInstance(result, SpeculativeResult)
         self.assertTrue(result.speculated)
@@ -196,7 +220,7 @@ class TestSpeculativeExecutor(unittest.TestCase):
         })
         subtask = Subtask(id=1, description="test", tier="medium")
         with SpeculativeExecutor(provider, self.config) as ex:
-            result = ex.execute_speculative(subtask, 0.55)
+            result = ex.execute_speculative(subtask, self.BORDERLINE)
         self.assertTrue(result.lower_tier_passed)
         self.assertEqual(result.tier_used, "low")
 
@@ -207,7 +231,7 @@ class TestSpeculativeExecutor(unittest.TestCase):
         })
         subtask = Subtask(id=1, description="test", tier="medium")
         with SpeculativeExecutor(provider, self.config) as ex:
-            result = ex.execute_speculative(subtask, 0.55)
+            result = ex.execute_speculative(subtask, self.BORDERLINE)
         self.assertFalse(result.lower_tier_passed)
         self.assertEqual(result.tier_used, "medium")
 
@@ -218,7 +242,7 @@ class TestSpeculativeExecutor(unittest.TestCase):
         })
         subtask = Subtask(id=1, description="test", tier="medium")
         with SpeculativeExecutor(provider, self.config) as ex:
-            result = ex.execute_speculative(subtask, 0.55)
+            result = ex.execute_speculative(subtask, self.BORDERLINE)
         self.assertFalse(result.lower_tier_passed)
         self.assertEqual(result.tier_used, "medium")
 
@@ -233,7 +257,7 @@ class TestSpeculativeExecutor(unittest.TestCase):
             })
             subtask = Subtask(id=1, description="test speculation logging", tier="medium")
             with SpeculativeExecutor(provider, self.config, db=db) as ex:
-                result = ex.execute_speculative(subtask, 0.55)
+                result = ex.execute_speculative(subtask, self.BORDERLINE)
             self.assertIsNotNone(result)
             row = db._conn.execute("SELECT COUNT(*) FROM speculation_log").fetchone()
             self.assertGreaterEqual(row[0], 1)
@@ -247,7 +271,7 @@ class TestSpeculativeExecutor(unittest.TestCase):
         })
         subtask = Subtask(id=1, description="test", tier="medium")
         with SpeculativeExecutor(provider, self.config, db=None) as ex:
-            result = ex.execute_speculative(subtask, 0.55)
+            result = ex.execute_speculative(subtask, self.BORDERLINE)
         self.assertIsNotNone(result)
 
     def test_speculation_worker_count_defaults_and_caps(self):
@@ -281,7 +305,7 @@ class TestSpeculativeExecutor(unittest.TestCase):
             threads = [
                 threading.Thread(
                     target=lambda st=subtask: results.append(
-                        executor.execute_speculative(st, 0.55)
+                        executor.execute_speculative(st, self.BORDERLINE)
                     ),
                     daemon=True,
                 )

@@ -1,0 +1,19 @@
+{
+  "id": "evidence-content-vocab-no-floor-01",
+  "category": "low_tier",
+  "tags": [
+    "stable",
+    "evidence"
+  ],
+  "prompt": "add a docstring",
+  "seed_files": {
+    "notes_helper.py": "# discusses password and token handling\nX = 1\n"
+  },
+  "expected": {
+    "tier": "low",
+    "score_min": 0.0,
+    "score_max": 0.06,
+    "urgency_expected": false,
+    "fanout_expected": "favor_parallel"
+  }
+}

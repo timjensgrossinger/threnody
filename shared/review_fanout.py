@@ -10,6 +10,14 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from .risk_signals import (
+    CONCRETE_HIGH_RISK_SIGNALS,
+    RISK_SIGNALS,
+    RISKY_EXTENSIONS,
+    has_concrete_high_risk_signals,
+    has_risk_signals,
+)
+
 if TYPE_CHECKING:
     from shared.code_intel import CodeIntel, Smell, StructuralTraits
     from shared.db import Database
@@ -35,25 +43,13 @@ _LOC_HIGH = 600
 _HIGH_DENSITY = 0.45
 _LOW_DENSITY = 0.18
 
-_RISKY_EXTENSIONS = frozenset({".py", ".js", ".ts", ".go", ".rb", ".java", ".php", ".cs", ".cpp", ".c"})
-
-_RISK_SIGNALS = re.compile(
-    r"(?:\b(?:sql|subprocess|os\.system|auth(?:enticate|entication|orization)?|"
-    r"crypto|cryptograph(?:y|ic)|encrypt(?:ion)?|decrypt(?:ion)?|payment|billing|card|"
-    r"password|secret|credential|keychain|token|api[_ -]?key|rce|remote code execution|"
-    r"cursor\.execute|raw_query|shell\s*=\s*True|deseriali[sz](?:e|ation)|"
-    r"pickle\.loads|ssrf|server-side request forgery|"
-    r"path traversal|directory traversal)\b|\b(?:exec|eval)\s*\(|\byaml\.load\s*\()",
-    re.IGNORECASE,
-)
-
-_CONCRETE_HIGH_RISK_SIGNALS = re.compile(
-    r"(?:\b(?:rce|remote code execution|os\.system|cursor\.execute|raw_query|"
-    r"shell\s*=\s*True|deseriali[sz](?:e|ation)|pickle\.loads|ssrf|"
-    r"server-side request forgery|path traversal|directory traversal)\b|"
-    r"\b(?:exec|eval)\s*\(|\byaml\.load\s*\()",
-    re.IGNORECASE,
-)
+# The risk vocabulary now lives in shared/risk_signals.py so the router's tier
+# floor and this content scan cannot drift apart. Re-exported under the original
+# private names because _cell_tier and the review-cell callers below reference
+# them, and because the config half used to be a hand-copy that fell behind.
+_RISKY_EXTENSIONS = RISKY_EXTENSIONS
+_RISK_SIGNALS = RISK_SIGNALS
+_CONCRETE_HIGH_RISK_SIGNALS = CONCRETE_HIGH_RISK_SIGNALS
 
 _HIGH_REVIEW_TASK_SIGNALS = re.compile(
     r"\b(?:deep(?:\s+security)?\s+review|threat[-\s]?model(?:ing)?|"
@@ -329,12 +325,8 @@ def _count_loc(content: str) -> int:
     return sum(1 for line in content.splitlines() if line.strip())
 
 
-def _has_risk_signals(content: str) -> bool:
-    return bool(_RISK_SIGNALS.search(content))
-
-
-def _has_concrete_high_risk_signals(content: str) -> bool:
-    return bool(_CONCRETE_HIGH_RISK_SIGNALS.search(content))
+_has_risk_signals = has_risk_signals
+_has_concrete_high_risk_signals = has_concrete_high_risk_signals
 
 
 # Comment-only line prefixes across the common review languages. Heuristic — a

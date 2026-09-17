@@ -1,0 +1,19 @@
+{
+  "id": "evidence-clean-file-is-inert-01",
+  "category": "low_tier",
+  "tags": [
+    "stable",
+    "evidence"
+  ],
+  "prompt": "tidy the helper",
+  "seed_files": {
+    "geometry.py": "def area(w, h):\n    return w * h\n"
+  },
+  "expected": {
+    "tier": "low",
+    "score_min": 0.06,
+    "score_max": 0.14,
+    "urgency_expected": false,
+    "fanout_expected": "favor_parallel"
+  }
+}

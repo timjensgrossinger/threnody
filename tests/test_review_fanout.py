@@ -1457,3 +1457,92 @@ class TestChangedLineScopedPrompts:
         review_a = [st for st in with_diff["subtasks"] if st.get("review_dimension")]
         review_b = [st for st in without_diff["subtasks"] if st.get("review_dimension")]
         assert len(review_a) == len(review_b)
+
+
+class TestFilenameRiskFloorVocabulary:
+    """The widened filename vocabulary must actually floor a review cell.
+
+    `DEFAULT_RISK_FILENAME_PATTERNS` grew 9 -> 27 tokens when the vocabulary was
+    unified in shared/risk_signals.py. `heuristic_plan._load_risk_floor` feeds
+    that list to this module as a per-cell filename floor, so it changes
+    review-swarm tiering and therefore cost. Measured at the time: **zero** files
+    in this repo match either the old or the new list, so the widening is inert
+    here and was never exercised anywhere — these fixtures are the only coverage.
+    """
+
+    # A flat mid-size .py logic cell is medium without a floor (see
+    # test_build_review_subtasks_applies_bias), so `high` proves the floor fired.
+    FLOOR = "high"
+
+    @staticmethod
+    def _cell_tier(tmp_path: Path, filename: str, floor: str | None) -> str:
+        from shared.config import DEFAULT_RISK_FILENAME_PATTERNS
+        from shared.risk_signals import compile_risk_floor_re
+
+        f = tmp_path / filename
+        f.write_text("\n".join(f"x{i} = {i}" for i in range(300)), encoding="utf-8")
+        risk_floor = None
+        if floor is not None:
+            risk_floor = (compile_risk_floor_re(list(DEFAULT_RISK_FILENAME_PATTERNS)), floor)
+        plan = build_review_subtasks(
+            [(str(f), "")], f"REVIEW: {f} [dims=logic]", risk_floor=risk_floor
+        )
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        assert logic, "expected a logic review cell"
+        return logic[0]["tier"]
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            # Tokens added when the two vocabularies were unified — none of these
+            # floored anything before.
+            "injection_guard.py",
+            "sanitizer.py",
+            "redaction.py",
+            "untrusted_input.py",
+            "privacy_filter.py",
+            "pii_scrubber.py",
+            "xss_escape.py",
+            "csrf_token_store.py",
+            "jwt_verify.py",
+            "blocklist_loader.py",
+            "allowlist_rules.py",
+            # Tokens that were already in the 9-word list — must not regress.
+            "credentials_store.py",
+            "auth_middleware.py",
+            "crypto_helpers.py",
+            "keychain_access.py",
+            "secret_loader.py",
+            "password_reset.py",
+            "token_cache.py",
+            "oauth_client.py",
+            "saml_assertion.py",
+        ],
+    )
+    def test_risky_filename_raises_the_cell_tier(self, tmp_path: Path, filename: str) -> None:
+        assert self._cell_tier(tmp_path, filename, self.FLOOR) == self.FLOOR
+
+    @pytest.mark.parametrize("filename", ["billing_engine.py", "payment_gateway.py", "subprocess_runner.py"])
+    def test_prose_excluded_tokens_still_floor_on_a_filename(
+        self, tmp_path: Path, filename: str
+    ) -> None:
+        """`filename_safe` and `prose_safe` are deliberately different sets.
+
+        "find files related to billing logic" is a read-only question carrying no
+        risk, so `billing` is excluded from the *prose* vocabulary — but
+        `billing_engine.py` names a payment surface and must still floor here.
+        That asymmetry is load-bearing and easy to erase by accident.
+        """
+        assert self._cell_tier(tmp_path, filename, self.FLOOR) == self.FLOOR
+
+    @pytest.mark.parametrize("filename", ["geometry.py", "list_helpers.py", "render_loop.py"])
+    def test_ordinary_filenames_are_untouched(self, tmp_path: Path, filename: str) -> None:
+        """The widening must not floor everything — that would erase the signal."""
+        assert self._cell_tier(tmp_path, filename, self.FLOOR) == "medium"
+
+    def test_no_floor_configured_leaves_the_heuristic_alone(self, tmp_path: Path) -> None:
+        assert self._cell_tier(tmp_path, "credentials_store.py", None) == "medium"
+
+    def test_the_floor_is_a_floor_not_a_ceiling(self, tmp_path: Path) -> None:
+        """A cell the heuristic already put above the floor must not be pulled down."""
+        assert self._cell_tier(tmp_path, "credentials_store.py", "low") == "medium"

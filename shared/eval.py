@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, ClassVar
 
-from .config import TGsConfig
+from .config import LOW_TIER_CEILING, LOW_TIER_FLOOR, TGsConfig
 from .db import Database
 from .outcomes import compute_learning_outcome_snapshot
 
@@ -926,11 +926,18 @@ def cold_path_adjust(
 
     rework_rate = rework_count / task_count
 
-    # If rework rate is high, thresholds need tightening (promote more tasks)
+    # If rework rate is high, thresholds need tightening (promote more tasks).
+    #
+    # The bounds come from shared/config.py, never from a literal here. These two
+    # clamps used to repeat 0.50/0.75, which was a silent no-op only for as long
+    # as those numbers happened to equal LOW_TIER_FLOOR/LOW_TIER_CEILING. When the
+    # bounds were re-derived, `max(0.20 - 0.02, 0.50)` returned 0.50 and clamp()
+    # pulled it to the ceiling — so a high rework rate *raised* low_max, the exact
+    # inverse of the intent stated on the line above.
     if rework_rate > 0.30:
         config.thresholds.low_max = max(
             config.thresholds.low_max - 0.02,
-            0.50,  # hard floor
+            LOW_TIER_FLOOR,
         )
         config.thresholds.clamp()
         log.info(
@@ -940,7 +947,7 @@ def cold_path_adjust(
     elif rework_rate < 0.10:
         config.thresholds.low_max = min(
             config.thresholds.low_max + 0.01,
-            0.75,  # hard ceiling
+            LOW_TIER_CEILING,
         )
         config.thresholds.clamp()
         log.info(

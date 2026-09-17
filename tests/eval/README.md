@@ -29,6 +29,32 @@ Field reminders:
 - Allowed `tier` values: `low`, `medium`, `high`
 - Categories must match the directory name from `tests/eval/schema.json`
 - For local runs, document fanout expectations with the runner-supported values `none` or `favor_parallel`
+- Optional top-level fields: `test_mode`, `simulated_result`, `seed_files`
+
+### Fixtures that need file evidence
+
+Routing tier is not a function of the prompt alone: `route_task` resolves the files a task
+touches and scores their security risk and size (`shared/risk_signals.py`). A prose-only fixture
+cannot exercise that path, so add `seed_files` to give the fixture something to look at:
+
+```json
+{
+  "id": "evidence-security-defect-01",
+  "category": "high_tier",
+  "tags": ["stable", "evidence"],
+  "prompt": "tidy the helper",
+  "seed_files": {
+    "store.py": "def q(conn, uid):\n    return conn.execute(f'SELECT * FROM t WHERE id={uid}').fetchall()\n"
+  },
+  "expected": { "tier": "high", "score_min": 0.36, "score_max": 0.44 }
+}
+```
+
+The files are written to a throwaway directory and scanned before the prompt is classified.
+Content is **inlined in the fixture** rather than pointing at real repo paths on purpose: a
+fixture that read the repo would silently change its own expected score every time the file it
+names is edited. Paths must be relative and must not contain `..` — the validator rejects
+anything that could escape the temp directory and write into the repo.
 
 ## 2. Run the suite before you change config or expected behavior
 

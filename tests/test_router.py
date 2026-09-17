@@ -166,12 +166,14 @@ def test_tier_returns_labels_not_models() -> None:
 
 def test_hard_bounds_respected() -> None:
     """Thresholds should be within hard bounds."""
+    from shared.config import LOW_TIER_FLOOR, MEDIUM_HIGH_BOUNDARY_CEILING
+
     config = TGsConfig()
-    config.thresholds.low_max = 0.20  # below floor
+    config.thresholds.low_max = 0.01  # below floor
     config.thresholds.medium_max = 0.99  # above ceiling
     config.thresholds.clamp()
-    assert config.thresholds.low_max >= 0.50
-    assert config.thresholds.medium_max <= 0.95
+    assert config.thresholds.low_max >= LOW_TIER_FLOOR
+    assert config.thresholds.medium_max <= MEDIUM_HIGH_BOUNDARY_CEILING
 
 
 def test_project_local_optin_gate() -> None:
@@ -356,11 +358,22 @@ def test_routing_hook_cli_blocks_without_guard(monkeypatch, tmp_path, capsys) ->
         "cwd": str(tmp_path),
         "tool_input": {"file_path": "bar.py"},
     })
+    # Enforcing mode blocks. The hook resolves enforce-vs-record from config, so
+    # force it here rather than depending on the ambient routing policy.
+    monkeypatch.setattr(routing_hook, "_resolve_record_only", lambda _caller: False)
     exit_code = routing_hook.main(["validate", "--json", payload])
     captured = capsys.readouterr()
     body = json.loads(captured.out)
     assert exit_code == 2
     assert body["valid"] is False
+
+    # Record-only reaches the same verdict and still emits it — the denial is what
+    # gets recorded — but never blocks the edit. This is the advisory default.
+    exit_code = routing_hook.main(["validate", "--record-only", "--json", payload])
+    body = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert body["valid"] is False
+    assert body["enforced"] is False
 
 
 if __name__ == "__main__":

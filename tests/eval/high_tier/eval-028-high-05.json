@@ -7,8 +7,8 @@
   "prompt": "Perform a security-critical review of a WAF rule set and identify risky rules plus safer alternatives.",
   "expected": {
     "tier": "high",
-    "score_min": 0.85,
-    "score_max": 0.95,
+    "score_min": 0.86,
+    "score_max": 0.94,
     "urgency_expected": false,
     "fanout_expected": "none"
   }

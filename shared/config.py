@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .risk_signals import FILENAME_RISK_TOKENS
+
 import logging
 
 try:
@@ -36,13 +38,32 @@ except RuntimeError as exc:
 DB_PATH = BASE_DIR / "cache.db"
 CONFIG_YAML = BASE_DIR / "config.yaml"
 
+#: Tiers cheapest-first. ``TIER_ORDER.index(t)`` is the comparable rank.
+#: shared/quality_bias.py, shared/review_memory.py and shared/router.py each
+#: carry a private copy of this; they are not migrated here to keep this change
+#: scoped, but new code should use this one.
+TIER_ORDER: tuple[str, ...] = ("low", "medium", "high")
+
 # ---------------------------------------------------------------------------
 # Hard bounds — tier boundaries can NEVER collapse past these
-# ---------------------------------------------------------------------------
-LOW_TIER_FLOOR = 0.50
-LOW_TIER_CEILING = 0.75
-MEDIUM_HIGH_BOUNDARY_FLOOR = 0.75
-MEDIUM_HIGH_BOUNDARY_CEILING = 0.95
+#
+# Re-derived after the scoring rebuild (per-level hit caps + risk evidence, and
+# the seven universal low verbs removed). Under the old model the eval corpus
+# scored low 0.22-0.32, medium 0.59-0.72: the classes were separated by how many
+# keywords a prompt used, not by difficulty, so a security rewrite that used none
+# landed below a routine task that used four. The rebuilt model separates the
+# same corpus cleanly — low 0.00-0.10, medium 0.30-0.57, high 0.62-0.90 — and
+# these bounds sit in the gaps between those clusters.
+#
+# The old LOW_TIER_FLOOR of 0.50 was also why threshold learning could never fix
+# a misroute of this kind: adaptive.compute_thresholds clamps to the floor and
+# adjusts by at most 0.10, so a task scoring 0.32 stayed on the low tier no
+# matter how many failures accumulated against it. The floor now sits below the
+# medium cluster, so feedback has somewhere to land.
+LOW_TIER_FLOOR = 0.12
+LOW_TIER_CEILING = 0.30
+MEDIUM_HIGH_BOUNDARY_FLOOR = 0.45
+MEDIUM_HIGH_BOUNDARY_CEILING = 0.75
 
 # ---------------------------------------------------------------------------
 # Token ceilings per tier (runaway kill switch)
@@ -318,10 +339,21 @@ DEFAULT_COMPLEXITY_SIGNALS: dict[str, list[str]] = {
         "protobuf", "grpc", "avro", "websocket",
         # Broader integration surface
         "integration",
+        # Scale-of-change verbs. "refactor" is high; these are its siblings and
+        # belonged somewhere from the start.
+        "rewrite", "overhaul", "harden", "invert",
     ],
-    "low": [
-        "add", "update", "fix", "change", "write", "create", "remove",
-    ],
+    # Deliberately empty. This level held the seven most common verbs in software
+    # work — add, update, fix, change, write, create, remove — each worth +0.06.
+    # They fired on nearly every task, so they raised every score by a similar
+    # amount and discriminated nothing, while inflating keyword-dense prompts
+    # past genuinely harder ones: "add credential handling" scored 0.16 and
+    # "fix the ci tests and add a regression test" scored 0.22, both below a
+    # security rewrite that happened to use none of them. They remain in
+    # DEFAULT_OVERRIDES["low"], which is the right home: that path applies a
+    # *negative* nudge and already suppresses itself when the task text mentions
+    # risk, names 3+ files, or matches a real high-complexity signal.
+    "low": [],
 }
 
 # Systems programming languages — word-boundary matched in router._compute_score()
@@ -427,12 +459,17 @@ def _shell_tier_model_defaults(shell_id: str) -> dict[str, str]:
 
 # Keyword overrides that bypass scoring entirely
 # Security-sensitive vocabulary for the risk-aware tier floor. Matched against
-# task text (router) and file basenames (host fanout). Mirrors the content-scan
-# vocabulary in shared/review_fanout.py::_RISK_SIGNALS; keep the two in sync.
-DEFAULT_RISK_FILENAME_PATTERNS: tuple[str, ...] = (
-    "credential", "auth", "crypto", "keychain", "secret",
-    "password", "token", "oauth", "saml",
-)
+# task text (router) and file basenames (host fanout).
+#
+# DERIVED, not copied. This used to be a 9-word hand-copy carrying a comment
+# telling the reader to keep it in sync with the ~30-token content scan in
+# review_fanout. It was not in sync and could not be: "injection", "sanitiz",
+# "redact", "untrusted", "privacy" and "pii" were in neither half, so a
+# prompt-injection hardening task matched nothing and routed to the cheapest
+# tier, while "oauth"/"saml" were here but missing from the content scan. Both
+# halves now come from shared/risk_signals.py::VOCABULARY, which is why adding a
+# filename_safe token there needs no second edit here.
+DEFAULT_RISK_FILENAME_PATTERNS: tuple[str, ...] = FILENAME_RISK_TOKENS
 
 DEFAULT_OVERRIDES: dict[str, list[str]] = {
     "low": [
@@ -468,8 +505,8 @@ DEFAULT_DELEGATION_UTILITIES: tuple[str, ...] = ("opencode", "aider")
 @dataclass
 class ThresholdConfig:
     """Adaptive threshold configuration with hard bounds."""
-    low_max: float = 0.55        # initial low-medium boundary
-    medium_max: float = 0.80     # initial medium-high boundary
+    low_max: float = 0.20        # initial low-medium boundary
+    medium_max: float = 0.60     # initial medium-high boundary
 
     def __post_init__(self) -> None:
         self.clamp()
@@ -751,6 +788,10 @@ class ShellRoutingProfile:
     low_tier_execute_subtask: bool = False
     agent_transparency_required: bool = False
     direct_edit_hooks: bool = False
+    # Explicit override for `direct_edit_hook_mode`. Empty means "derive": a
+    # shell that enforces gets `enforce`, any other hook-capable shell gets
+    # `record`. Set to "off" to install no hook at all.
+    direct_edit_hook_mode_override: str = ""
     # Opt-in: emit a Claude Code Dynamic Workflow JS script (tier-aware per-agent
     # model routing) instead of host_spawn_waves for fan-out plans. claude-code only.
     workflow_emit: bool = False
@@ -771,12 +812,43 @@ class ShellRoutingProfile:
     prompt_char_budget: int = 0
     tier_model_mapping: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROUTING_TIER_MODELS))
 
+    @property
+    def direct_edit_hook_mode(self) -> str:
+        """How the PreToolUse hook behaves for this shell: off | record | enforce.
+
+        ``advisory`` used to install no hook at all, so every direct edit was
+        unobserved — including a host editing a file an active handoff had
+        planned to spawn a subagent for, which is a genuine override the routing
+        loop never saw. ``record`` installs the same hook in a mode that only
+        ever records and never blocks, so the default configuration can learn
+        from disagreement without changing what it permits.
+
+        Note the limit: the PreToolUse payload carries no model, so a *sanctioned*
+        low-tier direct edit executed on a larger session model is
+        indistinguishable from a compliant one. That case still needs the host to
+        call ``record_outcome``.
+        """
+        explicit = str(self.direct_edit_hook_mode_override or "").strip().lower()
+        if explicit in {"off", "record", "enforce"}:
+            return explicit
+        if self.direct_edit_hooks:
+            return "enforce"
+        if self.shell_id in ROUTING_POLICY_HOOK_CAPABLE_SHELLS:
+            return "record"
+        return "off"
+
+    @property
+    def direct_edit_hook_installed(self) -> bool:
+        """True when install.sh should write a hook for this shell."""
+        return self.direct_edit_hook_mode != "off"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "route_task_mandatory": self.route_task_mandatory,
             "low_tier_execute_subtask": self.low_tier_execute_subtask,
             "agent_transparency_required": self.agent_transparency_required,
             "direct_edit_hooks": self.direct_edit_hooks,
+            "direct_edit_hook_mode": self.direct_edit_hook_mode,
             "workflow_emit": self.workflow_emit,
             "consensus_in_workflow": self.consensus_in_workflow,
             "named_subagent_types": self.named_subagent_types,
@@ -812,6 +884,7 @@ class RoutingPolicyConfig:
             low_tier_execute_subtask=override.low_tier_execute_subtask,
             agent_transparency_required=override.agent_transparency_required,
             direct_edit_hooks=direct_edit_hooks,
+            direct_edit_hook_mode_override=override.direct_edit_hook_mode_override,
             workflow_emit=override.workflow_emit,
             consensus_in_workflow=override.consensus_in_workflow,
             named_subagent_types=(
@@ -1347,6 +1420,27 @@ def _parse_shell_routing_profile(
         )
         direct_edit_hooks = False
 
+    hook_mode_raw = raw_profile.get("direct_edit_hook_mode")
+    direct_edit_hook_mode_override = ""
+    if hook_mode_raw is not None:
+        # YAML 1.1 resolves bare `off`/`on` to booleans, so `direct_edit_hook_mode: off`
+        # arrives as False and would otherwise fall through to the derived value —
+        # silently ignoring an explicit opt-out. Map the booleans to the modes they
+        # can only have meant.
+        if isinstance(hook_mode_raw, bool):
+            candidate = "enforce" if hook_mode_raw else "off"
+        else:
+            candidate = str(hook_mode_raw).strip().lower()
+        if candidate in {"off", "record", "enforce"}:
+            direct_edit_hook_mode_override = candidate
+        else:
+            log.warning(
+                "routing_policy.shells.%s.direct_edit_hook_mode must be off/record/enforce; "
+                "got %r — deriving instead",
+                canonical,
+                hook_mode_raw,
+            )
+
     named_subagent_types = _coerce_config_bool(
         raw_profile.get("named_subagent_types"),
         default=base.named_subagent_types,
@@ -1389,6 +1483,7 @@ def _parse_shell_routing_profile(
             field_name=f"routing_policy.shells.{canonical}.agent_transparency_required",
         ),
         direct_edit_hooks=direct_edit_hooks,
+        direct_edit_hook_mode_override=direct_edit_hook_mode_override,
         workflow_emit=_coerce_config_bool(
             raw_profile.get("workflow_emit"),
             default=base.workflow_emit,
@@ -1810,6 +1905,12 @@ class TGsConfig:
     # cheapest tier. On by default; operators may tune the vocabulary or disable.
     risk_floor_enabled: bool = True
     risk_floor_tier: str = "medium"
+    # The second, stronger step of the floor. Reached only on *evidence of a
+    # defect* — a high-severity security-dimension smell from code_intel in a
+    # file the task targets — never on vocabulary alone, so a task is not sent
+    # to the most expensive tier merely for mentioning authentication. Set to
+    # "medium" to collapse the floor back to a single step.
+    risk_floor_high_tier: str = "high"
     risk_filename_patterns: list[str] = field(
         default_factory=lambda: list(DEFAULT_RISK_FILENAME_PATTERNS)
     )
@@ -2283,6 +2384,20 @@ class TGsConfig:
             cfg.risk_floor_tier = raw_risk_floor_tier
         else:
             cfg.risk_floor_tier = "medium"
+        raw_risk_floor_high = raw.get("risk_floor_high_tier", "high")
+        if isinstance(raw_risk_floor_high, str) and raw_risk_floor_high in {"low", "medium", "high"}:
+            cfg.risk_floor_high_tier = raw_risk_floor_high
+        else:
+            cfg.risk_floor_high_tier = "high"
+        # A high step below the generic step would invert the two, letting file
+        # evidence *lower* a floor the task text already set.
+        if TIER_ORDER.index(cfg.risk_floor_high_tier) < TIER_ORDER.index(cfg.risk_floor_tier):
+            log.warning(
+                "risk_floor_high_tier=%s is below risk_floor_tier=%s; raising it to match",
+                cfg.risk_floor_high_tier,
+                cfg.risk_floor_tier,
+            )
+            cfg.risk_floor_high_tier = cfg.risk_floor_tier
         raw_risk_patterns = raw.get("risk_filename_patterns")
         if isinstance(raw_risk_patterns, (list, tuple)):
             parsed_patterns = [str(p).strip().lower() for p in raw_risk_patterns if str(p).strip()]

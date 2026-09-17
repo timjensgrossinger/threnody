@@ -7,8 +7,8 @@
   "prompt": "Implement middleware-backed validation across billing.py invoices.py receipts.py and migrate the shared module flow to the new execution path.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.57,
-    "score_max": 0.65,
+    "score_min": 0.45,
+    "score_max": 0.53,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   }

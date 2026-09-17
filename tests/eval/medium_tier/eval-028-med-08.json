@@ -7,8 +7,8 @@
   "prompt": "Implement authentication middleware for a single-host Ansible deployment on app01, integrate config validation, and migrate the release workflow to managed steps.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.71,
-    "score_max": 0.79,
+    "score_min": 0.35,
+    "score_max": 0.43,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   }

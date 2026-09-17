@@ -1,13 +1,16 @@
 {
   "id": "fixtures-swarm-dag-fallback",
   "category": "medium_tier",
-  "tags": ["stable", "swarm"],
+  "tags": [
+    "stable",
+    "swarm"
+  ],
   "test_mode": "THRENODY_TEST_MODE",
   "prompt": "Implement authentication middleware across auth_login.py auth_token.py auth_middleware.py with swarm fallback to DAG when parent artifacts are missing during hierarchical execution.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.60,
-    "score_max": 0.74,
+    "score_min": 0.45,
+    "score_max": 0.53,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   },
@@ -19,13 +22,31 @@
       "route_task_baseline_id": "eval-028-med-01",
       "plan_task": {
         "analysis": "dag fallback plan",
-        "subtasks": [{"id": "worker-1"}, {"id": "worker-2"}],
-        "waves": [[1, 2]],
+        "subtasks": [
+          {
+            "id": "worker-1"
+          },
+          {
+            "id": "worker-2"
+          }
+        ],
+        "waves": [
+          [
+            1,
+            2
+          ]
+        ],
         "strategy": "parallel"
       },
       "fleet_plan": {
-        "plan": {"topology": "dag"},
-        "fleet_waves": [{"wave_number": 1}],
+        "plan": {
+          "topology": "dag"
+        },
+        "fleet_waves": [
+          {
+            "wave_number": 1
+          }
+        ],
         "execution_note": "fallback to dag"
       },
       "execute_subtask": {

@@ -8,8 +8,8 @@
   "prompt": "Design a distributed rate limiter with sharded counters",
   "expected": {
     "tier": "high",
-    "score_min": 0.66,
-    "score_max": 1.0,
+    "score_min": 0.86,
+    "score_max": 0.94,
     "duration_expected": "medium",
     "file_count_expected": 0
   }

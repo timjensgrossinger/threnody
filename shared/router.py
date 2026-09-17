@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from .config import (
     TGsConfig,
+    DEFAULT_RISK_FILENAME_PATTERNS,
     SPEED_SIGNALS,
     QUALITY_SIGNALS,
     REASONING_SIGNALS,
@@ -29,6 +30,11 @@ from .config import (
     WORD_BOUNDARY_COMPLEXITY_SIGNALS,
 )
 from .db import Database
+from .risk_signals import (
+    PROSE_RISK_TOKENS,
+    TaskRiskEvidence,
+    compile_risk_floor_re,
+)
 
 if TYPE_CHECKING:  # bandit is imported lazily at call sites to keep import cost off
     from .bandit import BanditDecision  # noqa: F401
@@ -134,18 +140,34 @@ def reasoning_params_for(duration_bucket: str, tier: str = "medium") -> tuple[st
     return "medium", 2048
 
 
-def _compile_risk_floor_re(patterns: list[str]) -> "re.Pattern[str] | None":
-    """Compile the security-risk vocabulary into a word-start matcher.
+#: Alias kept for call sites and tests. The implementation moved to
+#: shared/risk_signals.py alongside the vocabulary it compiles, so the router's
+#: task-text floor and the file-evidence collector share one matcher.
+_compile_risk_floor_re = compile_risk_floor_re
 
-    Each pattern matches at a word boundary with optional trailing word chars, so
-    ``auth`` catches ``authentication``/``authorization`` and ``credential`` catches
-    ``credentials``. Errs toward over-matching (flooring an occasional benign token
-    to medium is the safe direction). Returns None when the list is empty.
-    """
-    cleaned = [re.escape(p.strip()) for p in patterns if isinstance(p, str) and p.strip()]
-    if not cleaned:
-        return None
-    return re.compile(r"\b(?:" + "|".join(cleaned) + r")\w*", re.IGNORECASE)
+# Max scoring hits per complexity level. The score should say what kind of work
+# this is, not how many synonyms the caller happened to use — see _compute_score.
+#
+# Two is deliberate for every level. Raising the high cap to 3 was measured on
+# the eval corpus: it lifts the domain fixtures (shader/firmware/tensor) from
+# 0.62 to 0.74, but lifts the deliberately-borderline medium ones by the same
+# amount, so the medium|high gap went from 0.05 to 0.04 rather than widening.
+# Both settings classify the corpus identically, so the tighter cap wins — it
+# keeps the anti-density property strongest.
+_LEVEL_HIT_CAP: dict[str, int] = {"high": 2, "medium": 2, "low": 1}
+
+# Risk-evidence weights, applied once per task from the resolved target files.
+# A target mentions risk vocabulary. Weak evidence — it fired on 62% of this
+# repo's shared modules, topped by the module that defines the vocabulary — so it
+# only ever nudges the score; the floor needs a filename match or a real defect.
+# Measured tier split for a neutral task naming one shared/*.py file:
+#   0.12 -> low=26 med=48   0.06 -> low=34 med=40   0.00 -> low=58 med=16
+# (the residual 16 at 0.00 are the >600 LOC files, i.e. pure size signal).
+_EVIDENCE_RISK_SCORE = 0.12
+_EVIDENCE_SMELL_SCORE = 0.18   # a target holds a high-severity security defect
+_EVIDENCE_LOC_SCORE = 0.12     # largest target is big (halved for mid-sized)
+_EVIDENCE_LOC_MID = 230        # mirrors review_fanout.tier_for banding
+_EVIDENCE_LOC_LARGE = 600
 
 
 class TaskRouter:
@@ -163,7 +185,17 @@ class TaskRouter:
         self._weights = config.signal_weights
         self._base_score = config.base_score
         self._thresholds = config.thresholds
-        self._risk_floor_re = _compile_risk_floor_re(config.risk_filename_patterns)
+        # The task-text floor matches the *prose* subset, not the filename set.
+        # "billing.py" names a payment surface worth a floor; "find files related
+        # to billing logic" is a read-only question that carries none, and
+        # flooring it spent a tier for nothing. An operator who overrides
+        # risk_filename_patterns has opted in explicitly, so their list is used
+        # verbatim for both jobs.
+        configured = list(config.risk_filename_patterns or [])
+        if configured == list(DEFAULT_RISK_FILENAME_PATTERNS):
+            self._risk_floor_re = compile_risk_floor_re(PROSE_RISK_TOKENS)
+        else:
+            self._risk_floor_re = compile_risk_floor_re(configured)
 
         if self._db:
             try:
@@ -340,26 +372,53 @@ class TaskRouter:
     # ------------------------------------------------------------------
 
     def _compute_score(self, task_lower: str) -> tuple[float, list[str]]:
-        """Compute raw complexity score from keyword signals."""
+        """Compute raw complexity score from the task text alone.
+
+        Deliberately free of file evidence. The evidence term is applied in
+        ``classify`` *after* the low-tier override, because the two describe
+        different things: the override asks "is this task trivially phrased?"
+        and the evidence asks "is the target dangerous?". Folding evidence in
+        here let a risky file push the raw score past the low boundary, which
+        made ``_low_override_delta`` bail out as "already complex" and switched
+        off the trivial-task cap — so "add a docstring" to a file with a SQL
+        interpolation routed to the most expensive tier.
+
+        Per-level hit counts are capped (see :data:`_LEVEL_HIT_CAP`). Uncapped,
+        the score measured *vocabulary density* rather than difficulty: four
+        medium keywords stacked to 0.48 while a security rewrite using none
+        scored 0.10, so no single threshold could separate them. Capping makes
+        the score reflect what kind of work this is, and the risk-evidence term
+        below is what expresses how dangerous the target actually is.
+        """
         score = self._base_score
         matched: list[str] = []
 
-        for level in ("high", "medium", "low"):
+        # Level hit counts are shared between the substring and word-boundary
+        # passes so a level cannot exceed its cap by splitting across the two.
+        hits: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
+
+        def _credit(level: str, kw: str) -> None:
+            nonlocal score
+            cap = _LEVEL_HIT_CAP.get(level, 0)
+            if hits.get(level, 0) >= cap:
+                matched.append(f"{kw}(capped)")
+                return
             weight = self._weights.get(level, 0.0)
-            keywords = self._signals.get(level, [])
-            for kw in keywords:
+            hits[level] = hits.get(level, 0) + 1
+            score += weight
+            matched.append(f"{kw}(+{weight})")
+
+        for level in ("high", "medium", "low"):
+            for kw in self._signals.get(level, []):
                 if kw in task_lower:
-                    score += weight
-                    matched.append(f"{kw}(+{weight})")
+                    _credit(level, kw)
 
         # Word-boundary signals: short tokens that are substrings of common words
         # (gui/tui/ffi/rails/...). Matched whole-token to avoid false positives.
         for level, keywords in WORD_BOUNDARY_COMPLEXITY_SIGNALS.items():
-            weight = self._weights.get(level, 0.0)
             for kw in keywords:
                 if re.search(r'\b' + re.escape(kw) + r'\b', task_lower):
-                    score += weight
-                    matched.append(f"{kw}(+{weight})")
+                    _credit(level, kw)
 
         word_count = len(task_lower.split())
         if word_count > 30:
@@ -388,6 +447,40 @@ class TaskRouter:
             matched.append(f"sys_lang_files:{_sys_file_refs}(+0.15)")
 
         return min(score, 1.0), matched
+
+    @staticmethod
+    def _evidence_score(
+        evidence: "TaskRiskEvidence | None",
+        matched: list[str],
+    ) -> float:
+        """Score the target files' risk and size. Zero without evidence.
+
+        LOC bands mirror ``review_fanout.tier_for`` (<230 / 230-600 / >600) so a
+        file lands in the same size class here as it would as a review cell.
+        Security smells are counted once for the set rather than per hit: a file
+        with 18 interpolations is not nine times more dangerous to edit than one
+        with 2, and scaling linearly would let a single large file saturate the
+        score on its own.
+        """
+        if evidence is None or not evidence.files:
+            return 0.0
+        delta = 0.0
+        if evidence.any_risk:
+            delta += _EVIDENCE_RISK_SCORE
+            matched.append(f"risk_files:{evidence.risk_files}(+{_EVIDENCE_RISK_SCORE})")
+        if evidence.any_security_smell:
+            delta += _EVIDENCE_SMELL_SCORE
+            matched.append(
+                f"security_smells:{evidence.security_smells}(+{_EVIDENCE_SMELL_SCORE})"
+            )
+        loc = evidence.max_loc
+        if loc > _EVIDENCE_LOC_LARGE:
+            delta += _EVIDENCE_LOC_SCORE
+            matched.append(f"large_file:{loc}(+{_EVIDENCE_LOC_SCORE})")
+        elif loc > _EVIDENCE_LOC_MID:
+            delta += _EVIDENCE_LOC_SCORE / 2
+            matched.append(f"mid_file:{loc}(+{_EVIDENCE_LOC_SCORE / 2})")
+        return delta
 
     # ------------------------------------------------------------------
     # Tier resolution with hard bounds
@@ -706,11 +799,98 @@ class TaskRouter:
             log.debug("Failed to update time_routing for hour %d", hour, exc_info=True)
 
     # ------------------------------------------------------------------
+    # Risk floor
+    # ------------------------------------------------------------------
+
+    def _resolve_risk_floor(
+        self,
+        task_lower: str,
+        evidence: "TaskRiskEvidence | None",
+        *,
+        trivial_task: bool = False,
+    ) -> tuple[str | None, str]:
+        """Resolve the minimum tier this task may run at, and why.
+
+        Three independent pieces of evidence, strongest wins. All three are
+        *floors* — none can pull a score-derived high tier back down:
+
+        ==========================================  ====================
+        Evidence                                    Floor
+        ==========================================  ====================
+        risk vocabulary in the task text            ``risk_floor_tier``
+        risk vocabulary in a target file's content  ``risk_floor_tier``
+        high-severity security smell in a target    ``risk_floor_high_tier``
+        ==========================================  ====================
+
+        The high step deliberately keys on ``code_intel``'s security-dimension
+        smells rather than on the ``CONCRETE_HIGH_RISK_SIGNALS`` vocabulary.
+        That regex matches any ``cursor.execute``, which appears throughout this
+        repo's own database layer — flooring every task that touches it to the
+        most expensive tier. A detected interpolation is evidence of a defect;
+        the mere presence of the API is not.
+
+        ``trivial_task`` caps the file-evidence step at ``risk_floor_tier``. A
+        defect in a target file describes the *file*, not the edit: "add a
+        docstring to db.py" would otherwise inherit that file's 18 SQL
+        interpolation smells and route a comment change to the most expensive
+        tier. It is set only when a low-tier override keyword genuinely fired,
+        and that path already suppresses itself when the task text itself
+        mentions risk, names 3+ files, or matches a high complexity signal.
+        Task-text risk is unaffected and still floors at full strength.
+
+        Returns ``(None, "")`` when the floor is disabled or nothing matched.
+        """
+        if not self._config.risk_floor_enabled:
+            return None, ""
+        generic = str(self._config.risk_floor_tier or "medium")
+        high = str(getattr(self._config, "risk_floor_high_tier", "high") or "high")
+
+        floor: str | None = None
+        why: list[str] = []
+        if self._risk_floor_re is not None and self._risk_floor_re.search(task_lower):
+            floor = generic
+            why.append("task_text")
+        if evidence is not None and evidence.files:
+            # A *filename* match is strong evidence — the file was named for what
+            # it holds. A *content* match is not: measured across this repo's 82
+            # shared modules it fired on 62% of them, topped by the module that
+            # defines the vocabulary and by a static analyser, while a file with
+            # two real defects scored a single hit. Raw hit count cannot separate
+            # "handles secrets" from "mentions secrets", so content vocabulary
+            # nudges the score (see _evidence_score) and never sets a floor.
+            if evidence.any_basename_risk:
+                if floor is None or _TIER_RANK.get(generic, 1) > _TIER_RANK.get(floor, 0):
+                    floor = generic
+                why.append("file_name")
+            if evidence.any_security_smell:
+                step = generic if trivial_task else high
+                if floor is None or _TIER_RANK.get(step, 2) > _TIER_RANK.get(floor, 0):
+                    floor = step
+                why.append(
+                    f"security_smells={evidence.security_smells}"
+                    + ("(capped:trivial)" if trivial_task and step != high else "")
+                )
+        return floor, "+".join(why)
+
+    # ------------------------------------------------------------------
     # Main classification
     # ------------------------------------------------------------------
 
-    def classify(self, task: str, project_path: str | None = None) -> RoutingDecision:
-        """Classify a task into a tier with intent, project, and time awareness."""
+    def classify(
+        self,
+        task: str,
+        project_path: str | None = None,
+        evidence: "TaskRiskEvidence | None" = None,
+    ) -> RoutingDecision:
+        """Classify a task into a tier with intent, project, and time awareness.
+
+        ``evidence`` carries risk facts about the files the task will touch (see
+        :func:`shared.risk_signals.collect_task_evidence`). It is optional and
+        defaults to None so every existing caller — planner, heuristic_plan,
+        tests — behaves exactly as before. Without it the router can only judge
+        the caller's prose, which is how a prompt-injection hardening task came
+        to route at the cheapest tier.
+        """
         task_lower = task.lower().strip()
 
         # 1. High-tier overrides first (hard — always win)
@@ -732,9 +912,20 @@ class TaskRouter:
         project_mod = self._get_project_modifier(project_path)
         time_mod = self._get_time_modifier()
 
+        # 4b. Risk evidence from the files themselves — the term the score model
+        # was missing entirely. Without it the only inputs are the caller's word
+        # choices, so "rewrite the scanner" scores the same whether the target is
+        # a 40-line helper or a 7,000-line SQL layer. Applied here, after
+        # low_delta, so file risk cannot suppress trivial-task detection.
+        evidence_mod = self._evidence_score(evidence, complexity_matched)
+
         # 5. Apply all modifiers, clamp within [0.0, 1.0]
         effective_score = max(
-            0.0, min(1.0, raw_score + low_delta + intent_mod + project_mod + time_mod)
+            0.0,
+            min(
+                1.0,
+                raw_score + low_delta + intent_mod + project_mod + time_mod + evidence_mod,
+            ),
         )
         effective_score = round(effective_score, 2)
 
@@ -754,18 +945,19 @@ class TaskRouter:
         # When reasoning fires, enforce a minimum of "medium"
         if reasoning_fired and tier == "low":
             tier = "medium"
-        # Security-sensitive work (credential/auth/crypto/keychain/secret/…) is
-        # never low-risk, but routine implementation should still score naturally
-        # instead of being forced to high tier. Floors low → risk_floor_tier.
-        risk_floor = str(self._config.risk_floor_tier or "medium")
+        # Security-sensitive work is never low-risk, but routine implementation
+        # should still score naturally instead of being forced upward. Floors
+        # only — see _resolve_risk_floor for the three evidence sources.
+        resolved_floor, floor_evidence = self._resolve_risk_floor(
+            task_lower, evidence, trivial_task=low_delta != 0.0
+        )
+        risk_floor = resolved_floor or str(self._config.risk_floor_tier or "medium")
         security_floor_fired = (
-            self._config.risk_floor_enabled
-            and self._risk_floor_re is not None
-            and _TIER_RANK.get(tier, 0) < _TIER_RANK.get(risk_floor, 1)
-            and self._risk_floor_re.search(task_lower) is not None
+            resolved_floor is not None
+            and _TIER_RANK.get(tier, 0) < _TIER_RANK.get(resolved_floor, 1)
         )
         if security_floor_fired:
-            tier = risk_floor
+            tier = resolved_floor
 
         # 7. Compute urgency explainability surface (Phase 14)
         urgency_score, urgency_matched = self._compute_urgency_modifier(task_lower)
@@ -788,12 +980,16 @@ class TaskRouter:
             mod_parts.append(f"project={project_mod:+.2f}")
         if time_mod != 0.0:
             mod_parts.append(f"time={time_mod:+.2f}")
+        if evidence_mod != 0.0:
+            mod_parts.append(f"evidence={evidence_mod:+.2f}")
         if urgency_score != 0.0:
             mod_parts.append(f"urgency={urgency_score:+.2f}")
         if reasoning_fired:
             mod_parts.append(f"reasoning={reasoning_score:+.2f}")
         if security_floor_fired:
             mod_parts.append(f"security_floor={risk_floor}")
+            if floor_evidence:
+                mod_parts.append(f"floor_evidence={floor_evidence}")
 
         if mod_parts:
             reason = (

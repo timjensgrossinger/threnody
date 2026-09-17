@@ -14,7 +14,12 @@ from .memory import memory_set
 
 log = logging.getLogger(__name__)
 
-OUTCOME_VALUES = ("accepted", "revised", "rejected", "reworked")
+#: "tier_overridden" is distinct from "rejected" on purpose: the model's output
+#: may have been fine, the *tier* was wrong. It is the strongest training signal
+#: the router can receive — a human looked at the routing decision and disagreed
+#: — and nothing in the documented protocol used to report it, which is why the
+#: adaptive bands sat at zero samples while misroutes recurred.
+OUTCOME_VALUES = ("accepted", "revised", "rejected", "reworked", "tier_overridden")
 OUTCOME_ALLOWLIST = frozenset(OUTCOME_VALUES)
 OUTCOME_MEMORY_KEY = "routing_outcomes"
 OUTCOME_MEMORY_PROJECT_ID = str(Path(__file__).resolve().parent.parent)
@@ -58,6 +63,14 @@ def _coerce_created_at(value: object, *, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("existing outcome row has invalid created_at") from exc
+
+
+def _normalize_tier(value: str | None) -> str | None:
+    """Accept only a known tier name; anything else is stored as unknown."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in ("low", "medium", "high") else None
 
 
 def _normalize_outcome(outcome: str) -> str:
@@ -323,8 +336,12 @@ def record_outcome(
     note: str | None = None,
     project_id: str | None = None,
     gate_verdict: str | None = None,
+    routed_tier: str | None = None,
+    actual_tier: str | None = None,
 ) -> dict[str, Any]:
     normalized_task_id = _normalize_required_string(task_id, "task_id")
+    normalized_routed_tier = _normalize_tier(routed_tier)
+    normalized_actual_tier = _normalize_tier(actual_tier)
     normalized_outcome = _normalize_outcome(outcome)
     normalized_operator_id = _normalize_recorded_operator_id(operator_id)
     normalized_note = _normalize_optional_string(note, "note")
@@ -353,19 +370,25 @@ def record_outcome(
                 )
 
             if prior:
+                # The routed context (tier / model / provider / complexity_score /
+                # telemetry_id) is deliberately NOT reset here. It used to be set
+                # to NULL on every correction, which meant a second call on the
+                # same task destroyed the very fields the learning loop reads:
+                # enqueue_learning_update looks up complexity_score and silently
+                # falls back to a tier-based default when it is missing. Since a
+                # "tier_overridden" report is usually the *second* call on an
+                # already-recorded task, the strongest signal in the system was
+                # degrading itself on the update path.
                 conn.execute(
                     """
                     UPDATE routing_outcomes
                     SET previous_outcome = ?,
                         current_outcome = ?,
                         recorded_at = ?,
-                        tier = NULL,
-                        model = NULL,
-                        provider_name = NULL,
-                        complexity_score = NULL,
-                        telemetry_id = NULL,
                         last_modified_by = ?,
-                        gate_verdict = ?
+                        gate_verdict = ?,
+                        routed_tier = COALESCE(?, routed_tier),
+                        actual_tier = COALESCE(?, actual_tier)
                     WHERE task_id = ?
                     """,
                     (
@@ -374,6 +397,8 @@ def record_outcome(
                         recorded_at,
                         normalized_operator_id,
                         normalized_gate_verdict,
+                        normalized_routed_tier,
+                        normalized_actual_tier,
                         normalized_task_id,
                     ),
                 )
@@ -392,9 +417,11 @@ def record_outcome(
                         telemetry_id,
                         last_modified_by,
                         created_at,
-                        gate_verdict
+                        gate_verdict,
+                        routed_tier,
+                        actual_tier
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_task_id,
@@ -409,6 +436,8 @@ def record_outcome(
                         normalized_operator_id,
                         created_at,
                         normalized_gate_verdict,
+                        normalized_routed_tier,
+                        normalized_actual_tier,
                     ),
                 )
 
@@ -434,16 +463,25 @@ def record_outcome(
                 ),
             )
 
+        # Refresh the routed context from telemetry. COALESCE, not a plain
+        # assignment: _latest_telemetry_context returns an all-None dict when it
+        # finds no telemetry row, and assigning that wiped the context a prior
+        # call had already stored. enqueue_learning_update reads
+        # complexity_score back and silently substitutes a tier-based default
+        # when it is missing, so the loss was invisible — it just made every
+        # corrected outcome train on an approximate score. A telemetry row that
+        # really does carry a value still wins.
         telemetry_context = _latest_telemetry_context(db, normalized_task_id)
         with db.conn() as conn:
             conn.execute(
                 """
                 UPDATE routing_outcomes
-                SET tier = ?,
-                    model = ?,
-                    provider_name = ?,
-                    complexity_score = ?,
-                    telemetry_id = ?
+                SET tier = COALESCE(?, tier),
+                    model = COALESCE(?, model),
+                    provider_name = COALESCE(?, provider_name),
+                    complexity_score = COALESCE(?, complexity_score),
+                    telemetry_id = COALESCE(?, telemetry_id),
+                    routed_tier = COALESCE(routed_tier, ?)
                 WHERE task_id = ?
                 """,
                 (
@@ -452,6 +490,13 @@ def record_outcome(
                     telemetry_context["provider"],
                     telemetry_context["complexity_score"],
                     telemetry_context["telemetry_id"],
+                    # Backfill the routed tier from telemetry when the caller did
+                    # not supply it. route_task already persisted the tier it chose
+                    # (persist_route_telemetry -> log_agent_result), so a host
+                    # reporting an override only has to say what it actually ran —
+                    # it never has to remember what Threnody recommended.
+                    # COALESCE(routed_tier, ?) so an explicit value always wins.
+                    telemetry_context["tier"],
                     normalized_task_id,
                 ),
             )

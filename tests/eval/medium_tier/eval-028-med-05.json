@@ -7,8 +7,8 @@
   "prompt": "Implement authorization middleware for admin.py policies.py routes.py and migrate checks to the shared guard.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.64,
-    "score_max": 0.72,
+    "score_min": 0.4,
+    "score_max": 0.48,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   }

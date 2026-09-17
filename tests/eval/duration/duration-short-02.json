@@ -9,7 +9,7 @@
   "expected": {
     "tier": "low",
     "score_min": 0.0,
-    "score_max": 0.16,
+    "score_max": 0.04,
     "duration_expected": "short",
     "file_count_expected": 1
   }

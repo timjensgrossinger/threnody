@@ -7,8 +7,8 @@
   "prompt": "Implement authentication middleware across auth_login.py auth_token.py auth_middleware.py and migrate callers to the new validation flow.",
   "expected": {
     "tier": "medium",
-    "score_min": 0.64,
-    "score_max": 0.72,
+    "score_min": 0.4,
+    "score_max": 0.48,
     "urgency_expected": false,
     "fanout_expected": "favor_parallel"
   }

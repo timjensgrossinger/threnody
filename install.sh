@@ -356,6 +356,11 @@ PROVIDER_SCAN_JSON=""
 
 python3 -m py_compile "$INSTALL_DIR/mcp_server.py" 2>/dev/null || error "Syntax check failed"
 python3 -m py_compile "$INSTALL_DIR/shared/router.py" 2>/dev/null || error "Syntax check failed"
+# config.py imports risk_signals at module load, so it is the base of the import
+# graph — a syntax error there breaks every entry point. py_compile only
+# compiles, so checking router.py does not cover it.
+python3 -m py_compile "$INSTALL_DIR/shared/config.py" 2>/dev/null || error "Syntax check failed"
+python3 -m py_compile "$INSTALL_DIR/shared/risk_signals.py" 2>/dev/null || error "Syntax check failed"
 info "Syntax check passed"
 
 # ── Register MCP server ─────────────────────────────────────────────────────
@@ -704,7 +709,12 @@ for file_stem, (shell_id, verbatim) in shells.items():
     (out_dir / f"{file_stem}.md").write_text(body, encoding="utf-8")
 
 claude_profile = config.routing_policy.effective_profile("claude-code")
-hook_enabled = claude_profile.direct_edit_hooks or policy_unresolved
+# Install the hook whenever the resolved mode is not "off". Advisory now resolves
+# to "record" — the same hook in a mode that only observes and never blocks — so
+# the default configuration can see a direct edit that contradicts a routed plan.
+# The hook resolves enforce-vs-record itself at runtime from config, so changing
+# the policy does not require re-running this installer.
+hook_enabled = claude_profile.direct_edit_hook_installed or policy_unresolved
 (out_dir / "claude-code.hook").write_text(
     "enabled\n" if hook_enabled else "disabled\n",
     encoding="utf-8",

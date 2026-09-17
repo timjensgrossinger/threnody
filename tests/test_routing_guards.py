@@ -238,7 +238,7 @@ def test_route_task_issues_low_tier_direct_guard_for_host(monkeypatch: pytest.Mo
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -305,7 +305,7 @@ def test_route_task_keeps_codex_host_native_metadata_separate_from_provider_sele
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -343,7 +343,7 @@ def test_route_task_keeps_other_host_provider_metadata_separate_from_provider_se
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -392,7 +392,7 @@ def test_validate_routing_guard_allows_low_tier_direct_edit_after_host_route(
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -422,7 +422,7 @@ def test_route_task_skips_guard_for_exempt_markdown(monkeypatch: pytest.MonkeyPa
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -449,7 +449,7 @@ def test_route_task_resolves_exempt_relative_hints_against_caller_cwd(
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(td)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -547,7 +547,7 @@ def test_validate_routing_guard_allows_medium_direct_edit_in_scope(monkeypatch: 
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -765,7 +765,7 @@ def test_route_task_preserves_routed_plan_guard_during_active_handoff(
             },
         )
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.16,
                 reason="low",
@@ -833,7 +833,7 @@ def test_route_task_active_handoff_keeps_codex_host_native_metadata(
             },
         )
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.16,
                 reason="low",
@@ -902,7 +902,7 @@ def test_route_task_active_handoff_keeps_other_host_provider_metadata(
             },
         )
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.16,
                 reason="low",
@@ -944,7 +944,7 @@ def test_route_task_uses_explicit_cwd_for_guard_scope(monkeypatch: pytest.Monkey
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(td)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -977,7 +977,7 @@ def test_validate_routing_guard_denies_target_outside_workspace_without_file_hin
     with tempfile.TemporaryDirectory() as td:
         cfg, db = _prepare_db(td)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -1018,7 +1018,7 @@ def test_validate_routing_guard_denies_missing_target_file(monkeypatch: pytest.M
     with tempfile.TemporaryDirectory() as td:
         cfg, db = _prepare_db(td)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -1046,7 +1046,7 @@ def test_route_task_extracts_extensionless_and_dotfile_hints(monkeypatch: pytest
     with tempfile.TemporaryDirectory() as td:
         cfg, db = _prepare_db(td)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -1071,7 +1071,7 @@ def test_route_task_tolerates_guard_store_failures(monkeypatch: pytest.MonkeyPat
     with tempfile.TemporaryDirectory() as td:
         cfg, db = _prepare_db(td)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="medium",
                 score=0.61,
                 reason="medium-tier task",
@@ -1265,7 +1265,19 @@ def test_install_removes_claude_routing_hook_when_policy_disables_it() -> None:
             script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             script.chmod(0o755)
 
-        (install_dir / "config.yaml").write_text("routing_policy:\n  mode: advisory\n", encoding="utf-8")
+        # Advisory no longer disables the hook — it installs it in `record` mode,
+        # which validates and records but never blocks. `direct_edit_hook_mode:
+        # "off"` is now the way to ask for no hook at all, so that is what this
+        # test (named for policy *disabling* the hook) has to exercise. Quoted
+        # because YAML 1.1 resolves bare `off` to a boolean.
+        (install_dir / "config.yaml").write_text(
+            'routing_policy:\n'
+            '  mode: custom\n'
+            '  shells:\n'
+            '    claude-code:\n'
+            '      direct_edit_hook_mode: "off"\n',
+            encoding="utf-8",
+        )
         settings_path = settings_dir / "settings.json"
         settings_path.write_text(
             json.dumps(
@@ -1304,7 +1316,7 @@ def test_install_removes_claude_routing_hook_when_policy_disables_it() -> None:
         assert result.returncode == 0, result.stderr
 
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
-        # Advisory policy removes the PreToolUse routing guard. The PostToolUse
+        # An explicit "off" removes the PreToolUse routing guard. The PostToolUse
         # learning hook is independent of routing policy (default-on), so it may
         # remain — but no routing guard should survive.
         hooks = settings.get("hooks", {})
@@ -1314,6 +1326,76 @@ def test_install_removes_claude_routing_hook_when_policy_disables_it() -> None:
                 assert "threnody-routing-hook" not in str(hook.get("command", ""))
 
 
+
+
+def test_install_keeps_the_routing_hook_in_advisory_record_mode() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        bin_dir = Path(td) / "bin"
+        settings_dir = home / ".claude"
+        install_dir = home / ".local" / "lib" / "threnody"
+        home.mkdir()
+        bin_dir.mkdir()
+        settings_dir.mkdir(parents=True)
+        install_dir.mkdir(parents=True)
+
+        for name in ("gh", "claude"):
+            script = bin_dir / name
+            script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            script.chmod(0o755)
+
+        (install_dir / "config.yaml").write_text(
+            "routing_policy:\n  mode: advisory\n", encoding="utf-8"
+        )
+        settings_path = settings_dir / "settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PreToolUse": [
+                            {
+                                "matcher": "Edit|Write",
+                                "hooks": [
+                                    {
+                                        "type": "mcp_tool",
+                                        "server": "Threnody",
+                                        "tool": "validate_routing_guard",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+        result = subprocess.run(
+            ["bash", "install.sh"],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert result.returncode == 0, result.stderr
+
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        # Advisory installs the hook in `record` mode. It previously installed
+        # nothing, so a direct edit contradicting a routed plan was unobservable
+        # in the default configuration — the gap this closes.
+        hooks = settings.get("hooks", {})
+        assert "PreToolUse" in hooks, "advisory must still observe direct edits"
+        commands = [
+            str(hook.get("command", ""))
+            for group in hooks["PreToolUse"]
+            for hook in group.get("hooks", [])
+        ]
+        assert any("threnody-routing-hook" in c for c in commands), commands
 def test_route_task_issues_execute_subtask_guard_for_delegate_low_tier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1321,7 +1403,7 @@ def test_route_task_issues_execute_subtask_guard_for_delegate_low_tier(
         cfg, db = _prepare_db(td)
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1357,7 +1439,7 @@ def test_soft_hint_when_delegate_guard_not_strict(monkeypatch: pytest.MonkeyPatc
         assert cfg.execute_subtask_guard_strict is False
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1400,7 +1482,7 @@ def test_hard_deny_when_execute_subtask_guard_strict(monkeypatch: pytest.MonkeyP
         cfg.execute_subtask_guard_strict = True
         monkeypatch.chdir(ROOT)
         router = SimpleNamespace(
-            classify=lambda _task, project_path=None: SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
                 tier="low",
                 score=0.21,
                 reason="low-tier task",
@@ -1480,3 +1562,60 @@ def test_multiple_executions(db):
     for i in range(5):
         db.routing_guard_record_execution(caller="claude", cwd="/proj", task_id=f"t{i}")
     assert db.routing_guard_has_executions(caller="claude", cwd="/proj") is True
+
+
+def _capture_emit(result: dict[str, object], *, record_only: bool) -> tuple[int, dict]:
+    """Run _emit_hook_result and return (exit_code, parsed stdout JSON)."""
+    import io
+    import contextlib
+
+    from shared.routing_hook import _emit_hook_result
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = _emit_hook_result(dict(result), record_only=record_only)
+    return code, json.loads(buf.getvalue())
+
+
+_DENY_RESULT: dict[str, object] = {
+    "valid": False,
+    "reason": "No routing decision found for Edit. Call route_task or decompose_task first.",
+    "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            "No routing decision found for Edit. Call route_task or decompose_task first."
+        ),
+    },
+}
+
+
+def test_record_mode_never_emits_a_permission_decision() -> None:
+    """Record mode must not carry a permission verdict.
+
+    Exit 0 is not enough to allow the call: Claude Code honours
+    `hookSpecificOutput.permissionDecision` whenever it is present, so a
+    "deny" beside exit 0 hard-blocked every Edit/Write in the *default*
+    (advisory) configuration — including edits to the hook's own source, which
+    made it unrepairable in-session.
+    """
+    code, payload = _capture_emit(_DENY_RESULT, record_only=True)
+    assert code == 0
+    assert "hookSpecificOutput" not in payload, payload
+    assert payload["enforced"] is False
+    # The reason survives for a reader; only the verdict is dropped.
+    assert "No routing decision found" in str(payload["reason"])
+
+
+def test_enforce_mode_still_denies() -> None:
+    code, payload = _capture_emit(_DENY_RESULT, record_only=False)
+    assert code == 2
+    assert payload["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "enforced" not in payload
+
+
+def test_record_mode_passes_a_valid_result_through_unchanged() -> None:
+    code, payload = _capture_emit({"valid": True, "reason": "guard ok"}, record_only=True)
+    assert code == 0
+    assert payload["valid"] is True
+    assert "hookSpecificOutput" not in payload

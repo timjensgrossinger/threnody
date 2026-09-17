@@ -442,6 +442,90 @@ def _is_interpolated(node: ast.AST) -> bool:
     return False
 
 
+def _sql_interpolation_is_provably_safe(node: ast.AST) -> bool:
+    """True when an interpolated SQL string provably cannot carry injected SQL.
+
+    ``_is_interpolated`` answers "is this string built dynamically", which is a
+    necessary but not sufficient condition for injection. Three shapes are
+    decidable as safe *from the call site alone* — the standard the rest of this
+    module holds itself to, because ``model_quality.record_static_recall_score``
+    grades reviewers against the high-severity set and a false positive marks a
+    correct reviewer as having missed a defect that never existed:
+
+    1. ``PRAGMA`` statements. SQLite does not accept bound parameters in a
+       PRAGMA at all, so interpolation is the only way to write one and cannot
+       be evidence of a mistake.
+    2. Every interpolated expression is ``int()``/``float()``-coerced or a
+       numeric literal. A number cannot carry SQL syntax.
+    3. Every interpolated expression builds a ``?`` placeholder list
+       (``", ".join("?" * n)`` and friends). Interpolating placeholders *is* the
+       bound-parameter idiom for a variable-length ``IN`` clause — the opposite
+       of injection.
+
+    Identifier and clause interpolation (``FROM {table}``, ``SET {col} = ?``)
+    are deliberately NOT covered. SQL cannot bind an identifier, so the
+    construct is unavoidable, but it is genuinely injectable when the value is
+    untrusted and proving otherwise needs taint analysis this module refuses to
+    do.
+    """
+    if not isinstance(node, ast.JoinedStr):
+        return False
+
+    literal = "".join(
+        v.value for v in node.values
+        if isinstance(v, ast.Constant) and isinstance(v.value, str)
+    )
+    if literal.lstrip()[:6].upper() == "PRAGMA":
+        return True
+
+    interpolated = [v.value for v in node.values if isinstance(v, ast.FormattedValue)]
+    if not interpolated:
+        return False
+    return all(_is_numeric_expr(e) for e in interpolated) or all(
+        _is_placeholder_join(e) for e in interpolated
+    )
+
+
+def _is_numeric_expr(node: ast.AST) -> bool:
+    """True for ``int(x)`` / ``float(x)`` calls and numeric literals."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("int", "float")
+    )
+
+
+def _is_placeholder_join(node: ast.AST) -> bool:
+    """True for expressions that build a ``?`` placeholder list and nothing else.
+
+    Matches ``sep.join(["?"] * n)`` and ``sep.join("?" for ...)`` shapes. The
+    separator and the count are irrelevant — what matters is that every element
+    joined is the literal ``?``, so no attacker-controlled text can appear.
+    """
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        return False
+    if node.func.attr != "join" or not node.args:
+        return False
+    arg = node.args[0]
+    # ["?"] * n  /  n * ["?"]
+    if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Mult):
+        for side in (arg.left, arg.right):
+            if isinstance(side, ast.List) and side.elts:
+                return all(
+                    isinstance(e, ast.Constant) and e.value == "?" for e in side.elts
+                )
+        return False
+    # ["?", "?"]  (explicit list)
+    if isinstance(arg, ast.List) and arg.elts:
+        return all(isinstance(e, ast.Constant) and e.value == "?" for e in arg.elts)
+    # "?" for _ in ...
+    if isinstance(arg, (ast.GeneratorExp, ast.ListComp)):
+        return isinstance(arg.elt, ast.Constant) and arg.elt.value == "?"
+    return False
+
+
 # Calls that unconditionally produce an unverified TLS context.
 _TLS_UNVERIFIED_CALLS = frozenset({
     "ssl._create_unverified_context",
@@ -719,7 +803,12 @@ def _scan_smells_ast(tree: ast.AST) -> list[Smell]:
                 f"{name or 'call'}(shell=True) allows command injection",
             ))
 
-        if short in _SQL_EXEC_METHODS and node.args and _is_interpolated(node.args[0]):
+        if (
+            short in _SQL_EXEC_METHODS
+            and node.args
+            and _is_interpolated(node.args[0])
+            and not _sql_interpolation_is_provably_safe(node.args[0])
+        ):
             add(Smell(
                 "sql_interpolation", DIM_SECURITY, SEVERITY_HIGH, node.lineno,
                 f"{short}() receives an interpolated query instead of bound parameters",

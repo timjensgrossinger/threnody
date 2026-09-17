@@ -108,6 +108,10 @@ Host shell (Claude / Copilot / Codex / Cursor / …)
 
 1. Call the start_task tool (or route_task/plan_task) from your MCP host shell — start_task returns a compact next_action and optional host_spawn_waves for host-native execution.
 2. Threnody scores complexity → low / medium / high tier (no extra LLM call on the hot path).
+   Pass `target_files` to `route_task` and the score also reflects the target code's security risk
+   and size, rather than only the wording of the task; omit it and paths named in the task text are
+   used. Security-sensitive work is floored to `medium`, and a target holding a high-severity
+   security defect to `high`.
 3. `route_task` / `plan_task` return spawn metadata — `host_spawn` for single-agent, `host_spawn_waves` for multi-step plans.
 4. The host runs the work — Claude Code uses **Agent**; other shells use **Task**.
 5. Swarms or utility delegation — `execute_swarm` returns a host-native wave plan by default; `execute_subtask` only for utility backends when enabled.

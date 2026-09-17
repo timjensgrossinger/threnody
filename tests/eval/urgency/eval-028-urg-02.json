@@ -7,8 +7,8 @@
   "prompt": "Production incident blocking release today: implement authentication middleware checks for the deploy pipeline, add error handling, and define a rollback threshold.",
   "expected": {
     "tier": "high",
-    "score_min": 0.95,
-    "score_max": 1.0,
+    "score_min": 0.7,
+    "score_max": 0.78,
     "urgency_expected": true,
     "fanout_expected": "none"
   }

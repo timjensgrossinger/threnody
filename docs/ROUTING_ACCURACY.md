@@ -3,9 +3,9 @@
 Reproducible fixture-based tier routing stats from `python3 -m shared.routing_report`.
 Do not commit `tests/eval/baseline.json`; regenerate this document locally or from CI artifacts.
 
-- **Generated:** 2026-06-10
-- **Config hash:** `c00783868c47`
-- **Fixtures:** 34
+- **Generated:** 2026-09-03
+- **Config hash:** `d1a0abe4ea35`
+- **Fixtures:** 55
 - **Executed accuracy:** 100.0%
 - **Boundary fixtures (informational):** 2 skipped
 
@@ -17,13 +17,13 @@ THRENODY_TEST_MODE=1 python3 -m shared.routing_eval
 ```
 # Threnody Routing Eval Report
 
-**Date:** 2026-06-10  
-**Fixtures:** 34  
-**Accuracy:** 94.1%  
+**Date:** 2026-09-03  
+**Fixtures:** 55  
+**Accuracy:** 96.4%  
 
 | Status | Count |
 |--------|-------|
-| Pass | 32 |
+| Pass | 53 |
 | Fail | 0 |
 | Skip | 2 |
 
@@ -31,7 +31,8 @@ THRENODY_TEST_MODE=1 python3 -m shared.routing_eval
 
 | Category | Pass | Fail | Skip | Executed Accuracy |
 |----------|------|------|------|-------------------|
-| high_tier | 8 | 0 | 2 | 100.0% |
-| low_tier | 10 | 0 | 0 | 100.0% |
-| medium_tier | 11 | 0 | 0 | 100.0% |
+| duration | 6 | 0 | 0 | 100.0% |
+| high_tier | 14 | 0 | 2 | 100.0% |
+| low_tier | 12 | 0 | 0 | 100.0% |
+| medium_tier | 18 | 0 | 0 | 100.0% |
 | urgency | 3 | 0 | 0 | 100.0% |
