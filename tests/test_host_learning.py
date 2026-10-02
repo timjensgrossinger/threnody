@@ -1115,7 +1115,9 @@ def test_record_verify_quality_attributes_hook_record_via_handoff(
         rows = conn.execute(
             "SELECT model, dimension, source FROM model_quality_events"
         ).fetchall()
-    assert rows == [("opus", "implementer", "verify_gate")]
+    from shared.model_quality import ledger_model_id
+
+    assert rows == [(ledger_model_id("opus"), "implementer", "verify_gate")]
     db.close()
 
 
@@ -1452,3 +1454,32 @@ def test_import_run_log_folds_in_wave_with_no_captured_records(
     assert meta["completed_waves"] == [1, 2]
     assert meta["waves_planned"] == [1, 2]
     assert meta["waves_captured"] == [1]
+
+
+def test_enrich_agent_from_handoff_carries_effort() -> None:
+    from shared.host_learning import _enrich_agent_from_handoff
+
+    snap = {"spawn_id": "s1", "task_id": "t1", "tier": "medium", "effort": "high"}
+    out = _enrich_agent_from_handoff(
+        {"spawn_id": "s1"},
+        snapshots_by_task_id={},
+        snapshots_by_spawn_id={"s1": snap},
+        snapshots_by_wave_agent={},
+        wave_index=1,
+        agent_index=0,
+    )
+    assert out["effort"] == "high"
+    assert out.get("requested_effort") is None
+
+    snap2 = {"spawn_id": "s2", "task_id": "t2", "tier": "medium", "requested_effort": "high"}
+    out2 = _enrich_agent_from_handoff(
+        {"spawn_id": "s2"},
+        snapshots_by_task_id={},
+        snapshots_by_spawn_id={"s2": snap2},
+        snapshots_by_wave_agent={},
+        wave_index=1,
+        agent_index=0,
+    )
+    # Requested-but-unapplied effort is inspectable but never becomes the ledger's effort.
+    assert out2["requested_effort"] == "high"
+    assert not out2.get("effort")

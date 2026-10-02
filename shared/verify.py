@@ -29,7 +29,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 if TYPE_CHECKING:
     from shared.config import VerifyGateConfig
@@ -101,6 +101,9 @@ class VerifyReport:
     baseline_ref: str | None = None
     baseline_used: bool = False
     note: str = ""
+    # Signals whose command actually executed and produced a verdict. Excludes
+    # unavailable/skipped signals and timeouts (no verdict either way).
+    ran_signals: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +115,7 @@ class VerifyReport:
             "baseline_ref": self.baseline_ref,
             "baseline_used": self.baseline_used,
             "note": self.note,
+            "ran_signals": self.ran_signals,
         }
 
 
@@ -143,6 +147,130 @@ def detect_gate_command(signal: str, project_root: str) -> str:
             return "python3 -m pytest --tb=no -q"
         return ""
     return ""
+
+
+_MAX_SCOPED_TEST_FILES = 20
+
+
+def _relative_py_files(project_root: str, files: Sequence[str]) -> list[str]:
+    """Normalize to existing ``.py`` files under ``project_root`` (relative, deduped)."""
+    try:
+        root = Path(project_root).resolve()
+    except Exception:
+        log.debug("verify: bad project_root %r", project_root, exc_info=True)
+        return []
+    out: list[str] = []
+    for raw in files:
+        if not raw:
+            continue
+        try:
+            path = Path(raw)
+            if not path.is_absolute():
+                path = root / path
+            path = path.resolve()
+            rel = path.relative_to(root)
+        except Exception:
+            continue  # outside the root or unresolvable
+        if path.suffix != ".py" or not path.is_file():
+            continue
+        text = rel.as_posix()
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def scoped_gate_command(signal: str, project_root: str, files: Sequence[str]) -> str:
+    """Command for ``signal`` limited to the changed ``files`` (``""`` if none).
+
+    Only existing ``.py`` files under ``project_root`` are considered. Lint and
+    type checks run on those files; tests run the changed test files plus the
+    ``tests/test_<module>.py`` / ``tests/test_<module>_*.py`` files that map to
+    each changed module (capped at 20). An empty string means "nothing to run".
+    """
+    rel_files = _relative_py_files(project_root, files)
+    if not rel_files:
+        return ""
+    quoted = " ".join(shlex.quote(f) for f in rel_files)
+    if signal == "lint":
+        if shutil.which("ruff") is not None:
+            return f"ruff check {quoted}"
+        if shutil.which("flake8") is not None:
+            return f"flake8 {quoted}"
+        return ""
+    if signal == "types":
+        if shutil.which("mypy") is not None:
+            return f"mypy {quoted}"
+        if shutil.which("pyright") is not None:
+            return f"pyright {quoted}"
+        return ""
+    if signal == "tests":
+        if shutil.which("pytest") is None:
+            return ""
+        tests_dir = Path(project_root) / "tests"
+        found: set[str] = set()
+        for rel in rel_files:
+            rel_path = Path(rel)
+            stem = rel_path.stem
+            if stem.startswith("test_") and rel_path.parts[:1] == ("tests",):
+                found.add(rel)
+                continue
+            if not tests_dir.is_dir():
+                continue
+            candidates = [tests_dir / f"test_{stem}.py", *tests_dir.glob(f"test_{stem}_*.py")]
+            for cand in candidates:
+                if cand.is_file():
+                    found.add(cand.relative_to(Path(project_root)).as_posix())
+        selected = sorted(found)[:_MAX_SCOPED_TEST_FILES]
+        if not selected:
+            return ""
+        return "python3 -m pytest --tb=no -q " + " ".join(shlex.quote(f) for f in selected)
+    return ""
+
+
+def scoped_resolver(files: Sequence[str]) -> Callable[[str, str], str]:
+    """``command_resolver`` for ``run_verify_gate`` scoped to the changed files."""
+    frozen = list(files)
+    return lambda signal, root: scoped_gate_command(signal, root, frozen)
+
+
+def verify_report_score(report: Mapping[str, Any]) -> float | None:
+    """Objective 0-10 score for a verify report, or None when it proves nothing.
+
+    Rules:
+    - No signal ran -> None. ``ran_signals`` is authoritative; legacy reports
+      without the key infer it from ``signals`` entries that were neither
+      unavailable, skipped nor timed out (reports with no ``signals`` either
+      count as "ran" unless ``degraded_signals`` is non-empty).
+    - Unavailable (degraded) signals do not suppress scoring: we score over the
+      signals that did run.
+    - Timed-out signals gave no verdict, so they are excluded from
+      ``ran_signals`` and neither pass nor fail the score.
+    - New failures without a baseline -> None (cannot tell whose fault).
+    - Otherwise 10.0 when clean, else ``max(0, 10 - 2.5 * len(new_failures))``.
+    """
+    ran = report.get("ran_signals")
+    if ran is None and "signals" not in report:
+        # Minimal legacy report carrying no per-signal detail at all: the only
+        # evidence available is the degraded list.
+        ran = [] if report.get("degraded_signals") else ["unknown"]
+    elif ran is None:
+        signals = report.get("signals") or {}
+        ran = [
+            name
+            for name, entry in signals.items()
+            if isinstance(entry, Mapping)
+            and not entry.get("unavailable")
+            and not entry.get("skipped")
+            and not entry.get("timed_out")
+        ]
+    if not ran:
+        return None
+    new_failures = list(report.get("new_failures") or [])
+    if new_failures and not report.get("baseline_used"):
+        return None
+    if not new_failures:
+        return 10.0
+    return max(0.0, 10.0 - 2.5 * len(new_failures))
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +625,8 @@ def run_verify_gate(
             # the result — unlike "unavailable", this still blocks.
             any_required_new = True
         report.signals[name] = entry
+        if not (outcome.unavailable or outcome.skipped or outcome.timed_out):
+            report.ran_signals.append(name)
 
     if any_required_new:
         report.verdict = VERDICT_REJECTED if gate_cfg.mode == "block" else VERDICT_WARN
@@ -512,6 +642,9 @@ __all__ = [
     "SignalOutcome",
     "VerifyReport",
     "detect_gate_command",
+    "scoped_gate_command",
+    "scoped_resolver",
+    "verify_report_score",
     "extract_failures",
     "run_signal",
     "resolve_baseline_ref",

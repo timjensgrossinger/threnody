@@ -1032,6 +1032,7 @@ class VerifyGateConfig:
     """Janitor-style verify gate run after file-writing subtasks."""
     enabled: bool = False
     mode: str = "warn"  # warn | block
+    scope: str = "changed"  # changed | full
     signals: dict[str, VerifyGateSignalConfig] = field(default_factory=lambda: {
         "lint": VerifyGateSignalConfig(command="auto", required=False),
         "types": VerifyGateSignalConfig(command="auto", required=True),
@@ -2428,6 +2429,10 @@ class TGsConfig:
             if mode not in {"warn", "block"}:
                 log.warning("verify_gate.mode must be warn or block; using warn")
                 mode = "warn"
+            scope = verify_gate_raw.get("scope", "changed")
+            if scope not in {"changed", "full"}:
+                log.warning("verify_gate.scope must be changed or full; using changed")
+                scope = "changed"
             default_signals = VerifyGateConfig().signals
             raw_signals = verify_gate_raw.get("signals", {})
             parsed_signals: dict[str, VerifyGateSignalConfig] = {}
@@ -2473,6 +2478,7 @@ class TGsConfig:
             cfg.verify_gate = VerifyGateConfig(
                 enabled=verify_gate_raw.get("enabled", False) is True,
                 mode=mode,
+                scope=scope,
                 signals=parsed_signals,
             )
 

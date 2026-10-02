@@ -76,12 +76,13 @@ def _render_claude_pointer_block(
         "Security-sensitive work is floored to `medium`, and a target holding a high-severity "
         "security defect to `high`.",
         "",
-        "Tier overrides are detected automatically on swarm, subtask and workflow paths — "
-        "report the tier each agent actually ran at and Threnody records the rest. Call "
-        "`record_outcome(task_id, outcome=\"tier_overridden\", actual_tier=...)` only for a "
-        "sanctioned direct edit run on a different model than the routed tier: the PreToolUse "
-        "hook carries no model, so that case is invisible otherwise. `routed_tier` is derived "
-        "and never needs to be supplied.",
+        "After every routed task call `record_outcome(task_id, outcome=\"accepted\"|\"revised\"|"
+        "\"reworked\"|\"rejected\", actual_model=...)` — the verdict plus the model that actually "
+        "did the work (the PreToolUse hook carries no model, so this is what makes attribution "
+        "exact). Tier overrides are detected automatically on swarm, subtask and workflow paths "
+        "(report each agent\'s actual tier); use `outcome=\"tier_overridden\", actual_tier=...` "
+        "only for a sanctioned direct edit run on a different model than routed. "
+        "`routed_tier` is derived and never needs to be supplied.",
         "",
         "Typed subagents per tier (Claude Code only):",
         "",
@@ -90,6 +91,9 @@ def _render_claude_pointer_block(
         "| low | `threnody-low` | haiku |",
         "| medium | `threnody-medium` | sonnet |",
         "| high | `threnody-high` | opus |",
+        "",
+        "When the spawn payload carries a `subagent_type` like `threnody-medium-high`, use it verbatim — "
+        "that variant pins the routed reasoning effort (Claude Code has no per-call effort param).",
         "",
         "Learning reporting follows `learning_report_contract.report_mode`. In `batch` mode (default) do "
         "NOT call `report_host_wave` per worker wave — capture is automatic (PostToolUse hook) or passed in "
@@ -154,7 +158,7 @@ def _render_claude_pointer_block(
         "",
         "Full routing contracts, execution patterns, and host-native details are in the installed Threnody skills:",
         "`/threnody-routing` · `/threnody-plan` · `/threnody-task` · "
-        "`/threnody-subtasks` · `/threnody-swarm` · `/threnody-workflow` · `/threnody-fullstack`",
+        "`/threnody-subtasks` · `/threnody-swarm` · `/threnody-workflow` · `/threnody-fullstack` · `/threnody-ladder`",
         "",
         "Run `/threnody-routing` first if you are unfamiliar with Threnody.",
     ])
@@ -234,6 +238,12 @@ def render_shell_instructions(
         "For low-tier work without an active host_spawn_waves handoff, prefer direct edits or the host "
         "subagent tool from `host_spawn`; do not use `execute_subtask` to route between host CLIs."
     )
+
+    if profile.shell_id == "codex":
+        lines.append(
+            "When the spawn payload carries a `subagent_type` like `threnody-medium-high`, spawn that custom agent "
+            "from `~/.codex/agents` verbatim — it pins the routed reasoning effort (`model_reasoning_effort`)."
+        )
 
     host_tool = "Agent" if profile.shell_id == "claude-code" else "Task"
     lines.extend(

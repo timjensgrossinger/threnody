@@ -1619,3 +1619,70 @@ def test_record_mode_passes_a_valid_result_through_unchanged() -> None:
     assert code == 0
     assert payload["valid"] is True
     assert "hookSpecificOutput" not in payload
+
+
+# --- direct edit touches ---------------------------------------------------
+
+
+def _low_router() -> SimpleNamespace:
+    return SimpleNamespace(
+        classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
+            tier="low", score=0.21, reason="low-tier task", agents=2, override=False,
+        )
+    )
+
+
+def test_direct_edit_under_route_guard_writes_touch_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    from shared import outcomes as shared_outcomes
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg, db = _prepare_db(td)
+        monkeypatch.chdir(ROOT)
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: _stub_init(cfg, db, router=_low_router()))
+        monkeypatch.setattr(mcp_server, "_get_registry_with_config", lambda *_a, **_k: SelectionRegistry())
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+        task = "fix shared/db.py"
+        mcp_server.handle_route_task({"task": task, "cwd": str(ROOT)})
+        target = str(ROOT / "shared" / "db.py")
+        for _ in range(2):  # repeated edits collapse to one row
+            res = mcp_server.handle_validate_routing_guard({
+                "cwd": str(ROOT), "target_file": target, "tool_name": "Edit",
+            })
+            assert res["valid"] is True
+        assert db.direct_edit_touches(shared_outcomes.route_task_id(task)) == [target]
+        # Must NOT satisfy a routed_plan guard.
+        assert db.routing_guard_has_executions(caller="claude-code", cwd=str(ROOT)) is False
+
+
+def test_routed_plan_guard_does_not_record_touch(monkeypatch: pytest.MonkeyPatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        cfg, db = _prepare_db(td)
+        monkeypatch.chdir(ROOT)
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: _stub_init(cfg, db))
+        target = str(ROOT / "shared" / "db.py")
+        db.routing_guard_put(
+            caller="claude-code", cwd=str(ROOT), mode=ROUTING_GUARD_MODE_ROUTED_PLAN,
+            tier="medium", provider=None, model=None, source_tool="plan_task",
+            task_text="plan work", file_hints=[target], ttl_seconds=600,
+        )
+        db.routing_guard_record_execution(caller="claude-code", cwd=str(ROOT), task_id="x")
+        res = mcp_server._validate_routing_guard(
+            db, caller="claude-code", cwd=str(ROOT), target_file=target, tool_name="Edit",
+        )
+        assert res["valid"] is True
+        with db.conn() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM direct_edit_touches").fetchone()[0] == 0
+
+
+def test_denied_edit_records_no_touch(monkeypatch: pytest.MonkeyPatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        cfg, db = _prepare_db(td)
+        monkeypatch.chdir(ROOT)
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: _stub_init(cfg, db))
+        res = mcp_server._validate_routing_guard(
+            db, caller="claude-code", cwd=str(ROOT),
+            target_file=str(ROOT / "shared" / "db.py"), tool_name="Edit",
+        )
+        assert res["valid"] is False
+        with db.conn() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM direct_edit_touches").fetchone()[0] == 0

@@ -138,6 +138,8 @@ def test_resolve_caller_maps_new_host_client_names(monkeypatch) -> None:
     monkeypatch.delenv("CLAUDE_CODE_SESSION", raising=False)
     monkeypatch.delenv("OPENCODE_HOST", raising=False)
     monkeypatch.delenv("OPENCODE_SESSION", raising=False)
+    for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
+        monkeypatch.delenv(marker, raising=False)
     monkeypatch.setattr(mcp_server, "_client_name", "Codex CLI")
     assert mcp_server._resolve_caller() == "codex"
 
@@ -151,8 +153,15 @@ def test_resolve_caller_maps_new_host_client_names(monkeypatch) -> None:
     assert mcp_server._resolve_caller() == "opencode"
 
 
-def test_resolve_caller_prefers_env_marker_over_client_name(monkeypatch) -> None:
-    monkeypatch.setattr(mcp_server, "_client_name", "Claude Code")
+def test_resolve_caller_prefers_recognised_client_name_over_env_marker(monkeypatch) -> None:
+    monkeypatch.setattr(mcp_server, "_client_name", "Codex CLI")
+    monkeypatch.setenv("CLAUDECODE", "1")
+
+    assert mcp_server._resolve_caller() == "codex"
+
+
+def test_resolve_caller_falls_back_to_env_marker_without_client_name(monkeypatch) -> None:
+    monkeypatch.setattr(mcp_server, "_client_name", "")
     monkeypatch.setenv("COPILOT_CLI", "1")
 
     assert mcp_server._resolve_caller() == "github-copilot"
@@ -3614,3 +3623,159 @@ def test_execute_subtask_allows_explicit_effort_for_supported_provider(monkeypat
         assert result.get("provider") == "Codex"
         assert result.get("effort") == "high"
         assert result.get("effort_source") == "explicit"
+
+
+# --- direct-edit quality glue ------------------------------------------------
+
+
+def test_record_outcome_accepts_actual_model_and_schedules_finalize(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "ro-finalize.db"
+        cfg = TGsConfig(db_path=db_path)
+        db = Database(db_path=db_path)
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, None, None, None))
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+        monkeypatch.setattr(
+            mcp_server.shared_outcomes, "record_outcome",
+            lambda *a, **k: {"stored": True},
+        )
+        scheduled: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            mcp_server.shared_direct_edit_quality, "schedule_finalize",
+            lambda _db, task_id, **kw: scheduled.append((task_id, kw)),
+        )
+
+        result = mcp_server.handle_record_outcome({
+            "task_id": "route-abc", "outcome": "accepted",
+            "actual_model": "claude-opus-x", "actual_tier": "high",
+        })
+
+        assert result == {"stored": True}
+        assert len(scheduled) == 1
+        task_id, kw = scheduled[0]
+        assert task_id == "route-abc"
+        assert kw["outcome"] == "accepted"
+        assert kw["actual_model"] == "claude-opus-x"
+        assert kw["actual_tier"] == "high"
+        assert kw["caller"] == "claude-code"
+        assert kw["config"] is cfg
+
+        bad = mcp_server.handle_record_outcome(
+            {"task_id": "route-abc", "outcome": "accepted", "actual_model": 5}
+        )
+        assert bad["error"] == "invalid_request"
+
+
+def test_record_outcome_schema_declares_actual_model() -> None:
+    tool = next(t for t in mcp_server.TOOLS if t["name"] == "record_outcome")
+    assert tool["inputSchema"]["properties"]["actual_model"]["type"] == "string"
+
+
+def test_route_task_finalizes_previous_route_guard(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "prev-guard.db"
+        cfg = TGsConfig(db_path=db_path)
+        db = Database(db_path=db_path)
+        cwd = str(Path(td).resolve())
+        prev_task = "tidy things in notes.py"
+        prev_id = mcp_server.shared_outcomes.route_task_id(prev_task)
+        db.routing_guard_put(
+            caller="claude-code", cwd=cwd, mode="direct", tier="low", provider=None,
+            model=None, source_tool="route_task", task_text=prev_task,
+            file_hints=[], ttl_seconds=600,
+        )
+        db.direct_edit_touch_record(task_id=prev_id, caller="claude-code", cwd=cwd,
+                                    file_path=str(Path(cwd) / "notes.py"))
+        scheduled: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            mcp_server.shared_direct_edit_quality, "schedule_finalize",
+            lambda _db, task_id, **kw: scheduled.append((task_id, kw)),
+        )
+
+        mcp_server._finalize_previous_route_guard(
+            db, cfg, caller="claude-code", cwd=cwd, new_task_id="route-different",
+        )
+        assert [s[0] for s in scheduled] == [prev_id]
+        assert scheduled[0][1]["outcome"] is None
+
+        scheduled.clear()  # same task again -> not finalized
+        mcp_server._finalize_previous_route_guard(
+            db, cfg, caller="claude-code", cwd=cwd, new_task_id=prev_id,
+        )
+        assert scheduled == []
+
+        # plan_task guards are not route tasks
+        db.routing_guard_clear(caller="claude-code", cwd=cwd)
+        db.routing_guard_put(
+            caller="claude-code", cwd=cwd, mode="routed_plan", tier="medium", provider=None,
+            model=None, source_tool="plan_task", task_text=prev_task,
+            file_hints=[], ttl_seconds=600,
+        )
+        mcp_server._finalize_previous_route_guard(
+            db, cfg, caller="claude-code", cwd=cwd, new_task_id="route-different",
+        )
+        assert scheduled == []
+
+
+def test_route_task_target_files_land_in_guard_file_hints(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "hints.db"
+        cfg = TGsConfig(db_path=db_path)
+        db = Database(db_path=db_path)
+        cwd = Path(td).resolve()
+        (cwd / "alpha.py").write_text("x = 1\n")
+        router = SimpleNamespace(
+            classify=lambda _t, project_path=None, evidence=None: SimpleNamespace(
+                tier="low", score=0.2, reason="r", agents=1, override=False)
+        )
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, router, None, None))
+        class _Reg:
+            def _ordered_execution_candidates(self, tier, **_kw):
+                return ([], None)
+
+            def select_provider_for_tier(self, tier, **_kw):
+                return {"provider": "GitHub Copilot", "provider_id": "github-copilot",
+                        "model": "gpt-5-mini", "tier": tier}
+
+        monkeypatch.setattr(mcp_server, "_get_registry_with_config", lambda *_a, **_k: _Reg())
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+        result = mcp_server.handle_route_task({
+            "task": "fix the bug and update the code", "cwd": str(cwd), "target_files": ["alpha.py"],
+        })
+
+        assert result["routing_guard"]["file_hints"] == [str(cwd / "alpha.py")]
+
+
+def test_ladder_tools_registered_and_dispatch(monkeypatch) -> None:
+    names = {t["name"] for t in mcp_server.TOOLS}
+    assert {"ladder_plan", "ladder_grade"} <= names
+    grade = next(t for t in mcp_server.TOOLS if t["name"] == "ladder_grade")
+    assert set(grade["inputSchema"]["required"]) == {"case_id", "tier", "content", "sweep_id"}
+
+    from shared import ladder as shared_ladder
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (TGsConfig(), object(), None, None, None))
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+    monkeypatch.setattr(shared_ladder, "plan_host_ladder",
+                        lambda **kw: seen.setdefault("plan", kw) or {"agents": []})
+    monkeypatch.setattr(shared_ladder, "grade_host_output",
+                        lambda db, **kw: seen.setdefault("grade", kw) or {"passed": True})
+
+    mcp_server.HANDLERS["ladder_plan"]({"tiers": ["low"], "levels": [0], "case_ids": ["c1"]})
+    assert seen["plan"]["tiers"] == ["low"] and seen["plan"]["levels"] == [0]
+    assert seen["plan"]["case_ids"] == ["c1"] and seen["plan"]["caller"] == "claude-code"
+
+    mcp_server.HANDLERS["ladder_grade"]({
+        "case_id": "c1", "tier": "low", "model": "m", "sweep_id": "s", "content": "x=1",
+    })
+    assert seen["grade"] == {"case_id": "c1", "tier": "low", "content": "x=1",
+                             "model": "m", "sweep_id": "s"}
+
+    missing = mcp_server.handle_ladder_grade({"case_id": "c1"})
+    assert missing["error"] == "invalid_request"

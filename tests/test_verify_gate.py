@@ -268,3 +268,181 @@ def test_verify_gate_progress_callback():
     assert progress_ticks[0][0] == 1
     assert progress_ticks[1][0] == 2
 
+
+
+# ---------------------------------------------------------------------------
+# Scoped verification
+# ---------------------------------------------------------------------------
+from shared import verify as _verify  # noqa: E402
+
+
+@pytest.fixture
+def scoped_repo(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "pkg" / "foo.py").write_text("x = 1\n")
+    (tmp_path / "pkg" / "bar.py").write_text("y = 1\n")
+    (tmp_path / "pkg" / "notes.txt").write_text("hi\n")
+    (tmp_path / "pkg" / "my mod.py").write_text("z = 1\n")
+    (tmp_path / "tests" / "test_foo.py").write_text("def test_a(): pass\n")
+    (tmp_path / "tests" / "test_foo_extra.py").write_text("def test_b(): pass\n")
+    return tmp_path
+
+
+@pytest.fixture
+def all_tools(monkeypatch):
+    monkeypatch.setattr(_verify.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+
+def test_scoped_tests_maps_module_to_tests(scoped_repo, all_tools):
+    cmd = _verify.scoped_gate_command("tests", str(scoped_repo), ["pkg/foo.py"])
+    assert cmd == "python3 -m pytest --tb=no -q tests/test_foo.py tests/test_foo_extra.py"
+
+
+def test_scoped_tests_test_file_itself(scoped_repo, all_tools):
+    cmd = _verify.scoped_gate_command(
+        "tests", str(scoped_repo), [str(scoped_repo / "tests" / "test_foo.py")]
+    )
+    assert cmd.endswith("tests/test_foo.py")
+
+
+def test_scoped_tests_no_matching_tests(scoped_repo, all_tools):
+    assert _verify.scoped_gate_command("tests", str(scoped_repo), ["pkg/bar.py"]) == ""
+
+
+def test_scoped_non_py_returns_empty(scoped_repo, all_tools):
+    for sig in ("lint", "types", "tests"):
+        assert _verify.scoped_gate_command(sig, str(scoped_repo), ["pkg/notes.txt"]) == ""
+
+
+def test_scoped_drops_outside_and_missing(scoped_repo, all_tools, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("elsewhere") / "o.py"
+    outside.write_text("a = 1\n")
+    cmd = _verify.scoped_gate_command(
+        "lint", str(scoped_repo), [str(outside), "pkg/missing.py", "pkg/bar.py"]
+    )
+    assert cmd == "ruff check pkg/bar.py"
+    assert _verify.scoped_gate_command("lint", str(scoped_repo), [str(outside)]) == ""
+
+
+def test_scoped_lint_types_and_quoting(scoped_repo, all_tools):
+    import shlex
+
+    cmd = _verify.scoped_gate_command("types", str(scoped_repo), ["pkg/my mod.py"])
+    assert shlex.split(cmd) == ["mypy", "pkg/my mod.py"]
+
+
+def test_scoped_fallback_tools(scoped_repo, monkeypatch):
+    monkeypatch.setattr(
+        _verify.shutil, "which", lambda n: "/x" if n in {"flake8", "pyright"} else None
+    )
+    assert _verify.scoped_gate_command("lint", str(scoped_repo), ["pkg/foo.py"]).startswith("flake8 ")
+    assert _verify.scoped_gate_command("types", str(scoped_repo), ["pkg/foo.py"]).startswith("pyright ")
+
+
+def test_scoped_tool_missing(scoped_repo, monkeypatch):
+    monkeypatch.setattr(_verify.shutil, "which", lambda n: None)
+    for sig in ("lint", "types", "tests"):
+        assert _verify.scoped_gate_command(sig, str(scoped_repo), ["pkg/foo.py"]) == ""
+
+
+def test_scoped_tests_capped(tmp_path, all_tools):
+    (tmp_path / "tests").mkdir()
+    files = []
+    for i in range(30):
+        p = tmp_path / "tests" / f"test_m{i:02d}.py"
+        p.write_text("")
+        files.append(f"tests/test_m{i:02d}.py")
+    cmd = _verify.scoped_gate_command("tests", str(tmp_path), files)
+    assert cmd.count("tests/test_m") == 20
+
+
+def _gate_cfg():
+    return VerifyGateConfig(
+        enabled=True,
+        signals={
+            "lint": VerifyGateSignalConfig(command="auto", required=False),
+            "tests": VerifyGateSignalConfig(command="auto", required=True),
+        },
+    )
+
+
+def test_scoped_resolver_through_gate_and_ran_signals(scoped_repo, all_tools, monkeypatch):
+    seen: list[str] = []
+
+    def fake_run(args, **kw):
+        seen.append(" ".join(args))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(_verify.subprocess, "run", fake_run)
+    report = _verify.run_verify_gate(
+        _gate_cfg(),
+        project_root=str(scoped_repo),
+        baseline=False,
+        command_resolver=_verify.scoped_resolver(["pkg/foo.py"]),
+    )
+    assert report.ran_signals == ["lint", "tests"]
+    assert report.to_dict()["ran_signals"] == ["lint", "tests"]
+    assert any("tests/test_foo.py" in c for c in seen)
+
+
+def test_ran_signals_excludes_unavailable(scoped_repo, all_tools, monkeypatch):
+    monkeypatch.setattr(
+        _verify.subprocess, "run", lambda a, **k: subprocess.CompletedProcess(a, 0, "", "")
+    )
+    report = _verify.run_verify_gate(
+        _gate_cfg(),
+        project_root=str(scoped_repo),
+        baseline=False,
+        command_resolver=_verify.scoped_resolver(["pkg/bar.py"]),  # no tests -> ""
+    )
+    assert report.ran_signals == ["lint"]
+    assert "tests" in report.degraded_signals
+
+
+def test_ran_signals_excludes_timeout(scoped_repo, all_tools, monkeypatch):
+    def boom(args, **kw):
+        raise subprocess.TimeoutExpired(args, 1)
+
+    monkeypatch.setattr(_verify.subprocess, "run", boom)
+    report = _verify.run_verify_gate(
+        _gate_cfg(),
+        project_root=str(scoped_repo),
+        baseline=False,
+        command_resolver=_verify.scoped_resolver(["pkg/foo.py"]),
+    )
+    assert report.ran_signals == []
+
+
+def test_verify_report_score_cases():
+    score = _verify.verify_report_score
+    assert score({"ran_signals": [], "new_failures": []}) is None
+    assert score({"ran_signals": ["lint"], "new_failures": []}) == 10.0
+    assert score({"ran_signals": ["lint"], "new_failures": ["a", "b"], "baseline_used": True}) == 5.0
+    assert score({"ran_signals": ["lint"], "new_failures": ["a"] * 9, "baseline_used": True}) == 0.0
+    assert score({"ran_signals": ["lint"], "new_failures": ["a"], "baseline_used": False}) is None
+    # degraded signal alone no longer suppresses scoring
+    assert score({"ran_signals": ["lint"], "degraded_signals": ["types"]}) == 10.0
+
+
+def test_verify_report_score_legacy_report():
+    assert _verify.verify_report_score({"signals": {"lint": {"passed": True}}}) == 10.0
+    assert _verify.verify_report_score(
+        {"signals": {"lint": {"passed": True, "unavailable": True, "skipped": True}}}
+    ) is None
+    assert _verify.verify_report_score({"signals": {"t": {"timed_out": True}}}) is None
+
+
+def test_verify_gate_scope_config(tmp_path):
+    from shared.config import TGsConfig
+
+    assert VerifyGateConfig().scope == "changed"
+
+    def load(body: str):
+        p = tmp_path / "c.yaml"
+        p.write_text(body)
+        return TGsConfig.from_yaml(p).verify_gate.scope
+
+    assert load("verify_gate:\n  enabled: true\n") == "changed"
+    assert load("verify_gate:\n  scope: full\n") == "full"
+    assert load("verify_gate:\n  scope: bogus\n") == "changed"

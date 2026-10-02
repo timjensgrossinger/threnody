@@ -15,6 +15,7 @@ from shared.planner import Subtask
 from shared.orchestrator import Provider
 from shared.discovery import get_registry, ProviderRegistry
 from shared.model_registry import bootstrap_tier_map
+from shared.effort_support import default_routed_effort
 
 log = logging.getLogger(__name__)
 
@@ -126,22 +127,34 @@ class ClaudeCodeProvider(Provider):
         """Reset the token counter (call at the start of each billing day)."""
         self._estimated_tokens = 0
 
+    # Provider id used to resolve effort support/config (see shared.effort_support).
+    effort_provider_id = "claude-code"
+
+    def effort_applied_for(self, model: str) -> bool:
+        """True when ``execute(..., effort=)`` reaches a CLI that takes the flag.
+
+        The gpt-5-mini cross-route uses ``gh copilot agent``, which gets none.
+        """
+        return not (model == "gpt-5-mini" and self._check_copilot())
+
     def execute(self, subtask: Subtask, model: str,
-                timeout: int = 120) -> str | None:
+                timeout: int = 120, effort: str | None = None) -> str | None:
         """Execute a subtask via the appropriate CLI."""
         # If model is gpt-5-mini and Copilot is available, use gh copilot
         if model == "gpt-5-mini" and self._check_copilot():
             return self._execute_via_copilot(subtask, model, timeout)
         # Otherwise use claude CLI
-        return self._execute_via_claude(subtask, model, timeout)
+        return self._execute_via_claude(subtask, model, timeout, effort=effort)
 
     def _execute_via_claude(self, subtask: Subtask, model: str,
-                            timeout: int = 120) -> str | None:
+                            timeout: int = 120, effort: str | None = None) -> str | None:
         if not self._check_claude():
             log.error("claude CLI not available")
             return None
         try:
             cmd = ["claude", "-p", subtask.description, "--model", model]
+            if effort:
+                cmd.extend(["--effort", effort])
             cwd = getattr(subtask, "workspace_root", None) or None
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
@@ -196,6 +209,7 @@ class ClaudeCodeProvider(Provider):
                 tier=effective_tier,
                 prefer_free=True,
                 timeout=timeout,
+                routed_effort=default_routed_effort(effective_tier),
             )
             log.info(
                 "Registry routed subtask #%d to %s (model=%s, fallback=%s)",

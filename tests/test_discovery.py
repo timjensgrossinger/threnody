@@ -491,17 +491,34 @@ def test_caller_from_client_name(client_name, expected):
     assert caller_from_client_name(client_name) == expected
 
 
+@pytest.fixture(autouse=True)
+def _scrub_host_markers(monkeypatch):
+    """Tests may run inside Claude Code (CLAUDECODE=1); keep detect_caller hermetic."""
+    for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("THRENODY_TEST_MODE", "1")
+    import shared.discovery as _d
+
+    _d._caller_from_process_tree.cache_clear()
+    yield
+    _d._caller_from_process_tree.cache_clear()
+
+
 def test_detect_caller_ignores_falsey_copilot_and_claude_markers(monkeypatch):
     monkeypatch.setenv("COPILOT_CLI", "0")
     monkeypatch.setenv("COPILOT_RUN_APP", "false")
     monkeypatch.setenv("CLAUDE_CODE", "no")
     monkeypatch.setenv("CLAUDE_CODE_SESSION", "")
+    for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
+        monkeypatch.delenv(name, raising=False)
 
     assert detect_caller() is None
 
 
 def test_detect_caller_uses_parent_process_transport_fallback(monkeypatch):
     monkeypatch.setenv("MCP_TRANSPORT", "stdio")
+    # conftest disables the process walk suite-wide; this test exercises it.
+    monkeypatch.setattr("shared.discovery._PROCESS_WALK_ENABLED", True)
     monkeypatch.setattr("shared.discovery.os.getppid", lambda: 123)
     monkeypatch.setattr(
         "shared.discovery.subprocess.run",

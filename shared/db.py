@@ -539,6 +539,21 @@ class Database:
              CREATE INDEX IF NOT EXISTS idx_rge_caller_cwd
                  ON routing_guard_executions (caller, cwd, executed_ts);
 
+             -- Files a host edited directly under a route_task guard. Deliberately NOT
+             -- routing_guard_executions: that table satisfies routed_plan guards, so
+             -- logging direct edits there would let later edits bypass a routed plan.
+             CREATE TABLE IF NOT EXISTS direct_edit_touches (
+                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id   TEXT NOT NULL,
+                 caller    TEXT,
+                 cwd       TEXT,
+                 file_path TEXT NOT NULL,
+                 ts        REAL NOT NULL,
+                 UNIQUE (task_id, file_path)
+             );
+             CREATE INDEX IF NOT EXISTS idx_direct_edit_touches_task
+                 ON direct_edit_touches (task_id);
+
              -- Routing exceptions: user-defined bypass rules for validate_routing_guard.
              CREATE TABLE IF NOT EXISTS routing_exceptions (
                  id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -797,8 +812,11 @@ class Database:
             -- 'static_recall' grades a reviewer against the deterministic
             -- code_intel pre-scan, 'verify_gate' records whether a write left new
             -- lint/type/test failures vs the merge base, and 'ladder' records a
-            -- graded benchmark pass/fail. model may be the literal 'host-native'
-            -- bucket when the host did not resolve one.
+            -- graded benchmark pass/fail. 'outcome' is a third proxy: the host's
+            -- own verdict on a routed task (accepted/revised/reworked/rejected) —
+            -- reported, not graded, so it never counts as ground truth.
+            -- model may be the literal 'host-native' bucket when the host did
+            -- not resolve one.
             CREATE TABLE IF NOT EXISTS model_quality_events (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 model         TEXT NOT NULL,
@@ -808,7 +826,8 @@ class Database:
                 score_0_10    REAL NOT NULL,
                 source        TEXT NOT NULL CHECK (source IN (
                                   'findings', 'judge',
-                                  'static_recall', 'verify_gate', 'ladder')),
+                                  'static_recall', 'verify_gate', 'ladder',
+                                  'outcome')),
                 sample_meta   TEXT,
                 task_hash     TEXT,
                 run_id        TEXT,
@@ -1111,7 +1130,8 @@ class Database:
                 score_0_10    REAL NOT NULL,
                 source        TEXT NOT NULL CHECK (source IN (
                                   'findings', 'judge',
-                                  'static_recall', 'verify_gate', 'ladder')),
+                                  'static_recall', 'verify_gate', 'ladder',
+                                  'outcome')),
                 sample_meta   TEXT,
                 task_hash     TEXT,
                 run_id        TEXT,
@@ -1182,12 +1202,23 @@ class Database:
 
     @staticmethod
     def _ensure_model_quality_sources(conn: sqlite3.Connection) -> None:
-        """Widen the ledger's ``source`` CHECK to admit the ground-truth sources.
+        """Widen the ledger's ``source`` CHECK to admit every current source.
 
-        SQLite cannot ALTER a CHECK constraint, so a database created before
-        static_recall/verify_gate/ladder existed needs the table rebuilt. Detected
-        by looking for the new source names in the stored DDL; rows are carried
-        over, so this is a one-time no-data-loss rewrite and a no-op afterwards.
+        SQLite cannot ALTER a CHECK constraint, so a database created before a
+        source existed needs the table rebuilt. Detected by the absence of the
+        NEWEST source literal (``'outcome'``) in the stored DDL — the CHECK list
+        only ever grows, so a DDL that admits the newest source admits them all.
+        Rows are carried over, so this is a one-time no-data-loss rewrite and a
+        no-op afterwards.
+
+        The copy is driven by the columns the old table ACTUALLY has, not a fixed
+        list: a ledger may be at any historical shape (pre-ground-truth with no
+        join axes, or current with tier/profile_key/spawn_id/kind/event_id), and a
+        fixed legacy column list would silently drop every later column's data —
+        including ``event_id``, the journal idempotency key. Columns the old table
+        lacks come out NULL. The rebuilt table already has every column, and
+        :meth:`_ensure_model_quality_columns` (run right after) recreates the
+        secondary indexes that ``DROP TABLE`` took with it.
         """
         try:
             row = conn.execute(
@@ -1197,7 +1228,7 @@ class Database:
             log.debug("db: model_quality DDL probe failed", exc_info=True)
             return
         ddl = (row[0] if row else "") or ""
-        if not ddl or "static_recall" in ddl:
+        if not ddl or "'outcome'" in ddl:
             return
         log.info("db: widening model_quality_events.source CHECK (one-time rebuild)")
         # Individual execute() calls, NOT executescript(): executescript issues an
@@ -1218,7 +1249,8 @@ class Database:
                 score_0_10    REAL NOT NULL,
                 source        TEXT NOT NULL CHECK (source IN (
                                   'findings', 'judge',
-                                  'static_recall', 'verify_gate', 'ladder')),
+                                  'static_recall', 'verify_gate', 'ladder',
+                                  'outcome')),
                 sample_meta   TEXT,
                 task_hash     TEXT,
                 run_id        TEXT,
@@ -1232,6 +1264,8 @@ class Database:
                 -- the model but no profile, so the two could never be joined.
                 profile_key   TEXT,
                 spawn_id      TEXT,
+                -- The task kind this score is about (see _init_schema).
+                kind          TEXT,
                 -- Idempotency key from shared/learning_journal.py. Makes a replay
                 -- (or a retried terminal report) a no-op instead of a double count.
                 event_id      TEXT,
@@ -1239,12 +1273,21 @@ class Database:
             )
             """
         )
+        old_columns = {
+            str(info[1])
+            for info in conn.execute("PRAGMA table_info(model_quality_events)").fetchall()
+        }
+        new_columns = [
+            str(info[1])
+            for info in conn.execute("PRAGMA table_info(model_quality_events_new)").fetchall()
+        ]
+        # Both sides come from PRAGMA table_info of tables this method owns, never
+        # from input, so interpolating the identifiers is safe (SQL cannot bind an
+        # identifier).
+        shared_columns = ", ".join(c for c in new_columns if c in old_columns)
         conn.execute(
-            "INSERT INTO model_quality_events_new "
-            "(id, model, effort, dimension, sub_dimension, score_0_10, source, "
-            " sample_meta, task_hash, run_id, ts) "
-            "SELECT id, model, effort, dimension, sub_dimension, score_0_10, source, "
-            "       sample_meta, task_hash, run_id, ts FROM model_quality_events"
+            f"INSERT INTO model_quality_events_new ({shared_columns}) "
+            f"SELECT {shared_columns} FROM model_quality_events"
         )
         conn.execute("DROP TABLE model_quality_events")
         conn.execute("ALTER TABLE model_quality_events_new RENAME TO model_quality_events")
@@ -6502,6 +6545,36 @@ class Database:
                 (caller_norm, cwd_norm, cutoff),
             ).fetchone()[0]
         return bool(exists)
+
+    def direct_edit_touch_record(
+        self,
+        *,
+        task_id: str,
+        caller: str | None,
+        cwd: str | None,
+        file_path: str,
+    ) -> None:
+        """Record that ``file_path`` was edited directly under route task ``task_id``.
+
+        Repeated edits of one file collapse to a single row.
+        """
+        if not task_id or not file_path:
+            return
+        with self.conn() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO direct_edit_touches "
+                "(task_id, caller, cwd, file_path, ts) VALUES (?, ?, ?, ?, ?)",
+                (task_id, caller, cwd, file_path, time.time()),
+            )
+
+    def direct_edit_touches(self, task_id: str) -> list[str]:
+        """Return the distinct files edited directly under ``task_id``, oldest first."""
+        with self.conn() as conn:
+            rows = conn.execute(
+                "SELECT file_path FROM direct_edit_touches WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        return [str(r[0]) for r in rows]
 
     # ------------------------------------------------------------------
     # Audit chain helpers (plan 03)

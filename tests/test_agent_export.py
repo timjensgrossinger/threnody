@@ -317,3 +317,26 @@ def test_check_and_promote_idempotent(temp_db_fixture: Database, tmp_path: Path)
     result = check_and_promote(temp_db_fixture, "already-promoted", cfg)
     assert result["promoted"] is False
     assert result["reason"] == "already promoted"
+
+
+def test_export_tier_effort_variants_generates_nine(tmp_path: Path) -> None:
+    from shared.agent_export import export_tier_effort_variants
+
+    written = export_tier_effort_variants(ROOT / "shell" / "agents", tmp_path)
+    assert len(written) == 9
+    text = (tmp_path / "threnody-medium-high.md").read_text(encoding="utf-8")
+    lines = text.split("\n")
+    assert "name: threnody-medium-high" in lines
+    model_idx = lines.index("model: sonnet")
+    assert lines[model_idx + 1] == "effort: high"
+    assert "(effort high)" in next(l for l in lines if l.startswith("description:"))
+    assert "Threnody host subagent" in text
+
+
+def test_export_tier_effort_variants_skips_missing_frontmatter(tmp_path: Path) -> None:
+    from shared.agent_export import export_tier_effort_variants
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "threnody-low.md").write_text("no frontmatter\n", encoding="utf-8")
+    assert export_tier_effort_variants(src, tmp_path / "out") == []

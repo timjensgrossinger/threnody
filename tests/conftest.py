@@ -42,6 +42,70 @@ from shared.config import TGsConfig
 
 
 # ============================================================================
+# FIXTURE 0a: _isolate_host_detection  (autouse — do not make opt-in)
+# ============================================================================
+
+_HOST_ENV_MARKERS = (
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE",
+    "CLAUDE_CODE_SESSION",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``discovery.detect_caller`` from seeing the developer's real host.
+
+    The suite is routinely run from inside Claude Code, which exports
+    ``CLAUDECODE=1`` and friends, and the process-tree fallback would find a
+    ``claude`` ancestor regardless. Either one turns every test that relies on
+    "no caller detected" into a claude-code (router-only, host-native) caller —
+    ``execute_subtask`` then answers ``HostNativeRequired`` instead of running
+    its stub provider. Tests that exercise detection set markers or patch the
+    walk themselves.
+    """
+    for marker in _HOST_ENV_MARKERS:
+        monkeypatch.delenv(marker, raising=False)
+    try:
+        from shared import discovery as _discovery
+    except Exception:  # pragma: no cover - import-light test modules
+        return
+    monkeypatch.setattr(_discovery, "_PROCESS_WALK_ENABLED", False)
+
+
+_HOST_MODEL_ENV = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_model_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's real Codex model cache and Claude settings out of tests.
+
+    ``ProviderRegistry`` projects ``~/.codex/models_cache.json`` onto codex's tier
+    map and the quality ledger resolves Claude aliases via ``ANTHROPIC_*`` env
+    vars and ``~/.claude/settings.json``. Tests that exercise either pass an
+    explicit path/env.
+    """
+    for var in _HOST_MODEL_ENV:
+        monkeypatch.delenv(var, raising=False)
+    try:
+        from shared import model_registry as _model_registry
+    except Exception:  # pragma: no cover - import-light test modules
+        return
+    monkeypatch.setattr(
+        _model_registry, "_codex_home", lambda: Path("/nonexistent/threnody-test-codex-home")
+    )
+    monkeypatch.setattr(_model_registry, "_claude_settings_path", lambda: None)
+
+
+# ============================================================================
 # FIXTURE 0: _isolate_learning_state  (autouse — do not make opt-in)
 # ============================================================================
 
@@ -583,6 +647,8 @@ def isolation_test_mode(monkeypatch):
     monkeypatch.delenv("JUNIE_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION", raising=False)
+    for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
+        monkeypatch.delenv(marker, raising=False)
     
     yield monkeypatch
     

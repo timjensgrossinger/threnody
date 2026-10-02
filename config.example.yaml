@@ -141,9 +141,12 @@ routing_exceptions:
   filetypes: []
   paths: []
 
+# Enabling verify_gate is what gives ordinary write work an objective quality score.
+# review_synthesis_mode: auto   # auto | python | llm — llm adjudicates findings → precision scores
 verify_gate:
   enabled: false
   mode: warn
+  scope: changed   # changed = lint/types/mapped tests on touched .py files only; full = whole repo
   signals:
     lint:
       command: auto

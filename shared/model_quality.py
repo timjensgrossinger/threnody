@@ -10,6 +10,15 @@ from two sources and aggregates them at read time (mirrors ``shared/spend.py``):
 * ``judge`` — an opt-out warm-path LLM judge (``shared/eval.py``) that scores general
   task output 0-10. Runs only on the existing warm-path executor, so it adds zero
   latency to tasks or swarms.
+* ``outcome`` — the host's own verdict on a routed task (``accepted`` / ``revised``
+  / ``reworked`` / ``rejected``), recorded by :func:`record_outcome_score`. A
+  proxy: it is what the host *said*, not something graded, so it is kept out of
+  ``avg_score`` and out of ``OBJECTIVE_SOURCES`` (and therefore never moves a tier
+  via ``shared/quality_bias.py``). Reported separately as ``outcome_n`` /
+  ``outcome_avg``.
+
+The objective sources (``static_recall``, ``verify_gate``, ``ladder``) are described
+next to their constants below.
 
 Everything here is best-effort: writers never raise into the finalize/warm paths,
 and ``build_quality_snapshot`` returns a well-formed empty snapshot on a fresh DB so
@@ -22,6 +31,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -41,6 +51,11 @@ SOURCE_JUDGE = "judge"
 SOURCE_STATIC_RECALL = "static_recall"
 SOURCE_VERIFY_GATE = "verify_gate"
 SOURCE_LADDER = "ladder"
+# Proxy source: the host's verdict on a routed task. Deliberately NOT objective —
+# a host saying "accepted" is a report, not a grade, and the same host model is
+# often the one that did the work. Must stay out of OBJECTIVE_SOURCES so it can
+# never move a routing tier through shared/quality_bias.py.
+SOURCE_OUTCOME = "outcome"
 
 VALID_SOURCES = frozenset({
     SOURCE_FINDINGS,
@@ -48,8 +63,19 @@ VALID_SOURCES = frozenset({
     SOURCE_STATIC_RECALL,
     SOURCE_VERIFY_GATE,
     SOURCE_LADDER,
+    SOURCE_OUTCOME,
 })
 OBJECTIVE_SOURCES = frozenset({SOURCE_STATIC_RECALL, SOURCE_VERIFY_GATE, SOURCE_LADDER})
+
+# Host verdict -> 0-10 score. Anything not listed (notably ``tier_overridden``,
+# which says the host disagreed with the routed TIER, not that the work was bad)
+# records no row at all.
+OUTCOME_SCORES: dict[str, float] = {
+    "accepted": 10.0,
+    "revised": 6.0,
+    "reworked": 3.0,
+    "rejected": 0.0,
+}
 # Bucket used when the host did not resolve a concrete model for an agent (e.g.
 # host-native review agents whose tier -> model resolution was unavailable). Kept
 # explicit so a real model is never falsely credited/blamed.
@@ -117,6 +143,30 @@ def _normalize_model(model: str | None) -> str:
     return m or MODEL_UNRESOLVED
 
 
+def _attributed_model(model: str | None) -> tuple[str, str]:
+    """``(model id to store, resolution source)`` — see ``resolve_model_alias``.
+
+    Best-effort: a resolver failure keeps the caller's id rather than dropping
+    the event.
+    """
+    try:
+        from .model_registry import resolve_model_alias
+
+        return resolve_model_alias(None, model)
+    except Exception:  # pragma: no cover - best-effort
+        log.debug("model_quality: alias resolution failed", exc_info=True)
+        return (model or "").strip(), "reported"
+
+
+def ledger_model_id(model: str | None) -> str:
+    """The id a ledger row for *model* is stored under.
+
+    Readers comparing a currently-routed model (often an alias) against stored
+    rows must go through this, or every alias lookup misses the concrete rows.
+    """
+    return _normalize_model(_attributed_model(model)[0])
+
+
 def _write_event(
     db: Database,
     *,
@@ -136,22 +186,36 @@ def _write_event(
     journal: bool = True,
     event_id: str | None = None,
     ts: float | None = None,
-) -> None:
+) -> bool:
     """Insert one ledger event. Best-effort — never raises into caller paths.
 
     The event is appended to the durable journal *before* the DB write, so a
     malformed image (nine quarantines on this install since June) costs a replay
     rather than the data. ``journal=False`` is for the replay path itself, which
     is reading the journal and must not write back into it.
+
+    Returns ``True`` when the insert statement ran without error (a no-op
+    ``ON CONFLICT`` replay of an already-stored event also counts), ``False`` when
+    the event was refused or the write failed.
     """
     if source not in VALID_SOURCES:
         log.debug("model_quality: refusing unknown source %r", source)
-        return
+        return False
     try:
         score = max(0.0, min(10.0, float(score_0_10)))
     except (TypeError, ValueError):
         log.debug("model_quality: bad score %r", score_0_10)
-        return
+        return False
+    # Attribute to the concrete model, not the alias it was spawned under, so a
+    # Claude Code alias moving (sonnet 5 -> 5.5) starts a new history instead of
+    # merging two models' scores. Resolved HERE, before the journal append: the
+    # resolved id is part of the event identity, and a replay must reproduce the
+    # stored row byte-for-byte rather than re-resolve against a newer alias table.
+    attributed_model, resolution = _attributed_model(model)
+    if resolution not in ("reported", "unresolved"):
+        sample_meta = dict(sample_meta or {})
+        sample_meta.setdefault("model_alias", (model or "").strip())
+        sample_meta.setdefault("model_resolution", resolution)
     meta_json: str | None = None
     if sample_meta is not None:
         try:
@@ -160,7 +224,7 @@ def _write_event(
             meta_json = None
 
     row = {
-        "model": _normalize_model(model),
+        "model": _normalize_model(attributed_model),
         "effort": (effort or None),
         "dimension": str(dimension or DIMENSION_GENERAL),
         "sub_dimension": (sub_dimension or None),
@@ -183,7 +247,7 @@ def _write_event(
         from .learning_journal import KIND_MODEL_QUALITY, append
 
         event_id = append(KIND_MODEL_QUALITY, row, ts=when)
-    write_quality_row(db, row, event_id=event_id, ts=when)
+    return write_quality_row(db, row, event_id=event_id, ts=when)
 
 
 def write_quality_row(
@@ -192,13 +256,22 @@ def write_quality_row(
     *,
     event_id: str | None,
     ts: float,
-) -> None:
+) -> bool:
     """Idempotent insert of one prepared ledger row.
 
     Shared by the live path and the journal replay. ``ON CONFLICT DO NOTHING``
     over the unique ``event_id`` index is what makes replaying a run — or the
     warm-path executor retrying a terminal report that failed partway — leave the
     counts unchanged instead of doubling them.
+
+    One exception, for ``source='outcome'`` only: a conflicting row is UPDATED
+    when the incoming event is at least as new. A host verdict can legitimately
+    change for the same task (``revised`` then ``accepted``), and the journal
+    identity of both is the same task, so plain ``DO NOTHING`` would freeze the
+    FIRST verdict forever. The ``excluded.ts >= ts`` guard makes the result
+    order-independent: a journal replay — in any order — converges on the latest
+    verdict, and replaying an identical event is still a no-op. Every other
+    source keeps ``DO NOTHING`` semantics (the ``WHERE`` is false for them).
     """
     try:
         with db.conn() as conn:
@@ -215,7 +288,13 @@ def write_quality_row(
                 # "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
                 # constraint" — swallowed by the best-effort except below, so
                 # every ledger write would silently vanish.
-                "ON CONFLICT (event_id) WHERE event_id IS NOT NULL DO NOTHING",
+                "ON CONFLICT (event_id) WHERE event_id IS NOT NULL DO UPDATE SET "
+                "score_0_10 = excluded.score_0_10, "
+                "sample_meta = excluded.sample_meta, "
+                "ts = excluded.ts "
+                "WHERE excluded.source = 'outcome' "
+                "AND model_quality_events.source = 'outcome' "
+                "AND excluded.ts >= model_quality_events.ts",
                 (
                     row.get("model"),
                     row.get("effort"),
@@ -236,6 +315,8 @@ def write_quality_row(
             )
     except Exception:  # pragma: no cover - best-effort
         log.debug("model_quality: event insert failed", exc_info=True)
+        return False
+    return True
 
 
 def record_findings_score(
@@ -420,6 +501,8 @@ def record_verify_gate_score(
     tier: str | None = None,
     profile_key: str | None = None,
     spawn_id: str | None = None,
+    kind: str | None = None,
+    ran_signals: Sequence[str] | None = None,
 ) -> None:
     """Record a verify-gate outcome (source='verify_gate').
 
@@ -430,24 +513,109 @@ def record_verify_gate_score(
     becomes the dimension when known, so non-review work gets a real axis instead
     of one flat ``general`` bucket; falls back to ``general`` when the role is
     unresolved.
+
+    ``kind`` (see ``shared/task_kinds.py``) is written to the ``kind`` column so a
+    verify verdict is attributable to what the work was *about*, the axis
+    ``quality_bias.load_kind_quality_bias`` keys on. ``ran_signals`` names the
+    verify signals that actually executed (``lint`` / ``types`` / ``tests``) and
+    is stored in ``sample_meta`` so a reader can tell a pass over three checks
+    from a pass over one. Both are optional; omitted means unknown.
     """
+    meta: dict[str, Any] = {
+        "new_failures": int(new_failure_count),
+        "preexisting_failures": int(preexisting_count),
+    }
+    if ran_signals is not None:
+        meta["ran_signals"] = [str(sig) for sig in ran_signals]
     _write_event(
         db,
         model=model,
         effort=effort,
-        dimension=role.strip().lower() if role and role.strip() else DIMENSION_GENERAL,
+        dimension=_role_dimension(role),
         sub_dimension="verify",
         score_0_10=score_0_10,
         source=SOURCE_VERIFY_GATE,
-        sample_meta={
-            "new_failures": int(new_failure_count),
-            "preexisting_failures": int(preexisting_count),
-        },
+        sample_meta=meta,
         task_hash=task_hash,
         run_id=run_id,
         tier=tier,
         profile_key=profile_key,
         spawn_id=spawn_id,
+        kind=kind,
+    )
+
+
+def _role_dimension(role: str | None) -> str:
+    """Lowercased role as the dimension, ``general`` when the role is unknown."""
+    return role.strip().lower() if role and role.strip() else DIMENSION_GENERAL
+
+
+def outcome_to_score(outcome: str | None) -> float | None:
+    """Map a host verdict to a 0-10 score, ``None`` when it carries no quality signal.
+
+    Case- and whitespace-insensitive. ``tier_overridden`` and any unknown verdict
+    return ``None``: an override says the host disagreed with the routed tier, not
+    that the output was good or bad.
+    """
+    return OUTCOME_SCORES.get(str(outcome or "").strip().lower())
+
+
+def record_outcome_score(
+    db: Database,
+    *,
+    model: str | None,
+    outcome: str,
+    effort: str | None = None,
+    role: str | None = None,
+    kind: str | None = None,
+    tier: str | None = None,
+    task_hash: str | None = None,
+    run_id: str | None = None,
+    attribution: str | None = None,
+) -> bool:
+    """Record the host's verdict on a routed task (source='outcome', a PROXY).
+
+    Returns ``True`` when a row was written, ``False`` when the verdict carries no
+    score (see :func:`outcome_to_score`) or the write failed.
+
+    ``dimension`` is the lowercased ``role`` (falling back to ``general``), the
+    same axis as :func:`record_verify_gate_score`, and ``sub_dimension`` is the
+    literal ``outcome`` so these rows never aggregate into a verify or judge
+    group. ``attribution`` says how the model was resolved (e.g. reported by the
+    host vs inferred from telemetry) and is stored in ``sample_meta`` only.
+
+    Identity / dedup: the journal identity is ``(run_id, spawn_id, source, model,
+    dimension, sub_dimension, task_hash, tier)`` — the verdict value is NOT part
+    of it. So one task has exactly one outcome row, and a later verdict for the
+    same task (``revised`` then ``accepted``) REPLACES the earlier one via the
+    outcome-only upsert in :func:`write_quality_row`: the latest verdict is what
+    counts, and journal replay converges on it regardless of order. ``source``
+    is part of the identity, so an outcome row never collides with a verify row
+    for the same run/task. A call with no ``run_id`` and no ``task_hash`` is
+    unaddressable and is kept as a distinct row (cannot be deduplicated).
+
+    Never feeds routing: ``outcome`` is not in ``OBJECTIVE_SOURCES``, which is
+    the only set ``shared/quality_bias.py`` reads.
+    """
+    score = outcome_to_score(outcome)
+    if score is None:
+        return False
+    return _write_event(
+        db,
+        model=model,
+        effort=effort,
+        dimension=_role_dimension(role),
+        sub_dimension="outcome",
+        score_0_10=score,
+        source=SOURCE_OUTCOME,
+        sample_meta={
+            "outcome": str(outcome).strip().lower(),
+            "attribution": attribution,
+        },
+        task_hash=task_hash,
+        run_id=run_id,
+        tier=tier,
+        kind=kind,
     )
 
 
@@ -728,7 +896,13 @@ def build_quality_snapshot(
         with db.conn() as conn:
             grouped = conn.execute(
                 "SELECT model, effort, dimension, sub_dimension, "
-                "COUNT(*), AVG(score_0_10), MIN(score_0_10), MAX(score_0_10), "
+                # n / avg / min / max exclude the host-verdict proxy: a host
+                # saying "accepted" must not dilute the findings/judge/objective
+                # blend. It is reported on its own as outcome_n / outcome_avg.
+                "SUM(CASE WHEN source != 'outcome' THEN 1 ELSE 0 END), "
+                "AVG(CASE WHEN source != 'outcome' THEN score_0_10 END), "
+                "MIN(CASE WHEN source != 'outcome' THEN score_0_10 END), "
+                "MAX(CASE WHEN source != 'outcome' THEN score_0_10 END), "
                 "SUM(CASE WHEN source='findings' THEN 1 ELSE 0 END), "
                 "SUM(CASE WHEN source='judge' THEN 1 ELSE 0 END), "
                 "SUM(CASE WHEN source IN ('static_recall', 'verify_gate', 'ladder') "
@@ -739,7 +913,9 @@ def build_quality_snapshot(
                 # precision: no judge ever saw them, so they cannot score below 7.
                 "SUM(CASE WHEN source='findings' "
                 "AND json_extract(sample_meta, '$.adjudicated') IS NOT 1 "
-                "THEN 1 ELSE 0 END) "
+                "THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN source='outcome' THEN 1 ELSE 0 END), "
+                "AVG(CASE WHEN source='outcome' THEN score_0_10 END) "
                 "FROM model_quality_events WHERE ts >= ? "
                 "GROUP BY model, effort, dimension, sub_dimension "
                 "ORDER BY model, dimension, sub_dimension",
@@ -764,9 +940,12 @@ def build_quality_snapshot(
         objective_n,
         objective_avg,
         unadjudicated_n,
+        outcome_n,
+        outcome_avg,
     ) in grouped:
         n = int(n or 0)
-        total_events += n
+        outcome_n = int(outcome_n or 0)
+        total_events += n + outcome_n
         if sub_dimension is None:
             scored_outputs += n
         rows_out.append({
@@ -774,8 +953,10 @@ def build_quality_snapshot(
             "effort": effort,
             "dimension": dimension,
             "sub_dimension": sub_dimension,
+            # n counts non-outcome events only, so avg_score is the mean of n.
+            # A group holding only host verdicts has n == 0 and avg_score None.
             "n": n,
-            "avg_score": round(float(avg_score or 0.0), 2),
+            "avg_score": round(float(avg_score), 2) if avg_score is not None else None,
             "min_score": round(float(min_score or 0.0), 2),
             "max_score": round(float(max_score or 0.0), 2),
             "findings_n": int(findings_n or 0),
@@ -789,6 +970,12 @@ def build_quality_snapshot(
             # Of findings_n, how many no adjudicator judged. A row where this equals
             # findings_n reports how much a model found, never how much of it was real.
             "unadjudicated_n": int(unadjudicated_n or 0),
+            # Host-reported verdicts (source='outcome'): a proxy, never ground
+            # truth, and excluded from avg_score and objective_*.
+            "outcome_n": outcome_n,
+            "outcome_avg": (
+                round(float(outcome_avg), 2) if outcome_avg is not None else None
+            ),
             "escalation_rate": esc_rates.get((str(model), effort), 0.0),
         })
 
@@ -807,7 +994,10 @@ def build_quality_snapshot(
             "only the ground-truth sources (static_recall, verify_gate, ladder) and "
             "is the column to trust when objective_n is non-zero. unadjudicated_n "
             "counts findings rows no synthesis agent judged — those measure yield, "
-            "not precision, and cannot score below 7. escalation_rate is approximate."
+            "not precision, and cannot score below 7. outcome_avg is the host's own "
+            "verdict on routed tasks (source='outcome': accepted 10, revised 6, "
+            "reworked 3, rejected 0) — host-reported, not ground truth, and kept out "
+            "of both avg_score and objective_avg. escalation_rate is approximate."
         ),
         "cli_hint": f"threnody quality --since {window_label}",
     }
@@ -827,13 +1017,21 @@ def _build_by_role_facet(db: Database, since_ts: float) -> list[dict[str, Any]]:
             rows = conn.execute(
                 """
                 SELECT t.role, m.model, m.effort,
-                       COUNT(*), AVG(m.score_0_10),
+                       -- Host verdicts (source='outcome') stay out of n/avg here
+                       -- too, same as the main snapshot rows.
+                       SUM(CASE WHEN m.source != 'outcome' THEN 1 ELSE 0 END),
+                       AVG(CASE WHEN m.source != 'outcome' THEN m.score_0_10 END),
                        SUM(CASE WHEN m.source IN ('static_recall','verify_gate','ladder')
                                 THEN 1 ELSE 0 END),
                        AVG(CASE WHEN m.source IN ('static_recall','verify_gate','ladder')
                                 THEN m.score_0_10 END)
                 FROM model_quality_events m
-                JOIN telemetry t ON t.session_id = m.run_id AND t.model = m.model
+                JOIN telemetry t ON t.session_id = m.run_id
+                    -- telemetry keeps the spawned id (often an alias); the
+                    -- ledger stores the concrete id and the alias in sample_meta.
+                    AND (t.model = m.model OR t.model = CASE
+                        WHEN json_valid(m.sample_meta)
+                        THEN json_extract(m.sample_meta, '$.model_alias') END)
                 WHERE m.ts >= ? AND t.role IS NOT NULL AND t.role != ''
                 GROUP BY t.role, m.model, m.effort
                 ORDER BY t.role, m.model
@@ -849,7 +1047,7 @@ def _build_by_role_facet(db: Database, since_ts: float) -> list[dict[str, Any]]:
             "model": r[1],
             "effort": r[2],
             "n": int(r[3] or 0),
-            "avg_score": round(float(r[4] or 0.0), 2),
+            "avg_score": round(float(r[4]), 2) if r[4] is not None else None,
             "objective_n": int(r[5] or 0),
             "objective_avg": round(float(r[6]), 2) if r[6] is not None else None,
         }
@@ -863,10 +1061,13 @@ __all__ = [
     "SOURCE_STATIC_RECALL",
     "SOURCE_VERIFY_GATE",
     "SOURCE_LADDER",
+    "SOURCE_OUTCOME",
     "VALID_SOURCES",
     "OBJECTIVE_SOURCES",
+    "OUTCOME_SCORES",
     "MODEL_UNRESOLVED",
     "DIMENSION_GENERAL",
+    "ledger_model_id",
     "parse_quality_window",
     "findings_to_score",
     "static_recall_to_score",
@@ -874,7 +1075,10 @@ __all__ = [
     "record_static_recall_score",
     "record_verify_gate_score",
     "record_ladder_score",
+    "outcome_to_score",
+    "record_outcome_score",
     "build_min_passing_tier_map",
+    "build_min_passing_tier_by_kind",
     "record_judge_score",
     "build_quality_snapshot",
 ]

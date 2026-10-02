@@ -48,6 +48,7 @@ from shared.config import CONFIG_YAML, TGsConfig, DEFAULT_ROUTING_EXCEPTION_FILE
 from shared.claude_compat import load_claude_module
 from shared.version import get_display_version, get_version
 from shared.context import is_within_repo, normalize_target_path
+from shared.effort_support import default_routed_effort
 from shared.risk_signals import TaskRiskEvidence, collect_task_evidence
 from shared.router import TaskRouter
 from shared.planner import (
@@ -96,6 +97,7 @@ from shared.memory import (
     memory_search,
     memory_set,
 )
+from shared import direct_edit_quality as shared_direct_edit_quality
 from shared import outcomes as shared_outcomes
 from shared.status import build_status_snapshot
 from shared.spend import build_spend_snapshot, build_usage_state
@@ -148,6 +150,7 @@ from shared.host_spawn import (
     build_host_native_required_response,
     build_host_spawn,
     build_host_spawn_waves,
+    tier_subagent_type,
     sanitize_plan_for_host,
     effective_planner_host_execution_mode,
     effective_swarm_host_execution_mode,
@@ -1343,6 +1346,40 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "ladder_plan",
+        "description": (
+            "Plan a host-native graded-ladder sweep: returns the agents (one per "
+            "case x tier) to spawn on the host. Grade each agent's raw file "
+            "content with ladder_grade."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tiers": {"type": "array", "items": {"type": "string", "enum": ["low", "medium", "high"]}},
+                "levels": {"type": "array", "items": {"type": "integer"}},
+                "case_ids": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "ladder_grade",
+        "description": (
+            "Grade file content a host agent produced for a ladder case and record "
+            "it in the model-quality ledger (source='ladder')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "case_id": {"type": "string"},
+                "tier": {"type": "string", "enum": ["low", "medium", "high"]},
+                "model": {"type": "string", "description": "Model the agent actually ran on"},
+                "sweep_id": {"type": "string", "description": "sweep_id returned by ladder_plan"},
+                "content": {"type": "string", "description": "The agent's raw file content"},
+            },
+            "required": ["case_id", "tier", "content", "sweep_id"],
+        },
+    },
+    {
         "name": "execute_subtask",
         "description": (
             "Execute a prompt via the cheapest available AI CLI provider.\n\n"
@@ -2113,6 +2150,13 @@ TOOLS = [
                     "type": "string",
                     "enum": ["low", "medium", "high"],
                     "description": "The tier the work actually ran on",
+                },
+                "actual_model": {
+                    "type": "string",
+                    "description": (
+                        "The model that actually did the work, when it differs from "
+                        "what route_task returned. Used to attribute quality-ledger rows."
+                    ),
                 },
             },
             "required": ["task_id", "outcome"],
@@ -3591,6 +3635,7 @@ def _attach_host_spawn_metadata(
         tier=resolved_tier,
         prompt=prompt,
         model=model,
+        effort=payload.get("reasoning_effort") if isinstance(payload.get("reasoning_effort"), str) else None,
     ).to_dict()
 
 
@@ -4695,7 +4740,45 @@ def _validate_routing_guard(
     )
     if not result.get("valid"):
         _record_guard_override(db, result)
+    else:
+        _record_direct_edit_touch(db, result, caller=caller, cwd=cwd, target_file=target_file)
     return result
+
+
+def _record_direct_edit_touch(
+    db: Database,
+    result: Mapping[str, object],
+    *,
+    caller: str | None,
+    cwd: object | None,
+    target_file: object | None,
+) -> None:
+    """Remember a permitted direct edit under a route_task guard. Never raises.
+
+    Stored in ``direct_edit_touches`` (not ``routing_guard_executions``, which
+    would satisfy routed_plan guards). Plan guards are skipped: they are not
+    route tasks and carry no task id to attribute the edit to.
+    """
+    try:
+        guard = result.get("routing_guard")
+        if not isinstance(guard, Mapping) or guard.get("source_tool") != "route_task":
+            return
+        task_text = str(guard.get("task_text") or "").strip()
+        target = _normalize_path_input(target_file) if target_file is not None else None
+        if not task_text or not target:
+            return
+        norm_cwd = _routing_guard_cwd(cwd)
+        resolved = _safe_resolve_path(normalize_target_path(target, norm_cwd))
+        if not resolved:
+            return
+        db.direct_edit_touch_record(
+            task_id=shared_outcomes.route_task_id(task_text),
+            caller=_normalize_route_text(caller) or "mcp",
+            cwd=norm_cwd,
+            file_path=resolved,
+        )
+    except Exception:
+        log.debug("direct edit touch record failed", exc_info=True)
 
 
 def _record_guard_override(db: Database, result: Mapping[str, object]) -> None:
@@ -5077,6 +5160,7 @@ def _build_route_execution_hint(
     caller_allowlists: dict[str, list[str]] | None,
     selection: dict[str, object] | None = None,
     config: TGsConfig | None = None,
+    effort: str | None = None,
 ) -> dict[str, object]:
     normalized_caller = normalize_caller_id(caller)
     delegation_targets = _delegation_targets_for_tier(
@@ -5092,6 +5176,14 @@ def _build_route_execution_hint(
     )
     host_native_method = _host_native_method_for_tier(tier)
 
+    # Claude Code has no per-call effort parameter: the routed effort rides on the
+    # subagent definition, so name it for the host to pass verbatim.
+    host_subagent_type = (
+        tier_subagent_type(caller, tier, effort)
+        if host_native and normalized_caller == "claude-code"
+        else None
+    )
+
     if host_native:
         if tier == "low":
             recommended = (
@@ -5102,6 +5194,11 @@ def _build_route_execution_hint(
         else:
             recommended = (
                 f"Spawn host Task agent with model='{host_native_model}'"
+                + (
+                    f", subagent_type='{host_subagent_type}'"
+                    if host_subagent_type
+                    else ""
+                )
                 if host_native_model
                 else {
                     "medium": "Spawn a host Task agent (e.g. sonnet-class model)",
@@ -5131,6 +5228,8 @@ def _build_route_execution_hint(
         }
         if host_native_model:
             payload["host_native_model"] = host_native_model
+        if host_subagent_type:
+            payload["subagent_type"] = host_subagent_type
         return payload
 
     if delegation_targets:
@@ -5192,6 +5291,41 @@ def _route_quick_action(
     }.get(tier, "→ proceed per tier guidance")
 
 
+def _finalize_previous_route_guard(
+    db: Database,
+    config: TGsConfig,
+    *,
+    caller: str | None,
+    cwd: object | None,
+    new_task_id: str,
+) -> None:
+    """Score the previous route_task's direct edits before its guard is replaced.
+
+    The next route_task for the same (caller, cwd) is the earliest point we know
+    the previous task is over when the host never reports an outcome. Best-effort.
+    """
+    try:
+        prev = db.routing_guard_get(
+            caller=_normalize_route_text(caller) or "mcp",
+            cwd=_routing_guard_cwd(cwd),
+        )
+        if not isinstance(prev, Mapping) or prev.get("source_tool") != "route_task":
+            return
+        prev_text = str(prev.get("task_text") or "").strip()
+        if not prev_text:
+            return
+        prev_id = shared_outcomes.route_task_id(prev_text)
+        if prev_id == new_task_id:
+            return
+        if not db.direct_edit_touches(prev_id):
+            return  # outcome=None and no edits: nothing to score, skip the thread hop
+        shared_direct_edit_quality.schedule_finalize(
+            db, prev_id, config=config, outcome=None, caller=caller, task_text=prev_text
+        )
+    except Exception:
+        log.debug("previous route guard finalize failed", exc_info=True)
+
+
 def handle_route_task(args: dict) -> dict:
     config, db, router, planner, orchestrator = _ensure_init()
     task = args.get("task", "")
@@ -5243,6 +5377,7 @@ def handle_route_task(args: dict) -> dict:
         caller_allowlists=caller_allowlists,
         selection=selection if isinstance(selection, dict) else None,
         config=config,
+        effort=getattr(decision, "reasoning_effort", None),
     )
     execution_mode = str(execution_hint.get("mode") or "")
     host_model = execution_hint.get("host_native_model")
@@ -5321,12 +5456,18 @@ def handle_route_task(args: dict) -> dict:
         if isinstance(existing_guard, Mapping):
             result["routing_guard"] = dict(existing_guard)
     else:
+        _finalize_previous_route_guard(db, config, caller=caller, cwd=args.get("cwd"), new_task_id=task_id)
         guard = _issue_routing_guard(
             db,
             caller=caller,
             cwd=args.get("cwd"),
             task=task,
             source_tool="route_task",
+            file_hints=(
+                _resolve_route_target_files(args.get("target_files"), task, project_path)
+                if args.get("target_files")
+                else None
+            ),
             mode=_route_guard_mode_for_route(
                 task=task,
                 tier=decision.tier,
@@ -7457,6 +7598,43 @@ def handle_cache_put(args: dict) -> dict:
     return {"stored": True}
 
 
+def handle_ladder_plan(args: dict) -> dict:
+    from shared import ladder as shared_ladder
+
+    config = _ensure_init()[0]
+    kwargs: dict[str, object] = {"caller": _resolve_caller(), "config": config}
+    if isinstance(args.get("tiers"), list) and args["tiers"]:
+        kwargs["tiers"] = [str(t) for t in args["tiers"]]
+    if isinstance(args.get("levels"), list) and args["levels"]:
+        kwargs["levels"] = [int(v) for v in args["levels"]]
+    if isinstance(args.get("case_ids"), list) and args["case_ids"]:
+        kwargs["case_ids"] = [str(c) for c in args["case_ids"]]
+    try:
+        return shared_ladder.plan_host_ladder(**kwargs)
+    except (TypeError, ValueError) as exc:
+        return {"error": "invalid_request", "details": str(exc)}
+
+
+def handle_ladder_grade(args: dict) -> dict:
+    from shared import ladder as shared_ladder
+
+    for key in ("case_id", "tier", "sweep_id"):
+        if not isinstance(args.get(key), str) or not args[key].strip():
+            return {"error": "invalid_request", "details": f"{key} is required"}
+    if not isinstance(args.get("content"), str):
+        return {"error": "invalid_request", "details": "content is required"}
+    _config, db, *_ = _ensure_init()
+    model = args.get("model")
+    return shared_ladder.grade_host_output(
+        db,
+        case_id=args["case_id"].strip(),
+        tier=args["tier"].strip(),
+        content=args["content"],
+        model=model if isinstance(model, str) and model.strip() else None,
+        sweep_id=args["sweep_id"].strip(),
+    )
+
+
 def handle_cache_stats(_args: dict) -> dict:
     try:
         _, db, *_ = _ensure_init()
@@ -7466,18 +7644,24 @@ def handle_cache_stats(_args: dict) -> dict:
 
 
 def _resolve_caller() -> str | None:
-    """Determine which provider is hosting us, preferring host env markers over clientInfo."""
+    """Determine which provider is hosting us.
+
+    An explicit, recognised MCP clientInfo name wins: it is what the connecting
+    client says it is, whereas env markers (CLAUDECODE, ...) are inherited and
+    can describe a parent process (a codex server launched from a Claude Code
+    shell). Env detection is the fallback when clientInfo is absent/unrecognised.
+    """
     env_caller = detect_caller()
     client_caller = caller_from_client_name(_client_name)
-    if env_caller:
-        if client_caller and client_caller != env_caller:
+    if client_caller:
+        if env_caller and client_caller != env_caller:
             log.warning(
-                "MCP caller detection conflict: clientInfo=%s env=%s; using env marker",
+                "MCP caller detection conflict: clientInfo=%s env=%s; using clientInfo",
                 client_caller,
                 env_caller,
             )
-        return env_caller
-    return client_caller
+        return client_caller
+    return env_caller
 
 
 def _register_shell_adapters(registry: object) -> None:
@@ -9458,9 +9642,16 @@ def handle_record_outcome(args: dict) -> dict:
             "details": "note must be a string when provided",
         }
 
+    actual_model = args.get("actual_model")
+    if actual_model is not None and not isinstance(actual_model, str):
+        return {
+            "error": "invalid_request",
+            "details": "actual_model must be a string when provided",
+        }
+
     try:
         _config, db, *_ = _ensure_init()
-        return shared_outcomes.record_outcome(
+        recorded = shared_outcomes.record_outcome(
             db,
             raw_task_id,
             normalized_outcome,
@@ -9470,6 +9661,16 @@ def handle_record_outcome(args: dict) -> dict:
             routed_tier=args.get("routed_tier"),
             actual_tier=args.get("actual_tier"),
         )
+        shared_direct_edit_quality.schedule_finalize(
+            db,
+            raw_task_id.strip(),
+            config=_config,
+            outcome=normalized_outcome,
+            actual_model=(actual_model or "").strip() or None,
+            actual_tier=args.get("actual_tier"),
+            caller=_resolve_caller(),
+        )
+        return recorded
     except shared_outcomes.OutcomeReadonlyWindowError as exc:
         return {"error": "readonly_window_expired", "details": str(exc)}
     except ValueError as exc:
@@ -10736,6 +10937,7 @@ def handle_execute_subtask(args: dict) -> dict:
                     caller=routing_caller,
                     code_only=code_only,
                     effort=effort,
+                    routed_effort=default_routed_effort(tier),
                     caller_allowlists=caller_allowlists,
                     on_pid=lambda pid: _store_active_pid(task_id, pid, cancel_event),
                     delegation_only=True,
@@ -12431,6 +12633,8 @@ HANDLERS = {
     "cache_get":      handle_cache_get,
     "cache_put":      handle_cache_put,
     "cache_stats":    handle_cache_stats,
+    "ladder_plan":    handle_ladder_plan,
+    "ladder_grade":   handle_ladder_grade,
     "execute_subtask": handle_execute_subtask,
     "execute_swarm": handle_execute_swarm,
     "report_host_wave": handle_report_host_wave,

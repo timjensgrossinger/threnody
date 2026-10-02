@@ -60,6 +60,7 @@ from .planner import (
     validate_single_coordinator_per_wave,
     validate_topology,
 )
+from .effort_support import default_routed_effort, subprocess_effort_supported
 from .consensus import (
     build_judge_prompt,
     build_queen_prompt,
@@ -1178,7 +1179,10 @@ class Orchestrator:
             subtask.id, current_tier, next_tier, reason, token_count, next_model,
         )
         retry_subtask = replace(subtask, tier=next_tier)
-        output = self._call_provider_execute(chosen_provider, retry_subtask, next_model, timeout)
+        output = self._call_provider_execute(
+            chosen_provider, retry_subtask, next_model, timeout,
+            effort=self._applied_effort(chosen_provider, retry_subtask, next_tier, next_model),
+        )
         if output is None:
             output = "(no output)"
         return output, next_tier, next_model
@@ -1186,6 +1190,7 @@ class Orchestrator:
     @staticmethod
     def _call_provider_execute(
         provider: "Provider", subtask: Subtask, model: str, timeout: int,
+        effort: str | None = None,
     ) -> str | None:
         """Call ``provider.execute`` with or without ``timeout``, matching its real signature.
 
@@ -1203,10 +1208,14 @@ class Orchestrator:
                 p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values()
             )
         except (TypeError, ValueError):
+            params = {}
             accepts_timeout = True  # introspection failed — assume the common case
+        kwargs: dict[str, str] = {}
+        if effort and "effort" in params:
+            kwargs["effort"] = effort
         if accepts_timeout:
-            return provider.execute(subtask, model, timeout)
-        return provider.execute(subtask, model)
+            return provider.execute(subtask, model, timeout, **kwargs)
+        return provider.execute(subtask, model, **kwargs)
 
     def _check_output_quality_for_retry(self, output: str) -> str | None:
         """Return a failure reason string if *output* fails quality checks, else ``None``."""
@@ -1241,22 +1250,69 @@ class Orchestrator:
 
         return None
 
-    def _effort_for_subtask(self, subtask: Subtask, tier: str) -> str | None:
+    def _effort_for_subtask(
+        self, subtask: Subtask, tier: str, provider: "Provider | None" = None
+    ) -> str | None:
         """Best-effort resolve the effort string applied for this subtask+tier.
 
-        Uses the operator-configured per-provider x tier default (the value the
-        subprocess execution path actually applies as ``--effort``). Returns
-        ``None`` when unconfigured or the provider id is unknown — we never guess
-        from a class-name fallback, since that is not a valid effort-config key.
+        Precedence: operator-configured per-provider x tier default (an explicit
+        pin), then the subtask's routed effort (``reasoning_effort`` when the
+        subtask carries a valid one, else derived from tier + duration bucket via
+        ``router.reasoning_params_for``), else ``None``. The routed step applies
+        only to providers whose subprocess flag is verified. ``None`` also when the
+        provider id is unknown — we never guess from a class-name fallback, since
+        that is not a valid effort-config key.
         """
-        provider_id = getattr(subtask, "provider_id", None)
+        provider_id = getattr(subtask, "provider_id", None) or getattr(
+            provider, "effort_provider_id", None
+        )
         if not provider_id:
             return None
         try:
-            return self._config.get_default_effort(str(provider_id), tier)
+            pinned = self._config.get_default_effort(str(provider_id), tier)
         except Exception:  # pragma: no cover - best-effort
             log.debug("effort resolve failed", exc_info=True)
+            pinned = None
+        if pinned:
+            return pinned
+        if not subprocess_effort_supported(str(provider_id)):
             return None
+        explicit = str(getattr(subtask, "reasoning_effort", "") or "").strip().lower()
+        if explicit in {"low", "medium", "high"}:
+            return explicit
+        duration = getattr(subtask, "expected_duration_bucket", None)
+        return default_routed_effort(tier, duration if isinstance(duration, str) else None)
+
+    @staticmethod
+    def _provider_accepts_effort(provider: "Provider") -> bool:
+        try:
+            params = inspect.signature(provider.execute).parameters
+        except (TypeError, ValueError):
+            return False
+        return "effort" in params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+
+    def _applied_effort(
+        self, provider: "Provider", subtask: Subtask, tier: str, model: str | None = None
+    ) -> str | None:
+        """The effort ``provider.execute`` will actually put on the CLI, else None.
+
+        Telemetry and escalation rows record this, never the merely requested value:
+        a provider whose ``execute`` takes no ``effort`` (or whose chosen route
+        drops it, per ``effort_applied_for``) applied nothing.
+        """
+        if not self._provider_accepts_effort(provider):
+            return None
+        gate = getattr(provider, "effort_applied_for", None)
+        if callable(gate) and model is not None:
+            try:
+                if not gate(model):
+                    return None
+            except Exception:  # pragma: no cover - best-effort
+                log.debug("effort_applied_for failed", exc_info=True)
+                return None
+        return self._effort_for_subtask(subtask, tier, provider)
 
     def _log_escalation_event(
         self,
@@ -1294,7 +1350,9 @@ class Orchestrator:
                 ceiling=ceiling,
                 from_model=from_model or None,
                 to_model=to_model or None,
-                effort=self._effort_for_subtask(subtask, from_tier),
+                effort=self._applied_effort(
+                    provider_override or self._provider, subtask, from_tier, from_model
+                ),
                 reason=reason,
             )
         except Exception:  # pragma: no cover - best-effort
@@ -1438,7 +1496,15 @@ class Orchestrator:
                     escalated=escalated,
                     success=success_actual,
                     used_speculation=True,
-                    effort=self._effort_for_subtask(subtask, spec_tier),
+                    # The speculative executor itself never passes effort; only an
+                    # escalation retry (a different tier) went through the provider.
+                    effort=(
+                        None
+                        if spec_tier == spec_result.tier_used
+                        else self._applied_effort(
+                            provider_override or self._provider, subtask, spec_tier, spec_model
+                        )
+                    ),
                     role=getattr(subtask, "role", None),
                 )
 
@@ -1449,7 +1515,10 @@ class Orchestrator:
 
         chosen_provider = provider_override or self._provider
         # Provider.execute may accept different signatures depending on adapter
-        output = self._call_provider_execute(chosen_provider, enriched, model, timeout)
+        output = self._call_provider_execute(
+            chosen_provider, enriched, model, timeout,
+            effort=self._applied_effort(chosen_provider, enriched, enriched.tier, model),
+        )
 
         # Meaningfully empty (None or whitespace-only) counts as failure too —
         # an empty string used to read as success (token_count=0, no ceiling
@@ -1583,7 +1652,7 @@ class Orchestrator:
             provider_name=provider_name,
             escalated=escalated,
             success=success_actual,
-            effort=self._effort_for_subtask(subtask, current_tier),
+            effort=self._applied_effort(chosen_provider, subtask, current_tier, model),
             role=getattr(subtask, "role", None),
         )
 

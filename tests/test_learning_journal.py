@@ -314,7 +314,7 @@ def test_review_quality_rows_carry_tier_and_profile_key(
         ).fetchall()
     assert rows, "review path wrote no ledger rows"
     for source, model, tier, profile_key, spawn_id in rows:
-        assert model == "opus", source
+        assert model == mq.ledger_model_id("opus"), source
         assert tier == "high", f"{source} row lost the tier"
         assert profile_key and profile_key.startswith(".py|"), f"{source}: {profile_key}"
         assert spawn_id == "7", source

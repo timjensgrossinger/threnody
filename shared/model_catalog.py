@@ -14,6 +14,7 @@ from .db import Database
 from .discovery import CLIProvider, DetectReason, ProviderReadiness, ProviderRegistry
 from .model_registry import (
     DiscoveredModel,
+    DiscoveryResult,
     assign_provider_relative_tiers,
     bootstrap_models,
     normalize_models,
@@ -251,7 +252,6 @@ class ModelCatalog:
 
     def _project_provider_catalog(self, provider: CLIProvider) -> None:
         rows = self.get(provider.name)
-        provider.model_catalog = rows
         models = [
             DiscoveredModel.from_dict({
                 "model_id": row["model_id"],
@@ -274,41 +274,43 @@ class ModelCatalog:
             })
             for row in rows
         ]
-        projected_tiers = tier_projection(models)
-        allowed_tiers = (
-            set(provider.allowed_auto_route_tiers)
-            if provider.allowed_auto_route_tiers is not None
-            else None
-        )
-        if allowed_tiers is not None:
-            operator_pinned_tiers = {
-                model.tier
-                for model in models
-                if model.tier_reason == "operator_pin" and model.tier is not None
-            }
-            effective_tiers = allowed_tiers | operator_pinned_tiers
-            projected_tiers = {
-                tier: model_id
-                for tier, model_id in projected_tiers.items()
-                if tier in effective_tiers
-            }
-            for row in provider.model_catalog:
-                row["auto_routeable"] = bool(
-                    row.get("auto_routeable", False)
-                    and (
-                        row.get("tier") in allowed_tiers
-                        or row.get("tier_reason") == "operator_pin"
-                    )
-                )
-            provider.cost_rank = {
-                tier: rank
-                for tier, rank in provider.cost_rank.items()
-                if tier in effective_tiers
-            }
+        apply_catalog_projection(provider, models, rows)
 
-        provider.tier_models = projected_tiers
-        for tier in projected_tiers:
-            provider.cost_rank.setdefault(tier, 1)
+    def _catalog_last_seen(self, provider: str) -> float:
+        with self._db.conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(last_seen), 0) FROM model_catalog WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
+    def _newer_official_cache(self, provider: CLIProvider) -> DiscoveryResult | None:
+        """A CLI-owned cache written after this catalog was, else ``None``.
+
+        TTL alone is not a freshness signal: Codex rewrites its cache when its
+        model list changes, and a catalog refreshed an hour before that would
+        keep routing to the old list for the rest of the TTL.
+        """
+        adapter = getattr(provider, "model_discovery_adapter", None)
+        if adapter is None:
+            return None
+        try:
+            cached = adapter.discover_official_cache()
+        except (OSError, ValueError, json.JSONDecodeError):
+            log.debug("%s: official cache probe failed", provider.name, exc_info=True)
+            return None
+        if cached is None or not cached.models:
+            return None
+        # last_seen is stored as whole seconds; the slack stops a cache fetched
+        # in the same second as the refresh from re-triggering every pass.
+        if cached.discovered_at <= self._catalog_last_seen(provider.name) + 1:
+            return None
+        # Live discovery outranks the CLI cache; only a catalog that came from
+        # this cache (or from bootstrap) may be superseded by a newer copy of it.
+        sources = {row.get("source") for row in self.get(provider.name)}
+        if not sources <= {cached.source, "bootstrap"}:
+            return None
+        return cached
 
     @staticmethod
     def _parse_model_discovery_output(provider: "CLIProvider", raw: str) -> dict[str, list[str]]:
@@ -406,20 +408,14 @@ class ModelCatalog:
             models = normalize_models(provider, discovered_models, source=source)
         else:
             current = self.get(provider)
-            if current:
+            # A catalog that is itself bootstrap is not last-known-good evidence:
+            # keeping it froze the bootstrap ids written on first run (this
+            # install still routed Copilot high to a 62-day-old row) no matter
+            # how often BOOTSTRAP_REGISTRY was corrected. Re-seed it instead.
+            if current and any(row.get("source") != "bootstrap" for row in current):
                 return
             models = bootstrap_models(provider)
-        prices = _load_price_data()
-        for model in models:
-            price_info = prices.get(model.model_id, {})
-            if model.input_price_per_million is None:
-                raw_price = price_info.get("input_cost_per_token")
-                if isinstance(raw_price, (int, float)):
-                    model.input_price_per_million = float(raw_price) * 1_000_000
-            if model.output_price_per_million is None:
-                raw_price = price_info.get("output_cost_per_token")
-                if isinstance(raw_price, (int, float)):
-                    model.output_price_per_million = float(raw_price) * 1_000_000
+        _enrich_prices(models)
         assign_provider_relative_tiers(models, pins=self._user_overrides)
         now = int(time.time())
         stale_until = now + self._stale_ttl_seconds
@@ -502,6 +498,17 @@ class ModelCatalog:
                 continue
 
             if count > 0 and stale_until > now:
+                newer = self._newer_official_cache(provider)
+                if newer is not None:
+                    self.refresh(
+                        provider.name,
+                        [model.to_dict() for model in newer.models],
+                        source=newer.source,
+                    )
+                    self._project_provider_catalog(provider)
+                    self._mark_provider_ready(provider, checked_at=now)
+                    results["refreshed"].append(provider.name)
+                    continue
                 self._project_provider_catalog(provider)
                 results["skipped"].append(provider.name)
                 continue
@@ -524,10 +531,16 @@ class ModelCatalog:
                     pass
                 try:
                     cached = adapter.discover_official_cache()
+                    # An old cache still beats an older LKG (or bootstrap): it is
+                    # what the CLI itself would offer, and what a fresh process
+                    # projects via project_official_cache().
                     if (
                         cached is not None
                         and cached.models
-                        and now - cached.discovered_at <= self._stale_ttl_seconds
+                        and (
+                            now - cached.discovered_at <= self._stale_ttl_seconds
+                            or cached.discovered_at > self._catalog_last_seen(provider.name) + 1
+                        )
                     ):
                         self.refresh(
                             provider.name,
@@ -664,3 +677,128 @@ class ModelCatalog:
     def is_auto_routeable(self, model_id: str) -> bool:
         ranked = rank_models_with_price_data([{"model_id": model_id}])
         return bool(ranked and ranked[0]["auto_routeable"])
+
+def project_official_cache(
+    provider: CLIProvider,
+    *,
+    stale_ttl_seconds: int | None = None,
+    user_overrides: dict[str, str] | None = None,
+) -> bool:
+    """Project a provider's CLI-owned model cache onto ``provider.tier_models``.
+
+    For processes that never run :meth:`ModelCatalog.refresh_all` (operator CLIs,
+    ``threnody ladder``, the routing hook). Without it those resolved Codex to
+    the bootstrap ids while the MCP server routed on the catalog, so two
+    processes on one machine disagreed about which model a tier means. Same
+    pipeline as the persisted path — price enrichment, provider-relative tiers,
+    :func:`apply_catalog_projection`. Reads a file only; never executes anything
+    and never opens the DB. Returns ``True`` when applied.
+
+    No age limit by default: once its TTL passes, the server keeps routing on the
+    last-known-good catalog it built from this same file, so rejecting an old
+    cache here would put the two processes back on different models.
+    """
+    adapter = getattr(provider, "model_discovery_adapter", None)
+    if adapter is None:
+        return False
+    try:
+        cached = adapter.discover_official_cache()
+    except (OSError, ValueError, json.JSONDecodeError):
+        log.debug("%s: official cache unreadable", provider.name, exc_info=True)
+        return False
+    if cached is None or not cached.models:
+        return False
+    if stale_ttl_seconds is not None and time.time() - cached.discovered_at > stale_ttl_seconds:
+        return False
+    models = normalize_models(
+        provider.name,
+        [model.to_dict() for model in cached.models],
+        source=cached.source,
+    )
+    _enrich_prices(models)
+    assign_provider_relative_tiers(models, pins=user_overrides or {})
+    if not tier_projection(models):
+        # Nothing routeable (e.g. every entry hidden): keep bootstrap rather than
+        # leave the provider with no tier at all.
+        return False
+    rows = [
+        {
+            "model_id": model.model_id,
+            "provider": provider.name,
+            "tier": model.tier or "unknown",
+            "cost": model.input_price_per_million,
+            "source": model.discovery_source,
+            "auto_routeable": model.routeable,
+            **{
+                key: value
+                for key, value in model.to_dict().items()
+                if key not in {"model_id", "tier", "discovery_source"}
+            },
+        }
+        for model in models
+    ]
+    apply_catalog_projection(provider, models, rows)
+    return bool(provider.tier_models)
+
+
+def _enrich_prices(models: list[DiscoveredModel]) -> None:
+    prices = _load_price_data()
+    for model in models:
+        price_info = prices.get(model.model_id, {})
+        if model.input_price_per_million is None:
+            raw_price = price_info.get("input_cost_per_token")
+            if isinstance(raw_price, (int, float)):
+                model.input_price_per_million = float(raw_price) * 1_000_000
+        if model.output_price_per_million is None:
+            raw_price = price_info.get("output_cost_per_token")
+            if isinstance(raw_price, (int, float)):
+                model.output_price_per_million = float(raw_price) * 1_000_000
+
+
+def apply_catalog_projection(
+    provider: CLIProvider,
+    models: list[DiscoveredModel],
+    rows: list[dict[str, Any]],
+) -> None:
+    """Set ``provider.tier_models`` / ``model_catalog`` / ``cost_rank`` from *models*.
+
+    The single place a catalog becomes routing state, shared by the persisted
+    path (``ModelCatalog._project_provider_catalog``) and the file-only path
+    (:func:`project_official_cache`) so both resolve a tier identically.
+    """
+    provider.model_catalog = rows
+    projected_tiers = tier_projection(models)
+    allowed_tiers = (
+        set(provider.allowed_auto_route_tiers)
+        if provider.allowed_auto_route_tiers is not None
+        else None
+    )
+    if allowed_tiers is not None:
+        operator_pinned_tiers = {
+            model.tier
+            for model in models
+            if model.tier_reason == "operator_pin" and model.tier is not None
+        }
+        effective_tiers = allowed_tiers | operator_pinned_tiers
+        projected_tiers = {
+            tier: model_id
+            for tier, model_id in projected_tiers.items()
+            if tier in effective_tiers
+        }
+        for row in provider.model_catalog:
+            row["auto_routeable"] = bool(
+                row.get("auto_routeable", False)
+                and (
+                    row.get("tier") in allowed_tiers
+                    or row.get("tier_reason") == "operator_pin"
+                )
+            )
+        provider.cost_rank = {
+            tier: rank
+            for tier, rank in provider.cost_rank.items()
+            if tier in effective_tiers
+        }
+
+    provider.tier_models = projected_tiers
+    for tier in projected_tiers:
+        provider.cost_rank.setdefault(tier, 1)

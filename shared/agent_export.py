@@ -3,10 +3,12 @@ from __future__ import annotations
 """Export approved learned agent definitions as provider-native skill files."""
 
 import argparse
+import json
 import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .config import DB_PATH, TGsConfig
 from .db import Database
@@ -399,6 +401,131 @@ def export_review_definitions(
                 errors.append({"provider": pid, "dimension": dim.key, "reason": str(exc)})
 
     return {"written": written, "skipped": skipped, "errors": errors}
+
+
+TIER_EFFORT_LEVELS = ("low", "medium", "high")
+_TIER_NAMES = ("low", "medium", "high")
+
+
+def export_tier_effort_variants(source_dir: Path, target_dir: Path) -> list[Path]:
+    """Generate ``threnody-<tier>-<effort>.md`` from each ``threnody-<tier>.md``.
+
+    Claude Code's Agent tool has no per-call effort parameter, but subagent
+    frontmatter supports ``effort:``. One definition per (tier, effort) pair lets
+    ``host_spawn`` pin the routed reasoning effort via ``subagent_type``. These are
+    Threnody-owned generated files, so overwriting is intended. A source without
+    frontmatter is skipped.
+    """
+    written: list[Path] = []
+    for tier in _TIER_NAMES:
+        src = source_dir / f"threnody-{tier}.md"
+        if not src.is_file():
+            continue
+        try:
+            text = src.read_text(encoding="utf-8")
+        except OSError:
+            log.debug("tier variant source unreadable: %s", src, exc_info=True)
+            continue
+        lines = text.split("\n")
+        if not lines or lines[0].strip() != "---":
+            continue
+        try:
+            end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+        except StopIteration:
+            continue
+        for effort in TIER_EFFORT_LEVELS:
+            out = list(lines)
+            fm: list[str] = []
+            for line in lines[1:end]:
+                if line.startswith("name:"):
+                    line = f"name: threnody-{tier}-{effort}"
+                elif line.startswith("description:"):
+                    line = f"{line.rstrip()} (effort {effort})"
+                fm.append(line)
+                if line.startswith("model:"):
+                    fm.append(f"effort: {effort}")
+            out[1:end] = fm
+            target_dir.mkdir(parents=True, exist_ok=True)
+            dest = target_dir / f"threnody-{tier}-{effort}.md"
+            try:
+                dest.write_text("\n".join(out), encoding="utf-8")
+            except OSError:
+                log.debug("tier variant write failed: %s", dest, exc_info=True)
+                continue
+            written.append(dest)
+    return written
+
+
+def _toml_str(value: str) -> str:
+    """TOML basic string. ``json.dumps`` is nearly TOML-compatible, but its default
+    ASCII mode emits surrogate-pair escapes TOML rejects, and it leaves DEL raw."""
+    out = json.dumps(value, ensure_ascii=False)
+    return out.replace("\x7f", "\\u007f")
+
+
+def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        return {}, text
+    meta: dict[str, str] = {}
+    for line in lines[1:end]:
+        key, sep, val = line.partition(":")
+        if sep:
+            meta[key.strip()] = val.strip()
+    return meta, "\n".join(lines[end + 1:]).strip("\n")
+
+
+def export_codex_tier_agents(target_dir: Path, config: Any, source_dir: Path | None = None) -> list[Path]:
+    """Generate Codex custom agents ``threnody-<tier>[-<effort>].toml``.
+
+    Codex reads ``~/.codex/agents/*.toml`` (required: ``name``, ``description``,
+    ``developer_instructions``; optional ``model``, ``model_reasoning_effort``).
+    Writes a base agent per tier (no effort key) plus one variant per effort level.
+    Only ``threnody-*`` files are written, so a user's own agents are never touched.
+    """
+    from .host_spawn import host_native_model_for_tier
+
+    src_dir = source_dir or (Path(__file__).resolve().parent.parent / "shell" / "agents")
+    written: list[Path] = []
+    for tier in _TIER_NAMES:
+        src = src_dir / f"threnody-{tier}.md"
+        try:
+            meta, body = _split_frontmatter(src.read_text(encoding="utf-8"))
+        except OSError:
+            log.debug("codex tier source unreadable: %s", src, exc_info=True)
+            continue
+        if not body.strip():
+            continue
+        try:
+            model = host_native_model_for_tier(config, "codex", tier)
+        except Exception:
+            log.debug("codex tier model lookup failed for %s", tier, exc_info=True)
+            model = None
+        desc = meta.get("description") or f"Threnody {tier}-tier host subagent"
+        for effort in (None, *TIER_EFFORT_LEVELS):
+            name = f"threnody-{tier}" if effort is None else f"threnody-{tier}-{effort}"
+            lines = [
+                f"name = {_toml_str(name)}",
+                f"description = {_toml_str(desc if effort is None else f'{desc} (effort {effort})')}",
+            ]
+            if model:
+                lines.append(f"model = {_toml_str(model)}")
+            if effort:
+                lines.append(f"model_reasoning_effort = {_toml_str(effort)}")
+            lines.append(f"developer_instructions = {_toml_str(body)}")
+            dest = target_dir / f"{name}.toml"
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError:
+                log.debug("codex tier agent write failed: %s", dest, exc_info=True)
+                continue
+            written.append(dest)
+    return written
 
 
 def export_all_active(

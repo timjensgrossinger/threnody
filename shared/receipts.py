@@ -3,13 +3,31 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import time
 from hashlib import sha256
 from typing import Any, Mapping
 
 from .db import Database
 
+log = logging.getLogger(__name__)
+
 _TIER_TOKEN_BUDGETS = {"low": 2000, "medium": 8000, "high": 20000}
+
+
+def _derived_label(which: str, task: str) -> str:
+    """Role (shared/roles.py) or task kind (shared/task_kinds.py) of ``task``; "" on failure."""
+    try:
+        if which == "role":
+            from .roles import derive_role_from_task
+
+            return derive_role_from_task(task) or ""
+        from .task_kinds import derive_kind_from_task
+
+        return derive_kind_from_task(task) or ""
+    except Exception:
+        log.debug("receipt: %s derivation failed", which, exc_info=True)
+        return ""
 
 
 def _model_price_known(model: str | None) -> bool:
@@ -199,6 +217,10 @@ def build_run_receipt_payload(
         "created_ts": time.time(),
         "workspace_root": workspace_root,
         "task_hash": sha256(task.encode("utf-8")).hexdigest()[:16],
+        # Derived labels only (never the prose): direct_edit_quality needs the
+        # role/kind of a route task long after its routing guard was replaced.
+        "task_role": _derived_label("role", task),
+        "task_kind": _derived_label("kind", task),
         "status": payload.get("status") or payload.get("host_execution_mode") or "planned",
         "topology": payload.get("topology") or (plan.get("topology") if isinstance(plan, Mapping) else None),
         "plan": {

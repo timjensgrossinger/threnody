@@ -613,3 +613,142 @@ def test_instruction_tax_report_is_per_host_and_thresholded(tmp_path) -> None:
     assert instruction_tax_report(
         config, workspace_root=str(tmp_path), agent_count=15, caller="mystery-shell"
     ) is None
+
+
+# --- effort variants ---------------------------------------------------------
+
+
+def _agents_dir(monkeypatch, tmp_path, *names: str):
+    import shared.host_spawn as hs
+
+    d = tmp_path / "agents"
+    d.mkdir()
+    for n in names:
+        (d / f"{n}.md").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(hs, "claude_agents_dir", lambda: d)
+
+
+def test_effort_variant_chosen_when_installed(monkeypatch, tmp_path) -> None:
+    _agents_dir(monkeypatch, tmp_path, "threnody-medium-high")
+    spec = build_host_spawn(
+        config=TGsConfig.defaults(), caller="claude-code", tier="medium",
+        prompt="do it", effort="high",
+    )
+    assert spec.subagent_type == "threnody-medium-high"
+    assert spec.to_dict()["effort"] == "high"
+    assert spec.to_dict()["requested_effort"] == "high"
+
+
+def test_effort_variant_falls_back_when_missing(monkeypatch, tmp_path) -> None:
+    _agents_dir(monkeypatch, tmp_path)
+    spec = build_host_spawn(
+        config=TGsConfig.defaults(), caller="claude-code", tier="medium",
+        prompt="do it", effort="high",
+    )
+    assert spec.subagent_type == "threnody-medium"
+    # Requested but not applied: the ledger must not claim an effort never pinned.
+    assert spec.effort is None
+    d = spec.to_dict()
+    assert "effort" not in d
+    assert d["requested_effort"] == "high"
+
+
+def test_effort_variant_not_used_for_other_callers(monkeypatch, tmp_path) -> None:
+    import shared.host_spawn as hs
+
+    _agents_dir(monkeypatch, tmp_path, "threnody-medium-high")
+    monkeypatch.setattr(hs, "codex_agents_dir", lambda: tmp_path / "no-codex")
+    # junie has no host-native effort support at all; codex has no file installed.
+    for caller in ("codex", "junie"):
+        spec = build_host_spawn(
+            config=TGsConfig.defaults(), caller=caller, tier="medium",
+            prompt="do it", effort="high",
+        )
+        assert spec.subagent_type == "threnody-medium"
+        assert spec.effort is None
+
+
+def _codex_dir(monkeypatch, tmp_path, *names: str):
+    import shared.host_spawn as hs
+
+    d = tmp_path / "codex-agents"
+    d.mkdir()
+    for n in names:
+        (d / f"{n}.toml").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(hs, "codex_agents_dir", lambda: d)
+    # A Claude file of the same name must not satisfy a codex lookup.
+    _agents_dir(monkeypatch, tmp_path, "threnody-medium-high")
+
+
+def test_codex_variant_chosen_when_installed(monkeypatch, tmp_path) -> None:
+    _codex_dir(monkeypatch, tmp_path, "threnody-medium-high")
+    spec = build_host_spawn(
+        config=TGsConfig.defaults(), caller="codex", tier="medium",
+        prompt="do it", effort="high",
+    )
+    assert spec.subagent_type == "threnody-medium-high"
+    assert spec.effort == "high"
+    assert spec.requested_effort == "high"
+
+
+def test_codex_variant_falls_back_when_missing(monkeypatch, tmp_path) -> None:
+    _codex_dir(monkeypatch, tmp_path)
+    spec = build_host_spawn(
+        config=TGsConfig.defaults(), caller="codex", tier="medium",
+        prompt="do it", effort="high",
+    )
+    assert spec.subagent_type == "threnody-medium"
+    assert spec.effort is None
+    assert spec.requested_effort == "high"
+
+
+def test_codex_agents_dir_honors_codex_home(monkeypatch, tmp_path) -> None:
+    import shared.host_spawn as hs
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "ch"))
+    assert hs.codex_agents_dir() == tmp_path / "ch" / "agents"
+
+
+def test_no_effort_omitted_from_dict(monkeypatch, tmp_path) -> None:
+    _agents_dir(monkeypatch, tmp_path, "threnody-medium-high")
+    spec = build_host_spawn(
+        config=TGsConfig.defaults(), caller="claude-code", tier="medium", prompt="x",
+    )
+    assert spec.subagent_type == "threnody-medium"
+    assert "effort" not in spec.to_dict()
+
+
+def test_explicit_review_subagent_type_wins_over_variant(monkeypatch, tmp_path) -> None:
+    _agents_dir(monkeypatch, tmp_path, "threnody-medium-high")
+    cfg = TGsConfig.defaults()
+    import shared.host_spawn as hs
+
+    monkeypatch.setattr(hs, "named_subagent_types_supported", lambda c, k: True)
+    spec = build_host_spawn(
+        config=cfg, caller="claude-code", tier="medium", prompt="x",
+        subagent_type="threnody-review-security", effort="high",
+    )
+    assert spec.subagent_type == "threnody-review-security"
+
+
+def test_waves_derive_effort(monkeypatch, tmp_path) -> None:
+    _agents_dir(monkeypatch, tmp_path, "threnody-high-high", "threnody-low-low")
+    plan = {
+        "subtasks": [
+            {"id": "a", "description": "refactor auth module", "tier": "high"},
+            {"id": "b", "description": "add docstring", "tier": "low"},
+            {"id": "c", "description": "edit thing", "tier": "medium",
+             "reasoning_effort": "high"},
+        ],
+        "waves": [["a", "b", "c"]],
+    }
+    agents = build_host_spawn_waves(plan, config=TGsConfig.defaults(), caller="claude-code")[0]["agents"]
+    by_id = {a["id"]: a for a in agents}
+    assert by_id["a"]["effort"] == "high"
+    assert by_id["a"]["requested_effort"] == "high"
+    assert by_id["a"]["subagent_type"] == "threnody-high-high"
+    assert by_id["b"]["effort"] == "low"
+    assert by_id["b"]["subagent_type"] == "threnody-low-low"
+    assert by_id["c"]["subagent_type"] == "threnody-medium"  # variant not installed
+    assert "effort" not in by_id["c"]  # requested, never applied
+    assert by_id["c"]["requested_effort"] == "high"

@@ -828,6 +828,45 @@ install_threnody_tier_agents() {
     info "Installed Threnody tier agent templates to $target_dir"
 }
 
+install_tier_effort_variants() {
+    # Claude Code only: subagent frontmatter `effort:` is the only way to pin the
+    # routed reasoning effort. Generated after the base tier copy.
+    [[ -d "$INSTALL_DIR/shell/agents" ]] || return 0
+    (cd "$INSTALL_DIR" && python3 - "$INSTALL_DIR/shell/agents" "$1" <<'PY'
+import sys
+from pathlib import Path
+try:
+    from shared.agent_export import export_tier_effort_variants
+except Exception as exc:  # pragma: no cover - install-time guard
+    print(f"  ⚠️  tier effort variants unavailable: {exc}")
+    raise SystemExit(0)
+written = export_tier_effort_variants(Path(sys.argv[1]), Path(sys.argv[2]))
+print(f"  ✅ Tier effort agent variants: {len(written)} written")
+PY
+    ) || warn "Tier effort variant generation failed (spawns fall back to base tier agents)"
+}
+
+install_codex_tier_agents() {
+    # Codex custom agents (~/.codex/agents/*.toml): tier base agents plus
+    # effort variants, since model_reasoning_effort is only settable per agent.
+    local agents_dir="${CODEX_HOME:-$HOME/.codex}/agents"
+    [[ -d "$INSTALL_DIR/shell/agents" ]] || return 0
+    (cd "$INSTALL_DIR" && python3 - "$agents_dir" <<'PY'
+import sys
+from pathlib import Path
+try:
+    from shared.agent_export import export_codex_tier_agents
+    from shared.config import CONFIG_YAML, TGsConfig
+    cfg = TGsConfig.from_yaml(CONFIG_YAML) if Path(CONFIG_YAML).exists() else TGsConfig()
+except Exception as exc:  # pragma: no cover - install-time guard
+    print(f"  ⚠️  codex tier agents unavailable: {exc}")
+    raise SystemExit(0)
+written = export_codex_tier_agents(Path(sys.argv[1]), cfg)
+print(f"  ✅ Codex tier agents: {len(written)} written")
+PY
+    ) || warn "Codex tier agent generation failed (Codex spawns fall back to default agents)"
+}
+
 install_threnody_skills() {
     local target_dir="$1"
     if [[ ! -d "$INSTALL_DIR/skills" ]]; then
@@ -938,6 +977,7 @@ if [[ "$HAS_CLAUDE" -eq 1 ]]; then
         info "Synced managed routing instructions to $CLAUDE_MD"
         SYNCED_CLAUDE_INSTRUCTIONS=1
         install_threnody_tier_agents "$HOME/.claude/agents"
+        install_tier_effort_variants "$HOME/.claude/agents"
     fi
 
     if routing_hooks_enabled "claude-code"; then
@@ -1188,6 +1228,10 @@ except Exception:
 PY
 then
     MULTI_LEARN_ACTION="install"
+fi
+
+if [[ "$HAS_CODEX" -eq 1 ]]; then
+    install_codex_tier_agents
 fi
 
 # Codex: ~/.codex/hooks.json, event PostToolUse, matcher Edit|Write (Claude-shaped).

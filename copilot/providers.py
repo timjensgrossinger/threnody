@@ -15,6 +15,7 @@ from shared.planner import Subtask
 from shared.orchestrator import Provider
 from shared.discovery import get_registry, ProviderRegistry, _build_gh_copilot_command, _clean_output
 from shared.model_registry import bootstrap_tier_map
+from shared.effort_support import default_routed_effort
 
 log = logging.getLogger(__name__)
 
@@ -54,15 +55,17 @@ class CopilotProvider(Provider):
         """Map tier label to Copilot model name."""
         return COPILOT_TIER_MAP.get(tier, COPILOT_TIER_MAP["medium"])
 
+    effort_provider_id = "github-copilot"
+
     def execute(self, subtask: Subtask, model: str,
-                timeout: int = 120) -> str | None:
+                timeout: int = 120, effort: str | None = None) -> str | None:
         """Execute a subtask via gh copilot non-interactive prompt mode."""
         if not self._check_gh():
             log.error("gh CLI not available")
             return None
 
         try:
-            cmd = _build_gh_copilot_command(subtask.description, model)
+            cmd = _build_gh_copilot_command(subtask.description, model, effort)
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout,
             )
@@ -91,6 +94,7 @@ class CopilotProvider(Provider):
                 tier=tier,
                 prefer_free=True,
                 timeout=timeout,
+                routed_effort=default_routed_effort(tier),
             )
             log.info(
                 "Registry routed subtask #%d to %s (model=%s, fallback=%s)",

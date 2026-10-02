@@ -21,6 +21,17 @@ from shared.review_fanout import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _default_config_not_the_install(monkeypatch, tmp_path):
+    """Plan builders fall back to ``TGsConfig.from_yaml()`` — the operator's LIVE
+    config.yaml, since the repo is also the install. Any tuned key there (e.g.
+    ``review_synthesis_mode: llm``) silently changed what these tests planned.
+    Point the default path at a file that does not exist so they get defaults."""
+    import shared.config as _config
+
+    monkeypatch.setattr(_config, "CONFIG_YAML", tmp_path / "no-config.yaml")
+
+
 def _llm_synthesis_config() -> SimpleNamespace:
     """Config stub pinning the LLM synthesis agent.
 

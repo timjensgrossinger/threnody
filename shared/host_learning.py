@@ -469,7 +469,7 @@ def _enrich_agent_from_handoff(
     planned_tier = snap.get("tier")
     if isinstance(planned_tier, str) and planned_tier.strip():
         merged["planned_tier"] = planned_tier.strip()
-    for key in ("prompt", "tier", "model", "task_id", "spawn_id", "subagent_type", "role"):
+    for key in ("prompt", "tier", "model", "task_id", "spawn_id", "subagent_type", "role", "effort", "requested_effort"):
         if not merged.get(key) and snap.get(key):
             merged[key] = snap[key]
     if not merged.get("description") and snap.get("prompt"):
@@ -619,6 +619,8 @@ def register_host_run_handoff(
                     "target_files": target_files,
                     "subagent_type": str(agent.get("subagent_type") or "") or None,
                     "role": str(agent.get("role") or "") or None,
+                    "effort": str(agent.get("effort") or "") or None,
+                    "requested_effort": str(agent.get("requested_effort") or "") or None,
                     "wave": wave_idx,
                     "agent_index": agent_index,
                 }
@@ -1951,12 +1953,16 @@ def _run_host_verify_gate(
     if not assigned:
         return None
     try:
-        from .verify import run_verify_gate
+        from .verify import run_verify_gate, scoped_resolver
 
+        resolver = None
+        if getattr(gate_cfg, "scope", "changed") == "changed":
+            resolver = scoped_resolver([str(f) for f in assigned])
         report = run_verify_gate(
             gate_cfg,
             project_root=workspace_root,
             run_id=run_id,
+            command_resolver=resolver,
         )
     except Exception:  # pragma: no cover - gate is best-effort
         log.debug("host verify gate failed for %s", run_id, exc_info=True)
@@ -2007,40 +2013,12 @@ def _record_verify_quality(
     mq_cfg = getattr(config, "model_quality", None) if config is not None else None
     if mq_cfg is None or not getattr(mq_cfg, "enabled", True):
         return
-    new_failures = list(verify_report.get("new_failures") or [])
+    from .verify import verify_report_score
 
-    # A signal that could not run proves nothing, and a clean-looking report made
-    # entirely of such signals is the single most dangerous row this ledger can
-    # hold. `verify.run_signal` marks an unavailable command `unavailable=True`
-    # and `run_verify_gate` deliberately keeps it out of `any_required_new`, so
-    # the verdict comes back "pass" with `new_failures` empty — previously scoring
-    # a perfect 10.0 for a run where ZERO checks executed, indistinguishable from
-    # a genuine lint+types+tests pass.
-    #
-    # `detect_gate_command` resolves commands by `shutil.which` alone, so this is
-    # the default outcome for any non-Python repo, and "write boilerplate" became a
-    # guaranteed 10.0 generator: four such rows clear quality_bias's
-    # DEFAULT_MIN_SAMPLES=4 and DEFAULT_HIGH_THRESHOLD=8.5 and emit a -1
-    # de-escalation for that model's role — punishing a model because trivial work
-    # did not break anything.
-    degraded = [str(s) for s in (verify_report.get("degraded_signals") or [])]
-    if degraded:
-        log.debug(
-            "verify-gate quality skipped for %s: signals unavailable (%s)",
-            run_id, ", ".join(degraded),
-        )
+    score = verify_report_score(verify_report)
+    if score is None:
+        log.debug("verify-gate quality skipped for %s: no usable verdict", run_id)
         return
-
-    # Without a baseline a *failure* cannot be attributed to this run — the repo
-    # may have arrived broken — so those are left out of the objective ledger.
-    # A clean result needs no baseline: with the degraded check above guaranteeing
-    # the required signals actually ran, "no failures at all" is an absolute
-    # statement about the tree, not a relative one, and discarding it would throw
-    # away legitimate ground truth from exactly the repos that have no merge base.
-    if not verify_report.get("baseline_used") and new_failures:
-        return
-
-    score = 10.0 if not new_failures else max(0.0, 10.0 - 2.5 * len(new_failures))
     try:
         from . import model_quality, run_log
 
@@ -2082,7 +2060,7 @@ def _record_verify_quality(
                 effort=effort,
                 role=role,
                 score_0_10=score,
-                new_failure_count=len(new_failures),
+                new_failure_count=len(verify_report.get("new_failures") or []),
                 preexisting_count=len(verify_report.get("preexisting_failures") or []),
                 run_id=run_id,
             )

@@ -846,7 +846,12 @@ class TestStaleTiers:
         from shared.model_quality import graded_models_by_tier
 
         self._seed(db, {"low": "haiku", "high": "opus"})
-        assert graded_models_by_tier(db) == {"low": {"haiku"}, "high": {"opus"}}
+        from shared.model_quality import ledger_model_id
+
+        # Rows store the concrete id each alias resolved to at write time.
+        assert graded_models_by_tier(db) == {
+            "low": {ledger_model_id("haiku")}, "high": {ledger_model_id("opus")},
+        }
 
 
 class TestLadderRootOverride:
@@ -860,3 +865,105 @@ class TestLadderRootOverride:
     def test_default_root_ships_the_bundled_cases(self, monkeypatch):
         monkeypatch.delenv("THRENODY_LADDER_DIR", raising=False)
         assert len(ladder.load_cases()) > 0
+
+
+# ---------------------------------------------------------------------------
+# Host-native ladder (router-only hosts)
+# ---------------------------------------------------------------------------
+
+
+class TestHostLadder:
+    @pytest.fixture(autouse=True)
+    def _models(self, monkeypatch):
+        import shared.host_spawn as hs
+
+        monkeypatch.setattr(
+            hs, "host_native_model_for_tier",
+            lambda config, caller, tier, registry=None: f"{caller}-{tier}-model",
+        )
+        monkeypatch.setattr(
+            "shared.config.TGsConfig.from_yaml", classmethod(lambda cls, *a, **k: cls())
+        )
+
+    def test_plan_counts_models_and_prompt(self):
+        plan = ladder.plan_host_ladder(
+            case_ids=["l0-return-constant", "l2-lru-cache"], caller="claude-code",
+            sweep_id="ladder-1",
+        )
+        assert plan["sweep_id"] == "ladder-1"
+        assert plan["count"] == len(plan["items"]) == 6
+        assert {i["tier"]: i["model"] for i in plan["items"]} == {
+            "low": "claude-code-low-model",
+            "medium": "claude-code-medium-model",
+            "high": "claude-code-high-model",
+        }
+        for item in plan["items"]:
+            assert "Do not create or edit any files" in item["prompt"]
+            assert item["kind"]
+        assert "ladder_grade" in plan["grading"]
+
+    def test_plan_tier_subset(self):
+        plan = ladder.plan_host_ladder(
+            tiers=["high"], case_ids=["l0-return-constant"], caller="codex"
+        )
+        assert [i["model"] for i in plan["items"]] == ["codex-high-model"]
+
+    def test_grade_reference_passes_and_records(self, db: Database):
+        out = ladder.grade_host_output(
+            db, case_id="l0-return-constant", tier="medium",
+            content=REFERENCE["l0-return-constant"], model="m-x", sweep_id="ladder-7",
+        )
+        assert out["passed"] is True
+        assert out["model"] == "m-x"
+        with db.conn() as conn:
+            row = conn.execute(
+                "SELECT source, run_id, tier, kind FROM model_quality_events"
+            ).fetchone()
+        case = ladder.load_cases(case_ids=["l0-return-constant"])[0]
+        assert tuple(row) == ("ladder", "ladder-7", "medium", case.kind)
+
+    def test_grade_broken_fails(self, db: Database):
+        out = ladder.grade_host_output(
+            db, case_id="l0-return-constant", tier="low", content="# nothing\n",
+            model="m", sweep_id="s",
+        )
+        assert out["passed"] is False
+
+    def test_grade_empty_content_fails_with_error(self):
+        out = ladder.grade_host_output(
+            None, case_id="l0-return-constant", tier="low", content="  ",
+            model="m", sweep_id="s",
+        )
+        assert out["passed"] is False and out["error"]
+
+    def test_grade_unknown_case_and_tier(self):
+        assert "error" in ladder.grade_host_output(
+            None, case_id="nope", tier="low", content="x", model=None, sweep_id="s"
+        )
+        assert "error" in ladder.grade_host_output(
+            None, case_id="l0-return-constant", tier="turbo", content="x",
+            model=None, sweep_id="s",
+        )
+
+    def test_cli_run_router_only_exits_2_without_executing(self, monkeypatch, capsys):
+        def boom(*a, **k):
+            raise AssertionError("executor must not run")
+
+        monkeypatch.setattr(ladder, "default_executor", boom)
+        monkeypatch.setattr(ladder, "run_ladder", boom)
+        rc = ladder.main(["run", "--provider", "claude-code", "--case", "l0-return-constant"])
+        assert rc == 2
+        assert "router-only" in capsys.readouterr().out
+
+    def test_cli_run_passes_provider_id(self, monkeypatch, capsys):
+        seen = {}
+
+        def fake_run_ladder(**kwargs):
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr(ladder, "run_ladder", fake_run_ladder)
+        monkeypatch.setattr(ladder, "summarize", lambda r: {})
+        monkeypatch.setattr(ladder, "render_summary", lambda s: "ok")
+        ladder.main(["run", "--provider", "codex", "--no-record", "--case", "l0-return-constant"])
+        assert seen["provider_id"] == "codex"

@@ -33,6 +33,11 @@ def _fmt_dim(dimension: str, sub_dimension: str | None) -> str:
     return f"{dimension}/{sub_dimension}" if sub_dimension else dimension
 
 
+def _fmt_score(value: Any) -> str:
+    """Two-decimal score, or an em dash when the group has no such samples."""
+    return f"{float(value):.2f}" if value is not None else "—"
+
+
 def render_quality_markdown(snapshot: dict[str, Any]) -> str:
     """Render the ledger snapshot as an operator markdown document."""
     rows = snapshot.get("rows") or []
@@ -68,27 +73,26 @@ def render_quality_markdown(snapshot: dict[str, Any]) -> str:
 
     table = [
         "| Model | Effort | Dimension | Score | n | Objective | Obj.score | Findings | "
-        "Unadj. | Judge | Esc.rate |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "Unadj. | Judge | Outcome | Out.score | Esc.rate |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         table.append(
-            "| {model} | {effort} | {dim} | {score:.2f} | {n} | {on} | {oscore} | "
-            "{fn} | {un} | {jn} | {esc:.2f} |".format(
+            "| {model} | {effort} | {dim} | {score} | {n} | {on} | {oscore} | "
+            "{fn} | {un} | {jn} | {outn} | {outscore} | {esc:.2f} |".format(
                 model=row.get("model", "?"),
                 effort=_fmt_effort(row.get("effort")),
                 dim=_fmt_dim(str(row.get("dimension", "?")), row.get("sub_dimension")),
-                score=float(row.get("avg_score") or 0.0),
+                # avg_score is None for a group holding only host verdicts.
+                score=_fmt_score(row.get("avg_score")),
                 n=int(row.get("n") or 0),
                 on=int(row.get("objective_n") or 0),
-                oscore=(
-                    f"{float(row['objective_avg']):.2f}"
-                    if row.get("objective_avg") is not None
-                    else "—"
-                ),
+                oscore=_fmt_score(row.get("objective_avg")),
                 fn=int(row.get("findings_n") or 0),
                 un=int(row.get("unadjudicated_n") or 0),
                 jn=int(row.get("judge_n") or 0),
+                outn=int(row.get("outcome_n") or 0),
+                outscore=_fmt_score(row.get("outcome_avg")),
                 esc=float(row.get("escalation_rate") or 0.0),
             )
         )

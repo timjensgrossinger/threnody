@@ -306,7 +306,11 @@ def build_case_prompt(case: LadderCase) -> str:
 
 
 def default_executor(
-    case: LadderCase, tier: str, *, config: "TGsConfig | None" = None
+    case: LadderCase,
+    tier: str,
+    *,
+    config: "TGsConfig | None" = None,
+    provider_id: str | None = None,
 ) -> ExecutionOutput:
     """Execute one case at ``tier`` via the provider registry's cheapest route.
 
@@ -323,6 +327,7 @@ def default_executor(
             tier=tier,
             timeout=case.timeout_seconds,
             code_only=True,
+            provider_id=provider_id,
         )
     except Exception as exc:
         return ExecutionOutput(error=f"{type(exc).__name__}: {exc}")
@@ -353,10 +358,13 @@ def run_case(
     executor: "Executor | None" = None,
     config: "TGsConfig | None" = None,
     keep_sandbox: Path | None = None,
+    provider_id: str | None = None,
 ) -> LadderResult:
     """Run one case at one tier in a throwaway sandbox and grade the result."""
     started = time.monotonic()
-    run = executor or (lambda c, t: default_executor(c, t, config=config))
+    run = executor or (
+        lambda c, t: default_executor(c, t, config=config, provider_id=provider_id)
+    )
     tmpdir = keep_sandbox or Path(tempfile.mkdtemp(prefix="threnody-ladder-"))
     try:
         sandbox = materialize(case, tmpdir)
@@ -395,6 +403,7 @@ def run_ladder(
     levels: "Iterable[int] | None" = None,
     case_ids: "Iterable[str] | None" = None,
     run_id: "str | None" = None,
+    provider_id: str | None = None,
 ) -> list[LadderResult]:
     """Run every (case x tier) combination, recording each verdict in the ledger."""
     resolved = cases if cases is not None else load_cases(levels=levels, case_ids=case_ids)
@@ -409,7 +418,9 @@ def run_ladder(
     results: list[LadderResult] = []
     for case in resolved:
         for tier in ordered_tiers:
-            result = run_case(case, tier, executor=executor, config=config)
+            result = run_case(
+                case, tier, executor=executor, config=config, provider_id=provider_id
+            )
             results.append(result)
             log.info(
                 "ladder %s %s tier=%s -> %s",
@@ -441,6 +452,108 @@ def record_ladder_result(
         )
     except Exception:  # pragma: no cover - best-effort ledger write
         log.debug("ladder: ledger write failed for %s", result.case_id, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Host-native ladder (router-only hosts such as Claude Code)
+# ---------------------------------------------------------------------------
+
+HOST_NO_WRITE_INSTRUCTION = (
+    "Do not create or edit any files and do not use any tools. "
+    "Reply with ONLY the complete file contents."
+)
+
+
+def plan_host_ladder(
+    *,
+    tiers: "Iterable[str]" = TIERS,
+    levels: "Iterable[int] | None" = None,
+    case_ids: "Iterable[str] | None" = None,
+    caller: str | None = None,
+    config: "TGsConfig | None" = None,
+    sweep_id: str | None = None,
+) -> dict[str, Any]:
+    """Describe a host-native sweep: one item per (case x tier) for the host to spawn.
+
+    Threnody never spawns a router-only host's CLI, so the host runs an Agent per
+    item on ``item["model"]`` and returns the produced file via :func:`grade_host_output`.
+    """
+    from .host_spawn import host_native_model_for_tier
+
+    if caller is None:
+        try:
+            from .discovery import detect_caller
+
+            caller = detect_caller()
+        except Exception:
+            log.debug("plan_host_ladder: detect_caller failed", exc_info=True)
+    caller = caller or "claude-code"
+    if config is None:
+        try:
+            from .config import TGsConfig
+
+            config = TGsConfig.from_yaml()
+        except Exception:
+            log.debug("plan_host_ladder: config unavailable", exc_info=True)
+    ordered = [t for t in tiers if t in _TIER_RANK]
+    cases = load_cases(levels=levels, case_ids=case_ids)
+    items: list[dict[str, Any]] = []
+    for case in cases:
+        prompt = build_case_prompt(case) + "\n\n" + HOST_NO_WRITE_INSTRUCTION
+        for tier in ordered:
+            model = host_native_model_for_tier(config, caller, tier)
+            items.append({
+                "case_id": case.case_id,
+                "level": case.level,
+                "kind": case.kind,
+                "tier": tier,
+                "model": model,
+                "target_file": case.target_file,
+                "prompt": prompt,
+            })
+    return {
+        "sweep_id": sweep_id or f"ladder-{int(time.time())}",
+        "caller": caller,
+        "items": items,
+        "count": len(items),
+        "grading": (
+            "call ladder_grade with case_id, tier, model, sweep_id and the "
+            "agent's raw file content"
+        ),
+    }
+
+
+def grade_host_output(
+    db: "Database | None",
+    *,
+    case_id: str,
+    tier: str,
+    content: str,
+    model: str | None,
+    sweep_id: str,
+    provider: str | None = None,
+    effort: str | None = None,
+) -> dict[str, Any]:
+    """Grade file content a host agent produced and record it in the ledger."""
+    if tier not in _TIER_RANK:
+        return {"error": f"unknown tier: {tier}", "case_id": case_id, "tier": tier}
+    matches = load_cases(case_ids=[case_id])
+    if not matches:
+        return {"error": f"unknown case: {case_id}", "case_id": case_id, "tier": tier}
+    case = matches[0]
+    result = run_case(
+        case,
+        tier,
+        executor=lambda c, t: ExecutionOutput(
+            content=content or "",
+            model=model or "",
+            provider=provider or "",
+            effort=effort,
+        ),
+    )
+    if db is not None:
+        record_ladder_result(db, result, run_id=sweep_id)
+    return result.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +606,7 @@ def stale_tiers(
     set. A tier with no graded rows at all is NOT reported — it was never fresh, so
     "stale" is the wrong word; `min_passing_tier` already shows it as absent.
     """
-    from .model_quality import graded_models_by_tier
+    from .model_quality import graded_models_by_tier, ledger_model_id
 
     graded = graded_models_by_tier(db, since=since)
     out: list[str] = []
@@ -501,6 +614,9 @@ def stale_tiers(
         model = str(current_models.get(tier) or "").strip()
         if not model:
             continue
+        # Ledger rows store the concrete id an alias resolved to, so compare on
+        # that: an alias that moved to a new model is exactly what "stale" means.
+        model = ledger_model_id(model)
         seen = graded.get(tier)
         if not seen:
             continue
@@ -624,6 +740,11 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--case", default=None, help="Comma list of case ids")
     run_p.add_argument("--json", action="store_true", help="Print the JSON summary")
     run_p.add_argument(
+        "--provider",
+        default=None,
+        help="Explicit provider id to grade (default: the detected host CLI)",
+    )
+    run_p.add_argument(
         "--stale",
         action="store_true",
         help=(
@@ -647,7 +768,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no ladder cases found under {ladder_dir()}")
             return 0
         for case in cases:
-            print(f"{case.level_label:<3} {case.case_id:<28} -> {case.target_file}")
+            print(
+                f"{case.level_label:<3} {case.case_id:<28} "
+                f"{(case.kind or '-'):<22} -> {case.target_file}"
+            )
         return 0
 
     tiers = _parse_str_list(args.tier) or list(TIERS)
@@ -661,6 +785,28 @@ def main(argv: list[str] | None = None) -> int:
     if not cases:
         print("ERROR: no matching ladder cases")
         return 1
+
+    provider = args.provider
+    if not provider:
+        try:
+            from .discovery import detect_caller
+
+            provider = detect_caller()
+        except Exception:
+            log.debug("ladder: detect_caller failed", exc_info=True)
+            provider = None
+    if provider:
+        from .discovery import ROUTER_ONLY_PROVIDERS
+
+        if provider in ROUTER_ONLY_PROVIDERS:
+            print(
+                "Claude Code is router-only: run the ladder host-native with the "
+                "/threnody-ladder skill (ladder_plan -> Agent per item -> ladder_grade)"
+            )
+            return 2
+        print(f"Grading provider: {provider}")
+    else:
+        print("No host provider detected; using the cheapest available provider")
 
     try:
         from .config import TGsConfig
@@ -722,7 +868,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         tiers = [t for t in tiers if t in stale]
 
-    results = run_ladder(cases=cases, tiers=tiers, config=config, db=db)
+    results = run_ladder(
+        cases=cases, tiers=tiers, config=config, db=db, provider_id=provider
+    )
     summary = summarize(results)
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
@@ -747,6 +895,8 @@ __all__ = [
     "default_executor",
     "run_case",
     "run_ladder",
+    "plan_host_ladder",
+    "grade_host_output",
     "record_ladder_result",
     "min_passing_tier_by_level",
     "summarize",

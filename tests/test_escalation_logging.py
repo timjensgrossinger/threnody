@@ -31,6 +31,15 @@ class _PlaceholderProvider(Provider):
         return ["low", "medium", "high"]
 
 
+class _EffortPlaceholderProvider(_PlaceholderProvider):
+    """Same output, but ``execute`` takes ``effort`` — so the effort is applied."""
+
+    def execute(
+        self, subtask: Subtask, model: str, timeout: int = 120, effort: str | None = None
+    ) -> str | None:
+        return "def f():\n    pass"
+
+
 class _DummyPlanner(Planner):
     def __init__(self) -> None:
         self._backend = SimpleNamespace(call=lambda *a, **k: None)
@@ -72,7 +81,7 @@ def test_quality_trigger_logs_escalation(tmp_path: Path) -> None:
     cfg = TGsConfig()
     cfg.output_quality_retry_enabled = True
     cfg.provider_effort_defaults = {"dummyprov": {"low": "high"}}
-    orch = Orchestrator(cfg, _PlaceholderProvider(), _DummyPlanner(), db=db)
+    orch = Orchestrator(cfg, _EffortPlaceholderProvider(), _DummyPlanner(), db=db)
 
     subtask = Subtask(
         id=7, stable_id="phase-esc-01", description="write a helper",
@@ -101,6 +110,23 @@ def test_effort_none_when_provider_id_unknown(tmp_path: Path) -> None:
         id=8, stable_id="phase-esc-02", description="write a helper",
         tier="low", model="low", depends_on=[],
     )  # no provider_id -> effort must stay None, never a mis-resolved guess
+    orch.execute_subtask(subtask, timeout=5)
+    rows = _escalation_rows(db)
+    assert rows and rows[0]["effort"] is None
+
+
+def test_effort_none_when_provider_cannot_apply_it(tmp_path: Path) -> None:
+    # A configured effort the provider's execute() cannot take was never applied,
+    # so the escalation row must not claim it.
+    db = Database(tmp_path / "e.db")
+    cfg = TGsConfig()
+    cfg.output_quality_retry_enabled = True
+    cfg.provider_effort_defaults = {"dummyprov": {"low": "high"}}
+    orch = Orchestrator(cfg, _PlaceholderProvider(), _DummyPlanner(), db=db)
+    subtask = Subtask(
+        id=9, stable_id="phase-esc-03", description="write a helper",
+        tier="low", model="low", provider_id="dummyprov", depends_on=[],
+    )
     orch.execute_subtask(subtask, timeout=5)
     rows = _escalation_rows(db)
     assert rows and rows[0]["effort"] is None

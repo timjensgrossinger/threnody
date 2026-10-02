@@ -8,7 +8,7 @@
 3. When `host_spawn_waves` or `host_execution_contract: spawn_subagents` is present, spawn one **Agent** or **Task** subagent per agent entry — do not use direct Write/Edit on planned `target_files`.
 4. For lone `route_task` results without a pending handoff, direct edits are allowed when `host_native_method` is `direct_edit`.
 5. Use `execute_subtask(provider_id=...)` only for utility backends when `delegation_utilities_enabled` is true.
-5a. Tier overrides on swarm, subtask and workflow paths are detected automatically — report the
+5a. After every routed task call `record_outcome(task_id, outcome="accepted"|"revised"|"reworked"|"rejected", actual_model=...)` — the verdict plus the model that actually did the work (feeds the quality ledger as a proxy `outcome` score and finalizes direct-edit verification). Tier overrides on swarm, subtask and workflow paths are detected automatically — report the
    tier each agent actually ran at and Threnody does the rest. You only need
    `record_outcome(task_id, outcome="tier_overridden", actual_tier="high")` when you run a
    *sanctioned direct edit* on a different model than the routed tier: the PreToolUse hook
@@ -136,7 +136,7 @@ All MCP hosts installed from this repo share `~/.local/lib/threnody/cache.db`. U
 ## Adaptive routing feedback
 
 1. `route_task` returns `task_id` and records `complexity_score` in telemetry (pass `cwd` for project-local adaptive thresholds).
-2. Call `record_outcome(task_id=..., outcome=...)` when work finishes.
+2. Call `record_outcome(task_id=..., outcome=..., actual_model=...)` when work finishes.
 3. Enable per-project learning: `threnody tune set learning_enabled true --project .`
 
 Learning is durable independently of SQLite. Every learning event is appended and

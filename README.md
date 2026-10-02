@@ -144,7 +144,7 @@ Host shell (Claude / Copilot / Codex / Cursor / …)
 
 **Cross-CLI memory:** all hosts share one SQLite store at `~/.local/lib/threnody/cache.db`. Use `global` (no `project_id`), `project` (pass a **stable absolute path**, not `"."`), or `task` (explicit `task_id`) scopes. Do not store secrets — any connected host can read keys.
 
-**Adaptive routing:** `route_task` returns a `task_id`; after work, call `record_outcome(task_id=…, outcome=accepted|revised|rejected|reworked)`. Enable per project with `threnody tune set learning_enabled true --project .`.
+**Adaptive routing:** `route_task` returns a `task_id`; after work, call `record_outcome(task_id=…, outcome=accepted|revised|rejected|reworked, actual_model=…)` (also recorded as a proxy `outcome` score in the quality ledger). Enable per project with `threnody tune set learning_enabled true --project .`.
 
 ---
 
@@ -217,6 +217,7 @@ ghcs "how to list files recursively in python"        # quick routed call
 threnody inspect status --project . --details         # provider readiness
 threnody quality --since 7d                           # model quality ledger
 threnody ladder run --tier low,medium,high            # graded ground truth (spends tokens)
+threnody ladder run --provider codex                   # grade another host's tier models; in Claude Code use /threnody-ladder
 threnody ladder run --stale                           # re-grade only tiers whose model changed
 threnody db learn status                              # durable learning journal + table counts
 threnody db learn rebuild                             # rebuild the DB's learning tables from the journal

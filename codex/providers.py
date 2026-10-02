@@ -169,11 +169,14 @@ class CodexProvider(Provider):
     def resolve_model(self, tier: str) -> str:
         return CODEX_TIER_MAP.get(tier, CODEX_TIER_MAP["medium"])
 
+    effort_provider_id = "codex"
+
     def execute(
         self,
         subtask: Subtask,
         model: str,
         timeout: int = 120,
+        effort: str | None = None,
     ) -> str | None:
         if shutil.which("codex") is None:
             raise RuntimeError("codex CLI not available")
@@ -183,6 +186,7 @@ class CodexProvider(Provider):
             "execute_code_only",
             model,
             subtask.description,
+            effort,
         )
         output_file = getattr(self, "_pending_output_file", None)
         try:

@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 log = logging.getLogger(__name__)
 
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from .config import (
@@ -18,6 +19,7 @@ from .config import (
 )
 from .context import is_within_repo, normalize_target_path
 from .discovery import HOST_PROVIDER_NAMES, ROUTER_ONLY_PROVIDERS
+from .effort_support import host_native_effort_mode
 from .roles import derive_role_from_task, DEFAULT_ROLE
 
 HOST_SPAWN_ERROR = "HostNativeRequired"
@@ -63,6 +65,12 @@ class HostSpawnSpec:
     # and so the routing guard can tell a review target (named to be READ) apart
     # from a write target instead of issuing a write guard for every review run.
     read_only: bool = False
+    # APPLIED reasoning effort: set only when a `threnody-<tier>-<effort>` agent
+    # definition was actually chosen (the host has no per-call effort parameter).
+    # Learning attributes the spawn to this, so it must never claim an effort that
+    # was not pinned. `requested_effort` is what routing wanted, always carried.
+    effort: str | None = None
+    requested_effort: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -96,6 +104,10 @@ class HostSpawnSpec:
             payload["role"] = self.role
         if self.read_only:
             payload["read_only"] = True
+        if self.effort:
+            payload["effort"] = self.effort
+        if self.requested_effort:
+            payload["requested_effort"] = self.requested_effort
         return payload
 
 
@@ -205,6 +217,69 @@ def subagent_type_for_tier(tier: str) -> str:
     return "generalPurpose"
 
 
+EFFORT_LEVELS = ("low", "medium", "high")
+
+
+def normalize_effort(value: Any) -> str | None:
+    """Return a valid effort level (low|medium|high) or None."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    return cleaned if cleaned in EFFORT_LEVELS else None
+
+
+def claude_agents_dir() -> Path:
+    """Claude Code user agent-definition directory (module function so tests patch it)."""
+    return Path.home() / ".claude" / "agents"
+
+
+def effort_variant_subagent_type(tier: str, effort: str | None) -> str | None:
+    """``threnody-<tier>-<effort>`` when both are valid, else None."""
+    norm = normalize_effort(effort)
+    if tier not in {"low", "medium", "high"} or norm is None:
+        return None
+    return f"threnody-{tier}-{norm}"
+
+
+def codex_agents_dir() -> Path:
+    """Codex custom-agent directory (module function so tests patch it)."""
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "agents"
+
+
+def _effort_definition_path(caller: str | None, name: str) -> Path | None:
+    mode = host_native_effort_mode(caller)
+    if mode == "frontmatter":
+        return claude_agents_dir() / f"{name}.md"
+    if mode == "codex_toml":
+        return codex_agents_dir() / f"{name}.toml"
+    return None
+
+
+def _installed_effort_variant(caller: str | None, tier: str, effort: str | None) -> str | None:
+    """The effort variant for *caller*, only if its definition file is installed.
+
+    Shells without host-native effort support (see ``effort_support``) never get
+    one. Falling back when the file is missing is load-bearing: an
+    unknown ``subagent_type`` makes the host's Agent call fail outright, so a
+    machine that has not re-run install.sh must keep getting ``threnody-<tier>``.
+    """
+    name = effort_variant_subagent_type(tier, effort)
+    if name is None:
+        return None
+    try:
+        path = _effort_definition_path(caller, name)
+        if path is not None and path.is_file():
+            return name
+    except OSError:
+        log.debug("effort variant lookup failed for %s", name, exc_info=True)
+    return None
+
+
+def tier_subagent_type(caller: str | None, tier: str, effort: str | None = None) -> str:
+    """Subagent type for a tier: the installed effort variant, else ``threnody-<tier>``."""
+    return _installed_effort_variant(caller, tier, effort) or subagent_type_for_tier(tier)
+
+
 def named_subagent_types_supported(config: TGsConfig, caller: str | None) -> bool:
     """True when *caller* resolves a named ``subagent_type`` to a real definition.
 
@@ -246,15 +321,19 @@ def build_host_spawn(
     artifact_path: str | None = None,
     upstream: list[dict[str, Any]] | None = None,
     role: str | None = None,
+    effort: str | None = None,
 ) -> HostSpawnSpec:
     # Review agents use named subagent types on shells that resolve them to an
     # exported definition; every other host falls back to the tier-derived type.
     normalized_caller = normalize_caller_id(caller)
-    resolved_subagent_type = (
-        subagent_type
-        if subagent_type and named_subagent_types_supported(config, caller)
-        else subagent_type_for_tier(tier)
-    )
+    resolved_effort = normalize_effort(effort)
+    applied_effort: str | None = None
+    if subagent_type and named_subagent_types_supported(config, caller):
+        resolved_subagent_type = subagent_type
+    else:
+        variant = _installed_effort_variant(caller, tier, resolved_effort)
+        resolved_subagent_type = variant or subagent_type_for_tier(tier)
+        applied_effort = resolved_effort if variant else None
     # read_only tasks must never use direct_edit — they read source context only.
     method = "host_task" if read_only else host_native_method_for_tier(tier)
     resolved_role = role or derive_role_from_task(prompt)
@@ -277,7 +356,42 @@ def build_host_spawn(
         upstream=list(upstream or []),
         role=resolved_role,
         read_only=bool(read_only),
+        effort=applied_effort,
+        requested_effort=resolved_effort,
     )
+
+
+def _effort_for_subtask(
+    subtask: Mapping[str, Any], tier: str, prompt: str, router_holder: list[Any], config: TGsConfig
+) -> str:
+    """Valid subtask ``reasoning_effort``, else derived from tier + duration bucket.
+
+    *router_holder* is a one-slot list so a single TaskRouter is built lazily per
+    waves call and reused across subtasks.
+    """
+    explicit = normalize_effort(subtask.get("reasoning_effort"))
+    if explicit:
+        return explicit
+    duration = "medium"
+    try:
+        if not router_holder:
+            from .router import TaskRouter
+
+            router_holder.append(TaskRouter(config, db=None))
+        duration = str(
+            getattr(router_holder[0].classify(prompt), "expected_duration_bucket", "medium")
+        )
+    except Exception:
+        log.debug("host_spawn_waves: duration classification failed", exc_info=True)
+        if not router_holder:
+            router_holder.append(None)  # don't retry a failing construction per subtask
+    try:
+        from .router import reasoning_params_for
+
+        return reasoning_params_for(duration, tier)[0]
+    except Exception:
+        log.debug("host_spawn_waves: reasoning_params_for failed", exc_info=True)
+        return "medium"
 
 
 def _subtask_target_files(subtask: Mapping[str, Any]) -> list[str]:
@@ -925,6 +1039,7 @@ def build_host_spawn_waves(
             for dep in raw.get("depends_on") or []:
                 depended_upon.add(_subtask_id_key(dep))
 
+    router_holder: list[Any] = []
     host_waves: list[dict[str, Any]] = []
     for wave_idx, wave_ids in enumerate(waves, start=1):
         if not isinstance(wave_ids, list):
@@ -965,6 +1080,12 @@ def build_host_spawn_waves(
             )
             subtask_read_only = bool(subtask.get("read_only", False))
             resolved_spawn_id = _spawn_id_for_subtask(subtask, sid)
+
+            # Effort comes from the original description, before the repo prefix and
+            # protocol blocks below inflate it.
+            subtask_effort = _effort_for_subtask(
+                subtask, tier, prompt, router_holder, config
+            )
 
             # Read-only agents are deliberately excluded: a reviewer primed with the
             # repo's prior beliefs is a biased reviewer, and its findings feed
@@ -1077,6 +1198,7 @@ def build_host_spawn_waves(
                     artifact_path=artifact_path_str,
                     upstream=upstream_specs,
                     role=subtask_role,
+                    effort=subtask_effort,
                 ).to_dict()
             )
         if agents:

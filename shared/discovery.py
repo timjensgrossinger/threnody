@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import errno
+import functools
 import inspect
 import json
 import logging
@@ -31,6 +32,7 @@ from urllib.request import Request, urlopen
 
 from .adapters import ProviderAdapter, ProviderCapability, _coerce_capability
 from .config import DEFAULT_DELEGATION_UTILITIES
+from .effort_support import subprocess_effort_supported
 from .resilience import AuthProbe, ErrorCategory, RetryPolicy, classify
 from .health import is_available as _provider_is_available
 from .health import record_provider_failure as _record_prov_failure
@@ -214,11 +216,15 @@ def _copilot_supports_model_flag() -> bool:
     return _COPILOT_HAS_MODEL_FLAG
 
 
-def _build_gh_copilot_command(prompt: str, model: str | None = None) -> list[str]:
+def _build_gh_copilot_command(
+    prompt: str, model: str | None = None, effort: str | None = None
+) -> list[str]:
     """Build a gh copilot command that avoids loading builtin MCP servers."""
     cmd = ["gh", "copilot", "--", "-p", prompt]
     if model and _copilot_supports_model_flag():
         cmd.extend(["--model", model])
+    if effort:
+        cmd.extend(["--effort", effort])
     if _copilot_supports_disable_builtin_mcps():
         cmd.append("--disable-builtin-mcps")
     return cmd
@@ -305,11 +311,63 @@ def caller_from_client_name(client_name: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+_CALLER_PROCESS_MARKERS: tuple[tuple[str, str], ...] = (
+    ("claude", "claude-code"),
+    ("codex", "codex"),
+    ("opencode", "opencode"),
+)
+_CALLER_WALK_DEPTH = 4
+
+
+def _caller_from_command(command: str) -> str | None:
+    lowered = command.lower()
+    for marker, provider_id in _CALLER_PROCESS_MARKERS:
+        if marker in lowered:
+            return provider_id
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _caller_from_process_tree(ppid: int) -> str | None:
+    """Walk up to ``_CALLER_WALK_DEPTH`` ancestors of *ppid* looking for a host CLI.
+
+    Cached per parent pid: the ancestry of a live process does not change, and
+    ``ps`` is a subprocess spawn.
+    """
+    pid = ppid
+    for _ in range(_CALLER_WALK_DEPTH):
+        if pid <= 1:
+            return None
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "ppid=,command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception:
+            log.debug("detect_caller: ps failed for pid %s", pid, exc_info=True)
+            return None
+        line = (result.stdout or "").strip()
+        if not line:
+            return None
+        parent_field = line.split(None, 1)[0]
+        found = _caller_from_command(line)
+        if found:
+            return found
+        try:
+            pid = int(parent_field)
+        except ValueError:
+            return None
+    return None
+
+
 def detect_caller() -> str | None:
     """Detect which AI CLI client is hosting the MCP server.
 
     Returns the provider name (e.g., ``"github-copilot"``, ``"claude-code"``)
-    or *None* if detection fails.  Uses environment variables set by each CLI.
+    or *None* if detection fails.  Env markers are checked first on every call;
+    the (cached) parent-process walk is the fallback.  Under
+    ``THRENODY_TEST_MODE`` the walk only runs when ``MCP_TRANSPORT`` is set, so
+    tests do not inherit the developer's real host.
     """
     if _env_marker_enabled(os.environ.get("OPENCODE_HOST")) or _env_marker_enabled(
         os.environ.get("OPENCODE_SESSION")
@@ -319,28 +377,28 @@ def detect_caller() -> str | None:
         os.environ.get("COPILOT_RUN_APP")
     ):
         return "github-copilot"
-    if _env_marker_enabled(os.environ.get("CLAUDE_CODE")) or _env_marker_enabled(
-        os.environ.get("CLAUDE_CODE_SESSION")
+    for name in (
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE",
+        "CLAUDE_CODE_SESSION",
     ):
-        return "claude-code"
-    # Claude Code also sets MCP-related env vars when running servers
-    if os.environ.get("MCP_TRANSPORT"):
-        # Heuristic: check parent process name
-        try:
-            ppid = os.getppid()
-            import subprocess as _sp
-            result = _sp.run(
-                ["ps", "-o", "command=", "-p", str(ppid)],
-                capture_output=True, text=True, timeout=5,
-            )
-            parent = result.stdout.lower()
-            if "claude" in parent:
-                return "claude-code"
-            if "opencode" in parent:
-                return "opencode"
-        except Exception:
-            pass
-    return None
+        if _env_marker_enabled(os.environ.get(name)):
+            return "claude-code"
+    if _env_marker_enabled(os.environ.get("THRENODY_TEST_MODE")) and not os.environ.get(
+        "MCP_TRANSPORT"
+    ):
+        return None
+    if not _PROCESS_WALK_ENABLED:
+        return None
+    return _caller_from_process_tree(os.getppid())
+
+
+# Off-switch for the parent-process fallback. The test suite clears it globally
+# (tests/conftest.py) because it runs inside real hosts whose ancestry would
+# otherwise leak into every "no caller detected" test.
+_PROCESS_WALK_ENABLED = True
 
 
 def _http_join(base_url: str, path: str) -> str:
@@ -1152,7 +1210,7 @@ class CLIProvider:
             # gh copilot passes arbitrary args after the bare '--'. Router-driven
             # subprocess calls always use an isolated COPILOT_HOME plus builtin
             # MCP disablement to avoid host/session recursion across CLIs.
-            return _build_gh_copilot_command(prompt, model)
+            return _build_gh_copilot_command(prompt, model, effort)
 
         if self.name == "claude-code":
             # Claude Code supports a native per-call effort flag.
@@ -1753,7 +1811,7 @@ def _build_aider_command(
         action: Execution action type (e.g., "execute")
         model: Model name (e.g., "claude-opus")
         prompt: User prompt or task (may include file targets)
-        effort: Optional reasoning effort value (currently ignored for Aider)
+        effort: Optional reasoning effort value, passed as --reasoning-effort
     
     Returns:
         Command list for subprocess execution
@@ -1776,7 +1834,9 @@ def _build_aider_command(
         "--no-pretty",
         "--no-stream",
     ]
-    
+    if effort:
+        command.extend(["--reasoning-effort", str(effort)])
+
     logger.debug(
         "Aider command: aider --model %s --message [prompt] --yes-always --no-git --no-auto-commits --no-pretty --no-stream",
         model
@@ -2812,6 +2872,23 @@ class ProviderUsageChecker:
 # ---------------------------------------------------------------------------
 
 
+def _project_official_model_cache(provider: CLIProvider) -> None:
+    """Give a fresh process the same tier map the MCP server's catalog projects.
+
+    File-only (a CLI-owned cache such as ``~/.codex/models_cache.json``); see
+    ``model_catalog.project_official_cache``. Best-effort: bootstrap stays on any
+    failure.
+    """
+    if getattr(provider, "model_discovery_adapter", None) is None:
+        return
+    try:
+        from .model_catalog import project_official_cache
+
+        project_official_cache(provider)
+    except Exception:
+        logger.debug("%s: official model cache projection failed", provider.name, exc_info=True)
+
+
 class ProviderRegistry:
     """Discovers available providers and exposes adapter-aware routing metadata."""
 
@@ -2949,6 +3026,7 @@ class ProviderRegistry:
             logger.info("  ✗ %s not available (%s)", provider.display_name, current.reason.value)
             return current
 
+        _project_official_model_cache(provider)
         self.available_providers.append(provider)
         status = "✓" if current.routeable else "○"
         logger.info(
@@ -3414,6 +3492,7 @@ class ProviderRegistry:
         provider: CLIProvider,
         tier: str,
         effort: str | None = None,
+        routed_effort: str | None = None,
     ) -> tuple[str | None, str | None]:
         explicit_effort = self._normalize_effort_value(effort)
         if explicit_effort is not None:
@@ -3423,6 +3502,12 @@ class ProviderRegistry:
         if default_effort is not None:
             return default_effort, "config_default"
 
+        # Lowest precedence: the effort routing derived for this task. Only for
+        # providers whose flag is verified, so an unverified shell never gets one.
+        routed = self._normalize_effort_value(routed_effort)
+        if routed is not None and subprocess_effort_supported(provider.name):
+            return routed, "routed"
+
         return None, None
 
     def _selection_metadata_for_provider_with_effort(
@@ -3430,6 +3515,7 @@ class ProviderRegistry:
         provider: CLIProvider,
         tier: str,
         effort: str | None = None,
+        routed_effort: str | None = None,
     ) -> dict[str, Any]:
         metadata_fn = getattr(provider, "selection_metadata_for", None)
         if callable(metadata_fn):
@@ -3439,7 +3525,7 @@ class ProviderRegistry:
                 # Attach configured concurrency/capacity for spillover allocation (Wave 1)
                 selection["concurrency"] = self._config_provider_capacity(provider.name)
                 resolved_effort, effort_source = self._resolve_effort_for_provider(
-                    provider, tier, effort
+                    provider, tier, effort, routed_effort
                 )
                 if resolved_effort is not None:
                     selection["effort"] = resolved_effort
@@ -3470,7 +3556,7 @@ class ProviderRegistry:
             "concurrency": self._config_provider_capacity(provider.name),
         }
         resolved_effort, effort_source = self._resolve_effort_for_provider(
-            provider, tier, effort
+            provider, tier, effort, routed_effort
         )
         if resolved_effort is not None:
             selection["effort"] = resolved_effort
@@ -4370,6 +4456,7 @@ class ProviderRegistry:
         on_pid: Callable[[int], None] | None = None,
         provider_id: str | None = None,
         delegation_only: bool = False,
+        routed_effort: str | None = None,
     ) -> dict[str, Any]:
         """Try each available provider in ascending cost order; return on first success.
 
@@ -4529,7 +4616,9 @@ class ProviderRegistry:
                 effective_timeout,
             )
 
-            resolved_effort, _ = self._resolve_effort_for_provider(provider, tier, effort)
+            resolved_effort, _ = self._resolve_effort_for_provider(
+                provider, tier, effort, routed_effort
+            )
             _exec_kwargs: dict = {
                 "timeout": effective_timeout,
                 "code_only": code_only,
@@ -4549,7 +4638,7 @@ class ProviderRegistry:
                 if self._db is not None:
                     _record_prov_success(self._db, provider.name)
                 selection = self._selection_metadata_for_provider_with_effort(
-                    provider, tier, effort
+                    provider, tier, effort, routed_effort
                 )
                 selection.update({
                     "result": output,
