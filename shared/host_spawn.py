@@ -495,6 +495,45 @@ def _is_fragment_prompt(text: str, target_basename: str | None = None) -> bool:
     return False
 
 
+_OWNERSHIP_MARKER = "You own exactly these files:"
+# Connective left dangling where a sibling path was blanked out of the prose:
+# "in and ;", "in ;", "and ,", or a prompt that simply ends on "in"/"and".
+_DANGLING_CONNECTIVE = re.compile(
+    r"\b(?:in|on|at|into|via|with)\s+(?:and|or)\s*(?:[;,:.]|$)"
+    r"|\b(?:in|on|at|into|via|with|and|or)\s+[;,]"
+    r"|\b(?:in|and|or|on|at|with|into|via)\s*[.;:,]*\s*$",
+    re.IGNORECASE,
+)
+# "tests/ test_x.py": a directory whose file name was split off by a clause cut.
+_SPLIT_DIR_SHAPE = re.compile(r"(?<![\w/.\-])[\w.\-]+/\s+[\w.\-]+\.[A-Za-z][A-Za-z0-9]{0,4}\b")
+_MIN_PROSE_WORDS = 4
+
+
+def is_mangled_prompt(text: str) -> bool:
+    """True when a heuristic-built prompt reads as spliced fragments.
+
+    Operates on the description *without* the ownership sentence — that line is
+    appended to every finalized subtask, so it would make any fragment look
+    complete. Complements :func:`_is_fragment_prompt`, which only catches
+    path-shaped slices: a lexical clause cut leaves prose such as
+    ``"scoped verify signals in and ;"`` that has whitespace and so passes it.
+    """
+    body = (text or "")
+    marker = body.find(_OWNERSHIP_MARKER)
+    if marker != -1:
+        body = body[:marker]
+    body = body.strip()
+    if not body:
+        return True
+    if _DANGLING_CONNECTIVE.search(body) or _SPLIT_DIR_SHAPE.search(body):
+        return True
+    words = [
+        w for w in re.split(r"\s+", body)
+        if w.strip(".,;:()") and "/" not in w and not _BARE_FILE_TOKEN.fullmatch(w.strip(".,;:()"))
+    ]
+    return len(words) < _MIN_PROSE_WORDS
+
+
 def _target_within_workspace(target: str, root: str) -> bool:
     try:
         resolved = normalize_target_path(target, root)
@@ -548,6 +587,39 @@ def sanitize_plan_for_host(
         return report
 
     root = str(workspace_root).strip() if workspace_root else ""
+
+    # A heuristic-built write prompt (it carries the ownership sentence) that reads
+    # as spliced fragments cannot be repaired by dropping it: its siblings are cut
+    # from the same task text, and keeping only the survivors silently loses files.
+    # Fall back to one agent over the full task instead.
+    for raw in subtasks:
+        if not isinstance(raw, dict) or raw.get("read_only") or raw.get("review_dimension"):
+            continue
+        desc = str(raw.get("description") or "")
+        if _OWNERSHIP_MARKER in desc and is_mangled_prompt(desc):
+            report["collapsed_to_single"] = True
+            report["fragment_prompt"] = {"id": raw.get("id"), "description": desc[:120]}
+            report["reasons"].append(
+                f"subtask {raw.get('id')}: mangled prompt fragment; "
+                "collapsed to single full-task agent"
+            )
+            log.info("host plan: mangled prompt in subtask %s; collapsing to one agent", raw.get("id"))
+            tiers = [str(s.get("tier")) for s in subtasks if isinstance(s, dict)]
+            tier = default_tier if default_tier in {"low", "medium", "high"} else "medium"
+            for t in tiers:
+                if t in {"low", "medium", "high"} and (
+                    ("low", "medium", "high").index(t) > ("low", "medium", "high").index(tier)
+                ):
+                    tier = t
+            full = (str(task).strip() if task else "") or "Complete the requested task."
+            plan_dict["subtasks"] = [
+                {"id": 1, "description": full, "tier": tier, "depends_on": []}
+            ]
+            plan_dict["waves"] = [[1]]
+            plan_dict["topology"] = "linear"
+            plan_dict["strategy"] = "sequential"
+            plan_dict["sanitization"] = report
+            return report
 
     surviving: list[dict[str, Any]] = []
     dropped_ids: set[tuple[str, str]] = set()

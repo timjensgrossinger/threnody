@@ -37,7 +37,7 @@ from .plan_cache import (
     PLAN_CACHE_SCHEMA_INVALID,
     estimated_planner_tokens_from_plan,
 )
-from .heuristic_plan import build_heuristic_plan_payload
+from .heuristic_plan import HEURISTIC_PLAN_VERSION, build_heuristic_plan_payload
 from .style import StyleLearner, DecompositionPrefs
 
 log = logging.getLogger(__name__)
@@ -1339,6 +1339,12 @@ class Planner:
         cache_key = task + constraint_suffix
         if caller:
             cache_key += f"\n\nCALLER: {caller}"
+        # The heuristic plan depends on the workspace (bare names are resolved and
+        # tiers floored against its files) and on the planner's own plan shape; a
+        # plan cached under an older shape must not be served after an upgrade.
+        cache_key += f"\n\nHEURISTIC_PLAN_V{HEURISTIC_PLAN_VERSION}"
+        if workspace_root:
+            cache_key += f"\nWORKSPACE: {workspace_root}"
 
         if not skip_cache and self._db:
             lookup = self._safe_plan_lookup(cache_key)
@@ -1378,9 +1384,13 @@ class Planner:
         started_at = time.monotonic()
         intent_templates = True
         coupled_strategy = "single"
+        single_agent_when_complex = False
         if self._config is not None:
             intent_templates = bool(self._config.heuristic_intent_templates)
             coupled_strategy = getattr(self._config, "heuristic_coupled_strategy", "single")
+            single_agent_when_complex = bool(
+                getattr(self._config, "heuristic_single_agent_when_complex", False)
+            )
         parsed = build_heuristic_plan_payload(
             task,
             default_tier=default_tier,
@@ -1390,6 +1400,7 @@ class Planner:
             coupled_strategy=coupled_strategy,
             caller=caller,
             workspace_root=workspace_root,
+            single_agent_when_complex=single_agent_when_complex,
         )
         plan = self._build_plan(parsed, task)
         plan.planner_mode = "heuristic"

@@ -2,8 +2,9 @@
 opencode/providers.py — OpenCode provider implementation for Threnody.
 
 Implements command building, auth detection, and output cleaning for the
-OpenCode CLI. The initial rollout is intentionally low-tier-only and targets
-the free Nemotron 3 Super Free model exposed by OpenCode.
+OpenCode CLI. Statically low-tier-only (a free Zen model); medium/high are
+added at catalog projection when ``opencode models --verbose`` lists a matching
+model on a provider the user configured (see provider_model_adapters).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import subprocess
 from pathlib import Path
 
 from shared.discovery import CLIProvider, DetectReason, ProviderReadiness
+from shared.effort_support import model_effort_accepted
 from shared.model_registry import bootstrap_tier_map
 
 logger = logging.getLogger(__name__)
@@ -33,7 +35,9 @@ def _build_opencode_command(
 
     OpenCode accepts provider-qualified model identifiers and runs headlessly via
     ``opencode run``. ``--dangerously-skip-permissions`` avoids interactive
-    permission prompts for router-driven executions.
+    permission prompts for router-driven executions. ``--variant`` is added only
+    when the model lists that variant (verbose catalog, else models.dev); an
+    unknown model gets none rather than a variant it may reject.
     """
     command = [
         "opencode",
@@ -44,7 +48,9 @@ def _build_opencode_command(
     ]
     if action == "execute_code_only":
         command.append("--pure")
-    if effort is not None:
+    if effort is not None and model_effort_accepted(
+        "opencode", model, effort, catalog=getattr(provider, "model_catalog", None)
+    ):
         command.extend(["--variant", str(effort)])
     command.append(prompt)
     return command

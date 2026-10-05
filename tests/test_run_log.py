@@ -122,3 +122,100 @@ def test_prune_keeps_most_recent() -> None:
     run_log.prune_runs(keep=2)
     remaining = [p.name for p in run_log.RUNS_ROOT.iterdir() if p.is_dir()]
     assert len(remaining) == 2
+
+
+# ---- Active-pointer TTL / pruning -------------------------------------------
+
+def _age_pointer(workspace_root: str | None, age_s: float) -> Path:
+    import json
+    import time
+
+    path = run_log._active_pointer_path(workspace_root)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["ts"] = time.time() - age_s
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def test_append_agent_record_stamps_ts() -> None:
+    run_log.append_agent_record("swarm-ts", {"wave": 1})
+    run_log.append_agent_record("swarm-ts", {"wave": 2, "ts": 123.0})
+    records = run_log.read_run_log("swarm-ts")
+    assert isinstance(records[0]["ts"], float)
+    assert records[1]["ts"] == 123.0
+
+
+def test_expired_pointer_with_only_hook_activity_is_dropped(tmp_path: Path) -> None:
+    """A dead run's pointer must not be kept alive by the hook's own appends."""
+    ws = str(tmp_path / "ws")
+    run_log.set_active_run("plan-dead", workspace_root=ws)
+    run_log.append_agent_record(
+        "plan-dead", {"wave": 0, "source": run_log.HOOK_SOURCE, "touched_files": ["a.py"]}
+    )
+    path = _age_pointer(ws, run_log.ACTIVE_POINTER_TTL_S + 60)
+
+    assert run_log.get_active_run(workspace_root=ws) is None
+    assert not path.exists()
+
+
+def test_expired_pointer_kept_and_refreshed_by_artifact_activity(tmp_path: Path) -> None:
+    import json
+
+    ws = str(tmp_path / "ws")
+    run_log.set_active_run("swarm-long", workspace_root=ws)
+    artifact = run_log.artifact_path("swarm-long", "agent-1")
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("upstream output", encoding="utf-8")
+    path = _age_pointer(ws, run_log.ACTIVE_POINTER_TTL_S + 60)
+
+    assert run_log.get_active_run(workspace_root=ws) == "swarm-long"
+    refreshed = json.loads(path.read_text(encoding="utf-8"))["ts"]
+    assert abs(refreshed - artifact.stat().st_mtime) < 1.0
+
+
+def test_expired_pointer_kept_by_non_hook_record(tmp_path: Path) -> None:
+    ws = str(tmp_path / "ws")
+    run_log.set_active_run("swarm-model", workspace_root=ws)
+    run_log.append_agent_record("swarm-model", {"wave": 1, "spawn_id": "a1"})
+    _age_pointer(ws, run_log.ACTIVE_POINTER_TTL_S + 60)
+
+    assert run_log.get_active_run(workspace_root=ws) == "swarm-model"
+
+
+def test_run_activity_ts_ignores_hook_lines() -> None:
+    run_log.append_agent_record("swarm-h", {"wave": 0, "source": run_log.HOOK_SOURCE})
+    assert run_log.run_activity_ts("swarm-h") == 0.0
+    run_log.append_agent_record("swarm-h", {"wave": 1, "ts": 500.0})
+    assert run_log.run_activity_ts("swarm-h") == 500.0
+
+
+def test_clear_without_workspace_removes_workspace_pointers(tmp_path: Path) -> None:
+    """The terminal report clears by run id only; that must reach the
+    per-workspace pointer, not just the legacy global file."""
+    ws = str(tmp_path / "ws")
+    run_log.set_active_run("swarm-term", workspace_root=ws)
+    run_log.set_active_run("swarm-other", workspace_root=str(tmp_path / "ws2"))
+
+    run_log.clear_active_run("swarm-term")
+
+    assert run_log.get_active_run(workspace_root=ws) is None
+    assert run_log.get_active_run(workspace_root=str(tmp_path / "ws2")) == "swarm-other"
+
+
+def test_prune_active_pointers(tmp_path: Path) -> None:
+    live_ws = tmp_path / "live"
+    live_ws.mkdir()
+    old_ws = tmp_path / "old"
+    old_ws.mkdir()
+    run_log.set_active_run("swarm-live", workspace_root=str(live_ws))
+    run_log.set_active_run("swarm-gone", workspace_root=str(tmp_path / "deleted-pytest-ws"))
+    run_log.set_active_run("swarm-old", workspace_root=str(old_ws))
+    _age_pointer(str(old_ws), run_log.ACTIVE_POINTER_TTL_S + 60)
+    (run_log.RUNS_ROOT / "active-garbage.json").write_text("{not json", encoding="utf-8")
+
+    removed = run_log.prune_active_pointers()
+
+    assert len(removed) == 3
+    assert "active-garbage.json" in removed
+    assert run_log.get_active_run(workspace_root=str(live_ws)) == "swarm-live"
+    assert set(run_log.active_pointer_runs()) == {"swarm-live"}

@@ -33,6 +33,10 @@ class ErrorCategory(str, enum.Enum):
     TIMEOUT = "timeout"
     DB_LOCKED = "db_locked"
     DB_CORRUPT = "db_corrupt"
+    # The process's view of the files is broken (sidecars deleted or the file
+    # swapped underneath it, cannot open, moved): not corruption, and not
+    # retryable in-process — only a fresh process (new shm mapping) recovers.
+    DB_IOERR = "db_ioerr"
     UNKNOWN = "unknown"
 
 
@@ -48,6 +52,7 @@ _RETRY_MAP: dict[ErrorCategory, bool] = {
     ErrorCategory.TIMEOUT: False,
     ErrorCategory.DB_LOCKED: True,
     ErrorCategory.DB_CORRUPT: False,
+    ErrorCategory.DB_IOERR: False,
     ErrorCategory.UNKNOWN: True,
 }
 
@@ -98,19 +103,50 @@ def classify(
     return ErrorCategory.UNKNOWN
 
 
+# Primary SQLite result codes (``sqlite_errorcode & 0xFF``).
+_SQLITE_BUSY = 5
+_SQLITE_LOCKED = 6
+_SQLITE_READONLY = 8
+_SQLITE_IOERR = 10
+_SQLITE_CORRUPT = 11
+_SQLITE_CANTOPEN = 14
+_SQLITE_NOTADB = 26
+_SQLITE_READONLY_DBMOVED = 1032  # extended: the file was moved/replaced under us
+
+
 def classify_sqlite_error(exc: BaseException) -> ErrorCategory:
     """Classify a SQLite exception into a retry-relevant category.
 
     Distinguishes a transient ``database is locked``/``busy`` (retryable —
     another process holds the write lock) from genuine on-disk corruption
     (``malformed`` / ``not a database`` / ``disk image``), which must NOT be
-    retried and instead trigger guarded recovery. Anything else → UNKNOWN.
+    retried and instead trigger guarded recovery, and from an I/O-level failure
+    (``disk I/O error``, cannot open, file moved), which is neither: the file is
+    fine, this process's handle on it is not. Anything else → UNKNOWN.
+
+    ``sqlite_errorcode`` (Python 3.11+) is authoritative when present; the
+    message checks are the fallback for 3.10 and for exceptions that were
+    re-raised across the daemon wire without their code.
     """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        primary = code & 0xFF
+        if primary in (_SQLITE_BUSY, _SQLITE_LOCKED):
+            return ErrorCategory.DB_LOCKED
+        if primary in (_SQLITE_CORRUPT, _SQLITE_NOTADB):
+            return ErrorCategory.DB_CORRUPT
+        if (
+            primary in (_SQLITE_IOERR, _SQLITE_CANTOPEN, _SQLITE_READONLY)
+            or code == _SQLITE_READONLY_DBMOVED
+        ):
+            return ErrorCategory.DB_IOERR
     msg = str(exc).lower()
     if any(k in msg for k in ("database is locked", "database is busy", "is locked", "database table is locked")):
         return ErrorCategory.DB_LOCKED
     if any(k in msg for k in ("malformed", "not a database", "disk image", "file is encrypted")):
         return ErrorCategory.DB_CORRUPT
+    if any(k in msg for k in ("disk i/o error", "readonly database", "unable to open database file")):
+        return ErrorCategory.DB_IOERR
     return ErrorCategory.UNKNOWN
 
 

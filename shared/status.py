@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json as _json
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from shared.agents import DEFAULT_PENDING_APPROVAL_LIMIT, approval_queue_list
@@ -98,6 +99,7 @@ def build_status_snapshot(
         "recent_summary": _load_recent_summary(db),
         "adaptive_thresholds": _load_adaptive_summary(db),
         "rework_summary": _load_rework_summary(db),
+        "swarm_runs": _load_swarm_run_summary(db),
         "provider_health": _load_provider_health(db),
         "spend_summary": spend_snapshot,
         "quality_summary": quality_summary,
@@ -154,9 +156,11 @@ def _load_backup_health(db: Database) -> dict:
         "backups_present": None,
         "newest_backup_age_hours": None,
     }
-    age_fn = getattr(db, "_newest_backup_age_s", None)
+    # Public accessor first: RemoteDatabase proxies it to the daemon, whereas the
+    # private name resolves to nothing over the proxy and always reported None.
+    age_fn = getattr(db, "newest_backup_age_s", None) or getattr(db, "_newest_backup_age_s", None)
     if not callable(age_fn):
-        return result  # RemoteDatabase / stub — nothing to report.
+        return result  # stub — nothing to report.
     try:
         age_s = age_fn()
     except Exception:
@@ -233,6 +237,34 @@ def _load_recent_summary(db: Database) -> dict:
                 result["latest_notable_event"] = latest_note
     except Exception:
         log.debug("recent summary load failed", exc_info=True)
+    return result
+
+
+def _load_swarm_run_summary(db: Database, *, stale_after_s: float = 86400.0) -> dict:
+    """Swarm run counts by status, plus active runs past the reaper's age cutoff.
+
+    ``stale_active`` counts runs still in an active status that are older than
+    *stale_after_s* — the backlog ``Database.reap_stale_swarm_runs`` has not
+    marked ``abandoned`` yet (or skipped for recent run-dir activity).
+    """
+    result: dict[str, object] = {"by_status": {}, "abandoned": 0, "stale_active": 0}
+    active = Database.ACTIVE_SWARM_STATUSES
+    try:
+        with db.conn() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) FROM swarm_runs GROUP BY status"
+            ).fetchall()
+            by_status = {str(row[0]): int(row[1]) for row in rows}
+            stale_row = conn.execute(
+                f"SELECT COUNT(*) FROM swarm_runs "
+                f"WHERE status IN ({', '.join(['?'] * len(active))}) AND created_ts < ?",
+                (*active, time.time() - stale_after_s),
+            ).fetchone()
+        result["by_status"] = by_status
+        result["abandoned"] = by_status.get("abandoned", 0)
+        result["stale_active"] = int(stale_row[0]) if stale_row and stale_row[0] else 0
+    except Exception:
+        log.debug("swarm run summary load failed", exc_info=True)
     return result
 
 

@@ -38,6 +38,11 @@ _WARM_PATH_EXECUTOR_WORKERS: int | None = None
 _WARM_PATH_WORKER_CAP = 8
 _WARM_PATH_WORKER_DEFAULT = 2
 
+# Stale swarm-run reaper cadence: once at the first warm-path tick of a process,
+# then at most every 6 h. ``None`` means "not yet run in this process".
+_SWARM_REAP_INTERVAL_S = 6 * 3600.0
+_LAST_SWARM_REAP_TS: float | None = None
+
 
 def _warm_path_worker_count(config: TGsConfig | None) -> int:
     """Return warm-path worker count from config (default 2, capped at 8)."""
@@ -205,6 +210,30 @@ def run_warm_path_background_tasks(db: Database) -> dict[str, str | int | dict]:
     except Exception as e:
         log.debug("run-log import scan failed: %s", e, exc_info=True)
         results["run_log_import"] = {"error": str(e)}
+
+    # Runs a host never reported back on stay awaiting_host_execution/running
+    # forever. Ordered after the run-log import so a terminal-but-unimported run
+    # completes before it could be considered stale.
+    global _LAST_SWARM_REAP_TS
+    now = time.time()
+    if _LAST_SWARM_REAP_TS is None or now - _LAST_SWARM_REAP_TS >= _SWARM_REAP_INTERVAL_S:
+        # Expired pointers and pointers at deleted (e.g. pytest temp) workspaces
+        # would otherwise keep the PostToolUse hook appending to dead runs.
+        try:
+            from . import run_log
+
+            results["pointer_prune"] = len(run_log.prune_active_pointers(now=now))
+        except Exception as e:
+            log.debug("active pointer prune failed: %s", e, exc_info=True)
+            results["pointer_prune"] = {"error": str(e)}
+        try:
+            reaped = db.reap_stale_swarm_runs(now=now)
+            # Stamp only on success so a failed first attempt retries next tick.
+            _LAST_SWARM_REAP_TS = now
+            results["swarm_reap"] = len(reaped)
+        except Exception as e:
+            log.debug("stale swarm-run reap failed: %s", e, exc_info=True)
+            results["swarm_reap"] = {"error": str(e)}
 
     return results
 

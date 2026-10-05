@@ -196,6 +196,39 @@ def _isolate_learning_state(tmp_path_factory: pytest.TempPathFactory) -> Iterato
                 os.environ[env_key] = saved[saved_key]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_models_dev(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Point both models.dev copies at absent scratch files for every test.
+
+    ``shared.model_capabilities`` gates Copilot ``--effort`` / OpenCode
+    ``--variant`` on the operator's ``~/.cache/opencode/models.json``, so argv
+    assertions would otherwise depend on whatever OpenCode last downloaded, and
+    an absent cache would trigger a real download from models.dev. A test that
+    needs data writes a fixture file to one of these paths.
+    """
+    root = tmp_path_factory.mktemp("models_dev")
+    monkeypatch.setenv("THRENODY_MODELS_DEV_OFFLINE", "1")
+    monkeypatch.setenv("THRENODY_OPENCODE_MODELS_JSON", str(root / "opencode-models.json"))
+    monkeypatch.setenv("THRENODY_MODELS_DEV_CACHE", str(root / "models_dev.json"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_agent_dirs(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Hide the operator's installed agent definitions from every test.
+
+    ``host_spawn`` picks ``threnody-<tier>-<effort>`` only when that definition
+    exists in ``~/.claude/agents`` / ``$CODEX_HOME/agents``, so once install.sh has
+    generated the variants every spawn assertion would depend on the machine.
+    Codex is redirected through ``CODEX_HOME`` (not by patching the function) so
+    tests of ``codex_agents_dir`` itself still exercise the real resolver.
+    """
+    from shared import host_spawn as _host_spawn
+
+    root = tmp_path_factory.mktemp("agent_dirs")
+    monkeypatch.setattr(_host_spawn, "claude_agents_dir", lambda: root / "claude-agents")
+    monkeypatch.setenv("CODEX_HOME", str(root / "codex-home"))
+
+
 # ============================================================================
 # FIXTURE 1: temp_db_fixture
 # ============================================================================

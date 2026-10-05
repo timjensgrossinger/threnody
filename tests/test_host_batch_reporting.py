@@ -103,3 +103,20 @@ def test_inline_mode_still_ingests_per_wave(monkeypatch, tmp_path: Path) -> None
     # Inline path returns the legacy ingest shape, ingesting immediately.
     assert r1.get("agents_recorded") == 1
     assert _telemetry_count(db, run_id) == 1
+
+
+def test_worker_wave_refreshes_hook_pointer_without_stealing(monkeypatch, tmp_path: Path) -> None:
+    # Long host runs must outlive run_log.ACTIVE_POINTER_TTL_S: a worker-wave
+    # report re-stamps the pointer (or restores an expired one), but never
+    # repoints a workspace another run currently owns.
+    _init(monkeypatch, tmp_path, capture="hook")
+    root = str(tmp_path / "project")
+    Path(root).mkdir()
+
+    run_log.set_active_run("swarm-other", workspace_root=root)
+    mcp_server.handle_report_host_wave({"run_id": "swarm-long", "wave": 1, "workspace_root": root, "agents": []})
+    assert run_log.get_active_run(root) == "swarm-other"
+
+    run_log.clear_active_run("swarm-other")
+    mcp_server.handle_report_host_wave({"run_id": "swarm-long", "wave": 2, "workspace_root": root, "agents": []})
+    assert run_log.get_active_run(root) == "swarm-long"

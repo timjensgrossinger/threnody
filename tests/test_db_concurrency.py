@@ -298,13 +298,35 @@ def test_recovery_restores_backup_and_keeps_it() -> None:
         assert rows == [("good",)], rows
 
 
+_HOLDER_SCRIPT = """
+import sys
+sys.path.insert(0, sys.argv[2])
+from pathlib import Path
+from shared.db import Database
+db = Database(Path(sys.argv[1]))
+conn = db._connect()
+conn.execute("SELECT COUNT(*) FROM cache").fetchone()
+print("ready", flush=True)
+sys.stdin.readline()
+conn.close()
+db.close()
+"""
+
+
 def test_recovery_declines_while_another_process_holds_db() -> None:
-    """Recovery must not mutate the DB file while a peer connection is attached.
+    """Recovery must not mutate the DB file while a peer process has it open.
 
     The process lock only serializes processes that take it; a peer merely holding
     a connection does not. Replacing the file or deleting its WAL underneath that
-    reader invalidates its shm mapping (``disk I/O error``).
+    reader invalidates its shm mapping (``disk I/O error``). The peer's access-lock
+    SHARED hold (shared/db_locks.py) is what recovery now checks — SQLite's own
+    EXCLUSIVE probe could not see an *idle* WAL reader at all. (A raw sqlite3
+    connection that never constructs a ``Database`` is outside that protocol.)
     """
+    import subprocess
+
+    from shared.db import RECOVERY_DECLINED_IN_USE
+
     with tempfile.TemporaryDirectory() as d:
         db_path = Path(d) / "cache.db"
         db = Database(db_path)
@@ -316,16 +338,22 @@ def test_recovery_declines_while_another_process_holds_db() -> None:
         assert db.backup_db() is not None
         db.close()
 
-        holder = sqlite3.connect(str(db_path))
-        holder.execute("BEGIN EXCLUSIVE")
+        root = str(Path(__file__).resolve().parent.parent)
+        holder = subprocess.Popen(
+            [sys.executable, "-c", _HOLDER_SCRIPT, str(db_path), root],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
         try:
-            before = db_path.stat().st_mtime_ns
-            Database(db_path)._recover_db()
-            assert db_path.stat().st_mtime_ns == before, "recovery mutated a shared DB"
+            assert holder.stdout.readline().strip() == "ready"
+            before = (db_path.stat().st_ino, db_path.stat().st_mtime_ns)
+            result = Database(db_path)._recover_db(timeout_s=0.2)
+            assert result == RECOVERY_DECLINED_IN_USE
+            after = (db_path.stat().st_ino, db_path.stat().st_mtime_ns)
+            assert after == before, "recovery mutated a shared DB"
             assert glob.glob(str(db_path) + ".corrupt.*") == []
         finally:
-            holder.rollback()
-            holder.close()
+            holder.stdin.close()
+            holder.wait(timeout=30)
 
 
 def test_orphaned_wal_discarded_when_main_db_missing() -> None:

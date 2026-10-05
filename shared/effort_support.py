@@ -33,9 +33,10 @@ EFFORT_SUPPORT: dict[str, EffortSupport] = {
     "codex": EffortSupport("codex_toml", True, '-c model_reasoning_effort="<e>"', True),
     # Copilot agent files have no effort key, so no host-native pinning. Subprocess flag verified via
     # `gh copilot -- --help`: --effort, --reasoning-effort <none|minimal|low|medium|high|xhigh|max> (we route low|medium|high).
+    # Gated per model (see model_effort_accepted): only levels models.dev lists for that model are sent.
     "github-copilot": EffortSupport(None, True, "--effort <e>", True),
     "aider": EffortSupport(None, True, "--reasoning-effort <e>", True),
-    # Variant names are provider/model specific; forwarded as-is.
+    # Variant names are provider/model specific: sent only when the model lists that variant.
     "opencode": EffortSupport(None, True, "--variant <e>", True),
     # Builder forwards an explicit effort, but the flag is unverified: never route one.
     "cursor": EffortSupport(None, False, "--reasoning-effort <e>", False),
@@ -79,6 +80,41 @@ def subprocess_effort_supported(provider_id: str | None) -> bool:
     """True when a routed (not explicitly requested) effort may be added to argv."""
     entry = support_for(provider_id)
     return bool(entry and entry.subprocess and entry.verified)
+
+
+def model_effort_accepted(
+    provider_id: str | None,
+    model: str | None,
+    effort: str | None,
+    *,
+    catalog: list[dict] | None = None,
+) -> bool:
+    """True when *effort* may go on the argv for *model* on *provider_id*.
+
+    Copilot and OpenCode take a flag whose valid values depend on the model, so
+    an effort the model does not list (or a model whose levels are unknown) is
+    dropped rather than sent. Every other shell is model-independent here.
+    """
+    if not effort:
+        return False
+    key = _canonical(provider_id)
+    try:
+        if key == "github-copilot":
+            from .model_capabilities import copilot_effort_accepted
+
+            return copilot_effort_accepted(model, effort)
+        if key == "opencode":
+            from .model_capabilities import opencode_variant_levels
+
+            levels = opencode_variant_levels(model, catalog)
+            if levels is None:
+                log.debug("opencode: variants for %r unknown; omitting --variant", model)
+                return False
+            return str(effort).strip().lower() in levels
+    except Exception:
+        log.debug("model effort gate failed for %s/%s", provider_id, model, exc_info=True)
+        return False
+    return True
 
 
 def default_routed_effort(tier: str, duration: str | None = None) -> str:

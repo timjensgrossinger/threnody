@@ -1304,15 +1304,22 @@ class Orchestrator:
         """
         if not self._provider_accepts_effort(provider):
             return None
+        effort = self._effort_for_subtask(subtask, tier, provider)
+        if effort is None:
+            return None
         gate = getattr(provider, "effort_applied_for", None)
         if callable(gate) and model is not None:
             try:
-                if not gate(model):
+                # A gate taking ``effort`` is per-level (Copilot: only the levels
+                # the model lists); a model-only gate is per-route (Claude).
+                params = inspect.signature(gate).parameters
+                applied = gate(model, effort=effort) if "effort" in params else gate(model)
+                if not applied:
                     return None
             except Exception:  # pragma: no cover - best-effort
                 log.debug("effort_applied_for failed", exc_info=True)
                 return None
-        return self._effort_for_subtask(subtask, tier, provider)
+        return effort
 
     def _log_escalation_event(
         self,

@@ -242,3 +242,23 @@ def test_main_captures_cursor_event(capsys: pytest.CaptureFixture) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["captured"] is True
     assert run_log.read_run_log("swarm-cursor")[0]["touched_files"] == ["/tmp/p/x.ts"]
+
+
+def test_capture_skips_expired_pointer(tmp_path: Path) -> None:
+    """An expired pointer (run never reported terminal) captures nothing, so a
+    dead run's log stops growing and stops looking active to the reaper."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    run_log.set_active_run("plan-stale", workspace_root=str(ws))
+    pointer = run_log._active_pointer_path(str(ws))
+    data = json.loads(pointer.read_text(encoding="utf-8"))
+    data["ts"] -= run_log.ACTIVE_POINTER_TTL_S + 60
+    pointer.write_text(json.dumps(data), encoding="utf-8")
+
+    out = learning_hook.capture_edit(
+        {"cwd": str(ws), "target_file": str(ws / "a.py"), "success": True}
+    )
+
+    assert out == {"captured": False, "reason": "no active run"}
+    assert run_log.read_run_log("plan-stale") == []
+    assert not pointer.exists()

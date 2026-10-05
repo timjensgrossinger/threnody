@@ -22,6 +22,18 @@ def _provider(name: str):
     return next(p for p in BUILTIN_PROVIDERS if p.name == name)
 
 
+@pytest.fixture
+def copilot_models_dev() -> None:
+    """Copilot --effort is gated per model on models.dev data (see model_capabilities)."""
+    import json
+    import os
+
+    Path(os.environ["THRENODY_OPENCODE_MODELS_JSON"]).write_text(json.dumps({
+        "github-copilot": {"models": {"gpt-5-mini": {"reasoning": True, "reasoning_options": [
+            {"type": "effort", "values": ["low", "medium", "high"]}]}}},
+    }), encoding="utf-8")
+
+
 # --- table -------------------------------------------------------------------
 
 
@@ -93,7 +105,7 @@ def test_codex_toml_escapes_hostile_source(tmp_path: Path) -> None:
 # --- subprocess argv ----------------------------------------------------------
 
 
-def test_copilot_argv_gets_effort_after_separator() -> None:
+def test_copilot_argv_gets_effort_after_separator(copilot_models_dev) -> None:
     with (
         patch("shared.discovery._copilot_supports_model_flag", return_value=True),
         patch("shared.discovery._copilot_supports_disable_builtin_mcps", return_value=False),
@@ -229,7 +241,7 @@ def test_claude_provider_argv_effort(monkeypatch) -> None:
     assert prov.effort_applied_for("gpt-5-mini") is False  # gh copilot agent route drops it
 
 
-def test_copilot_provider_argv_effort(monkeypatch) -> None:
+def test_copilot_provider_argv_effort(monkeypatch, copilot_models_dev) -> None:
     import copilot.providers as mod
 
     prov = mod.CopilotProvider()

@@ -88,28 +88,121 @@ def _suggest_fix(provider_name: str, category: str | None) -> str:
     return "—"
 
 
-def _daemon_health_check(db) -> None:
-    """Report single-writer daemon status when the operator has opted in."""
+def _lsof(args: list[str]) -> str | None:
+    """``lsof`` output, or None when lsof is not installed / fails."""
+    import shutil
+    import subprocess
+
+    binary = shutil.which("lsof")
+    if not binary:
+        return None
+    try:
+        return subprocess.run(
+            [binary, *args], capture_output=True, text=True, timeout=15
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        log.debug("lsof %s failed", args, exc_info=True)
+        return None
+
+
+def _deleted_db_mappings(pid: int, db_name: str) -> list[str] | None:
+    """Unlinked (``+L1``) cache.db* files the daemon still has open, or None if unknown.
+
+    A daemon still mapping a deleted ``-shm``/``-wal`` is the stale-mapping
+    state behind ``disk I/O error``; its watchdog should restart it within
+    seconds, so seeing this persist means the watchdog is not running.
+    """
+    out = _lsof(["-n", "-P", "+L1", "-p", str(pid)])
+    if out is None:
+        return None
+    return [line for line in out.splitlines() if db_name in line]
+
+
+def _pids_with_db_open(db_path: Path) -> dict[int, str] | None:
+    """pid → command for every process holding cache.db / -wal / -shm open."""
+    paths = [str(p) for p in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")) if p.exists()]
+    if not paths:
+        return {}
+    out = _lsof(["-n", "-P", "-F", "pc", *paths])
+    if out is None:
+        return None
+    pids: dict[int, str] = {}
+    current: int | None = None
+    for line in out.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            current = int(line[1:])
+            pids.setdefault(current, "")
+        elif line.startswith("c") and current is not None:
+            pids[current] = line[1:]
+    return pids
+
+
+def _daemon_health_check(db) -> list[str]:
+    """Report the single-writer daemon's state; returns the warnings it printed."""
+    warnings: list[str] = []
     try:
         from .config import TGsConfig
         cfg = TGsConfig.from_yaml()
     except Exception:
-        return
+        return warnings
     daemon_cfg = getattr(cfg, "db_daemon", None)
     if not daemon_cfg or not getattr(daemon_cfg, "enabled", False):
-        return
-    db_path = getattr(db, "_db_path", None) or getattr(cfg, "db_path", "")
-    sock = getattr(daemon_cfg, "socket_path", "") or (str(db_path) + ".sock")
-    import socket as _socket
-    try:
-        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.settimeout(2.0)
-        s.connect(sock)
-        s.close()
-        print(f"DB daemon: ENABLED and reachable ({sock})")
-    except OSError:
-        print(f"DB daemon: ENABLED but NOT reachable ({sock}) — will spawn on next use; "
-              "sessions fall back to direct DB if spawn fails")
+        print("DB daemon: disabled (every process opens the DB directly)")
+        return warnings
+    db_path = Path(str(getattr(db, "_db_path", None) or getattr(cfg, "db_path", "")))
+    from .db_client import probe_daemon
+
+    configured = getattr(daemon_cfg, "socket_path", "") or None
+    info = probe_daemon(db_path, socket_path=configured)
+
+    def warn(msg: str) -> None:
+        warnings.append(msg)
+        print(f"DB daemon: WARNING — {msg}")
+
+    pid = info.get("pid")
+    if not info.get("running"):
+        print(
+            f"DB daemon: ENABLED, not running ({info['socket_path']}) — will spawn on next "
+            f"foreground use; election lock {info.get('election_lock')}, "
+            f"access lock {info.get('access_lock')}"
+        )
+        if info.get("election_lock") == "held":
+            warn("election lock is held but nothing answers on the socket "
+                 "(a daemon starting, or one wedged without its socket)")
+    elif info.get("legacy"):
+        warn(f"pid {pid} speaks the legacy protocol (pre-upgrade code) — stop it with "
+             "SIGTERM so the next client spawns a current daemon")
+    else:
+        st = info.get("status") or {}
+        print(
+            f"DB daemon: running (pid {pid}, version {st.get('version')}, protocol "
+            f"{st.get('protocol')}, up {float(st.get('uptime_s') or 0) / 3600:.1f}h, "
+            f"{st.get('sessions_open')} open session(s))"
+        )
+        if st.get("legacy_clients"):
+            warn(f"{st['legacy_clients']} connected client(s) speak the legacy protocol — "
+                 "restart those Claude Code / MCP sessions to load current code")
+        for path, ids in (st.get("files") or {}).items():
+            if ids.get("recorded") and ids.get("recorded") != ids.get("current"):
+                warn(f"{Path(path).name} changed underneath the daemon "
+                     "(it should restart itself within seconds)")
+        err = st.get("last_error")
+        if err:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(err.get("ts", 0)))
+            print(f"DB daemon: last error {err.get('code')} at {when}: {err.get('message')}")
+    if pid:
+        deleted = _deleted_db_mappings(int(pid), db_path.name)
+        if deleted is None:
+            print("DB daemon: lsof not available — skipped the deleted-mapping check")
+        elif deleted:
+            warn(f"pid {pid} still has {len(deleted)} deleted {db_path.name}* file(s) open "
+                 "(stale mapping → disk I/O errors); restart it")
+    holders = _pids_with_db_open(db_path)
+    if holders is not None and len(holders) > 1:
+        listing = ", ".join(f"{p} ({c or '?'})" for p, c in sorted(holders.items()))
+        warn(f"{len(holders)} processes have {db_path.name} open directly: {listing} — "
+             "with the daemon on, only the daemon should")
+    return warnings
 
 
 def diagnose(db, repair: bool = False, dry_run: bool = False) -> int:
@@ -139,12 +232,11 @@ def diagnose(db, repair: bool = False, dry_run: bool = False) -> int:
         except Exception:
             pass
 
-    # DB integrity check
+    # DB integrity check — diagnosis only; `--repair` is what may fix it.
     db_ok = True
     if db is not None:
         try:
-            db._check_integrity_and_recover()
-            db_ok = db.last_integrity_ok
+            db_ok = db.check().get("integrity_ok") is not False
         except Exception:
             db_ok = False
 
@@ -278,14 +370,14 @@ def run_self_repair(db, dry_run: bool = False) -> None:
     else:
         print(f"{tag}repair: providers.json ok")
 
-    # 3. DB integrity — auto-recover if broken (now race-safe via cross-process lock)
+    # 3. DB integrity — recover if broken (gated by the access lock: declines
+    #    while another process has the database open)
     if db is not None:
         try:
-            db._check_integrity_and_recover()
-            if not db.last_integrity_ok:
+            if db.check().get("integrity_ok") is False:
                 if not dry_run:
-                    db._recover_db()
-                    print(f"{tag}repair: db integrity failed — recovery attempted")
+                    outcome = db.repair()
+                    print(f"{tag}repair: db integrity failed — recovery: {outcome}")
                 else:
                     print(f"{tag}repair: db integrity failed (would recover)")
             else:
@@ -328,8 +420,8 @@ def main(argv: list[str] | None = None) -> None:
     db_path = args.db or (Path.home() / ".local/lib/threnody/cache.db")
     if db_path.exists():
         try:
-            from .db import Database
-            db = Database(db_path)
+            from .db_client import open_database
+            db = open_database(db_path)
         except Exception as exc:
             print(f"warning: could not open DB — {exc}", file=sys.stderr)
 

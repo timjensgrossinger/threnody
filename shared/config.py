@@ -443,6 +443,13 @@ DEFAULT_ROUTING_TIER_MODELS = {
 }
 
 
+# Shells whose model ids are provider-qualified (`provider/model`): a bare
+# generic id such as `claude-sonnet-5` is not a valid model there, so a tier the
+# bootstrap does not cover stays unmapped (the host keeps its session model)
+# instead of being gap-filled from DEFAULT_ROUTING_TIER_MODELS.
+_SHELLS_WITHOUT_GENERIC_TIER_FALLBACK = frozenset({"opencode"})
+
+
 def _shell_tier_model_defaults(shell_id: str) -> dict[str, str]:
     """Return per-shell host-native tier models, falling back to generic defaults."""
     from .model_registry import bootstrap_tier_map
@@ -451,6 +458,8 @@ def _shell_tier_model_defaults(shell_id: str) -> dict[str, str]:
     if bootstrap_id is None:
         return dict(DEFAULT_ROUTING_TIER_MODELS)
     mapped = bootstrap_tier_map(bootstrap_id)
+    if shell_id in _SHELLS_WITHOUT_GENERIC_TIER_FALLBACK:
+        return dict(mapped)
     if not mapped:
         return dict(DEFAULT_ROUTING_TIER_MODELS)
     merged = dict(DEFAULT_ROUTING_TIER_MODELS)
@@ -1365,8 +1374,16 @@ def _normalize_routing_policy_mode(raw_mode: Any, *, field_name: str) -> str:
     return mode
 
 
-def _parse_tier_model_mapping(raw_value: Any, *, field_name: str) -> dict[str, str]:
-    mapping = dict(DEFAULT_ROUTING_TIER_MODELS)
+def _parse_tier_model_mapping(
+    raw_value: Any,
+    *,
+    field_name: str,
+    base: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    # Starts from the shell's own defaults: starting from the generic map made a
+    # shell override with no `tier_model_mapping` (e.g. only `mode: guarded`)
+    # replace that shell's bootstrap ids with generic ones in effective_profile.
+    mapping = dict(DEFAULT_ROUTING_TIER_MODELS if base is None else base)
     if raw_value is None:
         return mapping
     if not isinstance(raw_value, Mapping):
@@ -1508,6 +1525,7 @@ def _parse_shell_routing_profile(
         tier_model_mapping=_parse_tier_model_mapping(
             raw_profile.get("tier_model_mapping"),
             field_name=f"routing_policy.shells.{canonical}.tier_model_mapping",
+            base=base.tier_model_mapping,
         ),
     )
 
@@ -1750,9 +1768,42 @@ class DbDaemonConfig:
     """
     enabled: bool = True
     socket_path: str = ""          # empty → derived as <db_path>.sock
-    idle_timeout_s: float = 900.0  # daemon self-exits after this idle; 0 = never
+    # Self-exit after this long with no *foreground* request and no open
+    # session; background frames (health probe, warm loop) never count. 0 = never.
+    idle_timeout_s: float = 900.0
     connect_timeout_s: float = 5.0
-    fallback_to_direct: bool = True
+    fallback_to_direct: bool = True  # legacy switch; False ≡ fallback_mode "off"
+    # Recycle (ordered handover to a fresh process) after this uptime, at the
+    # first moment no session is open. 0 = never.
+    max_lifetime_s: float = 86400.0
+    # Cadence of the daemon's file-identity watchdog.
+    watch_interval_s: float = 5.0
+    # When the daemon cannot be reached after respawn attempts:
+    #   direct   — constrained direct connection (no automatic maintenance,
+    #              per-operation connections, re-probes the daemon every 30 s)
+    #   readonly — the same, opened read-only (writes fail)
+    #   off      — raise
+    fallback_mode: str = "direct"
+
+
+DB_FALLBACK_MODES = frozenset({"direct", "readonly", "off"})
+
+
+def _parse_db_fallback_mode(daemon_raw: Mapping, defaults: DbDaemonConfig) -> str:
+    """``fallback_mode`` wins; absent, the legacy ``fallback_to_direct: false`` means off."""
+    raw_mode = daemon_raw.get("fallback_mode")
+    if raw_mode is None:
+        if daemon_raw.get("fallback_to_direct") is False:
+            return "off"
+        return defaults.fallback_mode
+    mode = str(raw_mode).strip().lower()
+    if mode not in DB_FALLBACK_MODES:
+        log.warning(
+            "db.daemon.fallback_mode %r is not one of %s; using %r",
+            raw_mode, sorted(DB_FALLBACK_MODES), defaults.fallback_mode,
+        )
+        return defaults.fallback_mode
+    return mode
 
 
 def _dedupe_patterns(*groups: list[str] | tuple[str, ...]) -> list[str]:
@@ -1996,6 +2047,10 @@ class TGsConfig:
     #   "single"   -> collapse into one higher-tier subtask (default; no extra wave)
     #   "contract" -> 2-wave DAG: define a shared interface file first, rest depend on it
     heuristic_coupled_strategy: str = "single"
+    # Collapse a coupled / design-heavy task over >=4 source files into one
+    # high-tier agent owning every file. Off by default: per-directory fan-out is
+    # the point of decompose_task.
+    heuristic_single_agent_when_complex: bool = False
     # When the heuristic planner sees a high-complexity task (coupled group, >=4
     # source files, or design keywords), escalate to the real LLM planner instead
     # of producing a lexical plan. Degrades gracefully to heuristic on any error.
@@ -3138,6 +3193,9 @@ class TGsConfig:
             "contract",
         }:
             cfg.heuristic_coupled_strategy = raw_coupled_strategy.strip().lower()
+        raw_single_agent = orchestrator_raw.get("heuristic_single_agent_when_complex", False)
+        if isinstance(raw_single_agent, bool):
+            cfg.heuristic_single_agent_when_complex = raw_single_agent
         raw_llm_fallback = orchestrator_raw.get("heuristic_complexity_llm_fallback", False)
         if isinstance(raw_llm_fallback, bool):
             cfg.heuristic_complexity_llm_fallback = raw_llm_fallback
@@ -3274,6 +3332,23 @@ class TGsConfig:
                             "fallback_to_direct", _daemon_defaults.fallback_to_direct
                         )
                     ),
+                    max_lifetime_s=max(
+                        0.0,
+                        float(
+                            daemon_raw.get(
+                                "max_lifetime_s", _daemon_defaults.max_lifetime_s
+                            )
+                        ),
+                    ),
+                    watch_interval_s=max(
+                        0.05,
+                        float(
+                            daemon_raw.get(
+                                "watch_interval_s", _daemon_defaults.watch_interval_s
+                            )
+                        ),
+                    ),
+                    fallback_mode=_parse_db_fallback_mode(daemon_raw, _daemon_defaults),
                 )
 
         # Background daemon cadence (health-probe + warm-path loops).
@@ -3540,6 +3615,7 @@ class TGsConfig:
                 ),
                 "heuristic_intent_templates": self.heuristic_intent_templates,
                 "heuristic_coupled_strategy": self.heuristic_coupled_strategy,
+                "heuristic_single_agent_when_complex": self.heuristic_single_agent_when_complex,
                 "heuristic_complexity_llm_fallback": self.heuristic_complexity_llm_fallback,
                 "host_fast_start": {
                     "enabled": self.host_fast_start.enabled,

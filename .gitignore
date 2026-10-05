@@ -23,6 +23,11 @@ cache.db.salvage.tmp
 # Single-writer DB daemon (db_daemon.enabled, on by default).
 cache.db.sock
 cache.db.daemon.lock
+# Access lock (shared/db_locks.py) and the staging copy of a backup restore.
+cache.db.access.lock
+cache.db.restore.tmp
+# Rotating db daemon log (shared/db_daemon.py) and other runtime logs.
+logs/
 # Durable learning journal (shared/learning_journal.py) — the system of record
 # for this install's accumulated learning. Machine-local, never committed.
 journal/

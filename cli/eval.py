@@ -15,10 +15,11 @@ import time
 
 def _load_db():
     try:
-        from shared.db import Database
-        import os
-        db_path = os.path.expanduser("~/.local/lib/threnody/cache.db")
-        return Database(db_path)
+        from shared.db_client import open_database
+
+        # Configured db_path, through the single-writer daemon. (A bare str path
+        # here also made Database() raise on `.expanduser`.)
+        return open_database()
     except Exception as exc:
         print(f"error: could not open DB: {exc}", file=sys.stderr)
         sys.exit(1)

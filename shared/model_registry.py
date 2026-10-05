@@ -340,6 +340,17 @@ def resolve_alias(models: list[DiscoveredModel], requested: str) -> DiscoveredMo
     return None
 
 
+# A discovery adapter that tiers its own catalog from provider evidence (OpenCode
+# cost/family/release data, Copilot's listed ids) records the decision here, in
+# provider_metadata, so it survives refresh()'s re-normalization and the DB round
+# trip. ``adapter_tier`` may be None: the adapter looked and chose not to route it.
+ADAPTER_TIER_KEY = "adapter_tier"
+ADAPTER_TIER_REASON_KEY = "adapter_tier_reason"
+# Set by an adapter on a tier pick allowed to widen a provider's static
+# ``allowed_auto_route_tiers`` (see model_catalog.apply_catalog_projection).
+WIDENS_AUTO_ROUTE_KEY = "widens_auto_route"
+
+
 def assign_provider_relative_tiers(
     models: list[DiscoveredModel],
     *,
@@ -347,9 +358,11 @@ def assign_provider_relative_tiers(
 ) -> list[DiscoveredModel]:
     """Assign tiers within one provider; missing evidence remains unclassified."""
     pins = pins or {}
+    adapter_decided: set[str] = set()
 
     for model in models:
         pinned = pins.get(model.model_id)
+        adapter_reason = model.provider_metadata.get(ADAPTER_TIER_REASON_KEY)
         if pinned in TIERS:
             model.tier = pinned
             model.tier_reason = "operator_pin"
@@ -360,12 +373,20 @@ def assign_provider_relative_tiers(
             # projected onto a tier.
             model.tier = None
             model.tier_reason = "hidden_by_provider"
+        elif isinstance(adapter_reason, str) and adapter_reason:
+            # Never re-ranked below: price ranking over a 466-model OpenCode list
+            # is what made a $0 paid router the low tier.
+            adapter_tier = model.provider_metadata.get(ADAPTER_TIER_KEY)
+            model.tier = adapter_tier if adapter_tier in TIERS else None
+            model.tier_reason = adapter_reason
+            adapter_decided.add(model.model_id)
 
     active = [
         model for model in models
         if model.available
         and not model.deprecated
         and model.tier_reason != "hidden_by_provider"
+        and model.model_id not in adapter_decided
     ]
 
     unassigned = [model for model in active if model.tier is None]
@@ -494,6 +515,63 @@ def _assign_capabilities(models: list[DiscoveredModel]) -> None:
         elif capability_set or model.context_window or model.reasoning_levels:
             model.tier = "medium"
             model.tier_reason = "capability_metadata"
+
+
+_VERSION_TOKEN = re.compile(r"^v?\d+(?:\.\d+)*$")
+
+
+def model_name_tokens(model_id: str) -> list[str]:
+    """Lower-cased name tokens of the id's last path segment."""
+    bare = model_id.rsplit("/", 1)[-1].casefold()
+    return [token for token in re.split(r"[-_:]", bare) if token]
+
+
+def is_version_token(token: str) -> bool:
+    return bool(_VERSION_TOKEN.match(token))
+
+
+def model_family(model_id: str) -> str:
+    """Version-free family of a model id: ``claude-sonnet-4.6`` -> ``claude-sonnet``.
+
+    The same naming models.dev / OpenCode publish as ``family`` (``gpt-5.6-terra``
+    -> ``gpt-terra``), so a family derived here compares with one read there.
+    """
+    return "-".join(token for token in model_name_tokens(model_id) if not _VERSION_TOKEN.match(token))
+
+
+def model_version(model_id: str) -> tuple[int, ...]:
+    """Numeric version parts in id order (``claude-opus-4.8`` -> ``(4, 8)``)."""
+    parts: list[int] = []
+    for token in model_name_tokens(model_id):
+        if _VERSION_TOKEN.match(token):
+            parts.extend(int(piece) for piece in token.lstrip("v").split("."))
+    return tuple(parts)
+
+
+# Host shells whose bootstrap tiers anchor family-based tiering, in precedence
+# order: the first host to place a family on a tier owns it.
+_HOST_FAMILY_SOURCES = ("claude-code", "codex", "github-copilot")
+
+
+def host_tier_families() -> dict[str, tuple[str, ...]]:
+    """``{tier: families}`` derived from the host bootstraps, not a slug list.
+
+    A name with no version token (``sonnet``) is a CLI alias, not a family, and
+    is skipped; ``claude-sonnet-5`` contributes ``claude-sonnet``.
+    """
+    result: dict[str, list[str]] = {tier: [] for tier in TIERS}
+    seen: set[str] = set()
+    for provider_id in _HOST_FAMILY_SOURCES:
+        for model in BOOTSTRAP_REGISTRY.get(provider_id, ()):
+            if model.tier not in TIERS:
+                continue
+            for name in (model.model_id, *model.aliases):
+                family = model_family(name)
+                if not family or family == name.casefold() or family in seen:
+                    continue
+                seen.add(family)
+                result[model.tier].append(family)
+    return {tier: tuple(families) for tier, families in result.items()}
 
 
 def tier_projection(models: list[DiscoveredModel]) -> dict[str, str]:

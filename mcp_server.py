@@ -49,6 +49,7 @@ from shared.claude_compat import load_claude_module
 from shared.version import get_display_version, get_version
 from shared.context import is_within_repo, normalize_target_path
 from shared.effort_support import default_routed_effort
+from shared.heuristic_plan import HEURISTIC_PLAN_VERSION
 from shared.risk_signals import TaskRiskEvidence, collect_task_evidence
 from shared.router import TaskRouter
 from shared.planner import (
@@ -77,7 +78,7 @@ from shared.db import (
     ROUTING_GUARD_MODE_ROUTED_PLAN,
     ROUTING_GUARD_TTL_SECONDS,
 )
-from shared.db_client import open_database
+from shared.db_client import background_db_available, mark_background_thread, open_database
 from shared.eval import set_background_loop, run_warm_path_background_tasks
 from shared.resilience import (
     ErrorCategory,
@@ -526,6 +527,9 @@ def _run_health_probe_loop() -> None:
     from shared.health import record_probe_result as _record_probe_result
     from shared.resilience import AuthProbe as _AuthProbe
 
+    # Background frames: they never keep the db daemon alive or respawn it, so
+    # an idle MCP server lets the daemon exit (and release the DB) on schedule.
+    mark_background_thread()
     while True:
         try:
             interval = (
@@ -534,8 +538,8 @@ def _run_health_probe_loop() -> None:
                 else 60.0
             )
             time.sleep(interval)
-            if _db is None:
-                continue
+            if not background_db_available(_db):
+                continue  # no daemon right now; foreground traffic brings it back
             rows = _db.iter_provider_health()
             now = time.time()
             for row in rows:
@@ -568,6 +572,7 @@ def _run_warm_path_loop() -> None:
     Cadence is read from ``config.background.warm_path_interval_s`` on each
     iteration; falls back to 120 s before ``_config`` is initialised.
     """
+    mark_background_thread()  # see _run_health_probe_loop
     while True:
         try:
             interval = (
@@ -576,8 +581,8 @@ def _run_warm_path_loop() -> None:
                 else 120.0
             )
             time.sleep(interval)
-            if _db is None:
-                continue
+            if not background_db_available(_db):
+                continue  # deferred, not lost: the queue lives in the DB
             run_warm_path_background_tasks(_db)
         except Exception:
             log.debug("warm path background loop error", exc_info=True)
@@ -2501,6 +2506,23 @@ def _attach_and_persist_plan_receipt(
         threading.Thread(target=_bg_persist, daemon=True, name=f"receipt-persist-{run_id}").start()
 
 
+def _plan_cache_entry_is_stale(result_str: str) -> bool:
+    """True for a cached host-native heuristic plan from an older plan shape.
+
+    ``plan_task`` caches by task text alone. Plans built before
+    ``HEURISTIC_PLAN_VERSION`` carried spliced-fragment prompts, so they are
+    skipped (and overwritten) instead of served. Entries that are not heuristic
+    plans carry no marker and are never treated as stale.
+    """
+    try:
+        cached = json.loads(result_str)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(cached, dict) or cached.get("planner_host_execution_mode") != "host_native":
+        return False
+    return cached.get("heuristic_plan_version") != HEURISTIC_PLAN_VERSION
+
+
 def handle_plan_task(args: dict) -> dict:
     global _config, _db, _router, _planner, _orchestrator
     # Respect injected planner/config/db during tests; this handler does not use router/orchestrator.
@@ -2513,6 +2535,8 @@ def handle_plan_task(args: dict) -> dict:
     workspace_root = args.get("cwd") if isinstance(args.get("cwd"), str) else None
     host_run_id = plan_run_id(task) if normalize_caller_id(caller) in HOST_PROVIDER_NAMES else None
     cached = db.cache_get(task)
+    if cached is not None and _plan_cache_entry_is_stale(cached[0]):
+        cached = None
     if cached is not None:
         result_str, model = cached
         try:
@@ -2565,6 +2589,7 @@ def handle_plan_task(args: dict) -> dict:
             router,
             caller,
             task,
+            workspace_root=workspace_root,
         )
     except PlannerParseError as exc:
         return {
@@ -2576,6 +2601,7 @@ def handle_plan_task(args: dict) -> dict:
     result = _attach_models_to_subtasks(planner.plan_to_dict(plan))
     if used_heuristic:
         result["planner_host_execution_mode"] = "host_native"
+        result["heuristic_plan_version"] = HEURISTIC_PLAN_VERSION
 
     _sfi_subtasks = [st for st in result.get("subtasks", []) if isinstance(st, dict) and st.get("single_file_insertion")]
     _host_caller = normalize_caller_id(caller) in HOST_PROVIDER_NAMES
@@ -6824,6 +6850,22 @@ def _swarm_init_error_response(config, exc: Exception) -> dict:
             ),
             "retryable": True,
         }
+    if category == ErrorCategory.DB_IOERR:
+        # Not corruption and not contention: this process's (or the db daemon's)
+        # handle on the files went stale. The daemon restarts itself on it; a
+        # direct opener needs a new process. Retrying after a moment usually
+        # lands on the fresh daemon.
+        db_path = getattr(config, "db_path", "the shared Threnody cache.db")
+        return {
+            "error": "db_io_error",
+            "details": (
+                f"execute_swarm could not initialize: I/O error on the Threnody "
+                f"database ({db_path}). The db daemon restarts itself on this; retry "
+                f"in a few seconds. If it persists, check `threnody db status` and "
+                f"restart this Claude Code / MCP session. ({detail_cause})"
+            ),
+            "retryable": True,
+        }
     return {
         "error": "execution_error",
         "details": f"execute_swarm initialization failed: {detail_cause}",
@@ -7246,6 +7288,15 @@ def handle_report_host_wave(args: dict) -> dict:
                     run_log.append_agent_record(run_id, rec)
                     captured += 1
         # capture == "hook": records already appended by the PostToolUse hook.
+        # A worker-wave report is real host activity: refresh this run's hook
+        # pointer so a run longer than run_log.ACTIVE_POINTER_TTL_S keeps being
+        # captured, without stealing the pointer from a different active run.
+        if workspace_root:
+            try:
+                if run_log.get_active_run(workspace_root) in (None, run_id):
+                    run_log.set_active_run(run_id, workspace_root=workspace_root)
+            except Exception:
+                log.debug("active pointer refresh failed for %s", run_id, exc_info=True)
         return {
             "run_id": run_id,
             "wave": wave_index,

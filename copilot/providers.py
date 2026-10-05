@@ -13,7 +13,13 @@ import subprocess
 
 from shared.planner import Subtask
 from shared.orchestrator import Provider
-from shared.discovery import get_registry, ProviderRegistry, _build_gh_copilot_command, _clean_output
+from shared.discovery import (
+    get_registry,
+    ProviderRegistry,
+    _build_gh_copilot_command,
+    _clean_output,
+    _copilot_effort_applied,
+)
 from shared.model_registry import bootstrap_tier_map
 from shared.effort_support import default_routed_effort
 
@@ -56,6 +62,19 @@ class CopilotProvider(Provider):
         return COPILOT_TIER_MAP.get(tier, COPILOT_TIER_MAP["medium"])
 
     effort_provider_id = "github-copilot"
+
+    def effort_applied_for(self, model: str, effort: str | None = None) -> bool:
+        """True when ``execute(..., effort=effort)`` puts ``--effort`` on the argv.
+
+        Per model: Copilot takes only the levels models.dev lists for *model*
+        (``claude-haiku-4.5`` has a token budget, no effort), and an unknown
+        model gets none. Without *effort*, whether the model takes any level.
+        """
+        if effort is None:
+            from shared.model_capabilities import copilot_effort_levels
+
+            return bool(copilot_effort_levels(model))
+        return _copilot_effort_applied(model, effort)
 
     def execute(self, subtask: Subtask, model: str,
                 timeout: int = 120, effort: str | None = None) -> str | None:

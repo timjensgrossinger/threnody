@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import shared.config as config_module
+from shared.model_registry import bootstrap_tier_map
 from shared.config import (
     DEFAULT_ROUTING_EXCEPTION_FILETYPES,
     DEFAULT_ROUTING_EXCEPTION_PATHS,
@@ -360,7 +361,8 @@ def test_routing_policy_custom_shell_overrides() -> None:
         assert copilot.agent_transparency_required is True
         assert copilot.direct_edit_hooks is False
         assert copilot.tier_model_mapping["low"] == "custom-low"
-        assert copilot.tier_model_mapping["medium"] == "claude-sonnet-5"
+        # Unlisted tiers keep the shell's own default, not the generic map.
+        assert copilot.tier_model_mapping["medium"] == bootstrap_tier_map("github-copilot")["medium"]
 
 
 def test_basic_yaml_fallback_parses_floats_lists_and_policy(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -11,9 +11,11 @@ from pathlib import Path
 def _get_db():
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).parent.parent))
-    from shared.db import Database
-    db_path = Path.home() / ".local" / "lib" / "Threnody" / "cache.db"
-    return Database(db_path)
+    from shared.db_client import open_database
+
+    # Configured db_path through the single-writer daemon (was a hardcoded
+    # ".../Threnody/cache.db", which only resolved on case-insensitive disks).
+    return open_database()
 
 
 def cmd_leases(args) -> int:

@@ -13,6 +13,7 @@ from typing import Any
 from .db import Database
 from .discovery import CLIProvider, DetectReason, ProviderReadiness, ProviderRegistry
 from .model_registry import (
+    WIDENS_AUTO_ROUTE_KEY,
     DiscoveredModel,
     DiscoveryResult,
     assign_provider_relative_tiers,
@@ -25,6 +26,7 @@ from .model_registry import (
 _PRICE_DATA_PATH = Path(__file__).resolve().parent / "data" / "model_prices.json"
 _LOW_TIER_MAX_PER_MILLION = 0.50
 _MEDIUM_TIER_MAX_PER_MILLION = 5.00
+_WIDENED_TIER_COST_RANK = {"low": 1, "medium": 2, "high": 3}
 _TIER_OVERRIDES: dict[str, str] = {
     "o1": "high",
     "o3": "high",
@@ -779,18 +781,35 @@ def apply_catalog_projection(
             for model in models
             if model.tier_reason == "operator_pin" and model.tier is not None
         }
-        effective_tiers = allowed_tiers | operator_pinned_tiers
+        # A static allowlist (OpenCode: low only) is the floor for "nothing
+        # found"; a tier the discovery adapter filled from the user's own
+        # configured providers widens it for this projection only.
+        adapter_widened_tiers = {
+            model.tier
+            for model in models
+            if model.routeable
+            and model.tier is not None
+            and model.provider_metadata.get(WIDENS_AUTO_ROUTE_KEY)
+        }
+        effective_tiers = allowed_tiers | operator_pinned_tiers | adapter_widened_tiers
         projected_tiers = {
             tier: model_id
             for tier, model_id in projected_tiers.items()
             if tier in effective_tiers
         }
         for row in provider.model_catalog:
+            row_metadata = row.get("provider_metadata")
+            widened = (
+                isinstance(row_metadata, dict)
+                and bool(row_metadata.get(WIDENS_AUTO_ROUTE_KEY))
+                and row.get("tier") in adapter_widened_tiers
+            )
             row["auto_routeable"] = bool(
                 row.get("auto_routeable", False)
                 and (
                     row.get("tier") in allowed_tiers
                     or row.get("tier_reason") == "operator_pin"
+                    or widened
                 )
             )
         provider.cost_rank = {
@@ -798,6 +817,10 @@ def apply_catalog_projection(
             for tier, rank in provider.cost_rank.items()
             if tier in effective_tiers
         }
+        for tier in adapter_widened_tiers - allowed_tiers:
+            # Rank like the subscription hosts, so a widened tier is an
+            # alternative rather than the new cheapest route for that tier.
+            provider.cost_rank.setdefault(tier, _WIDENED_TIER_COST_RANK.get(tier, 1))
 
     provider.tier_models = projected_tiers
     for tier in projected_tiers:

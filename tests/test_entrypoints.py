@@ -159,7 +159,7 @@ def test_codex_entry_init_uses_codex_backend_and_provider(tmp_path) -> None:
 
     with (
         patch.object(entry.TGsConfig, "from_yaml", return_value=fake_config),
-        patch.object(entry, "Database", return_value=MagicMock()),
+        patch.object(entry, "open_database", return_value=MagicMock()),
         patch.object(entry, "TaskRouter", return_value=MagicMock()),
         patch.object(entry, "get_registry", return_value=fake_registry),
         patch.object(entry, "_resolve_provider", return_value=CodexProvider()),

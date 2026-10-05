@@ -70,6 +70,18 @@ _ARTIFACTS_NAME = "artifacts"
 # per workspace (see _active_pointer_path) plus a legacy global fallback. The
 # MCP execute_swarm/plan response sets it; the terminal report clears it. The
 # hook stays dependency-light (run_log only) by reading this rather than the DB.
+#
+# A pointer whose run never got its terminal report (session closed, abandoned
+# plan) used to live forever: the hook kept appending every edit in that
+# workspace to a dead run that would never be imported, and those appends kept
+# the run looking active to the stale-run reaper. A pointer older than this TTL
+# with no non-hook activity in its run dir is treated as absent and removed.
+# 6 h is far past any observed host handoff (``_caller_has_active_host_handoff``
+# considers 1 h); artifact/findings/meta writes extend a genuinely long run.
+ACTIVE_POINTER_TTL_S = 6 * 3600.0
+# ``source`` of records the PostToolUse hook appends. Hook appends are not
+# evidence a run is alive — they are exactly what a stale pointer produces.
+HOOK_SOURCE = "post_tool_use_hook"
 
 # A run id is a generated ``swarm-<hex>`` token, but callers may pass a
 # user-supplied id. Constrain it to a single safe path segment so it can never
@@ -130,6 +142,9 @@ def append_agent_record(run_id: str, record: dict) -> None:
     try:
         path = run_log_path(run_id)
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Stamp host-reported records too, so run_activity_ts can date them.
+        if "ts" not in record:
+            record = {**record, "ts": time.time()}
         line = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line)
@@ -217,6 +232,48 @@ def iter_pending_runs() -> list[str]:
     return pending
 
 
+def run_activity_ts(run_id: str, *, root: Path | None = None) -> float:
+    """Newest *non-hook* activity in a run dir as an epoch timestamp, ``0.0`` if none.
+
+    Counts the mtime of every file under the run dir except ``wave.jsonl``
+    (meta, synthesis, ``artifacts/``, ``findings/``) and the ``ts`` of the newest
+    ``wave.jsonl`` record whose ``source`` is not the PostToolUse hook. Hook
+    lines are excluded because a stale active pointer produces them for as long
+    as anyone edits files in that workspace.
+    """
+    try:
+        run_dir = (root if root is not None else runs_root()) / _safe_run_id(run_id)
+    except ValueError:
+        return 0.0
+    newest = 0.0
+    try:
+        if not run_dir.is_dir():
+            return 0.0
+        for child in run_dir.iterdir():
+            if child.is_dir():
+                for grandchild in child.iterdir():
+                    if grandchild.is_file():
+                        newest = max(newest, grandchild.stat().st_mtime)
+            elif child.name != _LOG_NAME:
+                newest = max(newest, child.stat().st_mtime)
+        log_path = run_dir / _LOG_NAME
+        if log_path.exists():
+            with open(log_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(rec, dict) or rec.get("source") == HOOK_SOURCE:
+                        continue
+                    ts = rec.get("ts")
+                    if isinstance(ts, (int, float)):
+                        newest = max(newest, float(ts))
+    except OSError:
+        log.debug("run_log: activity scan failed for %s", run_id, exc_info=True)
+    return newest
+
+
 def prune_runs(keep: int = 20) -> None:
     """Keep the *keep* most-recently-modified run dirs; drop older ones.
 
@@ -292,18 +349,148 @@ def get_active_run(workspace_root: str | None = None) -> str | None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(data, dict):
+        return None
     if workspace_root:
         stored_root = data.get("workspace_root")
         if stored_root and stored_root != _normalize_workspace_root(workspace_root):
             return None
     rid = data.get("run_id")
-    return str(rid) if rid else None
+    if not rid or not _pointer_is_fresh(path, data):
+        return None
+    return str(rid)
+
+
+def _pointer_ts(path: Path, data: dict) -> float:
+    ts = data.get("ts")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _pointer_is_fresh(
+    path: Path,
+    data: dict,
+    *,
+    now: float | None = None,
+    ttl_s: float = ACTIVE_POINTER_TTL_S,
+) -> bool:
+    """True if the pointer is within its TTL; an expired one is refreshed or removed.
+
+    Past the TTL, non-hook activity in the run dir (``run_activity_ts``) keeps
+    the pointer alive and is written back as its ``ts`` so the next lookup is
+    cheap again; otherwise the pointer file is unlinked. Filesystem only — the
+    hook calling this must stay DB-free.
+    """
+    current = time.time() if now is None else now
+    if current - _pointer_ts(path, data) <= ttl_s:
+        return True
+    rid = str(data.get("run_id") or "")
+    activity = run_activity_ts(rid, root=path.parent) if rid else 0.0
+    try:
+        if activity and current - activity <= ttl_s:
+            path.write_text(
+                json.dumps({**data, "ts": activity}, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            return True
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.debug("run_log: expired pointer update failed for %s", path, exc_info=True)
+    return False
+
+
+def _iter_active_pointers(root: Path) -> list[tuple[Path, dict]]:
+    pointers: list[tuple[Path, dict]] = []
+    try:
+        candidates = sorted(root.glob("active*.json"))
+    except OSError:
+        log.debug("run_log: pointer scan failed under %s", root, exc_info=True)
+        return pointers
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            log.debug("run_log: unreadable active pointer %s", path, exc_info=True)
+            data = {}
+        pointers.append((path, data if isinstance(data, dict) else {}))
+    return pointers
+
+
+def active_pointer_runs(*, root: Path | None = None) -> dict[str, float]:
+    """``{run_id: newest pointer ts}`` for every readable active pointer (read-only)."""
+    resolved = root if root is not None else runs_root()
+    runs: dict[str, float] = {}
+    for path, data in _iter_active_pointers(resolved):
+        rid = str(data.get("run_id") or "")
+        if rid:
+            runs[rid] = max(runs.get(rid, 0.0), _pointer_ts(path, data))
+    return runs
+
+
+def remove_active_pointers_for(run_id: str, *, root: Path | None = None) -> int:
+    """Unlink every active pointer (any workspace) naming *run_id*. Returns the count."""
+    try:
+        target = _safe_run_id(run_id)
+    except ValueError:
+        return 0
+    resolved = root if root is not None else runs_root()
+    removed = 0
+    for path, data in _iter_active_pointers(resolved):
+        if str(data.get("run_id") or "") != target:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            log.debug("run_log: pointer unlink failed for %s", path, exc_info=True)
+    return removed
+
+
+def prune_active_pointers(
+    *,
+    now: float | None = None,
+    ttl_s: float = ACTIVE_POINTER_TTL_S,
+    root: Path | None = None,
+) -> list[str]:
+    """Remove pointers that are unreadable, expired, or whose workspace is gone.
+
+    The workspace check lives here rather than in ``get_active_run``: the hook
+    looks a pointer up by its own (existing) cwd, so only a sweep can find the
+    pointers pytest temp workspaces left behind. Returns removed file names.
+    """
+    resolved = root if root is not None else runs_root()
+    removed: list[str] = []
+    for path, data in _iter_active_pointers(resolved):
+        workspace = data.get("workspace_root")
+        stale = (
+            not data.get("run_id")
+            or (isinstance(workspace, str) and workspace and not os.path.isdir(workspace))
+        )
+        if not stale and _pointer_is_fresh(path, data, now=now, ttl_s=ttl_s):
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            removed.append(path.name)
+        except OSError:
+            log.debug("run_log: pointer unlink failed for %s", path, exc_info=True)
+    if removed:
+        log.info("run_log: removed %d stale active-run pointer(s)", len(removed))
+    return removed
 
 
 def clear_active_run(run_id: str | None = None, *, workspace_root: str | None = None) -> None:
     """Clear the active-run pointer (optionally only if it matches *run_id*)."""
     try:
         path = _active_pointer_path(workspace_root)
+        if run_id is not None and workspace_root is None:
+            # The terminal report clears without a workspace root, which only
+            # ever reached the legacy global file and left the per-workspace
+            # pointer aimed at a finished run. Clear every pointer naming it.
+            remove_active_pointers_for(run_id)
         if run_id is not None and get_active_run(workspace_root=workspace_root) not in (
             None,
             _safe_run_id(run_id),

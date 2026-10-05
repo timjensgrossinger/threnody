@@ -147,11 +147,14 @@ def test_coupled_group_single_strategy_collapses_to_one_subtask() -> None:
     # The coupled group escalates to high, which the hybrid split then fronts with
     # a read-only diagnosis. The invariant under test is about the *implementers*:
     # all coupled files stay owned by exactly one writing agent.
+    # Coupling is per directory (lua/app vs lua/app/sources), so each directory's
+    # files are owned by exactly one writer; the old single merged owner of all four
+    # files across both directories was the defect.
     writers = [st for st in payload["subtasks"] if not st.get("read_only")]
-    assert len(writers) == 1
+    assert len(writers) == 2
+    assert sorted(len(w.get("target_files", [])) for w in writers) == [2, 2]
     # Coupled source group escalates above the flat "low".
-    assert writers[0]["tier"] in {"medium", "high"}
-    assert len(writers[0].get("target_files", [])) == 4
+    assert all(w["tier"] in {"medium", "high"} for w in writers)
 
 
 def test_coupled_group_contract_strategy_builds_dag() -> None:
@@ -162,7 +165,17 @@ def test_coupled_group_contract_strategy_builds_dag() -> None:
     assert len(subtasks) >= 2
     assert payload["strategy"] == "dag"
     assert subtasks[0]["depends_on"] == []
-    assert all(st["depends_on"] == [1] for st in subtasks[1:])
+    # Coupling is per directory (lua/app vs lua/app/sources): each group defines its
+    # own interface and only its own members depend on it. The merged-set behaviour
+    # this used to assert (everything behind subtask 1) was the defect.
+    by_dir: dict[str, list[dict]] = {}
+    for st in subtasks:
+        by_dir.setdefault(st["target_file"].rsplit("/", 1)[0], []).append(st)
+    assert len(by_dir) == 2
+    for members in by_dir.values():
+        interface = members[0]
+        assert interface["depends_on"] == []
+        assert all(st["depends_on"] == [interface["id"]] for st in members[1:])
 
 
 def test_init_lua_recognized_as_integration_stem() -> None:

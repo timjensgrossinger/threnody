@@ -13,7 +13,7 @@ def _get_db():
 
     _sys.path.insert(0, str(Path(__file__).parent.parent))
     from shared.config import DB_PATH, TGsConfig
-    from shared.db import Database
+    from shared.db_client import open_database
 
     config_path = Path.home() / ".local" / "lib" / "threnody" / "config.yaml"
     db_path = DB_PATH
@@ -22,7 +22,7 @@ def _get_db():
             db_path = TGsConfig.from_yaml(config_path).db_path
         except Exception:
             db_path = DB_PATH
-    return Database(db_path)
+    return open_database(db_path)
 
 
 def _avg_compression_ratio(db, since_ts: float, group_col: str) -> dict[str, float | None]:

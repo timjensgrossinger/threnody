@@ -1383,12 +1383,12 @@ PY
             local pybin=""
             pybin=$(_tgs_python) || return 1
             case "$subcmd" in
-                check|repair|backup|prune|salvage|learn)
+                check|repair|backup|status|prune|salvage|learn)
                     (cd "$_ROUTER_DIR" && "$pybin" -m shared.db_cli "$subcmd" "$@")
                     return $?
                     ;;
                 ""|-h|--help)
-                    echo "Usage: threnody db {check|repair|backup|prune|salvage|learn} [--db PATH] [--keep N]" >&2
+                    echo "Usage: threnody db {check|repair|backup|status|prune|salvage|learn} [--db PATH] [--keep N] [--json]" >&2
                     return 0
                     ;;
                 *)

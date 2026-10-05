@@ -173,7 +173,7 @@ def capture_edit(fields: dict[str, Any]) -> dict[str, Any]:
         "success": bool(fields.get("success", True)),
         "touched_files": targets,
         "output_excerpt": "",
-        "source": "post_tool_use_hook",
+        "source": run_log.HOOK_SOURCE,
         "ts": time.time(),
     }
     run_log.append_agent_record(str(run_id), record)

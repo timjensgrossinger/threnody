@@ -104,7 +104,7 @@ def cmd_route(task: str) -> None:
 
 
 def cmd_cache_get(task: str) -> None:
-    db = Database()
+    db = open_database()
     hit = db.cache_get(task)
     if hit:
         result, model = hit
@@ -114,13 +114,13 @@ def cmd_cache_get(task: str) -> None:
 
 
 def cmd_cache_put(task: str, result: str, model: str) -> None:
-    db = Database()
+    db = open_database()
     db.cache_put(task, result, model)
     print(json.dumps({"stored": True}))
 
 
 def cmd_cache_stats() -> None:
-    db = Database()
+    db = open_database()
     print(json.dumps(db.cache_stats(), indent=2))
 
 

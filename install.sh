@@ -254,24 +254,62 @@ echo "📁 Installing files..."
 
 mkdir -p "$INSTALL_DIR"
 
-# Backup existing DB before overwriting installation files
+# Stop the DB daemon, then back up the DB, before overwriting installation files.
+#
+# The daemon must be gone first: it holds the DB open (and, in current code,
+# the access lock SHARED), and a running daemon keeps executing the code that is
+# about to be replaced. Order: `admin shutdown` (an ordered handover) — or, for
+# a pre-protocol daemon, SIGTERM to the process holding cache.db.daemon.lock —
+# then wait (<=15 s) for the election lock to be free, then take the access lock
+# EXCLUSIVE so nobody can be mid-write, back up, release. The helpers come from
+# the SOURCE tree: the installed copy may predate stop_daemon and the lock.
+# A raw sqlite3 backup is used on purpose — Database() would itself wait for
+# the access lock this script is holding.
 if [[ -f "$INSTALL_DIR/cache.db" ]]; then
-    python3 - "$INSTALL_DIR" <<'PYEOF' 2>/dev/null || true
+    python3 - "$SOURCE_DIR" "$INSTALL_DIR" <<'PYEOF' 2>/dev/null || true
+import os
+import sqlite3
 import sys
+import time
 from pathlib import Path
-base = Path(sys.argv[1])
-sys.path.insert(0, str(base))
+
+source = Path(sys.argv[1]).resolve()
 try:
     _home = Path.home().resolve()
-    base = Path(sys.argv[1]).resolve()
+    base = Path(sys.argv[2]).resolve()
     if not str(base).startswith(str(_home)):
         raise SystemExit(f"base path outside home: {base}")
-    from shared.db import Database
-    db = Database(base / "cache.db")
-    bp = db.backup_db()
-    db.close()
-    if bp:
-        print(f"  pre-install DB backup: {bp}")
+    sys.path.insert(0, str(source))
+    from shared import db_locks
+    from shared.db_client import stop_daemon
+
+    db = base / "cache.db"
+    stopped = stop_daemon(db, wait_s=15.0)
+    if stopped.get("requested") or stopped.get("signalled"):
+        how = "admin shutdown" if stopped.get("requested") else f"SIGTERM {stopped['signalled']}"
+        state = "stopped" if stopped.get("released") else "did NOT release its lock within 15s"
+        print(f"  db daemon: {how} — {state}")
+    exclusive = db_locks.access_lock(db).try_exclusive(15.0)
+    if exclusive is None:
+        print("  pre-install DB backup skipped: the database is still in use (access lock held)")
+        raise SystemExit(0)
+    try:
+        backup = db.with_name(f"cache.db.bak.{int(time.time())}")
+        src = sqlite3.connect(str(db), timeout=10)
+        try:
+            dst = sqlite3.connect(str(backup), timeout=10)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        os.chmod(backup, 0o600)
+        print(f"  pre-install DB backup: {backup}")
+    finally:
+        exclusive.release()
+except SystemExit:
+    raise
 except Exception as e:
     print(f"  pre-install DB backup skipped: {e}")
 PYEOF
@@ -286,6 +324,12 @@ copy_source_tree() {
             --exclude='cache.db*' \
             --exclude='config.yaml' \
             --exclude='backup/' \
+            --exclude='journal/' \
+            --exclude='runs/' \
+            --exclude='logs/' \
+            --exclude='worktrees/' \
+            --exclude='.runtime/' \
+            --exclude='audit_secret' \
             --exclude='.git/' \
             --exclude='.DS_Store' \
             "$SOURCE_DIR/" "$INSTALL_DIR/"
@@ -300,12 +344,21 @@ from pathlib import Path
 
 source = Path(sys.argv[1]).resolve()
 target = Path(sys.argv[2]).resolve()
-preserved_names = {"config.yaml", "cache.db", "cache.db-wal", "cache.db-shm", "backup"}
+# Runtime state that lives only in the install dir. Must match the rsync
+# excludes above. Every cache.db* file is kept — the db, -wal/-shm, .bak.*, and
+# the .lock / .daemon.lock / .access.lock / .sock files: deleting a lock file
+# that a live process holds hands the next locker a fresh inode and a second
+# "exclusive" holder. journal/ is the learning system of record; audit_secret
+# keys the audit HMAC chain.
+preserved_names = {
+    "config.yaml", "backup", "journal", "runs", "logs", "worktrees", ".runtime",
+    "audit_secret",
+}
 ignored_dirs = {".git", "__pycache__", ".pytest_cache"}
 
 target.mkdir(parents=True, exist_ok=True)
 for child in list(target.iterdir()):
-    if child.name in preserved_names or child.name.startswith("cache.db.bak"):
+    if child.name in preserved_names or child.name.startswith("cache.db"):
         continue
     if child.is_dir() and not child.is_symlink():
         shutil.rmtree(child)
@@ -320,7 +373,7 @@ for source_path in source.rglob("*"):
         continue
     if relative.as_posix() == "config.yaml" or source_path.name.startswith("cache.db"):
         continue
-    if relative.parts and relative.parts[0] == "backup":
+    if relative.parts and relative.parts[0] in preserved_names:
         continue
     target_path = target / relative
     if source_path.is_symlink():
@@ -1467,6 +1520,9 @@ fi
 if [[ "$HAS_OPENCODE" -eq 1 ]]; then
     echo "     OpenCode is available as a low-tier host/provider via opencode/nemotron-3-super-free"
 fi
+echo ""
+echo "  ↻ Restart Claude Code / MCP sessions (and other host CLIs) to load the new code —"
+echo "    running sessions keep the code they started with. \`threnody db status\` shows the DB daemon."
 echo "  Provider terms: see $INSTALL_DIR/docs/LEGAL.md"
 echo "  Provider policies may change at any time; use at your own risk."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

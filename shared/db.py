@@ -23,9 +23,12 @@ import sqlite3
 import stat
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, TypeVar
 
+from . import db_locks
 from .db_ipc import register_dataclass
 
 try:  # POSIX-only; best-effort cross-process lock.
@@ -89,6 +92,50 @@ ROUTING_GUARD_MODE_DIRECT: str = "direct"
 ROUTING_GUARD_MODE_EXECUTE_SUBTASK: str = "execute_subtask"
 ROUTING_GUARD_MODE_ROUTED_PLAN: str = "routed_plan"
 ROUTING_GUARD_TTL_SECONDS: int = 3600
+
+
+_F = TypeVar("_F", bound=Callable[..., object])
+
+
+def db_readonly(fn: _F) -> _F:
+    """Mark a ``Database`` method as a pure read (SELECT only, no side effects).
+
+    The daemon client re-sends a marked call after a daemon restart even when it
+    cannot tell whether the first copy was delivered — re-running a read is
+    harmless, re-running a write may double it. Be conservative: a method that
+    also deletes expired rows (``cache_get``, ``plan_lookup``) is NOT read-only.
+    """
+    setattr(fn, "__db_readonly__", True)
+    return fn
+
+
+class _TrackedConnection(sqlite3.Connection):
+    """``sqlite3.Connection`` that can be weakly referenced and knows it closed.
+
+    The C type supports neither, and ``_close_all_connections`` needs both: a
+    registry of every live handle this ``Database`` opened (not just the calling
+    thread's) and a way to tell which of them are still open.
+    """
+
+    closed = False
+
+    def close(self) -> None:
+        self.closed = True
+        super().close()
+
+
+# Serialized SQLite builds (threadsafety 3, the CPython default) allow a handle
+# to be closed from another thread, which recovery must do before it swaps
+# files. Usage stays thread-local; only the Python-level guard is relaxed.
+_CHECK_SAME_THREAD = sqlite3.threadsafety != 3
+
+# How long a connection open waits for a peer's file-swap maintenance (which
+# holds the access lock EXCLUSIVE) before failing as "locked".
+_ACCESS_SHARED_TIMEOUT_S = 30.0
+# How long in-process recovery waits for every other holder to let go before it
+# declines rather than swapping files under a live connection.
+_ACCESS_EXCLUSIVE_TIMEOUT_S = 2.0
+RECOVERY_DECLINED_IN_USE = "declined: database in use"
 
 
 def _coerce_db_bool(value: object) -> bool:
@@ -230,7 +277,27 @@ class Database:
         resilience: object | None = None,
         integrity_reprobe_interval_hours: float = DB_INTEGRITY_REPROBE_INTERVAL_HOURS,
         synchronous: str = DB_SYNCHRONOUS_DEFAULT,
+        *,
+        maintenance: bool = True,
+        readonly: bool = False,
+        persistent_connections: bool = True,
     ) -> None:
+        """Open the database.
+
+        The keyword-only flags exist for the db client's *constrained* fallback
+        (daemon unreachable): ``maintenance=False`` skips every automatic file
+        operation — the open-time integrity check and recovery, the scheduled
+        backup, journal replay, and recovery on detected corruption — because a
+        degraded peer of a live daemon must not be the one to swap files.
+        Explicit operator calls (``repair()``, ``backup_db()``) still work and
+        are still gated by the access lock. ``readonly`` opens ``mode=ro`` and
+        never creates or migrates anything. ``persistent_connections=False``
+        gives every ``conn()`` block its own connection, closed afterwards, so
+        a fallback holds no handle between operations.
+        """
+        self._maintenance = maintenance
+        self._readonly = readonly
+        self._persistent_connections = persistent_connections
         self._db_path = (db_path or DB_PATH).expanduser() if db_path else DB_PATH
         self._result_ttl = result_ttl_hours * 3600
         self._plan_ttl = plan_ttl_hours * 3600
@@ -272,8 +339,41 @@ class Database:
         # Each thread gets its own SQLite connection to avoid ProgrammingError
         # when multiple threads access the shared database.
         self._thread_local = threading.local()
-        self._ensure_private_db_file(self._db_path)
-        self._restrict_db_permissions()
+        # Every connection this instance opens, on any thread (see
+        # _close_all_connections). Bumping the generation invalidates the
+        # per-thread caches that still point at a handle closed from elsewhere.
+        self._live_conns: weakref.WeakSet[_TrackedConnection] = weakref.WeakSet()
+        self._conn_generation = 0
+        # Access lock (shared/db_locks.py): held SHARED while this instance has
+        # connections, EXCLUSIVE only around file-swapping maintenance. The
+        # RLock keeps this process's own threads from opening a connection in
+        # the window where recovery has traded SHARED for EXCLUSIVE.
+        self._access = db_locks.access_lock(self._db_path)
+        self._access_guard = threading.RLock()
+        self._access_shared: db_locks.LockHandle | None = None
+        self._exclusive_held = False
+        self._access_shared_timeout_s = _ACCESS_SHARED_TIMEOUT_S
+        self._access_exclusive_timeout_s = _ACCESS_EXCLUSIVE_TIMEOUT_S
+        self.last_recovery_result: str | None = None
+        # Bumped by every file swap recovery performs, so a long-lived holder
+        # (the db daemon) can tell its handles now point at a replaced file.
+        self.recovery_generation = 0
+        self._ensure_access_shared()
+        if readonly:
+            if not self._db_path.exists():
+                raise sqlite3.OperationalError(
+                    f"unable to open database file (read-only, missing): {self._db_path}"
+                )
+            self._schema_ready = True  # never migrate a read-only handle
+        else:
+            # Path-only (lstat/chmod, O_EXCL create): opening and closing a
+            # descriptor on the live file would drop every fcntl lock SQLite holds
+            # on it in this process. See _ensure_private_db_file.
+            self._ensure_private_db_file(self._db_path)
+            self._restrict_db_permissions()
+        self._last_integrity_probe_ts = time.time()
+        if not maintenance:
+            return
         self._check_integrity_and_recover()
         self._last_integrity_probe_ts = time.time()
         self._maybe_auto_backup()
@@ -320,48 +420,169 @@ class Database:
         finally:
             os.close(fd)
 
+    @staticmethod
+    def _chmod_private(path: Path) -> None:
+        """chmod 0600 without following a symlink (plain chmod where unsupported)."""
+        if os.chmod in os.supports_follow_symlinks:
+            os.chmod(path, 0o600, follow_symlinks=False)
+        else:  # Linux: the caller has just lstat()ed it as a regular file.
+            os.chmod(path, 0o600)
+
     def _ensure_private_db_file(self, path: Path) -> None:
-        if not hasattr(os, "O_NOFOLLOW"):
-            raise RuntimeError("secure database file handling requires O_NOFOLLOW")
-        flags = os.O_RDWR | os.O_CREAT
-        flags |= os.O_NOFOLLOW
+        """Make *path* exist as a regular file with mode 0600 — by path only.
+
+        Never opens an existing file. POSIX drops *all* of a process's fcntl
+        locks on an inode when *any* descriptor for it is closed, so the old
+        open/fchmod/close here silently released the locks SQLite held on the
+        live database: a peer could then take EXCLUSIVE, checkpoint, and delete
+        ``-wal``/``-shm`` underneath this process, leaving every later connection
+        in it failing with ``disk I/O error``. A descriptor is only opened when
+        ``O_EXCL`` proves the file is brand new, so nobody can hold a lock on it.
+        """
         try:
-            fd = os.open(path, flags, 0o600)
+            st = os.lstat(path)
+        except FileNotFoundError:
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                os.close(os.open(path, flags, 0o600))
+                return
+            except FileExistsError:
+                st = os.lstat(path)  # lost a creation race; check what won
+            except OSError as exc:
+                raise RuntimeError(f"failed to create private database file: {path}") from exc
         except OSError as exc:
-            raise RuntimeError(f"failed to open private database file: {path}") from exc
-        try:
-            stat_result = os.fstat(fd)
-            if not stat.S_ISREG(stat_result.st_mode):
-                raise RuntimeError(f"refusing to secure non-regular database file: {path}")
-            os.fchmod(fd, 0o600)
-        except OSError as exc:
-            raise RuntimeError(f"failed to secure database file: {path}") from exc
-        finally:
-            os.close(fd)
+            raise RuntimeError(f"failed to stat database file: {path}") from exc
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"refusing to secure non-regular database file: {path}")
+        if stat.S_IMODE(st.st_mode) != 0o600:
+            try:
+                self._chmod_private(path)
+            except OSError as exc:
+                raise RuntimeError(f"failed to secure database file: {path}") from exc
 
     def _restrict_db_permissions(self) -> None:
-        """Keep the router DB and WAL sidecars private to the current user."""
+        """Keep the router DB and WAL sidecars private to the current user.
+
+        Runs once, from ``__init__``. It used to run on every new connection and
+        open/close each file to fchmod it — the lock-dropping hazard described
+        in ``_ensure_private_db_file``. Per-connection repetition is also
+        unnecessary: SQLite creates ``-wal``/``-shm`` with the main file's mode,
+        and the directory itself is 0700.
+        """
         self._ensure_private_db_directory()
-        for candidate in (
-            self._db_path,
-            self._db_path.with_name(f"{self._db_path.name}-wal"),
-            self._db_path.with_name(f"{self._db_path.name}-shm"),
-        ):
+        for candidate in (self._db_path, *self._sidecar_paths()):
             try:
-                fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+                st = os.lstat(candidate)
             except FileNotFoundError:
                 continue
-            except OSError:
-                raise RuntimeError(f"failed to open database file securely: {candidate}")
-            try:
-                stat_result = os.fstat(fd)
-                if not stat.S_ISREG(stat_result.st_mode):
-                    raise RuntimeError(f"refusing to secure non-regular database path: {candidate}")
-                os.fchmod(fd, 0o600)
             except OSError as exc:
-                raise RuntimeError(f"failed to secure database file: {candidate}") from exc
+                raise RuntimeError(f"failed to stat database file: {candidate}") from exc
+            if not stat.S_ISREG(st.st_mode):
+                raise RuntimeError(f"refusing to secure non-regular database path: {candidate}")
+            if stat.S_IMODE(st.st_mode) != 0o600:
+                try:
+                    self._chmod_private(candidate)
+                except OSError as exc:
+                    raise RuntimeError(f"failed to secure database file: {candidate}") from exc
+
+    # ------------------------------------------------------------------
+    # Access lock (shared/db_locks.py)
+    # ------------------------------------------------------------------
+
+    def _ensure_access_shared(self) -> None:
+        """Hold the access lock SHARED before any connection to the live DB opens."""
+        if self._access_shared is not None:
+            return
+        with self._access_guard:
+            if self._access_shared is not None:
+                return
+            if self._exclusive_held:
+                return  # this thread is the maintainer; EXCLUSIVE covers it
+            handle = self._access.acquire_shared(self._access_shared_timeout_s)
+            if handle is None:
+                raise sqlite3.OperationalError(
+                    "database is locked: file maintenance in progress "
+                    f"(access lock {self._access.path.name} held exclusively)"
+                )
+            self._access_shared = handle
+
+    def _release_access_shared(self) -> None:
+        with self._access_guard:
+            handle, self._access_shared = self._access_shared, None
+            if handle is not None:
+                handle.release()
+
+    def _abandon_for_exit(self) -> None:
+        """Drop the access lock while leaving every SQLite handle untouched.
+
+        Only for a process about to ``os._exit``: closing a WAL connection after
+        its files were swapped makes SQLite checkpoint and unlink ``-wal``/``-shm``
+        *by path* — which by then may name a peer's live files.
+        """
+        self._release_access_shared()
+
+    def _require_exclusive(self, operation: str) -> bool:
+        """Gate for every file-swapping operation: True only under EXCLUSIVE."""
+        if self._exclusive_held:
+            return True
+        log.warning(
+            "refusing %s on %s: the access lock is not held exclusively",
+            operation, self._db_path,
+        )
+        return False
+
+    @contextmanager
+    def _exclusive_access(self, timeout_s: float | None = None) -> Iterator[bool]:
+        """Trade this instance's SHARED hold for EXCLUSIVE; yield whether it was won.
+
+        Closes this instance's connections first (they pin the old inode and
+        its WAL), then releases its own SHARED hold — two descriptions in one
+        process conflict under flock, so keeping it would make EXCLUSIVE
+        unobtainable. Any *other* holder, in this process or another, makes the
+        attempt fail after *timeout_s* and the caller must decline. SHARED is
+        re-acquired on the way out either way.
+        """
+        timeout = self._access_exclusive_timeout_s if timeout_s is None else timeout_s
+        with self._access_guard:
+            if self._exclusive_held:  # re-entrant: already the maintainer
+                yield True
+                return
+            if not self._close_all_connections():
+                yield False
+                return
+            self._release_access_shared()
+            handle = self._access.try_exclusive(timeout)
+            if handle is None:
+                self._reacquire_access_shared()
+                yield False
+                return
+            self._exclusive_held = True
+            try:
+                yield True
             finally:
-                os.close(fd)
+                self._exclusive_held = False
+                handle.release()
+                self._reacquire_access_shared()
+
+    def _reacquire_access_shared(self) -> None:
+        try:
+            self._ensure_access_shared()
+        except sqlite3.OperationalError:
+            # Someone else started maintenance in the gap; the next connection
+            # open retries (and fails as "locked" if it still cannot get it).
+            log.warning("could not re-acquire the DB access lock after maintenance", exc_info=True)
+
+    def _access_lock_state(self) -> dict[str, object]:
+        try:
+            state = self._access.probe()
+        except OSError:
+            log.debug("access lock probe failed", exc_info=True)
+            state = "unknown"
+        return {
+            "access_lock": state,
+            "access_lock_held_shared_by_self": self._access_shared is not None,
+            "access_lock_held_exclusive_by_self": self._exclusive_held,
+        }
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
         """Create all tables if they don't exist."""
@@ -1853,7 +2074,7 @@ class Database:
             raise ValueError(f"{field_name} must be a number") from exc
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
-        if self._schema_ready:
+        if self._schema_ready or self._readonly:
             return
         with self._schema_lock:
             if self._schema_ready:
@@ -1864,28 +2085,47 @@ class Database:
 
     def _apply_conn_pragmas(self, conn: sqlite3.Connection, *, set_wal: bool) -> None:
         """Apply the standard pragmas. busy_timeout is the primary lock guard."""
-        if set_wal:
+        if set_wal and not self._readonly:
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(f"PRAGMA synchronous={self._synchronous_mode}")
         conn.execute(f"PRAGMA busy_timeout = {int(self._db_busy_timeout_ms)}")
         # Bound WAL growth under long-running swarms (only close() checkpointed before).
         conn.execute("PRAGMA wal_autocheckpoint = 1000")
 
+    def _open_tracked(self, timeout_s: float) -> _TrackedConnection:
+        if self._readonly:
+            target, uri = f"file:{self._db_path}?mode=ro", True
+        else:
+            target, uri = str(self._db_path), False
+        conn = sqlite3.connect(
+            target,
+            timeout=timeout_s,
+            factory=_TrackedConnection,
+            check_same_thread=_CHECK_SAME_THREAD,
+            uri=uri,
+        )
+        self._live_conns.add(conn)
+        return conn
+
     def _connect(self) -> sqlite3.Connection:
         """Open a fresh WAL connection for one logical DB operation."""
         timeout_s = max(1.0, self._db_busy_timeout_ms / 1000.0)
 
         def _open() -> sqlite3.Connection:
-            conn = sqlite3.connect(str(self._db_path), timeout=timeout_s)
-            self._apply_conn_pragmas(conn, set_wal=True)
-            self._ensure_schema(conn)
+            conn = self._open_tracked(timeout_s)
+            try:
+                self._apply_conn_pragmas(conn, set_wal=True)
+                self._ensure_schema(conn)
+            except BaseException:
+                conn.close()
+                raise
             return conn
 
-        conn = run_with_retry(
-            _open, classify_exc=classify_sqlite_error, policy=self._db_retry_policy()
-        )
-        self._restrict_db_permissions()
-        return conn
+        self._ensure_access_shared()
+        with self._access_guard:
+            return run_with_retry(
+                _open, classify_exc=classify_sqlite_error, policy=self._db_retry_policy()
+            )
 
     def _get_connection(self) -> sqlite3.Connection:
         """
@@ -1903,27 +2143,40 @@ class Database:
         Returns:
             sqlite3.Connection: Thread-local connection for this thread
         """
+        # A cached handle closed from another thread (_close_all_connections,
+        # before a file swap) is stale: forget it and reopen.
+        if (
+            hasattr(self._thread_local, 'conn')
+            and getattr(self._thread_local, 'conn_gen', None) != self._conn_generation
+        ):
+            self._drop_thread_local_conn()
         # Check if this thread already has a connection
         if not hasattr(self._thread_local, 'conn'):
             timeout_s = max(1.0, self._db_busy_timeout_ms / 1000.0)
 
             def _open() -> sqlite3.Connection:
-                conn = sqlite3.connect(str(self._db_path), timeout=timeout_s)
-                # Do not change journal_mode here; it can conflict when multiple
-                # threads/processes initialize (WAL is persisted on the file).
-                self._apply_conn_pragmas(conn, set_wal=False)
-                # Ensure schema is initialized (first thread will create tables).
-                # Retried so a locked schema-init under concurrent init waits instead
-                # of propagating as a swarm "initialization failed".
-                self._ensure_schema(conn)
+                conn = self._open_tracked(timeout_s)
+                try:
+                    # Do not change journal_mode here; it can conflict when multiple
+                    # threads/processes initialize (WAL is persisted on the file).
+                    self._apply_conn_pragmas(conn, set_wal=False)
+                    # Ensure schema is initialized (first thread will create tables).
+                    # Retried so a locked schema-init under concurrent init waits instead
+                    # of propagating as a swarm "initialization failed".
+                    self._ensure_schema(conn)
+                except BaseException:
+                    conn.close()
+                    raise
                 return conn
 
-            conn = run_with_retry(
-                _open, classify_exc=classify_sqlite_error, policy=self._db_retry_policy()
-            )
-            self._restrict_db_permissions()
-            # Store in thread-local storage for reuse
-            self._thread_local.conn = conn
+            self._ensure_access_shared()
+            with self._access_guard:
+                conn = run_with_retry(
+                    _open, classify_exc=classify_sqlite_error, policy=self._db_retry_policy()
+                )
+                # Store in thread-local storage for reuse
+                self._thread_local.conn = conn
+                self._thread_local.conn_gen = self._conn_generation
             log.debug(f"Created thread-local connection for thread {threading.get_ident()}")
         return self._thread_local.conn
 
@@ -1944,8 +2197,10 @@ class Database:
             with db.conn() as conn:
                 conn.execute("INSERT INTO telemetry ...")
         """
+        self._ensure_access_shared()
         self._maybe_reprobe_integrity()
-        conn = self._get_connection()
+        per_op = not self._persistent_connections
+        conn = self._connect() if per_op else self._get_connection()
         try:
             yield conn
             # Commit is the main WAL contention point; retry a locked commit with
@@ -1964,7 +2219,13 @@ class Database:
             # thread-local connection so the next call reopens fresh (the programmatic
             # equivalent of an MCP reconnect). Best-effort.
             category = classify_sqlite_error(exc)
-            if category in (ErrorCategory.DB_LOCKED, ErrorCategory.DB_CORRUPT):
+            # DB_IOERR is deliberately not routed to recovery: the file is fine,
+            # this process's mapping of it is not, and a swap would make it worse.
+            if category in (
+                ErrorCategory.DB_LOCKED,
+                ErrorCategory.DB_CORRUPT,
+                ErrorCategory.DB_IOERR,
+            ):
                 self._drop_thread_local_conn()
             if category == ErrorCategory.DB_CORRUPT:
                 # Immediate detection, not just the periodic re-probe above — a
@@ -1973,8 +2234,12 @@ class Database:
                 # (vs. a probe that might not run for up to the reprobe interval).
                 self._handle_corruption_detected("conn_exception")
             raise
+        finally:
+            if per_op:
+                conn.close()
         # Note: Connection is NOT closed here — it persists in thread-local storage
-        # for reuse by subsequent calls in the same thread (FNDX-01)
+        # for reuse by subsequent calls in the same thread (FNDX-01) — unless
+        # persistent_connections=False (the client's constrained fallback).
 
     def _drop_thread_local_conn(self) -> None:
         """Close and forget the current thread's cached connection (auto-reconnect)."""
@@ -1987,6 +2252,10 @@ class Database:
             try:
                 del self._thread_local.conn
             except AttributeError:  # pragma: no cover
+                pass
+            try:
+                del self._thread_local.conn_gen
+            except AttributeError:
                 pass
 
     # ------------------------------------------------------------------
@@ -2569,6 +2838,7 @@ class Database:
 
         return self.get_project_settings(project_path)
 
+    @db_readonly
     def list_pending_approvals(
         self,
         project_path: str,
@@ -2733,23 +3003,32 @@ class Database:
         the main file is empty, so the stale frames are already inert. Dropping them
         keeps a multi-MB sidecar from lingering indefinitely and stops it becoming
         live again the moment something repopulates the main file.
-        MUST hold ``_process_lock``.
+        MUST hold ``_process_lock``. Takes the access lock EXCLUSIVE for the
+        unlink and skips (it is hygiene) when anyone else has the DB open.
         """
-        wal, _shm = self._sidecar_paths()
-        try:
-            if not wal.exists() or wal.stat().st_size == 0:
-                return
-            main_size = self._db_path.stat().st_size if self._db_path.exists() else 0
-        except OSError:
-            log.debug("could not stat DB/sidecars", exc_info=True)
+        if not self._has_orphaned_wal():
             return
-        if main_size == 0:
+        with self._exclusive_access(timeout_s=0.0) as exclusive:
+            # Re-check: a peer may have populated the file before we got here.
+            if not exclusive or not self._has_orphaned_wal():
+                return
             log.warning(
                 "Discarding orphaned WAL %s (main DB is missing or empty) — "
                 "its frames belong to a database that no longer exists",
-                wal,
+                self._sidecar_paths()[0],
             )
             self._discard_wal_sidecars()
+
+    def _has_orphaned_wal(self) -> bool:
+        wal, _shm = self._sidecar_paths()
+        try:
+            if not wal.exists() or wal.stat().st_size == 0:
+                return False
+            main_size = self._db_path.stat().st_size if self._db_path.exists() else 0
+        except OSError:
+            log.debug("could not stat DB/sidecars", exc_info=True)
+            return False
+        return main_size == 0
 
     def _check_integrity_and_recover(self) -> None:
         with self._process_lock():
@@ -2767,10 +3046,51 @@ class Database:
             )
             self._recover_db_locked()
 
-    def _recover_db(self) -> None:
-        """Public/legacy entry — always runs under the cross-process lock."""
+    def _recover_db(self, timeout_s: float | None = None) -> str:
+        """Public/legacy entry — always runs under the cross-process lock.
+
+        Returns the outcome (also kept on ``last_recovery_result``);
+        ``RECOVERY_DECLINED_IN_USE`` means nothing was touched because another
+        holder of the database did not let go within *timeout_s*.
+        """
         with self._process_lock():
-            self._recover_db_locked()
+            return self._recover_db_locked(timeout_s=timeout_s)
+
+    # -- public maintenance API (proxied unchanged by the db daemon client) --
+
+    @db_readonly
+    def check(self) -> dict[str, object]:
+        """Integrity probe — read-only, never repairs (``repair()`` does).
+
+        ``integrity_ok`` is True / False, or None when contention made the
+        probe inconclusive (which is not corruption).
+        """
+        result = self._integrity_probe(str(self._db_path))
+        if result is not None:
+            self._last_integrity_ok = result
+        return {"integrity_ok": result, "db_path": str(self._db_path)}
+
+    def repair(self, timeout_s: float | None = None) -> str:
+        """Restore / salvage / quarantine. Returns the ``_recover_db`` outcome.
+
+        ``RECOVERY_DECLINED_IN_USE`` when another holder of the database did
+        not let go within *timeout_s* — nothing was touched. Under the daemon
+        this arrives as the ``admin repair`` RPC, which first quiesces its own
+        sessions so the daemon is not itself the holder.
+        """
+        return self._recover_db(timeout_s=timeout_s)
+
+    def prune_backups(self, keep: int = DB_BACKUP_KEEP) -> int:
+        """Rotate ``.bak.*`` files down to *keep*; returns how many remain."""
+        import glob as _glob
+
+        self._prune_old_backups(keep=keep)
+        return len(_glob.glob(str(self._db_path) + ".bak.*"))
+
+    @db_readonly
+    def newest_backup_age_s(self) -> float | None:
+        """Age of the newest ``.bak.*`` restore candidate, None when there is none."""
+        return self._newest_backup_age_s()
 
     def _maybe_reprobe_integrity(self) -> None:
         """Periodic mid-session corruption check.
@@ -2819,10 +3139,9 @@ class Database:
             )
         except OSError:
             log.debug("corruption forensics: stat failed", exc_info=True)
-        try:
-            info["exclusive_available"] = self._can_take_exclusive()
-        except Exception:
-            log.debug("corruption forensics: exclusive probe failed", exc_info=True)
+        # Who else holds the database right now. (SQLite's own EXCLUSIVE probe,
+        # used before, cannot see idle WAL readers — they hold only -shm locks.)
+        info.update(self._access_lock_state())
         info["synchronous_mode"] = self._synchronous_mode
         return info
 
@@ -2839,6 +3158,17 @@ class Database:
         attempts.
         """
         self._last_integrity_ok = False
+        if not self._maintenance:
+            # Constrained fallback: report, never repair — the daemon (or an
+            # operator's `threnody db repair`) owns that.
+            if self._corruption_detected_ts is None:
+                log.warning(
+                    "DB corruption detected (source=%s) at %s in a no-maintenance "
+                    "handle; not recovering here — run `threnody db repair`",
+                    source, self._db_path,
+                )
+            self._corruption_detected_ts = self._corruption_detected_ts or time.time()
+            return
         already_recovering = not self._corruption_recovery_lock.acquire(blocking=False)
         if already_recovering:
             self._corruption_detected_ts = self._corruption_detected_ts or time.time()
@@ -2857,6 +3187,7 @@ class Database:
         finally:
             self._corruption_recovery_lock.release()
 
+    @db_readonly
     def db_health_snapshot(self) -> dict[str, object]:
         """Single producer of DB health for MCP responses, status, and doctor.
 
@@ -2897,7 +3228,12 @@ class Database:
         With ``move_to`` the sidecars are renamed alongside a quarantined DB (kept
         for forensics); otherwise they are unlinked. Best-effort per file — a
         missing sidecar is the normal case after a clean checkpoint.
+
+        Requires the access lock EXCLUSIVE: deleting a WAL a live reader has
+        mapped is the original ``disk I/O error`` failure.
         """
+        if not self._require_exclusive("discarding WAL sidecars"):
+            return
         for sidecar in self._sidecar_paths():
             suffix = sidecar.name[len(self._db_path.name):]  # "-wal" / "-shm"
             try:
@@ -2910,75 +3246,74 @@ class Database:
             except Exception:
                 log.debug("Could not discard sidecar %s", sidecar, exc_info=True)
 
-    def _close_all_connections(self) -> None:
-        """Drop every cached handle in this process before swapping the DB file.
+    def _close_all_connections(self) -> bool:
+        """Close every handle this instance opened, on any thread.
 
         Connections opened against the old inode keep their own WAL alive; if one
         checkpoints after the swap it writes old-DB pages back under the new file's
-        name. Callers reopen lazily via ``_get_connection`` / ``_legacy_conn``.
+        name. This used to reach only the calling thread's and the legacy handles,
+        so a worker thread's cached connection — or the db daemon's keeper and
+        session connections — survived every swap. Callers reopen lazily via
+        ``_get_connection`` / ``_legacy_conn`` (the generation bump invalidates
+        other threads' caches).
+
+        Returns False when a handle could not be closed (only possible on a
+        non-serialized SQLite build, where closing from another thread is
+        refused); callers must then not swap files.
         """
+        all_closed = True
         with self._legacy_conn_lock:
-            for conn in list(self._legacy_conns.values()):
-                try:
-                    conn.close()
-                except Exception:
-                    log.debug("closing legacy conn failed", exc_info=True)
             self._legacy_conns.clear()
         self._drop_thread_local_conn()
-        self._schema_ready = False
-
-    def _can_take_exclusive(self) -> bool:
-        """True when no other connection (in any process) holds the DB.
-
-        ``_process_lock`` only serializes processes that *take* it — a peer MCP
-        server merely holding an open connection never does. Replacing the file or
-        deleting its WAL underneath such a reader invalidates its shm mapping and
-        surfaces as ``disk I/O error``. SQLite's own EXCLUSIVE lock is the reliable
-        probe: if we cannot get it, someone is attached and recovery must decline
-        rather than mutate shared state.
-        """
-        if not self._db_path.exists():
-            return True
-        try:
-            probe = sqlite3.connect(str(self._db_path), timeout=1.0)
+        for conn in list(self._live_conns):
+            if conn.closed:
+                continue
             try:
-                probe.execute("PRAGMA locking_mode = EXCLUSIVE")
-                # Only an actual write attempt acquires the exclusive lock.
-                probe.execute("BEGIN EXCLUSIVE")
-                probe.execute("ROLLBACK")
-                return True
-            finally:
-                probe.close()
-        except sqlite3.DatabaseError as exc:
-            # A corrupt DB cannot be read but is not shared — recovery is its point.
-            if classify_sqlite_error(exc) == ErrorCategory.DB_CORRUPT:
-                return True
-            log.debug("exclusive probe failed (%s)", exc, exc_info=True)
-            return False
-        except Exception:
-            log.debug("exclusive probe errored", exc_info=True)
-            return False
+                conn.close()
+            except Exception:
+                all_closed = False
+                log.warning("could not close a DB connection before maintenance", exc_info=True)
+        self._conn_generation += 1
+        self._schema_ready = False
+        return all_closed
 
-    def _recover_db_locked(self) -> None:
-        """Recovery body. MUST be called while holding ``_process_lock``."""
+    def _open_conn_count(self) -> int:
+        return sum(1 for conn in list(self._live_conns) if not conn.closed)
+
+    def _recover_db_locked(self, timeout_s: float | None = None) -> str:
+        """Recovery body. MUST be called while holding ``_process_lock``.
+
+        Every branch below replaces, renames or deletes the live files, so all
+        of it runs under the access lock EXCLUSIVE — i.e. only once no other
+        process (or other ``Database`` in this one) has the database open. If
+        that cannot be had within *timeout_s* recovery declines and touches
+        nothing: swapping files under a live reader is how a recoverable
+        corruption becomes ``disk I/O error`` in every peer.
+        """
+        with self._exclusive_access(timeout_s) as exclusive:
+            if not exclusive:
+                log.warning(
+                    "Skipping DB recovery at %s — another process holds the database. "
+                    "Retry when idle (threnody doctor --repair).",
+                    self._db_path,
+                )
+                self._last_integrity_ok = None
+                self.last_recovery_result = RECOVERY_DECLINED_IN_USE
+                return RECOVERY_DECLINED_IN_USE
+            result = self._recover_db_exclusive()
+            self.last_recovery_result = result
+            return result
+
+    def _recover_db_exclusive(self) -> str:
+        """Recovery proper; the caller holds ``_process_lock`` and EXCLUSIVE."""
         import glob as _glob
+        if not self._require_exclusive("DB recovery"):
+            return RECOVERY_DECLINED_IN_USE
         # Whatever the outcome below, this DB is no longer the one we started
         # with — _maybe_auto_backup must not turn a restored or recreated file
         # into the newest backup candidate.
         self._recovered_this_session = True
-        # Release our own handles first: they pin the old inode and its WAL.
-        self._close_all_connections()
-        if not self._can_take_exclusive():
-            # Another process is attached. Mutating the file now would corrupt its
-            # view; leave the DB alone and let a later run (or `threnody doctor
-            # --repair` on a quiet system) recover it.
-            log.warning(
-                "Skipping DB recovery at %s — another process holds the database. "
-                "Retry when idle (threnody doctor --repair).",
-                self._db_path,
-            )
-            self._last_integrity_ok = None
-            return
+        self.recovery_generation += 1
 
         # Salvage before falling back, but ONLY for an image that actually fails
         # integrity. A backup restore discards everything written since it was
@@ -2992,7 +3327,7 @@ class Database:
         # back to a known-good backup and drop a possibly-poisoned WAL. Salvaging
         # would instead preserve that WAL, quietly overriding the request.
         if self._integrity_probe(str(self._db_path)) is False and self._salvage_db():
-            return
+            return "salvaged"
 
         pattern = str(self._db_path) + ".bak.*"
         candidates = sorted(
@@ -3000,6 +3335,7 @@ class Database:
             key=lambda p: (p.rsplit(".", 1)[-1].isdigit(), p),
             reverse=True,
         )
+        staging = self._db_path.with_name(self._db_path.name + ".restore.tmp")
         for candidate in candidates:
             try:
                 conn = sqlite3.connect(candidate, timeout=5)
@@ -3010,11 +3346,14 @@ class Database:
                     conn.close()
                 if valid:
                     # Copy, don't move: a consumed backup leaves nothing to retry
-                    # with if the restored file turns out bad. And discard the old
-                    # sidecars BEFORE the swap so no foreign WAL is replayed into it.
+                    # with if the restored file turns out bad. Copy beside the DB
+                    # and rename over it, so the live name never holds a half-
+                    # written file. And discard the old sidecars BEFORE the swap
+                    # so no foreign WAL is replayed into it.
+                    shutil.copyfile(candidate, staging)
+                    self._ensure_private_db_file(staging)
                     self._discard_wal_sidecars()
-                    shutil.copyfile(candidate, self._db_path)
-                    self._ensure_private_db_file(self._db_path)
+                    os.replace(staging, self._db_path)
                     if self._integrity_probe(str(self._db_path)) is False:
                         log.warning(
                             "Restored backup %s did not verify in place — discarding",
@@ -3024,12 +3363,13 @@ class Database:
                         continue
                     self._last_integrity_ok = True
                     log.warning("DB recovered from backup %s", candidate)
-                    return
+                    return "restored"
                 else:
                     os.unlink(candidate)
                     log.warning("Discarded invalid backup %s", candidate)
             except Exception:
                 log.debug("Recovery candidate %s failed", candidate, exc_info=True)
+                staging.unlink(missing_ok=True)
         # No valid backup: QUARANTINE the corrupt DB (rename, don't delete) so it is
         # preserved for forensics and durable rows aren't silently destroyed.
         quarantined = False
@@ -3053,10 +3393,18 @@ class Database:
         if not quarantined:
             # DB file gone but sidecars may remain — they must not outlive it.
             self._discard_wal_sidecars()
+        # Recreate the live name empty and private now, while still exclusive:
+        # left to the next connect, SQLite would create it with its default
+        # 0644 mode, and permissions are no longer re-applied per connection.
+        try:
+            self._ensure_private_db_file(self._db_path)
+        except RuntimeError:
+            log.debug("could not recreate an empty private DB file", exc_info=True)
         # The corrupt file is off the main path; the next connect recreates a clean
         # DB. Report ok so callers don't immediately re-run recovery on the fresh
         # file (which would quarantine an empty database).
         self._last_integrity_ok = True
+        return "quarantined" if quarantined else "recreated"
 
     def salvage_file(self, source: Path | str, destination: Path | str) -> int:
         """Recover readable rows out of a damaged image. Returns rows written.
@@ -3153,7 +3501,13 @@ class Database:
         return total
 
     def _salvage_db(self) -> bool:
-        """Try to salvage the live DB in place. True when it now verifies."""
+        """Try to salvage the live DB in place. True when it now verifies.
+
+        The salvage itself only reads the live file; the swap that follows
+        requires the access lock EXCLUSIVE (held by ``_recover_db_locked``).
+        """
+        if not self._require_exclusive("swapping in a salvaged DB"):
+            return False
         staging = self._db_path.with_name(self._db_path.name + ".salvage.tmp")
         try:
             rows = self._salvage_to(self._db_path, staging)
@@ -3309,6 +3663,7 @@ class Database:
             self._db_path.name + f".bak.{int(time.time())}"
         )
         try:
+            self._ensure_access_shared()
             src = sqlite3.connect(str(self._db_path), timeout=10)
             src.execute(f"PRAGMA busy_timeout = {int(self._db_busy_timeout_ms)}")
             try:
@@ -3316,11 +3671,12 @@ class Database:
                 try:
                     src.backup(dst, pages=100)
                     self._last_backup_ts = time.time()
-                    self._ensure_private_db_file(backup_path)
                 finally:
                     dst.close()
             finally:
                 src.close()
+            # Only once SQLite has let go of it; path-only either way.
+            self._ensure_private_db_file(backup_path)
             self._prune_old_backups(keep=self._backup_keep)
             log.debug("DB backup written to %s", backup_path)
             return backup_path
@@ -3411,6 +3767,17 @@ class Database:
                 del self._thread_local.conn
             except AttributeError:
                 pass
+        # The access lock is held while this instance has *any* connection.
+        # Other threads' cached handles (and _connect() handles a caller still
+        # owns) are not closed here, so keep the hold until they are gone; an
+        # instance that is used again re-acquires it on the next open.
+        if self._open_conn_count() == 0:
+            self._release_access_shared()
+        else:
+            log.debug(
+                "close: %d connection(s) still open on other threads; keeping the access lock",
+                self._open_conn_count(),
+            )
 
     # ------------------------------------------------------------------
     # Result cache (preserves original Cache interface)
@@ -3447,6 +3814,7 @@ class Database:
                 (key, task, result, model, time.time()),
             )
 
+    @db_readonly
     def cache_stats(self) -> dict:
         """Return cache statistics."""
         now = time.time()
@@ -3803,6 +4171,7 @@ class Database:
             )
         return stable_ref
 
+    @db_readonly
     def query_artifacts(
         self,
         execution_id: str,
@@ -3870,6 +4239,7 @@ class Database:
             )
         return artifacts
 
+    @db_readonly
     def get_parent_scoped_artifacts(
         self,
         execution_id: str,
@@ -3970,6 +4340,7 @@ class Database:
                 ),
             )
 
+    @db_readonly
     def query_degradation_events(self, execution_id: str) -> list[dict[str, object]]:
         """Return persisted degradation events for one execution in stable order."""
         with self.conn() as conn:
@@ -3994,6 +4365,7 @@ class Database:
             for row in rows
         ]
 
+    @db_readonly
     def get_artifact_bindings(
         self,
         execution_id: str,
@@ -4066,6 +4438,7 @@ class Database:
                 ],
             )
 
+    @db_readonly
     def get_artifacts_for_consumes(
         self,
         execution_id: str,
@@ -4204,6 +4577,107 @@ class Database:
                 """,
                 (swarm_id, *insert_values.values()),
             )
+
+    # Statuses a run sits in while a host (or the runtime handoff) still owes it
+    # a terminal report. ``planned`` is the persist_swarm_run default.
+    ACTIVE_SWARM_STATUSES: tuple[str, ...] = ("awaiting_host_execution", "running", "planned")
+
+    def reap_stale_swarm_runs(
+        self,
+        *,
+        max_age_s: float = 86400.0,
+        now: float | None = None,
+        runs_root: Path | None = None,
+    ) -> list[str]:
+        """Mark active swarm runs older than *max_age_s* with no recent activity ``abandoned``.
+
+        Nothing else ever moves a run out of an active status when its host never
+        reports back (session closed, crash, an abandoned plan_task): the warm path
+        only imports run logs whose meta carries an ``outcome``, and
+        ``run_log.prune_runs`` deletes dirs without touching the DB. Those rows sat
+        ``awaiting_host_execution`` for months. Activity is non-hook activity in the
+        run dir (``run_log.run_activity_ts`` — PostToolUse hook appends are what a
+        stale active pointer produces, so they never count), an active-run pointer
+        naming it set within the cutoff, or a ``swarm_events``/``swarm_workers`` row
+        newer than the cutoff. The UPDATE re-checks the status, so a run that
+        completed between the scan and the write is never overwritten.
+
+        Also removes every active-run pointer naming a run that is no longer
+        active (just reaped, or terminal), so the hook stops appending to it.
+        """
+        from . import run_log
+
+        current = time.time() if now is None else float(now)
+        cutoff = current - float(max_age_s)
+        active = self.ACTIVE_SWARM_STATUSES
+        placeholders = ", ".join(["?"] * len(active))
+        root = Path(runs_root) if runs_root is not None else run_log.runs_root()
+        pointer_ts = run_log.active_pointer_runs(root=root)
+        with self.conn() as conn:
+            candidates = [
+                str(row[0])
+                for row in conn.execute(
+                    f"""
+                    SELECT swarm_id FROM swarm_runs r
+                    WHERE status IN ({placeholders}) AND created_ts < ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM swarm_events e
+                          WHERE e.swarm_id = r.swarm_id AND e.ts >= ?
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM swarm_workers w
+                          WHERE w.swarm_id = r.swarm_id AND w.ts >= ?
+                      )
+                    """,
+                    (*active, cutoff, cutoff, cutoff),
+                ).fetchall()
+            ]
+
+        stale = [
+            sid
+            for sid in candidates
+            if max(pointer_ts.get(sid, 0.0), run_log.run_activity_ts(sid, root=root)) < cutoff
+        ]
+        reaped: list[str] = []
+        if stale:
+            with self.conn() as conn:
+                for swarm_id in stale:
+                    cursor = conn.execute(
+                        f"""
+                        UPDATE swarm_runs
+                        SET status = 'abandoned', resume_status = 'abandoned'
+                        WHERE swarm_id = ? AND status IN ({placeholders}) AND created_ts < ?
+                        """,
+                        (swarm_id, *active, cutoff),
+                    )
+                    if cursor.rowcount:
+                        reaped.append(swarm_id)
+        if reaped:
+            log.info(
+                "reaped %d stale swarm run(s) older than %.0fs as abandoned",
+                len(reaped),
+                max_age_s,
+            )
+
+        # Pointers naming a run the DB knows is over. Run ids absent from
+        # swarm_runs are left to the pointer TTL (run_log.prune_active_pointers).
+        finished: set[str] = set(reaped)
+        unknown = [rid for rid in pointer_ts if rid not in finished]
+        if unknown:
+            with self.conn() as conn:
+                for rid in unknown:
+                    row = conn.execute(
+                        "SELECT status FROM swarm_runs WHERE swarm_id = ?", (rid,)
+                    ).fetchone()
+                    if row is not None and str(row[0]) not in active:
+                        finished.add(rid)
+        removed = sum(
+            run_log.remove_active_pointers_for(rid, root=root)
+            for rid in sorted(finished & set(pointer_ts))
+        )
+        if removed:
+            log.info("removed %d active-run pointer(s) naming finished runs", removed)
+        return reaped
 
     @staticmethod
     def _coerce_coordinator_verdict(value: object) -> str:
@@ -4369,6 +4843,7 @@ class Database:
                 ),
             )
 
+    @db_readonly
     def list_coordinator_round_checkpoints(
         self,
         swarm_id: str,
@@ -4447,6 +4922,7 @@ class Database:
             )
         return summaries
 
+    @db_readonly
     def get_latest_completed_coordinator_checkpoint(
         self,
         swarm_id: str,
@@ -4477,6 +4953,7 @@ class Database:
             return None
         return self._coordinator_checkpoint_from_row(row)
 
+    @db_readonly
     def get_latest_fallback_ready_coordinator_checkpoint(
         self,
         swarm_id: str,
@@ -4589,6 +5066,7 @@ class Database:
             )
         self._preview_token_last_prune_ts = now
 
+    @db_readonly
     def get_latest_swarm_event_payload(
         self,
         swarm_id: str,
@@ -4743,6 +5221,7 @@ class Database:
         self._maybe_prune_preview_tokens(now=now)
         return True
 
+    @db_readonly
     def lookup_preview_token_swarm_id(self, token_hmac: str) -> str | None:
         """Return the pending swarm_id for a preview token, if still valid."""
         normalized_token_hmac = str(token_hmac or "").strip()
@@ -4815,6 +5294,7 @@ class Database:
             compact["summary"] = "snapshot recorded"
         return compact
 
+    @db_readonly
     def get_swarm_summary(self, swarm_id: str) -> dict[str, object] | None:
         """Return a compact top-level swarm summary suitable for inspect surfaces."""
         normalized_swarm_id = str(swarm_id or "").strip()
@@ -4883,6 +5363,7 @@ class Database:
             "last_updated_ts": max(last_worker_ts, last_event_ts, float(row[2])),
         }
 
+    @db_readonly
     def get_coordinator_round_checkpoint_by_index(
         self,
         swarm_id: str,
@@ -4961,6 +5442,7 @@ class Database:
         state["workers"] = workers
         return state
 
+    @db_readonly
     def get_handoff_agent_snapshots(self, swarm_id: str) -> list[dict[str, object]]:
         """Return latest per-worker handoff snapshots for a host-native run."""
         normalized_swarm_id = str(swarm_id or "").strip()
@@ -4994,6 +5476,7 @@ class Database:
             snapshots.append(entry)
         return snapshots
 
+    @db_readonly
     def get_swarm_events(
         self,
         swarm_id: str,
@@ -5449,6 +5932,7 @@ class Database:
         )
 
 
+    @db_readonly
     def get_provider_token_usage(self, provider_name: str, since_ts: float) -> int:
         """Return total tokens_used for a provider since since_ts (unix timestamp).
 
@@ -5483,6 +5967,7 @@ class Database:
             )
             return int(cursor.lastrowid)
 
+    @db_readonly
     def get_latest_provider_quota_observation(
         self, provider: str
     ) -> dict[str, object] | None:
@@ -5641,6 +6126,7 @@ class Database:
                 """
             )
 
+    @db_readonly
     def get_write_audit(self, limit: int = 500) -> list[dict]:
         """Return recent out-of-workspace write audit entries, newest first."""
         import json as _json
@@ -5831,6 +6317,7 @@ class Database:
             )
             return True
 
+    @db_readonly
     def get_mature_patterns(self, min_occurrences: int = 5) -> list[dict]:
         """Return patterns that have hit the emergence threshold."""
         with self.conn() as conn:
@@ -5860,6 +6347,7 @@ class Database:
             )
         return results
 
+    @db_readonly
     def get_pattern(self, pattern_hash: str) -> dict | None:
         """Return a single pattern by hash."""
         with self.conn() as conn:
@@ -5960,6 +6448,7 @@ class Database:
                     ),
                 )
 
+    @db_readonly
     def get_agent_definition(self, pattern_hash: str) -> dict | None:
         """Return a single agent definition by pattern hash."""
         with self.conn() as conn:
@@ -5982,6 +6471,7 @@ class Database:
             "exported_global_ts": row[7],
         }
 
+    @db_readonly
     def get_all_agent_definitions(self) -> list[dict]:
         """Return all agent definitions, ordered by most-used first."""
         with self.conn() as conn:
@@ -6060,6 +6550,7 @@ class Database:
             log.warning(f"Failed to insert agent definition: {e}")
             return False
 
+    @db_readonly
     def agent_definition_get(self, agent_id: str) -> dict | None:
         """Get an agent definition by ID or pattern_hash (canonical identity).
 
@@ -6107,6 +6598,7 @@ class Database:
             log.warning(f"Failed to get agent definition: {e}")
             return None
 
+    @db_readonly
     def agent_definitions_list(
         self,
         lane: str,
@@ -6239,6 +6731,7 @@ class Database:
             log.warning(f"Failed to log agent audit: {e}")
             return None
 
+    @db_readonly
     def list_agent_audit_events(
         self,
         *,
@@ -6278,6 +6771,7 @@ class Database:
             for row in rows
         ]
 
+    @db_readonly
     def get_active_agents(self) -> list[dict]:
         """Get all agents with status='active'.
         
@@ -6388,6 +6882,7 @@ class Database:
             "created_ts": now,
         }
 
+    @db_readonly
     def routing_guard_get(
         self,
         *,
@@ -6785,6 +7280,7 @@ class Database:
                 (scope, idempotency_key, target_path, lines_written, _time.time(), _chain),
             )
 
+    @db_readonly
     def get_file_write(self, scope: str, idempotency_key: str) -> dict | None:
         """Return a previously completed file_write record, or None if not found."""
         with self.conn() as conn:
@@ -6913,6 +7409,7 @@ class Database:
                     (task_id, error, now, now, payload),
                 )
 
+    @db_readonly
     def get_dead_letters(self, limit: int = 50) -> list[dict]:
         """Return dead letter queue entries."""
         with self.conn() as conn:
@@ -6995,6 +7492,7 @@ class Database:
                     (now, session_id),
                 )
 
+    @db_readonly
     def get_worker_session(self, session_id: str) -> dict | None:
         """Return session row as dict or None."""
         with self.conn() as conn:
@@ -7012,6 +7510,7 @@ class Database:
             "status": row[6], "token_count": row[7],
         }
 
+    @db_readonly
     def list_worker_sessions(
         self,
         status: str | None = None,
@@ -7105,6 +7604,7 @@ class Database:
                 (outcome_score, regret, task_id, task_id),
             )
 
+    @db_readonly
     def load_bandit_arms(self) -> dict[str, dict]:
         """Return persisted LinUCB arm state keyed by arm_id."""
         out: dict[str, dict] = {}
@@ -7158,6 +7658,7 @@ class Database:
         except Exception:
             log.debug("bandit arm save failed for %s", arm_id, exc_info=True)
 
+    @db_readonly
     def get_bandit_train_cursor(self) -> int:
         """Highest routing_decisions.id already replayed into the arm models."""
         try:
@@ -7186,6 +7687,7 @@ class Database:
         except Exception:
             log.debug("bandit train cursor write failed", exc_info=True)
 
+    @db_readonly
     def get_scored_routing_decisions(self, after_row_id: int = 0, limit: int = 500) -> list[dict]:
         """Scored decisions newer than ``after_row_id``, oldest first (training order)."""
         try:
@@ -7216,6 +7718,7 @@ class Database:
             })
         return out
 
+    @db_readonly
     def get_bandit_summary(
         self,
         limit: int = 500,
@@ -7273,6 +7776,7 @@ class Database:
                 ),
             )
 
+    @db_readonly
     def get_cost_summary(
         self,
         since_ts: float = 0.0,
@@ -7344,6 +7848,7 @@ class Database:
                 ),
             )
 
+    @db_readonly
     def get_run_receipt(self, run_id: str) -> dict[str, object] | None:
         """Return a persisted operator receipt."""
         normalized_run_id = str(run_id or "").strip()
@@ -7495,6 +8000,7 @@ class Database:
             )
             return cursor.rowcount > 0
 
+    @db_readonly
     def routing_exception_list(self) -> list[dict[str, object]]:
         """Return all routing bypass rules ordered by type then pattern."""
         with self.conn() as conn:
@@ -7517,6 +8023,7 @@ class Database:
     # Provider health — circuit-breaker state                             #
     # ------------------------------------------------------------------ #
 
+    @db_readonly
     def get_provider_health(self, provider_id: str) -> dict[str, object] | None:
         """Return the current health row for one provider, or None if unseen."""
         with self.conn() as conn:
@@ -7635,3 +8142,12 @@ class Database:
                         now, provider_id,
                     ),
                 )
+
+
+# Methods the daemon client may transparently re-send after a daemon restart
+# (see ``db_readonly``). Derived, so a new read-only method only needs the mark.
+READONLY_METHODS: frozenset[str] = frozenset(
+    name
+    for name, member in vars(Database).items()
+    if getattr(member, "__db_readonly__", False)
+)

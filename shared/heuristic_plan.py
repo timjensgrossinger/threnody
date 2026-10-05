@@ -6,7 +6,9 @@ via host Task/Agent tools. No subprocess to Copilot, Codex, or other CLIs.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import subprocess
 from pathlib import Path, PurePosixPath
 
 from .config import (
@@ -17,6 +19,10 @@ from .config import (
 from .context import extract_references
 
 log = logging.getLogger(__name__)
+
+# Bump when plan *shape* changes. Part of the plan-cache salt, so a plan cached by
+# an older planner (e.g. one with spliced-fragment prompts) is never served again.
+HEURISTIC_PLAN_VERSION = 2
 
 _FILE_EXT_GROUP = (
     r"py|ts|tsx|js|jsx|html|htm|css|scss|vue|svelte|go|rs|java|kt|rb|cs|yaml|yml|json|toml|md"
@@ -274,7 +280,7 @@ def _extract_explicit_file_entries(
         _add(match.group(1))
 
     for match in _BARE_FILENAME.finditer(task):
-        _add(match.group(1))
+        _add(_attach_directory(task, match))
 
     if not ordered:
         return []
@@ -282,6 +288,35 @@ def _extract_explicit_file_entries(
     ordered = _drop_bare_duplicates(ordered)
     hints = _description_hints_by_path(task, [path for path, _ in ordered])
     return [(path, hints.get(path.lower(), "")) for path, _ in ordered]
+
+
+# A directory named on its own: ``tests/`` in "tests in tests/: a.py, b.py". The
+# lookahead rejects ``shared/verify.py`` (the slash is followed by a name).
+_DIR_MARKER = re.compile(
+    r"(?<![\w/.\-])((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+)/(?![\w.\-])"
+)
+_LIST_FILLER = re.compile(r"(?:\band\b|\bor\b|\bplus\b|&|[\s:,;])+", re.IGNORECASE)
+
+
+def _attach_directory(task: str, match: "re.Match[str]") -> str:
+    """Prefix a bare filename with a directory that heads its list.
+
+    ``tests in tests/: test_a.py, test_b.py`` names two files in ``tests/``; the
+    bare-name scan alone sees only ``test_a.py`` and ``test_b.py``, which then
+    resolve (or fail to) against the repo root. The directory applies only while
+    nothing but file names and list punctuation separate it from the file.
+    """
+    name = match.group(1)
+    marker = None
+    for candidate in _DIR_MARKER.finditer(task, 0, match.start()):
+        marker = candidate
+    if marker is None:
+        return name
+    between = task[marker.end():match.start()]
+    leftover = _LIST_FILLER.sub("", _PATH_OR_FILE_TOKEN.sub("", between))
+    if leftover:
+        return name
+    return f"{_normalize_path(marker.group(1)).strip('/')}/{name}"
 
 
 def _drop_bare_duplicates(entries: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -613,6 +648,278 @@ def _trim_dangling(text: str) -> str:
     return stripped or trimmed
 
 
+# ---------------------------------------------------------------------------
+# Prompt composition: the whole task, plus a per-agent focus
+# ---------------------------------------------------------------------------
+
+_SEGMENT_BREAK = re.compile(
+    r"\n[ \t]*\n"
+    r"|\n[ \t]*(?:[-*•]|\d+[.)])[ \t]"
+    r"|(?<=\s)\d{1,2}[.)]\s+(?=\S)"
+    r"|(?<=\S)[.!?]\s+(?=[A-Z])"
+)
+
+
+def _focus_clause(task: str, path: str) -> str:
+    """The sentence / list item of *task* that names *path*, verbatim.
+
+    A hint for the agent, never its instructions: sibling paths stay in the text,
+    so the clause cannot be left with a hole where another file's name was.
+    Returns ``""`` when no segment mentions the file.
+    """
+    spans: list[tuple[int, int]] = []
+    last = 0
+    for match in _SEGMENT_BREAK.finditer(task):
+        spans.append((last, match.start()))
+        last = match.end()
+    spans.append((last, len(task)))
+    for needle in (path.lower(), PurePosixPath(path).name.lower()):
+        if not needle:
+            continue
+        for start, end in spans:
+            segment = task[start:end]
+            if needle in segment.lower():
+                clause = re.sub(r"\s+", " ", segment).strip(" ,;:-.")
+                return _bounded_fragment(clause)
+    return ""
+
+
+def _is_mangled(text: str) -> bool:
+    from .host_spawn import is_mangled_prompt
+
+    return is_mangled_prompt(text)
+
+
+def _normalize_hint(hint: str, task: str) -> str:
+    """Reduce an entry hint to a usable clause, or ``""`` when it is a fragment.
+
+    Hints that already embed the whole task (numbered fan-out, intent templates)
+    have it removed, since the prompt carries the task once on its own.
+    """
+    text = (hint or "").strip()
+    task_s = (task or "").strip()
+    if task_s and task_s in text:
+        text = text.replace(task_s, " ")
+        text = re.sub(r"\s+", " ", text).strip(" :—-,;")
+    if not text or _is_mangled(text):
+        return ""
+    return text
+
+
+def _focus_block(items: list[tuple[str, str]], lead: str = "") -> str:
+    if len(items) == 1:
+        path, hint = items[0]
+        return f"Your focus: {lead}{path}" + (f" — {hint}" if hint else "")
+    # Files named in one clause share it; repeating it per file only adds noise.
+    by_hint: dict[str, list[str]] = {}
+    for path, hint in items:
+        by_hint.setdefault(hint, []).append(path)
+    lines = "\n".join(
+        f"- {', '.join(paths)}" + (f": {hint}" if hint else "")
+        for hint, paths in by_hint.items()
+    )
+    return f"Your focus ({len(items)} files):\n{lines}"
+
+
+def _compose_prompt(
+    task: str,
+    items: list[tuple[str, str]],
+    *,
+    lead: str = "",
+    fallback: str = "",
+) -> str:
+    """The full original task verbatim, then this agent's focus.
+
+    The old prompt was only the per-file clause, cut out of the task text — so an
+    agent never saw the task it was part of, and a clause cut mid-sentence read as
+    garbage. Without a task (a direct caller) the *fallback* is used unchanged.
+    """
+    body = (task or "").strip()
+    if not body:
+        return fallback
+    return f"{body}\n\n{_focus_block(items, lead)}"
+
+
+# ---------------------------------------------------------------------------
+# Workspace resolution: bare names -> repo paths, and file evidence
+# ---------------------------------------------------------------------------
+
+_SKIP_DIRS = frozenset(
+    {
+        ".git", "node_modules", "__pycache__", ".venv", "venv", "env", ".tox",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
+        "site-packages", "worktrees",
+    }
+)
+_MAX_INDEX_FILES = 20000
+_MAX_EVIDENCE_PATHS = 24
+# Above this many non-blank lines a file is too large for the cheapest tier to edit
+# safely, whatever the prose says.
+_LARGE_FILE_LOC = 1500
+
+
+def _git_listed_files(root: Path) -> list[str] | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others",
+             "--exclude-standard"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        log.debug("heuristic_plan: git ls-files failed in %s", root, exc_info=True)
+        return None
+    if proc.returncode != 0:
+        return None
+    return [p for p in proc.stdout.decode("utf-8", "replace").split("\0") if p]
+
+
+def _walked_files(root: Path) -> list[str]:
+    found: list[str] = []
+    for current, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for name in names:
+            rel = Path(current, name).relative_to(root)
+            found.append(rel.as_posix())
+            if len(found) >= _MAX_INDEX_FILES:
+                return found
+    return found
+
+
+def _workspace_index(root: Path) -> dict[str, list[str]]:
+    """``{lowercase basename: [repo-relative paths]}`` for the workspace."""
+    files = _git_listed_files(root)
+    if files is None:
+        files = _walked_files(root)
+    index: dict[str, list[str]] = {}
+    for rel in files[:_MAX_INDEX_FILES]:
+        parts = PurePosixPath(rel).parts
+        if not parts or any(part in _SKIP_DIRS for part in parts[:-1]):
+            continue
+        index.setdefault(parts[-1].lower(), []).append(rel)
+    return index
+
+
+def _resolve_workspace_entries(
+    entries: list[tuple[str, str]], workspace_root: str | None
+) -> tuple[list[tuple[str, str]], list[dict[str, object]]]:
+    """Resolve directory-less names against the repo.
+
+    Order: a root-level file that exists, else the one repo file with that
+    basename. Several candidates make the name ambiguous: it is reported, never
+    guessed, and owns no write target. No candidate means a new file at the
+    literal path. Duplicates are removed after resolution.
+    """
+    if not workspace_root:
+        return entries, []
+    root = Path(workspace_root)
+    if not root.is_dir():
+        return entries, []
+    from .context import is_within_repo
+
+    index: dict[str, list[str]] | None = None
+    resolved: list[tuple[str, str]] = []
+    ambiguous: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for path, hint in entries:
+        if path and "/" not in path and not (root / path).is_file():
+            if index is None:
+                index = _workspace_index(root)
+            matches = sorted(
+                m for m in index.get(path.lower(), [])
+                if (root / m).is_file() and is_within_repo(root / m, root)
+            )
+            if len(matches) == 1:
+                path = matches[0]
+            elif len(matches) > 1:
+                ambiguous.append({"name": path, "candidates": matches[:10]})
+                log.info("heuristic_plan: %s is ambiguous (%d matches)", path, len(matches))
+                continue
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append((path, hint))
+    return resolved, ambiguous
+
+
+def _evidence_floors(
+    paths: list[str], workspace_root: str | None, task: str, risk_re
+) -> dict[str, str]:
+    """``{lowercase path: tier floor}`` from what the target files actually hold.
+
+    Floors only: a file above ``_LARGE_FILE_LOC`` lines is at least ``medium``, and
+    a file whose evidence lifts the router's own tier for this task keeps that
+    tier. Prose cannot lower either. Best-effort — any failure yields no floor.
+    """
+    if not workspace_root or not paths:
+        return {}
+    root = Path(workspace_root)
+    if not root.is_dir():
+        return {}
+    try:
+        from .context import is_within_repo, normalize_target_path
+        from .risk_signals import TaskRiskEvidence, collect_task_evidence
+
+        located: list[tuple[str, Path]] = []
+        for rel in paths[:_MAX_EVIDENCE_PATHS]:
+            try:
+                absolute = normalize_target_path(rel, root)
+            except ValueError:
+                continue
+            if is_within_repo(absolute, root) and absolute.is_file():
+                located.append((rel, absolute))
+        if not located:
+            return {}
+        evidence = collect_task_evidence(
+            [str(absolute) for _rel, absolute in located],
+            max_files=len(located),
+            filename_re=risk_re,
+        )
+        router = None
+        base_tier = "low"
+        try:
+            from .config import TGsConfig
+            from .router import TaskRouter
+
+            router = TaskRouter(TGsConfig.from_yaml(), db=None)
+            base_tier = str(router.classify(task).tier)
+        except Exception:
+            log.debug("heuristic_plan: router unavailable for evidence floors", exc_info=True)
+            router = None
+        floors: dict[str, str] = {}
+        by_abs = {str(absolute): rel for rel, absolute in located}
+        for file_risk in evidence.files:
+            rel = by_abs.get(file_risk.path)
+            if rel is None:
+                continue
+            tier = "medium" if file_risk.loc > _LARGE_FILE_LOC else "low"
+            if router is not None:
+                try:
+                    with_file = str(
+                        router.classify(task, evidence=TaskRiskEvidence(files=(file_risk,))).tier
+                    )
+                    if with_file in _TIER_ORDER and with_file != base_tier:
+                        tier = _floor_tier(tier, with_file)
+                except Exception:
+                    log.debug("heuristic_plan: evidence classify failed", exc_info=True)
+            if tier != "low":
+                floors[rel.lower()] = tier
+        return floors
+    except Exception:
+        log.debug("heuristic_plan: evidence floors failed", exc_info=True)
+        return {}
+
+
+def _apply_floor(tier: str, paths: list[str], floors: dict[str, str] | None) -> str:
+    for path in paths:
+        floor = (floors or {}).get(_normalize_path(path).lower())
+        if floor:
+            tier = _floor_tier(tier, floor)
+    return tier
+
+
 def _tier_for_subtask(*, file_count: int, default_tier: str) -> str:
     if default_tier not in {"low", "medium", "high"}:
         default_tier = "low"
@@ -718,7 +1025,29 @@ def _close_sentence(text: str) -> str:
     return trimmed if trimmed[-1] in ".!?:" else f"{trimmed}."
 
 
-def _finalize_subtasks(subtasks: list[dict[str, object]]) -> list[dict[str, object]]:
+def _write_role(task: str, target_files: list[str]) -> str:
+    """Role for a subtask that writes files, judged on the WHOLE task.
+
+    The old role came from the per-file fragment, so "verify signals in x.py"
+    made an implementer a Tester and "check the reviewer gate" a Reviewer. A
+    writer is never a Reviewer; it is a Tester only when every file it owns is a
+    test file; a fix/debug task makes it a Debugger.
+    """
+    from .roles import derive_role_from_task
+
+    whole = derive_role_from_task(task)
+    if whole == "Debugger":
+        return whole
+    if target_files and all(_is_test_file(p) for p in target_files):
+        return "Tester"
+    if whole in {"Tester", "Reviewer", "Worker"}:
+        return "Implementer"
+    return whole
+
+
+def _finalize_subtasks(
+    subtasks: list[dict[str, object]], task: str = ""
+) -> list[dict[str, object]]:
     """Give every file-scoped subtask an authoritative target_files list and an
     ownership sentence, so prompt scope can never exceed declared ownership (#3).
 
@@ -774,7 +1103,10 @@ def _finalize_subtasks(subtasks: list[dict[str, object]]) -> list[dict[str, obje
         desc = str(st.get("description", "")).rstrip()
         if "You own exactly these files:" not in desc:
             st["description"] = _close_sentence(desc) + _ownership_line(deduped)
-        _apply_role(st, derive_role_from_task(str(st.get("description", ""))))
+        if st.get("read_only") or st.get("review_dimension"):
+            _apply_role(st, derive_role_from_task(str(st.get("description", ""))))
+        else:
+            _apply_role(st, _write_role(task or _strip_ownership(str(st.get("description", ""))), deduped))
     return subtasks
 
 
@@ -803,7 +1135,19 @@ def _entry_parent(path: str) -> str:
 
 
 def _coupled_group_indices(entries: list[tuple[str, str]], task_lower: str) -> list[int]:
-    """1-based indices of entries that form a coupled group (dir-cohesion proxy).
+    """1-based indices of every entry in any coupled group, flattened and sorted."""
+    return sorted(i for group in _coupled_groups(entries, task_lower) for i in group)
+
+
+def _group_by_directory(entries: list[tuple[str, str]], ids: list[int]) -> list[list[int]]:
+    by_dir: dict[str, list[int]] = {}
+    for i in ids:
+        by_dir.setdefault(_entry_parent(entries[i - 1][0]), []).append(i)
+    return list(by_dir.values())
+
+
+def _coupled_groups(entries: list[tuple[str, str]], task_lower: str) -> list[list[int]]:
+    """Coupled groups, one per directory (1-based entry indices, dir-cohesion proxy).
 
     Couples >=2 SOURCE files sharing the same non-empty parent directory — the
     directory cohesion is the signal, so no coupling keyword is required (the old
@@ -825,7 +1169,9 @@ def _coupled_group_indices(entries: list[tuple[str, str]], task_lower: str) -> l
             continue
         by_dir.setdefault(parent, []).append(index)
 
-    coupled: set[int] = set()
+    # One group per directory: two unrelated directories are not one module, and
+    # merging them handed a single agent files it had no reason to treat as a unit.
+    groups: list[list[int]] = []
     for ids in by_dir.values():
         if len(ids) < 2:
             continue
@@ -834,19 +1180,26 @@ def _coupled_group_indices(entries: list[tuple[str, str]], task_lower: str) -> l
         bases = {re.sub(r"\d+$", "", _stem(entries[i - 1][0])) for i in ids}
         if len(bases) < 2:
             continue
-        coupled.update(ids)
-    return sorted(coupled)
+        groups.append(sorted(ids))
+    return groups
 
 
-def assess_task_complexity(task: str) -> dict[str, object]:
-    """Cheap signal of whether a task warrants the real LLM planner over heuristics."""
+def assess_task_complexity(
+    task: str, entries: list[tuple[str, str]] | None = None
+) -> dict[str, object]:
+    """Cheap signal of whether a task warrants the real LLM planner over heuristics.
+
+    *entries* lets a caller that already resolved the task's files against the
+    workspace assess those, instead of re-extracting bare names from the text.
+    """
     if not isinstance(task, str) or not task.strip():
         return {"complex": False, "coupled": False, "source_count": 0, "design_keyword": False}
     task_lower = task.lower()
-    try:
-        entries = extract_task_file_entries(task, intent_templates=False)
-    except Exception:
-        entries = []
+    if entries is None:
+        try:
+            entries = extract_task_file_entries(task, intent_templates=False)
+        except Exception:
+            entries = []
     coupled = len(_coupled_group_indices(entries, task_lower)) >= 2
     source_count = sum(
         1 for path, _ in entries if PurePosixPath(_normalize_path(path)).suffix.lower() in _SOURCE_EXTS
@@ -860,6 +1213,17 @@ def assess_task_complexity(task: str) -> dict[str, object]:
     }
 
 
+def _plan_shape(subtasks: list[dict[str, object]], topology: str | None) -> tuple[str, str]:
+    """``(strategy, topology)`` for a built subtask list."""
+    has_deps = any(subtask.get("depends_on") for subtask in subtasks)
+    normalized_topology = str(topology or "").strip().lower()
+    if normalized_topology in {"star", "hierarchical", "dag", "linear"}:
+        plan_topology = normalized_topology
+    else:
+        plan_topology = "dag" if has_deps else "linear"
+    return ("dag" if has_deps else ("parallel" if len(subtasks) > 1 else "sequential")), plan_topology
+
+
 def _coupled_subtasks(
     entries: list[tuple[str, str]],
     coupled_ids: list[int],
@@ -870,123 +1234,155 @@ def _coupled_subtasks(
     strategy: str,
     risk_re=None,
     floor_tier: str = "medium",
+    task: str = "",
+    floors: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    """Build a plan for a detected coupled group.
+    """Build a plan for the detected coupled groups, one group per directory.
 
-    "single"   -> one higher-tier subtask owning all coupled files (no extra wave).
-    "contract" -> wave 1 defines a shared interface file; the rest depend on it.
+    "single"   -> one higher-tier subtask per group owning all of its files.
+    "contract" -> per group, wave 1 defines a shared interface file; the rest
+                  of that group depends on it.
     Non-coupled entries (if any) are appended as independent subtasks.
     """
     coupled_set = set(coupled_ids)
-    members = [entries[i - 1] for i in coupled_ids]
+    groups = _group_by_directory(entries, sorted(coupled_set))
     others = [(i, entries[i - 1]) for i in range(1, len(entries) + 1) if i not in coupled_set]
-    member_paths = [p for p, _ in members]
-    tier = _complexity_tier(
-        paths=member_paths, task_lower=task_lower, coupled=True, default_tier=default_tier
-    )
-    # Risk floor: a coupled group containing a security-sensitive file runs at
-    # least at floor_tier, taking the group's max tier (#4).
-    if risk_re is not None:
-        for mp in member_paths:
-            if _risk_floor_for(mp, risk_re, floor_tier) is not None:
-                tier = _floor_tier(tier, floor_tier)
-                break
-
-    # Pick the interface/primary file: an integration file if present, else the first.
-    primary_idx = 0
-    for j, (path, _hint) in enumerate(members):
-        if _is_integration_file(path):
-            primary_idx = j
-            break
-    primary_path = member_paths[primary_idx]
+    task_s = (task or "").strip()
 
     subtasks: list[dict[str, object]] = []
-    if strategy == "contract":
-        interface_hint = members[primary_idx][1] or f"Define the shared interface in {primary_path}"
-        subtasks.append(
-            {
-                "id": 1,
-                "description": f"Define the shared interface first — {interface_hint}",
-                "tier": tier,
-                "target_file": primary_path,
-                "single_file_insertion": False,
-                "depends_on": [],
-            }
+    next_id = 1
+    for group in groups:
+        members = [(path, _normalize_hint(hint, task_s)) for path, hint in (entries[i - 1] for i in group)]
+        member_paths = [p for p, _ in members]
+        tier = _complexity_tier(
+            paths=member_paths, task_lower=task_lower, coupled=True, default_tier=default_tier
         )
-        next_id = 2
-        for j, (path, hint) in enumerate(members):
-            if j == primary_idx:
-                continue
+        # Risk floor: a coupled group containing a security-sensitive file runs at
+        # least at floor_tier, taking the group's max tier (#4).
+        if risk_re is not None:
+            for mp in member_paths:
+                if _risk_floor_for(mp, risk_re, floor_tier) is not None:
+                    tier = _floor_tier(tier, floor_tier)
+                    break
+        tier = _apply_floor(tier, member_paths, floors)
+
+        # Pick the interface/primary file: an integration file if present, else the first.
+        primary_idx = 0
+        for j, (path, _hint) in enumerate(members):
+            if _is_integration_file(path):
+                primary_idx = j
+                break
+        primary_path = member_paths[primary_idx]
+
+        if strategy == "contract":
+            interface_id = next_id
+            hint = members[primary_idx][1]
             subtasks.append(
                 {
-                    "id": next_id,
-                    "description": (hint or f"Implement {path}")
-                    + f" (depends on the interface in {primary_path})",
+                    "id": interface_id,
+                    "description": _compose_prompt(
+                        task_s,
+                        [(primary_path, hint)],
+                        lead="define the shared interface first — ",
+                        fallback=f"Define the shared interface first — "
+                        f"{hint or f'Define the shared interface in {primary_path}'}",
+                    ),
                     "tier": tier,
-                    "target_file": path,
+                    "target_file": primary_path,
                     "single_file_insertion": False,
-                    "depends_on": [1],
+                    "depends_on": [],
+                    "_focus": [[primary_path, hint]],
                 }
             )
             next_id += 1
-    else:  # "single"
-        # One bullet per owned file. Joining the raw hints with "; " used to
-        # concatenate overlapping clause windows, so the same instruction block
-        # appeared once per member and read as a truncated path at each seam.
-        bullets = "\n".join(
-            f"- {path}: {_close_sentence(hint)}" if hint else f"- {path}"
-            for path, hint in members
-        )
-        subtasks.append(
-            {
-                "id": 1,
-                "description": (
-                    "Implement the coupled module as one coherent unit "
-                    f"(shared interface across {len(members)} files):\n{bullets}"
-                ),
-                "tier": tier,
-                "target_file": primary_path,
-                "target_files": member_paths,
-                "single_file_insertion": False,
-                "depends_on": [],
-            }
-        )
-        next_id = 2
+            for j, (path, hint) in enumerate(members):
+                if j == primary_idx:
+                    continue
+                subtasks.append(
+                    {
+                        "id": next_id,
+                        "description": _compose_prompt(
+                            task_s,
+                            [(path, hint)],
+                            fallback=hint or f"Implement {path}",
+                        )
+                        + f" (depends on the interface in {primary_path})",
+                        "tier": tier,
+                        "target_file": path,
+                        "single_file_insertion": False,
+                        "depends_on": [interface_id],
+                        "_focus": [[path, hint]],
+                    }
+                )
+                next_id += 1
+        else:  # "single"
+            # One bullet per owned file. Joining the raw hints with "; " used to
+            # concatenate overlapping clause windows, so the same instruction block
+            # appeared once per member and read as a truncated path at each seam.
+            bullets = "\n".join(
+                f"- {path}: {_close_sentence(hint)}" if hint else f"- {path}"
+                for path, hint in members
+            )
+            subtasks.append(
+                {
+                    "id": next_id,
+                    "description": _compose_prompt(
+                        task_s,
+                        members,
+                        fallback=(
+                            "Implement the coupled module as one coherent unit "
+                            f"(shared interface across {len(members)} files):\n{bullets}"
+                        ),
+                    ),
+                    "tier": tier,
+                    "target_file": primary_path,
+                    "target_files": member_paths,
+                    "single_file_insertion": False,
+                    "depends_on": [],
+                    "_focus": [list(m) for m in members],
+                }
+            )
+            next_id += 1
 
     # Append any non-coupled entries as independent subtasks.
-    for _orig_idx, (path, hint) in others:
+    for _orig_idx, (path, raw_hint) in others:
+        hint = _normalize_hint(raw_hint, task_s)
         subtasks.append(
             {
                 "id": next_id,
-                "description": hint or f"Create or update {path} as described in the task.",
-                "tier": _tier_for_file(
-                    path,
-                    default_tier=default_tier,
-                    entries=entries,
-                    risk_re=risk_re,
-                    floor_tier=floor_tier,
+                "description": _compose_prompt(
+                    task_s,
+                    [(path, hint)],
+                    fallback=hint or f"Create or update {path} as described in the task.",
+                ),
+                "tier": _apply_floor(
+                    _tier_for_file(
+                        path,
+                        default_tier=default_tier,
+                        entries=entries,
+                        risk_re=risk_re,
+                        floor_tier=floor_tier,
+                    ),
+                    [path],
+                    floors,
                 ),
                 "target_file": path,
                 "single_file_insertion": False,
                 "depends_on": [],
+                "_focus": [[path, hint]],
             }
         )
         next_id += 1
 
-    _finalize_subtasks(subtasks)
-    has_deps = any(st.get("depends_on") for st in subtasks)
-    normalized_topology = str(topology or "").strip().lower()
-    if normalized_topology in {"star", "hierarchical", "dag", "linear"}:
-        plan_topology = normalized_topology
-    else:
-        plan_topology = "dag" if has_deps else "linear"
+    _finalize_subtasks(subtasks, task=task_s)
+    strategy_name, plan_topology = _plan_shape(subtasks, topology)
     return {
         "analysis": (
-            f"Host-native heuristic plan: detected a coupled file group "
-            f"({len(members)} files); strategy={strategy}. No external planner LLM was called."
+            f"Host-native heuristic plan: detected {len(groups)} coupled file group(s) "
+            f"({len(coupled_set)} files); strategy={strategy}. No external planner LLM was called."
         ),
         "subtasks": subtasks,
-        "strategy": "dag" if has_deps else ("parallel" if len(subtasks) > 1 else "sequential"),
+        "strategy": strategy_name,
         "topology": plan_topology,
     }
 
@@ -1000,10 +1396,12 @@ def _subtasks_from_entries(
     coupled_strategy: str = "single",
     risk_re=None,
     floor_tier: str = "medium",
+    floors: dict[str, str] | None = None,
 ) -> dict[str, object]:
     # Detect a coupled file group first; if present, plan it coherently instead
     # of fanning out independent low-tier agents that cannot integrate.
     task_lower = task.lower() if isinstance(task, str) else ""
+    task_s = task.strip() if isinstance(task, str) else ""
     coupled_ids = _coupled_group_indices(entries, task_lower)
     if len(coupled_ids) >= 2:
         strategy = coupled_strategy if coupled_strategy in {"single", "contract"} else "single"
@@ -1016,19 +1414,30 @@ def _subtasks_from_entries(
             strategy=strategy,
             risk_re=risk_re,
             floor_tier=floor_tier,
+            task=task_s,
+            floors=floors,
         )
 
     integration_ids: list[int] = []
     foundation_ids: list[int] = []
     subtasks: list[dict[str, object]] = []
-    for index, (path, hint) in enumerate(entries, start=1):
-        description = hint or f"Create or update {path} as described in the task."
-        tier = _tier_for_file(
-            path,
-            default_tier=default_tier,
-            entries=entries,
-            risk_re=risk_re,
-            floor_tier=floor_tier,
+    for index, (path, raw_hint) in enumerate(entries, start=1):
+        hint = _normalize_hint(raw_hint, task_s)
+        description = _compose_prompt(
+            task_s,
+            [(path, hint)],
+            fallback=raw_hint or f"Create or update {path} as described in the task.",
+        )
+        tier = _apply_floor(
+            _tier_for_file(
+                path,
+                default_tier=default_tier,
+                entries=entries,
+                risk_re=risk_re,
+                floor_tier=floor_tier,
+            ),
+            [path],
+            floors,
         )
         subtasks.append(
             {
@@ -1038,6 +1447,7 @@ def _subtasks_from_entries(
                 "target_file": path,
                 "single_file_insertion": False,
                 "depends_on": [],
+                "_focus": [[path, hint]],
             }
         )
         if _is_integration_file(path):
@@ -1051,13 +1461,9 @@ def _subtasks_from_entries(
             if int(subtask.get("id", -1)) in integration_ids:
                 subtask["depends_on"] = sorted(foundation_set)
 
-    _finalize_subtasks(subtasks)
+    _finalize_subtasks(subtasks, task=task_s)
     has_deps = any(subtask.get("depends_on") for subtask in subtasks)
-    normalized_topology = str(topology or "").strip().lower()
-    if normalized_topology in {"star", "hierarchical", "dag", "linear"}:
-        plan_topology = normalized_topology
-    else:
-        plan_topology = "dag" if has_deps else "linear"
+    _strategy, plan_topology = _plan_shape(subtasks, topology)
 
     return {
         "analysis": (
@@ -1067,6 +1473,46 @@ def _subtasks_from_entries(
         "subtasks": subtasks,
         "strategy": "dag" if has_deps else "parallel",
         "topology": plan_topology,
+    }
+
+
+def _single_agent_payload(
+    entries: list[tuple[str, str]],
+    *,
+    task: str,
+    topology: str | None,
+    floors: dict[str, str] | None,
+) -> dict[str, object]:
+    """One high-tier agent owning every named file, given the full task.
+
+    For work that is both coupled (or design-heavy) and wide, splitting by file
+    leaves each agent a piece it cannot integrate; one agent that sees the whole
+    task and owns all the files can.
+    """
+    task_s = task.strip()
+    paths = [path for path, _ in entries]
+    items = [(path, _normalize_hint(hint, task_s)) for path, hint in entries]
+    subtask: dict[str, object] = {
+        "id": 1,
+        "description": _compose_prompt(task_s, items),
+        "tier": _apply_floor("high", paths, floors),
+        "target_file": paths[0],
+        "target_files": paths,
+        "single_file_insertion": False,
+        "depends_on": [],
+        "_focus": [list(i) for i in items],
+    }
+    _finalize_subtasks([subtask], task=task_s)
+    normalized_topology = str(topology or "").strip().lower()
+    return {
+        "analysis": (
+            f"Host-native heuristic plan: complex task over {len(paths)} source file(s); "
+            "one high-tier agent owns them all with the full task. "
+            "No external planner LLM was called."
+        ),
+        "subtasks": [subtask],
+        "strategy": "sequential",
+        "topology": normalized_topology if normalized_topology in {"star", "hierarchical", "dag", "linear"} else "linear",
     }
 
 
@@ -1307,7 +1753,9 @@ def apply_hybrid_split(
     return out
 
 
-def _pack_subtasks_to_cap(payload: dict[str, object], max_agents: int | None) -> None:
+def _pack_subtasks_to_cap(
+    payload: dict[str, object], max_agents: int | None, task: str = ""
+) -> None:
     """Fit file-scoped subtasks into *max_agents* by merging, never by dropping.
 
     Files sharing a parent directory are merged first, so an over-budget fanout
@@ -1357,7 +1805,7 @@ def _pack_subtasks_to_cap(payload: dict[str, object], max_agents: int | None) ->
 
     merged: list[dict[str, object]] = []
     for group in groups:
-        merged.append(group[0] if len(group) == 1 else _merge_subtasks(group))
+        merged.append(group[0] if len(group) == 1 else _merge_subtasks(group, task))
 
     renumbered = other + merged
     for index, st in enumerate(renumbered, start=1):
@@ -1383,7 +1831,7 @@ def _pack_subtasks_to_cap(payload: dict[str, object], max_agents: int | None) ->
     )
 
 
-def _merge_subtasks(group: list[dict[str, object]]) -> dict[str, object]:
+def _merge_subtasks(group: list[dict[str, object]], task: str = "") -> dict[str, object]:
     """Merge several file-scoped subtasks into one multi-file owner."""
     paths: list[str] = []
     for st in group:
@@ -1398,20 +1846,32 @@ def _merge_subtasks(group: list[dict[str, object]]) -> dict[str, object]:
         for st, path in ((st, _subtask_paths(st)[0]) for st in group)
     )
     read_only = all(bool(st.get("read_only")) for st in group)
+    task_s = (task or "").strip()
+    focus: list[list[str]] = []
+    for st in group:
+        for item in st.get("_focus") or []:
+            if item and item[0] not in {f[0] for f in focus}:
+                focus.append(list(item))
+    if task_s and focus:
+        description = _compose_prompt(task_s, [(f[0], f[1]) for f in focus])
+    else:
+        description = (
+            f"Apply the described changes to these {len(paths)} related files:\n{bullets}"
+        )
     merged: dict[str, object] = {
         "id": group[0].get("id", 1),
-        "description": (
-            f"Apply the described changes to these {len(paths)} related files:\n{bullets}"
-        ),
+        "description": description,
         "tier": tier,
         "target_file": paths[0],
         "target_files": paths,
         "single_file_insertion": False,
         "depends_on": [],
     }
+    if focus:
+        merged["_focus"] = focus
     if read_only:
         merged["read_only"] = True
-    _finalize_subtasks([merged])
+    _finalize_subtasks([merged], task=task_s)
     return merged
 
 
@@ -1426,6 +1886,7 @@ def _coverage_report(
     payload: dict[str, object],
     entries: list[tuple[str, str]],
     inline_files: list[str],
+    ambiguous: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Account for every file the task named — assigned, inline, or deferred.
 
@@ -1453,7 +1914,19 @@ def _coverage_report(
     packing = payload.get("packing")
     if isinstance(packing, dict):
         report["packed"] = dict(packing)
+    if ambiguous:
+        # Named in the task, matched several repo files, owned by no agent.
+        report["ambiguous_files"] = [dict(a) for a in ambiguous]
     return report
+
+
+def _ambiguous_note(ambiguous: list[dict[str, object]]) -> str:
+    """One sentence for ``analysis`` naming files that matched several repo paths."""
+    names = ", ".join(str(a.get("name")) for a in ambiguous)
+    return (
+        f" Ambiguous file name(s) with several repo matches and no owner: {names}. "
+        "Name the full path to include them."
+    )
 
 
 def _packing_note(payload: dict[str, object]) -> str:
@@ -1788,8 +2261,15 @@ def build_heuristic_plan_payload(
     duration_bucket: str | None = None,
     caller: str | None = None,
     workspace_root: str | None = None,
+    single_agent_when_complex: bool = False,
 ) -> dict[str, object]:
     """Build planner JSON compatible with ``Planner._build_plan`` without an LLM.
+
+    With a ``workspace_root`` the write path resolves bare file names against the
+    repo and floors each file's tier on what the file holds (see
+    ``_resolve_workspace_entries`` / ``_evidence_floors``). Every prompt carries the
+    full task. opt-in ``single_agent_when_complex`` collapses a coupled or design-heavy
+    task over four or more source files into one high-tier agent.
 
     ``urgency_score`` / ``duration_bucket`` only gate the hybrid diagnose->implement
     split: urgent or short work skips the extra hop. Both are derived from the task
@@ -1898,6 +2378,7 @@ def build_heuristic_plan_payload(
         )
 
     all_entries = extract_task_file_entries(task, intent_templates=intent_templates)
+    all_entries, ambiguous = _resolve_workspace_entries(all_entries, workspace_root)
 
     # Fold direct-edit exempt files (.md/.mdc, CLAUDE.md, …) into an inline bucket
     # instead of spawning a dedicated agent for each (#5).
@@ -1915,7 +2396,7 @@ def build_heuristic_plan_payload(
         # an inline bucket with no subtasks; otherwise fall back to one task-level
         # subtask (no file paths detected at all).
         if inline_files:
-            return {
+            exempt_only: dict[str, object] = {
                 "analysis": (
                     f"Host-native heuristic plan: {len(inline_files)} direct-edit "
                     "exempt file(s) folded inline; no agents spawned."
@@ -1925,11 +2406,15 @@ def build_heuristic_plan_payload(
                 "strategy": "sequential",
                 "topology": topology or "linear",
             }
+            if ambiguous:
+                exempt_only["coverage"] = _coverage_report(exempt_only, [], inline_files, ambiguous)
+            return exempt_only
         tier = default_tier if default_tier in {"low", "medium", "high"} else "medium"
-        return {
+        no_files: dict[str, object] = {
             "analysis": (
                 "Host-native heuristic plan: single subtask (no file paths detected). "
                 "No external planner LLM was called."
+                + (_ambiguous_note(ambiguous) if ambiguous else "")
             ),
             "subtasks": [
                 {
@@ -1942,20 +2427,60 @@ def build_heuristic_plan_payload(
             "strategy": "sequential",
             "topology": topology or "linear",
         }
+        if ambiguous:
+            no_files["coverage"] = _coverage_report(no_files, [], [], ambiguous)
+        return no_files
 
-    payload = _subtasks_from_entries(
-        entries,
-        default_tier=default_tier,
-        topology=topology,
-        task=task if isinstance(task, str) else "",
-        coupled_strategy=coupled_strategy,
-        risk_re=risk_re,
-        floor_tier=floor_tier,
-    )
+    task_text = task if isinstance(task, str) else ""
+    task_stripped = task_text.strip()
+    # The clause a file was named in is a hint for its agent. Entries whose hint
+    # already embeds the whole task (numbered fan-out, intent templates) keep it.
+    entries = [
+        (
+            path,
+            hint if (task_stripped and task_stripped in hint) else _focus_clause(task_text, path),
+        )
+        for path, hint in entries
+    ]
+    floors = _evidence_floors([path for path, _ in entries], workspace_root, task_text, risk_re)
+
+    payload: dict[str, object] | None = None
+    # An explicit ``contract`` strategy is the operator asking for a DAG, so it wins.
+    if single_agent_when_complex and task_stripped and coupled_strategy != "contract":
+        assessment = assess_task_complexity(task_text, entries)
+        # A design keyword inside a file name ("api/schema.py") says nothing about
+        # the work, so it is judged on the prose alone.
+        prose = _PATH_OR_FILE_TOKEN.sub(" ", task_text.lower())
+        design = any(kw in prose for kw in _COMPLEXITY_KEYWORDS)
+        if (
+            int(assessment.get("source_count") or 0) >= 4
+            and (assessment.get("coupled") or design)
+            and not _expand_numbered_fanout(task_text)
+        ):
+            payload = _single_agent_payload(
+                entries, task=task_text, topology=topology, floors=floors
+            )
+    if payload is None:
+        payload = _subtasks_from_entries(
+            entries,
+            default_tier=default_tier,
+            topology=topology,
+            task=task_text,
+            coupled_strategy=coupled_strategy,
+            risk_re=risk_re,
+            floor_tier=floor_tier,
+            floors=floors,
+        )
     # Fit the fanout to the agent budget by *packing* files into agents. The cap
     # used to slice the entry list, deleting every file past it from the plan.
-    _pack_subtasks_to_cap(payload, max_agents)
-    payload["coverage"] = _coverage_report(payload, entries, inline_files)
+    _pack_subtasks_to_cap(payload, max_agents, task_stripped)
+    for st in payload.get("subtasks") or []:
+        if isinstance(st, dict):
+            for key in [k for k in st if k.startswith("_")]:
+                del st[key]
+    payload["coverage"] = _coverage_report(payload, entries, inline_files, ambiguous)
+    if ambiguous:
+        payload["analysis"] = f"{str(payload.get('analysis', '')).rstrip()}{_ambiguous_note(ambiguous)}"
     if inline_files:
         payload["inline_files"] = inline_files
         base_analysis = str(payload.get("analysis", "")).rstrip()

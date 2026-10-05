@@ -32,7 +32,7 @@ from urllib.request import Request, urlopen
 
 from .adapters import ProviderAdapter, ProviderCapability, _coerce_capability
 from .config import DEFAULT_DELEGATION_UTILITIES
-from .effort_support import subprocess_effort_supported
+from .effort_support import model_effort_accepted, subprocess_effort_supported
 from .resilience import AuthProbe, ErrorCategory, RetryPolicy, classify
 from .health import is_available as _provider_is_available
 from .health import record_provider_failure as _record_prov_failure
@@ -40,10 +40,12 @@ from .health import record_provider_success as _record_prov_success
 from .quota import ProviderQuotaService
 from .model_registry import bootstrap_tier_map
 from .provider_model_adapters import (
-    CallbackModelDiscoveryAdapter,
     ClaudeModelDiscoveryAdapter,
     CodexModelDiscoveryAdapter,
-    CommandModelDiscoveryAdapter,
+    CopilotHelpConfigDiscoveryAdapter,
+    OpenCodeModelDiscoveryAdapter,
+    parse_opencode_verbose,
+    tier_opencode_catalog,
 )
 
 logger = logging.getLogger(__name__)
@@ -216,6 +218,20 @@ def _copilot_supports_model_flag() -> bool:
     return _COPILOT_HAS_MODEL_FLAG
 
 
+def _copilot_effort_applied(model: str | None, effort: str | None) -> bool:
+    """True when ``_build_gh_copilot_command`` puts ``--effort <effort>`` on the argv.
+
+    Only an effort the chosen model lists (models.dev); without ``--model`` the
+    CLI picks its own default, whose levels are unknown.
+    """
+    return bool(
+        effort
+        and model
+        and _copilot_supports_model_flag()
+        and model_effort_accepted("github-copilot", model, effort)
+    )
+
+
 def _build_gh_copilot_command(
     prompt: str, model: str | None = None, effort: str | None = None
 ) -> list[str]:
@@ -223,7 +239,7 @@ def _build_gh_copilot_command(
     cmd = ["gh", "copilot", "--", "-p", prompt]
     if model and _copilot_supports_model_flag():
         cmd.extend(["--model", model])
-    if effort:
+    if _copilot_effort_applied(model, effort):
         cmd.extend(["--effort", effort])
     if _copilot_supports_disable_builtin_mcps():
         cmd.append("--disable-builtin-mcps")
@@ -2113,7 +2129,9 @@ def _build_opencode_command_safe(
         ]
         if action == "execute_code_only":
             command.append("--pure")
-        if effort is not None:
+        if effort is not None and model_effort_accepted(
+            "opencode", model, effort, catalog=getattr(provider, "model_catalog", None)
+        ):
             command.extend(["--variant", str(effort)])
         command.append(prompt)
         return command
@@ -2416,8 +2434,12 @@ BUILTIN_PROVIDERS: list[CLIProvider] = [
         billing_model="subscription",
         safe_self_hosted_code_only=True,
         detect_cmd=["gh", "copilot", "--version"],
-        model_discovery_adapter=CallbackModelDiscoveryAdapter(
-            "github-copilot", source="copilot_provider_catalog"
+        # `help config` lists the CLI's selectable models (no cost data). The
+        # api.githubcopilot.com/models endpoint is deliberately not used: it is
+        # undocumented and needs spoofed VS Code client headers (docs/LEGAL.md).
+        model_discovery_adapter=CopilotHelpConfigDiscoveryAdapter(
+            env_factory=_copilot_subprocess_env,
+            cwd_factory=_copilot_neutral_cwd,
         ),
     ),
     CLIProvider(
@@ -2477,16 +2499,17 @@ BUILTIN_PROVIDERS: list[CLIProvider] = [
         cost_rank={
             "low": 0,
         },
+        # Static floor: medium/high are widened at catalog projection only when
+        # the verbose listing finds them on a provider the user configured.
         allowed_auto_route_tiers=("low",),
         billing_model="subscription",
         detect_cmd=None,
         command_builder=_build_opencode_command_safe,
         detect_hook=_detect_opencode_safe,
         output_cleaner=_clean_opencode_output_safe,
-        model_discovery_cmd=["opencode", "models"],
-        model_discovery_adapter=CommandModelDiscoveryAdapter(
-            "opencode", ("opencode", "models")
-        ),
+        model_discovery_cmd=["opencode", "models", "--verbose"],
+        model_discovery_parser=lambda _p, raw: tier_opencode_catalog(parse_opencode_verbose(raw)),
+        model_discovery_adapter=OpenCodeModelDiscoveryAdapter(),
     ),
     CLIProvider(
         name="cursor",
@@ -3493,22 +3516,29 @@ class ProviderRegistry:
         tier: str,
         effort: str | None = None,
         routed_effort: str | None = None,
+        *,
+        model: str | None = None,
     ) -> tuple[str | None, str | None]:
+        resolved: tuple[str | None, str | None] = (None, None)
         explicit_effort = self._normalize_effort_value(effort)
-        if explicit_effort is not None:
-            return explicit_effort, "explicit"
-
         default_effort = self._config_default_effort_for_provider(provider.name, tier)
-        if default_effort is not None:
-            return default_effort, "config_default"
-
         # Lowest precedence: the effort routing derived for this task. Only for
         # providers whose flag is verified, so an unverified shell never gets one.
         routed = self._normalize_effort_value(routed_effort)
-        if routed is not None and subprocess_effort_supported(provider.name):
-            return routed, "routed"
+        if explicit_effort is not None:
+            resolved = (explicit_effort, "explicit")
+        elif default_effort is not None:
+            resolved = (default_effort, "config_default")
+        elif routed is not None and subprocess_effort_supported(provider.name):
+            resolved = (routed, "routed")
 
-        return None, None
+        # The command builder drops a level the chosen model does not list
+        # (Copilot, OpenCode); report what reaches the argv, not what was asked.
+        if resolved[0] is not None and model and not model_effort_accepted(
+            provider.name, model, resolved[0], catalog=getattr(provider, "model_catalog", None)
+        ):
+            return None, None
+        return resolved
 
     def _selection_metadata_for_provider_with_effort(
         self,
@@ -3516,6 +3546,8 @@ class ProviderRegistry:
         tier: str,
         effort: str | None = None,
         routed_effort: str | None = None,
+        *,
+        model: str | None = None,
     ) -> dict[str, Any]:
         metadata_fn = getattr(provider, "selection_metadata_for", None)
         if callable(metadata_fn):
@@ -3525,7 +3557,8 @@ class ProviderRegistry:
                 # Attach configured concurrency/capacity for spillover allocation (Wave 1)
                 selection["concurrency"] = self._config_provider_capacity(provider.name)
                 resolved_effort, effort_source = self._resolve_effort_for_provider(
-                    provider, tier, effort, routed_effort
+                    provider, tier, effort, routed_effort,
+                    model=model or selection.get("model") or None,
                 )
                 if resolved_effort is not None:
                     selection["effort"] = resolved_effort
@@ -3556,7 +3589,7 @@ class ProviderRegistry:
             "concurrency": self._config_provider_capacity(provider.name),
         }
         resolved_effort, effort_source = self._resolve_effort_for_provider(
-            provider, tier, effort, routed_effort
+            provider, tier, effort, routed_effort, model=model or selection["model"] or None
         )
         if resolved_effort is not None:
             selection["effort"] = resolved_effort
@@ -4617,7 +4650,7 @@ class ProviderRegistry:
             )
 
             resolved_effort, _ = self._resolve_effort_for_provider(
-                provider, tier, effort, routed_effort
+                provider, tier, effort, routed_effort, model=model
             )
             _exec_kwargs: dict = {
                 "timeout": effective_timeout,
@@ -4638,7 +4671,7 @@ class ProviderRegistry:
                 if self._db is not None:
                     _record_prov_success(self._db, provider.name)
                 selection = self._selection_metadata_for_provider_with_effort(
-                    provider, tier, effort, routed_effort
+                    provider, tier, effort, routed_effort, model=model
                 )
                 selection.update({
                     "result": output,
