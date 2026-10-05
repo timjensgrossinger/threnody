@@ -31,7 +31,8 @@ class EffortSupport:
 EFFORT_SUPPORT: dict[str, EffortSupport] = {
     "claude-code": EffortSupport("frontmatter", True, "--effort <e>", True),
     "codex": EffortSupport("codex_toml", True, '-c model_reasoning_effort="<e>"', True),
-    # Copilot agent files have no effort key, so no host-native pinning.
+    # Copilot agent files have no effort key, so no host-native pinning. Subprocess flag verified via
+    # `gh copilot -- --help`: --effort, --reasoning-effort <none|minimal|low|medium|high|xhigh|max> (we route low|medium|high).
     "github-copilot": EffortSupport(None, True, "--effort <e>", True),
     "aider": EffortSupport(None, True, "--reasoning-effort <e>", True),
     # Variant names are provider/model specific; forwarded as-is.

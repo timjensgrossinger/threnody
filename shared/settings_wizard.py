@@ -68,7 +68,7 @@ FALLBACK_PROVIDERS: list[dict] = [
         "name": "opencode",
         "available": True,
         "routeable": True,
-        "models": {"low": "opencode/nemotron-3-super-free"},
+        "models": {"low": "opencode/nemotron-3-ultra-free"},
         "billing": "subscription",
     },
 ]

@@ -21,6 +21,7 @@ from shared.db import (
     ROUTING_GUARD_MODE_DIRECT,
     ROUTING_GUARD_MODE_EXECUTE_SUBTASK,
     ROUTING_GUARD_MODE_ROUTED_PLAN,
+    ROUTING_GUARD_TTL_SECONDS,
 )
 from shared.config import TGsConfig
 
@@ -1686,3 +1687,57 @@ def test_denied_edit_records_no_touch(monkeypatch: pytest.MonkeyPatch) -> None:
         assert res["valid"] is False
         with db.conn() as conn:
             assert conn.execute("SELECT COUNT(*) FROM direct_edit_touches").fetchone()[0] == 0
+
+
+def _handoff_row(swarm_id: str, created_ts: float) -> dict[str, object]:
+    return {
+        "swarm_id": swarm_id,
+        "status": "awaiting_host_execution",
+        "requested_agents": 1,
+        "effective_agents": 1,
+        "created_ts": created_ts,
+    }
+
+
+def test_active_handoff_ignores_abandoned_swarm_run() -> None:
+    import time
+
+    with tempfile.TemporaryDirectory() as td:
+        _cfg, db = _prepare_db(td)
+        old = time.time() - ROUTING_GUARD_TTL_SECONDS - 3600
+        db.persist_swarm_run(_handoff_row("abandoned", old))
+        assert mcp_server._caller_has_active_host_handoff(db, "claude-code", str(ROOT)) is False
+
+
+def test_active_handoff_honors_recent_swarm_run() -> None:
+    import time
+
+    with tempfile.TemporaryDirectory() as td:
+        _cfg, db = _prepare_db(td)
+        db.persist_swarm_run(_handoff_row("recent", time.time() - 60))
+        assert mcp_server._caller_has_active_host_handoff(db, "claude-code", str(ROOT)) is True
+
+
+def test_route_task_issues_guard_when_only_abandoned_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg, db = _prepare_db(td)
+        monkeypatch.chdir(ROOT)
+        db.persist_swarm_run(_handoff_row("abandoned", time.time() - ROUTING_GUARD_TTL_SECONDS - 3600))
+        router = SimpleNamespace(
+            classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
+                tier="low", score=0.1, reason="low", agents=1, override=False
+            )
+        )
+        monkeypatch.setattr(mcp_server, "_ensure_init", lambda: _stub_init(cfg, db, router=router))
+        monkeypatch.setattr(
+            mcp_server, "_get_registry_with_config",
+            lambda: SelectionRegistry(provider="Claude Code", model="claude-sonnet-4.6"),
+        )
+        monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+        routed = mcp_server.handle_route_task({"task": "fix typo in shared/db.py", "cwd": str(ROOT)})
+        assert routed["execution_hint"].get("active_handoff") is not True
+        assert isinstance(routed.get("routing_guard"), dict)

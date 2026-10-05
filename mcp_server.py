@@ -4388,14 +4388,21 @@ def _caller_has_active_host_handoff(db: Database, caller: str | None, cwd: objec
     )
     if isinstance(existing, Mapping) and existing.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN:
         return True
+    # swarm_runs carries no cwd/caller column, so this fallback cannot be scoped
+    # to a workspace; bound it by age instead. A handoff must not outlive its own
+    # routing guard (ROUTING_GUARD_TTL_SECONDS), otherwise abandoned rows would
+    # suppress route_task guards for every project indefinitely.
+    cutoff = time.time() - ROUTING_GUARD_TTL_SECONDS
     try:
         with db.conn() as conn:
             row = conn.execute(
                 """
                 SELECT 1 FROM swarm_runs
                 WHERE status IN ('awaiting_host_execution', 'running')
+                  AND created_ts >= ?
                 LIMIT 1
-                """
+                """,
+                (cutoff,),
             ).fetchone()
         return row is not None
     except Exception:
