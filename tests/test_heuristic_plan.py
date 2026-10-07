@@ -223,7 +223,7 @@ def test_review_dims_token_not_parsed_as_file(tmp_path: Path) -> None:
     subagent_types = {s.get("subagent_type") for s in review}
     target_files = {str(s.get("target_file")) for s in review}
     # Only the performance dimension ran (no logic/edge/types collapse)
-    assert subagent_types == {"review-performance"}
+    assert subagent_types == {"threnody-review-performance"}
     # The bracket token never became a file target
     assert all("[dims" not in p and "=performance]" not in p for p in target_files)
     assert all(p.endswith("svc.py") for p in target_files)

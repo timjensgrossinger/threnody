@@ -902,6 +902,28 @@ class TestHostLadder:
             assert item["kind"]
         assert "ladder_grade" in plan["grading"]
 
+    def test_plan_items_carry_resolved_type_and_effort(self, monkeypatch, tmp_path):
+        import shared.host_spawn as hs
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "threnody-high-high.md").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(hs, "claude_agents_dir", lambda: agents)
+        plan = ladder.plan_host_ladder(case_ids=["l0-return-constant"], caller="claude-code")
+        by_tier = {i["tier"]: i for i in plan["items"]}
+        assert by_tier["high"]["subagent_type"] == "threnody-high-high"
+        assert by_tier["high"]["effort"] == "high"
+        # Variant not installed: requested, never claimed as applied.
+        assert by_tier["low"]["subagent_type"] == "threnody-low"
+        assert "effort" not in by_tier["low"]
+        assert by_tier["low"]["requested_effort"] == "low"
+        forced = ladder.plan_host_ladder(
+            tiers=["high"], case_ids=["l0-return-constant"], caller="claude-code", effort="low"
+        )
+        assert forced["items"][0]["subagent_type"] == "threnody-high"
+        assert forced["items"][0]["requested_effort"] == "low"
+        assert "effort" in plan["grading"]
+
     def test_plan_tier_subset(self):
         plan = ladder.plan_host_ladder(
             tiers=["high"], case_ids=["l0-return-constant"], caller="codex"

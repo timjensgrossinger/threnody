@@ -156,7 +156,55 @@ def process_learning_queue(db: Database) -> dict[str, int]:
     return {"processed_count": processed, "skipped_count": skipped, "error_count": error_count}
 
 
-def run_warm_path_background_tasks(db: Database) -> dict[str, str | int | dict]:
+def _load_retry_context(config: object | None, router: object | None) -> tuple[object | None, object | None]:
+    """Config + router for a crash-recovery import, loaded the way the server does.
+
+    ``import_run_log`` without a config skips the verify gate and every gated
+    learning step in ``finalize_host_swarm``, so a retried terminal used to
+    finalize a run with less learning than the original call would have done.
+    Best-effort: a failure leaves the missing piece ``None``.
+    """
+    if config is None:
+        try:
+            from .config import TGsConfig
+
+            config = TGsConfig.from_yaml()
+        except Exception:
+            log.warning("warm-path retry: config load failed; importing without it", exc_info=True)
+            config = None
+    if router is None and config is not None:
+        try:
+            from .router import TaskRouter
+
+            router = TaskRouter(config)
+        except Exception:
+            log.warning("warm-path retry: router init failed; importing without it", exc_info=True)
+            router = None
+    return config, router
+
+
+def _run_workspace_root(db: Database, run_id: str, meta: dict) -> str | None:
+    """The run's workspace: ``swarm_runs.workspace_root``, else the run-log meta."""
+    try:
+        with db.conn() as conn:
+            row = conn.execute(
+                "SELECT workspace_root FROM swarm_runs WHERE swarm_id = ?", (run_id,)
+            ).fetchone()
+        value = str(row[0] or "").strip() if row else ""
+        if value:
+            return value
+    except Exception:
+        log.warning("warm-path retry: workspace_root lookup failed for %s", run_id, exc_info=True)
+    fallback = str((meta or {}).get("workspace_root") or "").strip()
+    return fallback or None
+
+
+def run_warm_path_background_tasks(
+    db: Database,
+    *,
+    config: object | None = None,
+    router: object | None = None,
+) -> dict[str, str | int | dict]:
     """
     Run background learning and outcome processing as warm-path tasks.
     
@@ -196,16 +244,28 @@ def run_warm_path_background_tasks(db: Database) -> dict[str, str | int | dict]:
         from .host_learning import import_run_log
 
         imported = 0
+        retry_loaded = False
         for rid in run_log.iter_pending_runs():
             meta = run_log.read_run_meta(rid)
             outcome = meta.get("outcome")
             if not outcome:
                 continue  # run not terminal yet — leave for its terminal call
+            if not retry_loaded:
+                # Lazily, once per tick: most ticks have nothing to retry.
+                config, router = _load_retry_context(config, router)
+                retry_loaded = True
             try:
-                import_run_log(db, rid, outcome=str(outcome))
+                import_run_log(
+                    db,
+                    rid,
+                    outcome=str(outcome),
+                    config=config,
+                    router=router,
+                    workspace_root=_run_workspace_root(db, rid, meta),
+                )
                 imported += 1
             except Exception:
-                log.debug("warm-path run-log import failed for %s", rid, exc_info=True)
+                log.warning("warm-path run-log import failed for %s", rid, exc_info=True)
         results["run_log_import"] = imported
     except Exception as e:
         log.debug("run-log import scan failed: %s", e, exc_info=True)
@@ -234,6 +294,14 @@ def run_warm_path_background_tasks(db: Database) -> dict[str, str | int | dict]:
         except Exception as e:
             log.debug("stale swarm-run reap failed: %s", e, exc_info=True)
             results["swarm_reap"] = {"error": str(e)}
+        # Expired routing guards are already ignored by routing_guard_get, but
+        # nothing ever deleted them, so the table only grew. Same cadence as the
+        # reaper: it is housekeeping, not a correctness step.
+        try:
+            results["routing_guard_purge"] = db.routing_guard_purge_expired()
+        except Exception as e:
+            log.debug("routing guard purge failed: %s", e, exc_info=True)
+            results["routing_guard_purge"] = {"error": str(e)}
 
     return results
 

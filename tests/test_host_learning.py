@@ -1483,3 +1483,17 @@ def test_enrich_agent_from_handoff_carries_effort() -> None:
     # Requested-but-unapplied effort is inspectable but never becomes the ledger's effort.
     assert out2["requested_effort"] == "high"
     assert not out2.get("effort")
+
+
+def test_review_dimension_survives_effort_variant_and_fallback() -> None:
+    """A spawned effort variant or tier fallback must still count as its review cell."""
+    from shared.host_learning import _review_dimension_of
+
+    assert _review_dimension_of({"subagent_type": "threnody-review-logic-high"}) == "logic"
+    assert _review_dimension_of(
+        {"subagent_type": "threnody-medium", "base_subagent_type": "threnody-review-edge"}
+    ) == "edge"
+    assert _review_dimension_of({"subagent_type": "review-security"}) == "security"
+    # Fast whole-file reviewers carry no single dimension, as before.
+    assert _review_dimension_of({"subagent_type": "threnody-review-fast"}) == ""
+    assert _review_dimension_of({"subagent_type": "threnody-medium-high"}) == ""

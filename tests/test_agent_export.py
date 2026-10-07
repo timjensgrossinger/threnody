@@ -340,3 +340,129 @@ def test_export_tier_effort_variants_skips_missing_frontmatter(tmp_path: Path) -
     src.mkdir()
     (src / "threnody-low.md").write_text("no frontmatter\n", encoding="utf-8")
     assert export_tier_effort_variants(src, tmp_path / "out") == []
+
+
+# ---------------------------------------------------------------------------
+# Generic effort variants + review definitions
+# ---------------------------------------------------------------------------
+
+
+def _base(tmp_path: Path, name: str, extra: str = "") -> Path:
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    path = src / f"{name}.md"
+    path.write_text(
+        f"---\nname: {name}\ndescription: A reviewer\ntools: Read, Grep, Glob\n{extra}---\n\nBody text.\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_export_effort_variant_marks_and_inserts_effort(tmp_path: Path) -> None:
+    from shared.agent_export import export_effort_variant
+
+    base = _base(tmp_path, "threnody-review-logic")
+    dest = export_effort_variant(base, "high", tmp_path / "out")
+    assert dest == tmp_path / "out" / "threnody-review-logic-high.md"
+    lines = dest.read_text(encoding="utf-8").split("\n")
+    assert "name: threnody-review-logic-high" in lines
+    desc_idx = next(i for i, l in enumerate(lines) if l.startswith("description:"))
+    assert lines[desc_idx] == "description: A reviewer (effort high)"
+    # No model: line, so effort goes right after the description.
+    assert lines[desc_idx + 1] == "effort: high"
+    assert "tools: Read, Grep, Glob" in lines
+    assert "<!-- threnody:effort-variant base=threnody-review-logic effort=high -->" in lines
+    assert "Body text." in lines
+
+
+def test_export_effort_variant_never_overwrites_foreign_file(tmp_path: Path) -> None:
+    from shared.agent_export import export_effort_variant
+
+    base = _base(tmp_path, "mine")
+    out = tmp_path / "out"
+    out.mkdir()
+    foreign = out / "mine-low.md"
+    foreign.write_text("hand written\n", encoding="utf-8")
+    assert export_effort_variant(base, "low", out) is None
+    assert foreign.read_text(encoding="utf-8") == "hand written\n"
+    # A file this generator wrote is regenerated freely.
+    generated = export_effort_variant(base, "medium", out)
+    assert generated is not None
+    assert export_effort_variant(base, "medium", out) == generated
+
+
+def test_export_effort_variant_refuses_effort_declaring_base(tmp_path: Path) -> None:
+    from shared.agent_export import export_effort_variant
+
+    base = _base(tmp_path, "pinned", extra="effort: low\n")
+    assert export_effort_variant(base, "high", tmp_path / "out") is None
+    assert not (tmp_path / "out" / "pinned-high.md").exists()
+    assert export_effort_variant(_base(tmp_path, "ok"), "extreme", tmp_path / "out") is None
+
+
+def test_tier_variants_overwrite_unmarked_legacy_files(tmp_path: Path) -> None:
+    """Pre-marker installs wrote these without the marker; upgrades must replace them."""
+    from shared.agent_export import export_tier_effort_variants
+
+    (tmp_path / "threnody-medium-high.md").write_text("old\n", encoding="utf-8")
+    export_tier_effort_variants(ROOT / "shell" / "agents", tmp_path)
+    text = (tmp_path / "threnody-medium-high.md").read_text(encoding="utf-8")
+    assert "effort: high" in text
+    assert "threnody:effort-variant base=threnody-medium effort=high" in text
+
+
+def _review_target(monkeypatch, tmp_path: Path) -> Path:
+    import shared.agent_export as ae
+
+    target = tmp_path / "claude-agents"
+    monkeypatch.setitem(
+        ae._REVIEW_TARGET_OVERRIDES,
+        "claude-code",
+        ae.ExportTarget(
+            provider_id="claude-code",
+            project_subdir=".claude/agents",
+            global_dir=target,
+            layout="flat_md",
+        ),
+    )
+    return target
+
+
+def test_export_review_definitions_writes_namespace_fast_and_variants(monkeypatch, tmp_path: Path) -> None:
+    from shared.agent_export import export_review_definitions
+    from shared.review_fanout import REVIEW_DIMENSIONS
+
+    target = _review_target(monkeypatch, tmp_path)
+    result = export_review_definitions(providers=["claude-code"], scope="user")
+    assert not result["errors"]
+    names = {p.name for p in target.iterdir()}
+    for dim in REVIEW_DIMENSIONS:
+        assert dim.subagent_type.startswith("threnody-review-")
+        assert f"{dim.subagent_type}.md" in names
+        for effort in ("low", "medium", "high"):
+            assert f"{dim.subagent_type}-{effort}.md" in names
+    assert "threnody-review-fast.md" in names
+    assert "threnody-review-fast-high.md" in names
+    fast = (target / "threnody-review-fast.md").read_text(encoding="utf-8")
+    assert "tools: Read, Grep, Glob" in fast
+    assert "where dimension is one of security, logic, edge, types, performance" in fast
+    variant = (target / "threnody-review-security-medium.md").read_text(encoding="utf-8")
+    assert "effort: medium" in variant and "model:" not in variant
+
+
+def test_agent_md_does_not_count_as_installed(monkeypatch, tmp_path: Path) -> None:
+    """A ``.agent.md`` body never loads, so it must not suppress the export."""
+    from shared.agent_export import export_review_definitions
+
+    target = _review_target(monkeypatch, tmp_path)
+    target.mkdir()
+    (target / "threnody-review-logic.agent.md").write_text("mine\n", encoding="utf-8")
+    (target / "threnody-review-types.md").write_text(
+        "---\nname: threnody-review-types\ndescription: mine\n---\nmy body\n", encoding="utf-8"
+    )
+    result = export_review_definitions(providers=["claude-code"], scope="user")
+    assert (target / "threnody-review-logic.md").is_file()
+    # A user's own .md is kept, and its variants mirror *its* body.
+    assert (target / "threnody-review-types.md").read_text(encoding="utf-8").endswith("my body\n")
+    assert "my body" in (target / "threnody-review-types-high.md").read_text(encoding="utf-8")
+    assert any(s.get("dimension") == "types" and "variant" not in s for s in result["skipped"])

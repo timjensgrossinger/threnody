@@ -215,6 +215,52 @@ def remove_claude_hook(path_value: str) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def remove_claude_agent_hook(path_value: str) -> None:
+    """Drop the Agent hook's entries from every event; leave other hooks alone."""
+    path = within_home(Path(path_value))
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
+        return
+    hooks = data["hooks"]
+
+    def managed(hook: object) -> bool:
+        return (
+            isinstance(hook, dict)
+            and hook.get("type") == "command"
+            and "threnody-agent-hook" in str(hook.get("command") or "")
+        )
+
+    changed = False
+    for event in ("PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "SessionStart"):
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        kept = []
+        for group in groups:
+            group_hooks = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(group_hooks, list) or not any(managed(h) for h in group_hooks):
+                kept.append(group)
+                continue
+            changed = True
+            rest = [h for h in group_hooks if not managed(h)]
+            if rest:
+                kept.append({**group, "hooks": rest})
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)
+    if not changed:
+        return
+    if not hooks:
+        data.pop("hooks", None)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
 def remove_shell_lines(path_value: str) -> None:
     path = within_home(Path(path_value))
     if not path.exists():
@@ -240,6 +286,7 @@ remove_json_mcp(str(home / ".cursor/mcp.json"))
 remove_json_mcp(str(home / ".junie/mcp/mcp.json"))
 remove_codex_mcp(str(home / ".codex/config.toml"))
 remove_claude_hook(str(home / ".claude/settings.json"))
+remove_claude_agent_hook(str(home / ".claude/settings.json"))
 
 for path, block_id in (
     (home / ".claude/CLAUDE.md", "claude"),

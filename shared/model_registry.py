@@ -115,15 +115,15 @@ BOOTSTRAP_REGISTRY: dict[str, tuple[DiscoveredModel, ...]] = {
         _model(
             "claude-opus-5",
             "high",
-            aliases=("claude-opus-4.6",),
+            aliases=("claude-opus-5-5", "claude-opus-4.6"),
             request_multiplier=3.0,
             verified=False,
         ),
     ),
     "claude-code": (
-        _model("haiku", "low", aliases=("claude-haiku-5", "claude-haiku-4.5")),
-        _model("sonnet", "medium", aliases=("claude-sonnet-5", "claude-sonnet-4.6")),
-        _model("opus", "high", aliases=("claude-opus-5", "claude-opus-4.6")),
+        _model("haiku", "low", aliases=("claude-haiku-4-5", "claude-haiku-5", "claude-haiku-4.5")),
+        _model("sonnet", "medium", aliases=("claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4.6")),
+        _model("opus", "high", aliases=("claude-opus-5-5", "claude-opus-5", "claude-opus-4.6")),
     ),
     "codex": (
         _model(

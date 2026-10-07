@@ -331,7 +331,7 @@ class TestReviewMetaBackfill:
                 "⚠️ [LOW] security/weak-crypto — a.py:2 — md5\n",
                 encoding="utf-8",
             )
-            spec = {"subagent_type": "review-security", "target_file": "a.py"}
+            spec = {"subagent_type": "threnody-review-security", "target_file": "a.py"}
             merged = _backfill_review_meta(_RUN, "7", spec, {"success": True})
             meta = merged["review_meta"]
             assert meta["findings_total"] == 2
@@ -345,7 +345,7 @@ class TestReviewMetaBackfill:
         from shared.host_learning import _backfill_review_meta
 
         original = {"success": True, "review_meta": {"findings_total": 9}}
-        spec = {"subagent_type": "review-security"}
+        spec = {"subagent_type": "threnody-review-security"}
         assert _backfill_review_meta(_RUN, "7", spec, original) is original
 
     def test_backfill_applies_the_runs_adjudication(self):
@@ -364,7 +364,7 @@ class TestReviewMetaBackfill:
                 "### Dropped\n⚠️ [HIGH] security/x — a.py:1 — bogus claim — not real\n",
                 encoding="utf-8",
             )
-            spec = {"subagent_type": "review-security", "target_file": "a.py"}
+            spec = {"subagent_type": "threnody-review-security", "target_file": "a.py"}
             merged = _backfill_review_meta(_RUN, "7", spec, {"success": True})
             assert merged["review_meta"]["kept_by_synthesis"] is False
         finally:
@@ -384,5 +384,5 @@ class TestReviewMetaBackfill:
         from shared.host_learning import _backfill_review_meta
 
         result = {"success": True}
-        spec = {"subagent_type": "review-security"}
+        spec = {"subagent_type": "threnody-review-security"}
         assert _backfill_review_meta("swarm-nope-nothing-here", "3", spec, result) is result

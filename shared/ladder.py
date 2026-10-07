@@ -472,13 +472,25 @@ def plan_host_ladder(
     caller: str | None = None,
     config: "TGsConfig | None" = None,
     sweep_id: str | None = None,
+    effort: str | None = None,
 ) -> dict[str, Any]:
     """Describe a host-native sweep: one item per (case x tier) for the host to spawn.
 
     Threnody never spawns a router-only host's CLI, so the host runs an Agent per
     item on ``item["model"]`` and returns the produced file via :func:`grade_host_output`.
+
+    Each item names the ``subagent_type`` that pins its effort (the Agent tool has
+    no effort parameter) and carries the *applied* ``effort`` — what ladder_grade
+    must report back — so a graded row is never attributed to an effort the agent
+    did not run at. *effort* forces one level for every item; otherwise each tier
+    gets its routed default.
     """
-    from .host_spawn import host_native_model_for_tier
+    from .effort_support import default_routed_effort
+    from .host_spawn import (
+        host_native_model_for_tier,
+        normalize_effort,
+        resolve_spawn_type,
+    )
 
     if caller is None:
         try:
@@ -497,28 +509,51 @@ def plan_host_ladder(
             log.debug("plan_host_ladder: config unavailable", exc_info=True)
     ordered = [t for t in tiers if t in _TIER_RANK]
     cases = load_cases(levels=levels, case_ids=case_ids)
+    forced_effort = normalize_effort(effort)
+    resolved_by_tier: dict[str, Any] = {}
     items: list[dict[str, Any]] = []
     for case in cases:
         prompt = build_case_prompt(case) + "\n\n" + HOST_NO_WRITE_INSTRUCTION
         for tier in ordered:
             model = host_native_model_for_tier(config, caller, tier)
-            items.append({
+            spawn = resolved_by_tier.get(tier)
+            if spawn is None:
+                spawn = resolve_spawn_type(
+                    caller=caller,
+                    base=None,
+                    tier=tier,
+                    effort=forced_effort or default_routed_effort(tier),
+                    config=config,
+                )
+                resolved_by_tier[tier] = spawn
+            item: dict[str, Any] = {
                 "case_id": case.case_id,
                 "level": case.level,
                 "kind": case.kind,
                 "tier": tier,
                 "model": model,
+                "subagent_type": spawn.subagent_type,
                 "target_file": case.target_file,
                 "prompt": prompt,
-            })
+            }
+            if spawn.applied_effort:
+                item["effort"] = spawn.applied_effort
+            if spawn.requested_effort:
+                item["requested_effort"] = spawn.requested_effort
+            if spawn.effort_source:
+                item["effort_source"] = spawn.effort_source
+            if spawn.effort_unapplied_reason:
+                item["effort_unapplied_reason"] = spawn.effort_unapplied_reason
+            items.append(item)
     return {
         "sweep_id": sweep_id or f"ladder-{int(time.time())}",
         "caller": caller,
         "items": items,
         "count": len(items),
         "grading": (
-            "call ladder_grade with case_id, tier, model, sweep_id and the "
-            "agent's raw file content"
+            "spawn each item with its subagent_type and model; call ladder_grade "
+            "with case_id, tier, model, sweep_id, the item's effort (when present) "
+            "and the agent's raw file content"
         ),
     }
 

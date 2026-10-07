@@ -1070,6 +1070,19 @@ class BeliefsConfig:
 
 
 @dataclass
+class AgentHookConfig:
+    """Claude Code Agent-tool hook (shared/agent_hook.py).
+
+    ``enabled`` false turns the PreToolUse decision into a no-op (no model or
+    effort applied, nothing rewritten) and makes install.sh remove the hook
+    entries. ``THRENODY_AGENT_HOOK=off`` does the same for one shell without
+    editing config.
+    """
+
+    enabled: bool = True
+
+
+@dataclass
 class PromptEconomyConfig:
     """Per-agent prompt cost controls for host-native waves (shared/prompt_budget.py).
 
@@ -2064,6 +2077,9 @@ class TGsConfig:
     # Per-agent prompt cost controls for host-native waves.
     prompt_economy: PromptEconomyConfig = field(default_factory=PromptEconomyConfig)
 
+    # Claude Code Agent-tool hook: model + effort on every subagent spawn.
+    agent_hook: AgentHookConfig = field(default_factory=AgentHookConfig)
+
     # Worktree isolation for execute_subtask (plan 06).
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
 
@@ -2328,6 +2344,14 @@ class TGsConfig:
                     )
                     coerced = 0
                 setattr(cfg.prompt_economy, numeric, max(lo, min(hi, coerced)))
+
+        agent_hook_raw = raw.get("agent_hook", {})
+        if isinstance(agent_hook_raw, Mapping):
+            cfg.agent_hook.enabled = _coerce_config_bool(
+                agent_hook_raw.get("enabled"),
+                default=cfg.agent_hook.enabled,
+                field_name="agent_hook.enabled",
+            )
 
         hybrid_raw = raw.get("hybrid", {})
         if isinstance(hybrid_raw, Mapping):
@@ -3552,8 +3576,8 @@ class TGsConfig:
         return {
             "models": {
                 "mini": {"id": "gpt-5-mini", "description": "Free tier", "agents": 2},
-                "sonnet": {"id": "claude-sonnet-4.6", "description": "Standard", "agents": 2},
-                "opus": {"id": "claude-opus-4.6", "description": "Premium", "agents": 1},
+                "sonnet": {"id": "claude-sonnet-5-5", "description": "Standard", "agents": 2},
+                "opus": {"id": "claude-opus-5-5", "description": "Premium", "agents": 1},
                 "tier_pins": self.model_tier_pins,
             },
             "providers": {
@@ -3650,6 +3674,7 @@ class TGsConfig:
                 "instruction_tax_warning": self.prompt_economy.instruction_tax_warning,
                 "instruction_tax_warn_bytes": self.prompt_economy.instruction_tax_warn_bytes,
             },
+            "agent_hook": {"enabled": self.agent_hook.enabled},
             "review_synthesis_mode": self.review_synthesis_mode,
             "review_scope": self.review_scope,
             "review_structural_dim_gating": self.review_structural_dim_gating,

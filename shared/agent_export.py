@@ -243,10 +243,16 @@ _REVIEW_TARGET_OVERRIDES: dict[str, ExportTarget] = {
     ),
 }
 
-# Filenames that already define a reviewer under a given name. Users commonly ship
-# their own tuned reviewers (`review-security.agent.md`); those are exactly the
-# definitions this feature wants the host to load, so they must never be overwritten.
-_REVIEW_DEFINITION_SUFFIXES = (".md", ".agent.md")
+# Filenames that count as an installed definition. Only ``.md``: probed on Claude
+# Code, a ``<name>.agent.md`` is accepted as a type name but its body is never
+# loaded, so treating it as present skipped the export and left the host spawning
+# an agent with no instructions at all. A user's own ``<name>.md`` is still never
+# overwritten — their tuned reviewer is the better version of the same file.
+_REVIEW_DEFINITION_SUFFIXES = (".md",)
+
+# Hosts whose definition format carries an ``effort:`` key, so per-effort review
+# variants can be generated for them (see effort_support.EFFORT_SUPPORT).
+_EFFORT_VARIANT_PROVIDERS = frozenset({"claude-code"})
 
 
 def _review_definition_exists(directory: Path, slug: str, layout: str) -> Path | None:
@@ -311,10 +317,16 @@ def export_review_definitions(
     a user's own tuned reviewer is precisely the definition this is trying to put in
     place, so clobbering it would destroy the better version of the same thing.
 
+    Also exports the fast whole-file reviewer, and — on hosts whose format carries
+    ``effort:`` — one ``<name>-<low|medium|high>`` variant per definition, so
+    ``host_spawn.resolve_spawn_type`` can pin the routed effort on a review agent
+    the same way it does on a tier agent. Variant entries carry ``"variant"``.
+
     Returns ``{"written": [...], "skipped": [...], "errors": [...]}``.
     """
-    from .review_fanout import REVIEW_DIMENSIONS
+    from .review_fanout import FAST_REVIEW_DEFINITION, REVIEW_DIMENSIONS
 
+    definitions = [*REVIEW_DIMENSIONS, FAST_REVIEW_DEFINITION]
     provider_ids = providers or [t.provider_id for t in _BUILTIN_TARGETS]
     written: list[dict] = []
     skipped: list[dict] = []
@@ -325,7 +337,7 @@ def export_review_definitions(
         if target is None:
             skipped.append({"provider": pid, "reason": "unknown provider"})
             continue
-        for dim in REVIEW_DIMENSIONS:
+        for dim in definitions:
             slug = dim.subagent_type
             try:
                 content = _build_review_definition(dim, pid)
@@ -345,6 +357,9 @@ def export_review_definitions(
                                 "reason": "definition already present",
                                 "path": str(existing),
                             }
+                        )
+                        _export_review_variants(
+                            pid, dim.key, existing, target.layout, dry_run, written, skipped, errors
                         )
                         continue
                 else:
@@ -379,6 +394,9 @@ def export_review_definitions(
                                 "path": str(existing),
                             }
                         )
+                        _export_review_variants(
+                            pid, dim.key, existing, target.layout, dry_run, written, skipped, errors
+                        )
                         continue
                 if not dry_run:
                     _safe_write(out_path, content)
@@ -389,6 +407,9 @@ def export_review_definitions(
                         "path": str(out_path),
                         "dry_run": dry_run,
                     }
+                )
+                _export_review_variants(
+                    pid, dim.key, out_path, target.layout, dry_run, written, skipped, errors
                 )
             except Exception as exc:
                 log.debug(
@@ -406,53 +427,177 @@ def export_review_definitions(
 TIER_EFFORT_LEVELS = ("low", "medium", "high")
 _TIER_NAMES = ("low", "medium", "high")
 
+# Marks a file this module generated, so a regeneration may replace it and a
+# hand-written definition of the same name is never clobbered.
+_EFFORT_VARIANT_MARKER = "<!-- threnody:effort-variant base={base} effort={effort} -->"
+_EFFORT_VARIANT_MARKER_PREFIX = "<!-- threnody:effort-variant "
+
+
+def export_effort_variant(
+    base_path: Path,
+    effort: str,
+    target_dir: Path,
+    *,
+    overwrite_unmarked: bool = False,
+) -> Path | None:
+    """Write ``<base>-<effort>.md`` into *target_dir*; return its path, ``None`` if refused.
+
+    Claude Code's Agent tool has no per-call effort parameter, and a definition is
+    loaded only when a session starts — so the one way to run a named agent at a
+    routed effort is a sibling definition that pins it. The variant is the base
+    verbatim (same tools, same body, so it behaves as the same agent) with
+    ``name: <base>-<effort>``, ``effort: <effort>`` (after ``model:`` when present,
+    else after ``description:``), `` (effort <e>)`` on the description, and a
+    marker comment opening the body.
+
+    Refused, with a warning: an existing file without the marker (someone else's
+    definition — unless *overwrite_unmarked*, for files whose whole namespace this
+    module owns), a base that declares ``effort:`` itself (a variant would
+    contradict its author), and a base with no frontmatter.
+    """
+    norm = str(effort or "").strip().lower()
+    if norm not in TIER_EFFORT_LEVELS:
+        log.warning("effort variant: invalid effort %r for %s", effort, base_path)
+        return None
+    try:
+        text = base_path.read_text(encoding="utf-8")
+    except OSError:
+        log.debug("effort variant base unreadable: %s", base_path, exc_info=True)
+        return None
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        return None
+    front = lines[1:end]
+    base_name = base_path.name[: -len(".md")] if base_path.name.endswith(".md") else base_path.stem
+    for line in front:
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        if key.strip() == "effort":
+            log.warning(
+                "effort variant: %s declares effort %r itself; not generating variants",
+                base_path,
+                value.strip(),
+            )
+            return None
+        if key.strip() == "name" and value.strip():
+            base_name = value.strip().strip("'\"")
+    variant = f"{base_name}-{norm}"
+    dest = target_dir / f"{variant}.md"
+    if dest.exists() and not overwrite_unmarked:
+        try:
+            current = dest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            current = ""
+        if _EFFORT_VARIANT_MARKER_PREFIX not in current:
+            log.warning(
+                "effort variant: %s exists and was not generated by Threnody; leaving it", dest
+            )
+            return None
+
+    fm: list[str] = []
+    has_name = False
+    effort_placed = False
+    for line in front:
+        if line.startswith("name:"):
+            line = f"name: {variant}"
+            has_name = True
+        elif line.startswith("description:"):
+            line = f"{line.rstrip()} (effort {norm})"
+        fm.append(line)
+        if line.startswith("model:") and not effort_placed:
+            fm.append(f"effort: {norm}")
+            effort_placed = True
+    if not effort_placed:
+        anchor = next((i for i, line in enumerate(fm) if line.startswith("description:")), None)
+        fm.insert(len(fm) if anchor is None else anchor + 1, f"effort: {norm}")
+    if not has_name:
+        fm.insert(0, f"name: {variant}")
+    marker = _EFFORT_VARIANT_MARKER.format(base=base_name, effort=norm)
+    out = ["---", *fm, "---", marker, *lines[end + 1:]]
+    try:
+        _safe_write(dest, "\n".join(out))
+    except OSError:
+        log.warning("effort variant write failed: %s", dest, exc_info=True)
+        return None
+    return dest
+
+
+def _export_review_variants(
+    provider_id: str,
+    dimension: str,
+    base_path: Path,
+    layout: str,
+    dry_run: bool,
+    written: list[dict],
+    skipped: list[dict],
+    errors: list[dict],
+) -> None:
+    """Per-effort variants of one exported (or already present) review definition."""
+    if provider_id not in _EFFORT_VARIANT_PROVIDERS or layout != "flat_md":
+        return
+    for effort in TIER_EFFORT_LEVELS:
+        name = f"{base_path.name[: -len('.md')]}-{effort}"
+        if dry_run:
+            written.append(
+                {
+                    "provider": provider_id,
+                    "dimension": dimension,
+                    "variant": name,
+                    "path": str(base_path.parent / f"{name}.md"),
+                    "dry_run": True,
+                }
+            )
+            continue
+        try:
+            dest = export_effort_variant(base_path, effort, base_path.parent)
+        except Exception as exc:
+            log.debug("review variant export failed for %s", name, exc_info=True)
+            errors.append({"provider": provider_id, "dimension": dimension, "reason": str(exc)})
+            continue
+        if dest is None:
+            skipped.append(
+                {
+                    "provider": provider_id,
+                    "dimension": dimension,
+                    "variant": name,
+                    "reason": "variant not generated (existing file, or base pins its own effort)",
+                }
+            )
+            continue
+        written.append(
+            {
+                "provider": provider_id,
+                "dimension": dimension,
+                "variant": dest.stem,
+                "path": str(dest),
+                "dry_run": False,
+            }
+        )
+
 
 def export_tier_effort_variants(source_dir: Path, target_dir: Path) -> list[Path]:
     """Generate ``threnody-<tier>-<effort>.md`` from each ``threnody-<tier>.md``.
 
-    Claude Code's Agent tool has no per-call effort parameter, but subagent
-    frontmatter supports ``effort:``. One definition per (tier, effort) pair lets
-    ``host_spawn`` pin the routed reasoning effort via ``subagent_type``. These are
-    Threnody-owned generated files, so overwriting is intended. A source without
-    frontmatter is skipped.
+    One definition per (tier, effort) pair lets ``host_spawn`` pin the routed
+    reasoning effort via ``subagent_type`` (see :func:`export_effort_variant`).
+    The whole ``threnody-<tier>-<effort>`` namespace is Threnody's, and installs
+    before the marker existed wrote these files without it, so overwriting is
+    intended here. A source without frontmatter is skipped.
     """
     written: list[Path] = []
     for tier in _TIER_NAMES:
         src = source_dir / f"threnody-{tier}.md"
         if not src.is_file():
             continue
-        try:
-            text = src.read_text(encoding="utf-8")
-        except OSError:
-            log.debug("tier variant source unreadable: %s", src, exc_info=True)
-            continue
-        lines = text.split("\n")
-        if not lines or lines[0].strip() != "---":
-            continue
-        try:
-            end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
-        except StopIteration:
-            continue
         for effort in TIER_EFFORT_LEVELS:
-            out = list(lines)
-            fm: list[str] = []
-            for line in lines[1:end]:
-                if line.startswith("name:"):
-                    line = f"name: threnody-{tier}-{effort}"
-                elif line.startswith("description:"):
-                    line = f"{line.rstrip()} (effort {effort})"
-                fm.append(line)
-                if line.startswith("model:"):
-                    fm.append(f"effort: {effort}")
-            out[1:end] = fm
-            target_dir.mkdir(parents=True, exist_ok=True)
-            dest = target_dir / f"threnody-{tier}-{effort}.md"
-            try:
-                dest.write_text("\n".join(out), encoding="utf-8")
-            except OSError:
-                log.debug("tier variant write failed: %s", dest, exc_info=True)
-                continue
-            written.append(dest)
+            dest = export_effort_variant(src, effort, target_dir, overwrite_unmarked=True)
+            if dest is not None:
+                written.append(dest)
     return written
 
 

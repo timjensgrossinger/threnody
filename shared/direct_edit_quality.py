@@ -87,10 +87,15 @@ def finalize_route_task(
     outcome: str | None = None,
     actual_model: str | None = None,
     actual_tier: str | None = None,
+    actual_effort: str | None = None,
     caller: str | None = None,
     task_text: str | None = None,
 ) -> dict[str, Any]:
-    """Write ledger rows for a route_task id. Returns a summary; never raises."""
+    """Write ledger rows for a route_task id. Returns a summary; never raises.
+
+    ``actual_effort`` is the host-reported effort; it is attributed to both rows.
+    Without it the effort is unknown (``None``) — never inferred from the route.
+    """
     summary: dict[str, Any] = {
         "task_id": task_id,
         "outcome_recorded": False,
@@ -134,9 +139,11 @@ def finalize_route_task(
             attribution, tier = "override", actual_tier
         else:
             model, attribution, tier = routed_model, "routed", routed_tier
+        effort = (str(actual_effort).strip().lower() or None) if actual_effort else None
         summary["attribution"] = attribution
         summary["model"] = model
         summary["tier"] = tier
+        summary["effort"] = effort
 
         if outcome:
             summary["outcome_recorded"] = bool(
@@ -144,6 +151,7 @@ def finalize_route_task(
                     db,
                     model=model,
                     outcome=outcome,
+                    effort=effort,
                     role=role,
                     kind=kind,
                     tier=tier,
@@ -159,6 +167,8 @@ def finalize_route_task(
             config=config,
             workspace_root=workspace_root,
             model=model,
+            effort=effort,
+            attribution=attribution,
             tier=tier,
             role=role,
             kind=kind,
@@ -166,7 +176,7 @@ def finalize_route_task(
             record_verify_gate_score=record_verify_gate_score,
         )
     except Exception:
-        log.debug("finalize_route_task failed for %s", task_id, exc_info=True)
+        log.warning("finalize_route_task failed for %s", task_id, exc_info=True)
         summary["error"] = True
     return summary
 
@@ -183,6 +193,8 @@ def _finalize_verify(
     kind: str | None,
     summary: dict[str, Any],
     record_verify_gate_score: Any,
+    effort: str | None = None,
+    attribution: str | None = None,
 ) -> None:
     if not getattr(config.verify_gate, "enabled", False):
         summary["verify_skipped"] = "verify_disabled"
@@ -225,7 +237,7 @@ def _finalize_verify(
     record_verify_gate_score(
         db,
         model=model,
-        effort=None,
+        effort=effort,
         score_0_10=score,
         new_failure_count=len(rd.get("new_failures") or []),
         preexisting_count=len(rd.get("preexisting_failures") or []),
@@ -235,6 +247,7 @@ def _finalize_verify(
         task_hash=task_id,
         run_id=task_id,
         ran_signals=rd.get("ran_signals"),
+        attribution={"model_source": attribution} if attribution else None,
     )
     summary["verify_recorded"] = True
     summary["verify_score"] = score
@@ -248,4 +261,4 @@ def schedule_finalize(db: Any, task_id: str, *, config: Any, **kw: Any) -> None:
         executor = _get_warm_path_executor(_warm_path_worker_count(config))
         executor.submit(finalize_route_task, db, task_id, config=config, **kw)
     except Exception:
-        log.debug("schedule_finalize failed for %s", task_id, exc_info=True)
+        log.warning("schedule_finalize failed for %s", task_id, exc_info=True)

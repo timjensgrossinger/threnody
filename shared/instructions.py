@@ -33,6 +33,27 @@ def _format_patterns(patterns: list[str]) -> str:
     return ", ".join(f"`{pattern}`" for pattern in patterns)
 
 
+def _claude_spawn_effort_lines(config: TGsConfig) -> list[str]:
+    """How model + effort reach a Claude Code subagent spawn."""
+    hook = getattr(config, "agent_hook", None)
+    if not bool(getattr(hook, "enabled", True)):
+        return [
+            (
+                "When the spawn payload carries a `subagent_type` like `threnody-medium-high`, use it verbatim — "
+                "that variant pins the routed reasoning effort (Claude Code has no per-call effort param)."
+            ),
+        ]
+    return [
+        (
+            "A managed `Agent` hook fills the routed `model` and reasoning effort on every subagent spawn — "
+            "Threnody-planned or not — and logs what ran. An explicit `model`, a definition's own "
+            "`model:`/`effort:`, or a `<agent>-<effort>` variant you name always win. Use a payload's "
+            "`subagent_type` (e.g. `threnody-medium-high`) as given; for another agent, pass its "
+            "`subagent_type` to `route_task` to get the effort-pinned type."
+        ),
+    ]
+
+
 def _render_claude_pointer_block(
     config: TGsConfig,
     profile: "ShellRoutingProfile",
@@ -92,8 +113,7 @@ def _render_claude_pointer_block(
         "| medium | `threnody-medium` | sonnet |",
         "| high | `threnody-high` | opus |",
         "",
-        "When the spawn payload carries a `subagent_type` like `threnody-medium-high`, use it verbatim — "
-        "that variant pins the routed reasoning effort (Claude Code has no per-call effort param).",
+        *_claude_spawn_effort_lines(config),
         "",
         "Learning reporting follows `learning_report_contract.report_mode`. In `batch` mode (default) do "
         "NOT call `report_host_wave` per worker wave — capture is automatic (PostToolUse hook) or passed in "

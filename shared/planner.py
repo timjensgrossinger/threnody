@@ -104,7 +104,7 @@ class Subtask:
     op_class: str = "side_effecting"  # replayable | side_effecting | approval_required
     session_id: str | None = None  # plan 10: reuse persistent worker session
     convergence_target: ConvergenceTarget | None = None  # plan 14: quality convergence loop
-    subagent_type: str | None = None  # override host subagent type (e.g. "review-security")
+    subagent_type: str | None = None  # override host subagent type (e.g. "threnody-review-security")
     read_only: bool = False  # skip direct_edit; force host_task method
     role: str | None = None  # semantic role derived from task (e.g. "Implementer", "Reviewer")
     # Plan-shape metadata produced by the heuristic/review builders. Carried
@@ -121,6 +121,12 @@ class Subtask:
     # kind of work instead of the rendered text. None → learning hashes the
     # description, which is the historical behaviour.
     pattern_hash: str | None = None
+    # Explicit routed effort (low|medium|high). Review cells set it from the cell's
+    # dimension and file profile; left None the host derives it from the prompt text.
+    reasoning_effort: str | None = None
+    # Review cell whose stable instruction block was left out of the prompt on the
+    # assumption that its exported definition carries it (host_spawn restores it).
+    review_stable_stripped: bool = False
     _consumes_explicit: bool = False
     _produces_explicit: bool = False
     _is_coordinator_explicit: bool = False
@@ -1601,6 +1607,8 @@ class Planner:
                 ),
                 hybrid_delta=hybrid_delta,
                 pattern_hash=self._coerce_optional_text(st_data.get("pattern_hash")),
+                reasoning_effort=self._coerce_optional_text(st_data.get("reasoning_effort")),
+                review_stable_stripped=bool(st_data.get("review_stable_stripped", False)),
                 _consumes_explicit=consumes_explicit,
                 _produces_explicit=produces_explicit,
                 _is_coordinator_explicit=is_coordinator_explicit,
@@ -2053,6 +2061,10 @@ class Planner:
                 subtask_payload["hybrid_delta"] = st.hybrid_delta
             if st.pattern_hash:
                 subtask_payload["pattern_hash"] = st.pattern_hash
+            if st.reasoning_effort:
+                subtask_payload["reasoning_effort"] = st.reasoning_effort
+            if st.review_stable_stripped:
+                subtask_payload["review_stable_stripped"] = True
             payload.setdefault("subtasks", []).append(subtask_payload)
         if plan.inline_files:
             payload["inline_files"] = list(plan.inline_files)

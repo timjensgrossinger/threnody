@@ -73,6 +73,44 @@ def _normalize_tier(value: str | None) -> str | None:
     return normalized if normalized in ("low", "medium", "high") else None
 
 
+EFFORT_VALUES: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+
+def _normalize_effort(value: str | None) -> str | None:
+    """A reported reasoning effort, or ``None`` when absent. Unknown values raise."""
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized not in EFFORT_VALUES:
+        raise ValueError(f"actual_effort must be one of: {', '.join(EFFORT_VALUES)}")
+    return normalized
+
+
+def _concrete_model_id(value: str | None, provider_id: str | None = None) -> str | None:
+    """Resolve a reported model (often a Claude Code alias) to the concrete id.
+
+    ``opus`` -> ``claude-opus-5-5``: an alias names whichever model Claude Code
+    maps it to *today*, so storing the alias would merge two models' outcomes
+    once the alias moves. *provider_id* scopes the alias (another provider's
+    ``opus`` is not Claude's). Best-effort — a resolver failure keeps the raw value.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        from .model_registry import resolve_model_alias
+
+        concrete, _source = resolve_model_alias(provider_id or None, raw)
+    except Exception:
+        log.warning("actual_model alias resolution failed for %r", raw, exc_info=True)
+        return raw
+    return concrete or raw
+
+
 def _normalize_outcome(outcome: str) -> str:
     normalized = _normalize_required_string(outcome, "outcome").lower()
     if normalized not in OUTCOME_ALLOWLIST:
@@ -194,7 +232,7 @@ def persist_route_telemetry(
             version="route",
         )
     except Exception:
-        log.debug(
+        log.warning(
             "Failed to persist route telemetry for task %s",
             task_id,
             exc_info=True,
@@ -338,10 +376,22 @@ def record_outcome(
     gate_verdict: str | None = None,
     routed_tier: str | None = None,
     actual_tier: str | None = None,
+    actual_model: str | None = None,
+    actual_effort: str | None = None,
 ) -> dict[str, Any]:
+    """Store (or correct) one routed task's outcome.
+
+    ``actual_model``/``actual_effort`` are what the host says it actually ran;
+    the model is stored as a concrete id (aliases resolved) in ``model_used``
+    with ``model_source='reported'``. Without a report, ``model_used`` falls back
+    to the model route_task chose (``model_source='routed'``). ``effort_used``
+    only ever holds a reported effort.
+    """
     normalized_task_id = _normalize_required_string(task_id, "task_id")
     normalized_routed_tier = _normalize_tier(routed_tier)
     normalized_actual_tier = _normalize_tier(actual_tier)
+    reported_effort = _normalize_effort(actual_effort)
+    reported_model = _concrete_model_id(actual_model)
     normalized_outcome = _normalize_outcome(outcome)
     normalized_operator_id = _normalize_recorded_operator_id(operator_id)
     normalized_note = _normalize_optional_string(note, "note")
@@ -349,6 +399,23 @@ def record_outcome(
     recorded_at = time.time()
 
     try:
+        # Read the routed context first so the INSERT below stores it directly;
+        # it used to insert tier/model as NULL and rely on the follow-up UPDATE.
+        telemetry_context = _latest_telemetry_context(db, normalized_task_id)
+        routed_model = str(telemetry_context["model"] or "").strip() or None
+        # ``model`` keeps the routed value verbatim; ``model_used`` is always a
+        # concrete id, so a routed alias is resolved the same way a reported one is.
+        # "mcp" is persist_route_telemetry's placeholder, not a provider.
+        routed_provider = str(telemetry_context["provider"] or "").strip()
+        routed_model_used = _concrete_model_id(
+            routed_model, routed_provider if routed_provider not in ("", "mcp") else None
+        )
+        if reported_model:
+            model_used, model_source = reported_model, "reported"
+        elif routed_model_used:
+            model_used, model_source = routed_model_used, "routed"
+        else:
+            model_used, model_source = None, None
         with db.conn() as conn:
             prior = conn.execute(
                 """
@@ -388,7 +455,10 @@ def record_outcome(
                         last_modified_by = ?,
                         gate_verdict = ?,
                         routed_tier = COALESCE(?, routed_tier),
-                        actual_tier = COALESCE(?, actual_tier)
+                        actual_tier = COALESCE(?, actual_tier),
+                        model_used = COALESCE(?, model_used),
+                        model_source = COALESCE(?, model_source),
+                        effort_used = COALESCE(?, effort_used)
                     WHERE task_id = ?
                     """,
                     (
@@ -399,6 +469,11 @@ def record_outcome(
                         normalized_gate_verdict,
                         normalized_routed_tier,
                         normalized_actual_tier,
+                        # Only a report overwrites; the routed fallback is applied
+                        # by the refresh below and never replaces a reported model.
+                        reported_model,
+                        "reported" if reported_model else None,
+                        reported_effort,
                         normalized_task_id,
                     ),
                 )
@@ -419,25 +494,31 @@ def record_outcome(
                         created_at,
                         gate_verdict,
                         routed_tier,
-                        actual_tier
+                        actual_tier,
+                        model_used,
+                        effort_used,
+                        model_source
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_task_id,
                         normalized_outcome,
                         None,
                         recorded_at,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
+                        telemetry_context["tier"],
+                        routed_model,
+                        telemetry_context["provider"],
+                        telemetry_context["complexity_score"],
+                        telemetry_context["telemetry_id"],
                         normalized_operator_id,
                         created_at,
                         normalized_gate_verdict,
-                        normalized_routed_tier,
+                        normalized_routed_tier or telemetry_context["tier"],
                         normalized_actual_tier,
+                        model_used,
+                        reported_effort,
+                        model_source,
                     ),
                 )
 
@@ -471,7 +552,6 @@ def record_outcome(
         # when it is missing, so the loss was invisible — it just made every
         # corrected outcome train on an approximate score. A telemetry row that
         # really does carry a value still wins.
-        telemetry_context = _latest_telemetry_context(db, normalized_task_id)
         with db.conn() as conn:
             conn.execute(
                 """
@@ -481,12 +561,17 @@ def record_outcome(
                     provider_name = COALESCE(?, provider_name),
                     complexity_score = COALESCE(?, complexity_score),
                     telemetry_id = COALESCE(?, telemetry_id),
-                    routed_tier = COALESCE(routed_tier, ?)
+                    routed_tier = COALESCE(routed_tier, ?),
+                    model_source = CASE
+                        WHEN model_used IS NULL AND ? IS NOT NULL THEN 'routed'
+                        ELSE model_source
+                    END,
+                    model_used = COALESCE(model_used, ?)
                 WHERE task_id = ?
                 """,
                 (
                     telemetry_context["tier"],
-                    telemetry_context["model"],
+                    routed_model,
                     telemetry_context["provider"],
                     telemetry_context["complexity_score"],
                     telemetry_context["telemetry_id"],
@@ -497,6 +582,10 @@ def record_outcome(
                     # it never has to remember what Threnody recommended.
                     # COALESCE(routed_tier, ?) so an explicit value always wins.
                     telemetry_context["tier"],
+                    # Rows stored before model_used existed (or before route
+                    # telemetry landed) pick up the routed model, labelled so.
+                    routed_model_used,
+                    routed_model_used,
                     normalized_task_id,
                 ),
             )

@@ -92,6 +92,16 @@ ROUTING_GUARD_MODE_DIRECT: str = "direct"
 ROUTING_GUARD_MODE_EXECUTE_SUBTASK: str = "execute_subtask"
 ROUTING_GUARD_MODE_ROUTED_PLAN: str = "routed_plan"
 ROUTING_GUARD_TTL_SECONDS: int = 3600
+# How restrictive a guard mode is: execute_subtask < direct < routed_plan.
+# routed_plan used to be missing from this ranking and read as rank 0, so any
+# live direct guard from an unrelated earlier task out-ranked a brand-new
+# plan_task / execute_swarm guard — the plan's guard was never written and the
+# old row was handed back to the caller as if it were the new one.
+ROUTING_GUARD_MODE_RANK: dict[str, int] = {
+    ROUTING_GUARD_MODE_EXECUTE_SUBTASK: 0,
+    ROUTING_GUARD_MODE_DIRECT: 1,
+    ROUTING_GUARD_MODE_ROUTED_PLAN: 2,
+}
 
 
 _F = TypeVar("_F", bound=Callable[..., object])
@@ -657,7 +667,9 @@ class Database:
                 resumable INTEGER NOT NULL DEFAULT 0,
                 resume_status TEXT NOT NULL DEFAULT 'not_resumable',
                 parent_swarm_id TEXT,
-                chosen_checkpoint_index INTEGER
+                chosen_checkpoint_index INTEGER,
+                workspace_root TEXT,
+                caller TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_swarm_runs_swarm_id
                 ON swarm_runs (swarm_id);
@@ -743,7 +755,8 @@ class Database:
                  task_text TEXT NOT NULL DEFAULT '',
                  file_hints_json TEXT NOT NULL DEFAULT '[]',
                  created_ts REAL NOT NULL,
-                 expires_ts REAL NOT NULL
+                 expires_ts REAL NOT NULL,
+                 task_id TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_routing_guards_caller_cwd
                  ON routing_guards (caller, cwd, expires_ts);
@@ -1231,6 +1244,7 @@ class Database:
         self._ensure_bandit_schema(conn)
         self._ensure_convergence_schema(conn)
         self._ensure_tier_override_schema(conn)
+        self._ensure_model_used_schema(conn)
         self._ensure_compression_schema(conn)
         self._ensure_agent_export_columns(conn)
         self._record_swarm_schema_version(conn)
@@ -1808,7 +1822,9 @@ class Database:
                     resumable INTEGER NOT NULL DEFAULT 0,
                     resume_status TEXT NOT NULL DEFAULT 'not_resumable',
                     parent_swarm_id TEXT,
-                    chosen_checkpoint_index INTEGER
+                    chosen_checkpoint_index INTEGER,
+                    workspace_root TEXT,
+                    caller TEXT
                 )
             """)
         swarm_runs_columns = {
@@ -1842,12 +1858,24 @@ class Database:
             "chosen_checkpoint_index": (
                 "ALTER TABLE swarm_runs ADD COLUMN chosen_checkpoint_index INTEGER"
             ),
+            # Which workspace/caller a host handoff belongs to. Nullable on purpose:
+            # rows written before this column existed have no recoverable workspace,
+            # and every reader treats NULL as "unknown", never as "matches nothing".
+            "workspace_root": "ALTER TABLE swarm_runs ADD COLUMN workspace_root TEXT",
+            "caller": "ALTER TABLE swarm_runs ADD COLUMN caller TEXT",
         }
         for column, statement in swarm_run_migrations.items():
             if column not in swarm_runs_columns:
                 conn.execute(statement)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_swarm_runs_swarm_id ON swarm_runs (swarm_id)"
+        )
+        # Created here, not in the base executescript: on an old DB the base
+        # CREATE TABLE IF NOT EXISTS is a no-op and the column only exists after
+        # the ALTER above, so an index in the base script would fail to apply.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_swarm_runs_workspace_status "
+            "ON swarm_runs (workspace_root, status)"
         )
 
         swarm_workers_exists = conn.execute(
@@ -1929,7 +1957,8 @@ class Database:
                     task_text TEXT NOT NULL DEFAULT '',
                     file_hints_json TEXT NOT NULL DEFAULT '[]',
                     created_ts REAL NOT NULL,
-                    expires_ts REAL NOT NULL
+                    expires_ts REAL NOT NULL,
+                    task_id TEXT
                 )
             """)
         else:
@@ -1941,6 +1970,12 @@ class Database:
             if "guard_key" not in existing_cols:
                 conn.execute(
                     "ALTER TABLE routing_guards ADD COLUMN guard_key TEXT"
+                )
+            # The task a guard was issued for, so a terminal report for that task
+            # can clear exactly its own guard. NULL on rows from before the column.
+            if "task_id" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE routing_guards ADD COLUMN task_id TEXT"
                 )
             missing_guard_rows = conn.execute(
                 """
@@ -2508,6 +2543,30 @@ class Database:
             for row in conn.execute("PRAGMA table_info(routing_outcomes)").fetchall()
         }
         for column in ("routed_tier", "actual_tier"):
+            if column not in cols:
+                conn.execute(
+                    f"ALTER TABLE routing_outcomes ADD COLUMN {column} TEXT"
+                )
+
+    # routing_outcomes.model_source values: the host said which model ran
+    # ("reported"), the model was taken from the handoff plan ("planned"), or it
+    # is what route_task chose and nothing contradicted it ("routed").
+    MODEL_SOURCES: tuple[str, ...] = ("reported", "planned", "routed")
+
+    @staticmethod
+    def _ensure_model_used_schema(conn: sqlite3.Connection) -> None:
+        """Add model_used/effort_used/model_source to routing_outcomes.
+
+        ``tier``/``model`` hold the routed context read back from telemetry; until
+        these existed the model a host *reported* (``record_outcome(actual_model=)``)
+        was stored nowhere, so an outcome row could not say what actually ran.
+        ``model_source`` keeps a planned or routed value from passing as reported.
+        """
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(routing_outcomes)").fetchall()
+        }
+        for column in ("model_used", "effort_used", "model_source"):
             if column not in cols:
                 conn.execute(
                     f"ALTER TABLE routing_outcomes ADD COLUMN {column} TEXT"
@@ -4544,6 +4603,8 @@ class Database:
             "resume_status": resume_status,
             "parent_swarm_id": parent_swarm_id,
             "chosen_checkpoint_index": chosen_checkpoint_index,
+            "workspace_root": str(swarm_run.get("workspace_root") or "").strip() or None,
+            "caller": str(swarm_run.get("caller") or "").strip() or None,
         }
         # created_ts is deliberately never in the update set — a run's creation
         # time does not change on a progress ping. resumable/resume_status update
@@ -4554,6 +4615,7 @@ class Database:
                 "task_hash", "status", "requested_agents", "effective_agents",
                 "progress_counters", "cost_summary_ref", "topology", "round",
                 "parent_swarm_id", "chosen_checkpoint_index",
+                "workspace_root", "caller",
             )
             if col in swarm_run
         ]
@@ -4678,6 +4740,204 @@ class Database:
         if removed:
             log.info("removed %d active-run pointer(s) naming finished runs", removed)
         return reaped
+
+    # Terminal status for a host handoff that was replaced by a newer handoff of
+    # the same workspace before any worker touched it (a re-issued execute_swarm).
+    # Deliberately NOT in ACTIVE_SWARM_STATUSES: the reaper, the active-handoff
+    # check and inspect_status's stale_active backlog must all ignore it.
+    SWARM_STATUS_SUPERSEDED: str = "superseded"
+
+    # Statuses a newer handoff may supersede. ``running`` is excluded: a host run
+    # only reaches it through a wave report, so it has already been worked on.
+    SUPERSEDABLE_SWARM_STATUSES: tuple[str, ...] = ("awaiting_host_execution", "planned")
+
+    # swarm_events written by execute_swarm/plan_task themselves while a run is
+    # registered and handed off — before any worker exists. Any other event type
+    # (wave_progress, host_agent_complete, consensus_vote, runtime_*, ...) counts
+    # as worker activity. The list is the safe direction to get wrong: an unknown
+    # registration event makes a run look worked-on, so it is merely reported as
+    # a concurrent run instead of being superseded.
+    SWARM_REGISTRATION_EVENT_TYPES: tuple[str, ...] = (
+        "execute_swarm_requested",
+        "cap_event",
+        "preview_required",
+        "preview_confirmed",
+        "host_native_handoff",
+        "host_handoff_registered",
+    )
+
+    def swarm_run_has_worker_activity(
+        self,
+        swarm_id: str,
+        *,
+        runs_root: Path | None = None,
+    ) -> bool:
+        """True if anything beyond registration has happened to *swarm_id*.
+
+        Worker activity is any of: a ``swarm_events`` row whose type is not in
+        ``SWARM_REGISTRATION_EVENT_TYPES``; a record in the run's ``wave.jsonl``
+        (hook appends included — in batch mode the PostToolUse hook is the only
+        trace a running host leaves); or a file in the run dir (meta, synthesis,
+        artifacts/findings written by an agent). Errors read as "active" so a
+        failed probe never supersedes a live run.
+
+        ``swarm_workers`` rows are deliberately not evidence: a host-native
+        handoff writes one stub snapshot per *planned* agent
+        (``host_learning.register_host_run_handoff``) before anything has run,
+        and a runtime run announces itself with ``runtime_*`` events anyway.
+        """
+        from . import run_log
+
+        normalized = str(swarm_id or "").strip()
+        if not normalized:
+            return True
+        registration = self.SWARM_REGISTRATION_EVENT_TYPES
+        try:
+            with self.conn() as conn:
+                if conn.execute(
+                    f"""
+                    SELECT 1 FROM swarm_events
+                    WHERE swarm_id = ?
+                      AND event_type NOT IN ({", ".join(["?"] * len(registration))})
+                    LIMIT 1
+                    """,
+                    (normalized, *registration),
+                ).fetchone():
+                    return True
+        except sqlite3.DatabaseError:
+            log.debug("swarm activity probe failed for %s", normalized, exc_info=True)
+            return True
+        # The handoff itself writes one file into the run dir: prior-review
+        # findings replayed for cached review cells (findings/replay.md). It is
+        # registration, not a worker's output.
+        handoff_files = {("findings", "replay.md")}
+        try:
+            root = Path(runs_root) if runs_root is not None else run_log.runs_root()
+            run_dir = root / run_log._safe_run_id(normalized)
+            if not run_dir.is_dir():
+                return False
+            for child in run_dir.iterdir():
+                if child.is_file() and child.stat().st_size > 0:
+                    return True
+                if child.is_dir() and any(
+                    g.is_file() and (child.name, g.name) not in handoff_files
+                    for g in child.iterdir()
+                ):
+                    return True
+        except (OSError, ValueError):
+            log.debug("swarm run-dir activity probe failed for %s", normalized, exc_info=True)
+            return True
+        return False
+
+    def supersede_idle_swarm_runs(
+        self,
+        *,
+        new_swarm_id: str,
+        workspace_root: str | None,
+        caller: str | None = None,
+        extra_candidates: list[str] | tuple[str, ...] = (),
+        runs_root: Path | None = None,
+    ) -> dict[str, list[str]]:
+        """Retire earlier, never-started handoffs of *workspace_root*.
+
+        A host that calls execute_swarm twice for the same workspace (a retry, a
+        rephrased task) used to leave the first run ``awaiting_host_execution``
+        until the 24 h reaper called it ``abandoned`` — and the active-run pointer
+        silently moved to the second. Candidates are the active runs recorded for
+        the same workspace (and the same caller, when both sides know it), plus
+        *extra_candidates* (the workspace's active-run pointer). A candidate with
+        no worker activity (``swarm_run_has_worker_activity``) in a supersedable
+        status becomes ``superseded``, gets a ``superseded_by`` event, and is set
+        as the new run's ``parent_swarm_id``. Anything else still active is
+        returned under ``concurrent_active`` and left alone.
+
+        Returns ``{"superseded": [...], "concurrent_active": [...]}``.
+        """
+        new_id = str(new_swarm_id or "").strip()
+        root_value = str(workspace_root or "").strip()
+        result: dict[str, list[str]] = {"superseded": [], "concurrent_active": []}
+        if not new_id or not root_value:
+            return result
+        active = self.ACTIVE_SWARM_STATUSES
+        caller_value = str(caller or "").strip() or None
+        with self.conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT swarm_id, status, caller, workspace_root FROM swarm_runs
+                WHERE swarm_id != ? AND status IN ({", ".join(["?"] * len(active))})
+                  AND workspace_root = ?
+                ORDER BY created_ts ASC
+                """,
+                (new_id, *active, root_value),
+            ).fetchall()
+            extra_rows = []
+            for rid in dict.fromkeys(str(r or "").strip() for r in extra_candidates):
+                if not rid or rid == new_id or any(str(r[0]) == rid for r in rows):
+                    continue
+                row = conn.execute(
+                    "SELECT swarm_id, status, caller, workspace_root FROM swarm_runs "
+                    f"WHERE swarm_id = ? AND status IN ({', '.join(['?'] * len(active))})",
+                    (rid, *active),
+                ).fetchone()
+                if row is not None:
+                    extra_rows.append(row)
+        candidates = []
+        for swarm_id, status, row_caller, row_root in [*rows, *extra_rows]:
+            # A pointer-only candidate recorded for another workspace is not ours.
+            if row_root and str(row_root) != root_value:
+                continue
+            if caller_value and row_caller and str(row_caller) != caller_value:
+                continue
+            candidates.append((str(swarm_id), str(status)))
+
+        now = time.time()
+        for swarm_id, status in candidates:
+            if status not in self.SUPERSEDABLE_SWARM_STATUSES or self.swarm_run_has_worker_activity(
+                swarm_id, runs_root=runs_root
+            ):
+                result["concurrent_active"].append(swarm_id)
+                continue
+            with self.conn() as conn:
+                cursor = conn.execute(
+                    f"""
+                    UPDATE swarm_runs SET status = ?, resume_status = ?
+                    WHERE swarm_id = ?
+                      AND status IN ({", ".join(["?"] * len(self.SUPERSEDABLE_SWARM_STATUSES))})
+                    """,
+                    (
+                        self.SWARM_STATUS_SUPERSEDED,
+                        self.SWARM_STATUS_SUPERSEDED,
+                        swarm_id,
+                        *self.SUPERSEDABLE_SWARM_STATUSES,
+                    ),
+                )
+            if not cursor.rowcount:
+                # Moved on between the scan and the write (a wave report landed).
+                result["concurrent_active"].append(swarm_id)
+                continue
+            result["superseded"].append(swarm_id)
+            try:
+                self.log_swarm_event(
+                    swarm_id,
+                    "superseded_by",
+                    {"superseded_by": new_id, "workspace_root": root_value},
+                    ts=now,
+                )
+            except (sqlite3.DatabaseError, ValueError):
+                log.debug("superseded_by event failed for %s", swarm_id, exc_info=True)
+        if result["superseded"]:
+            # The most recent superseded run is the new run's parent: the new run
+            # is a re-issue of it. parent_swarm_id holds a single id.
+            self.persist_swarm_run(
+                {"swarm_id": new_id, "parent_swarm_id": result["superseded"][-1]}
+            )
+            log.info(
+                "superseded %d idle swarm run(s) for %s by %s",
+                len(result["superseded"]),
+                root_value,
+                new_id,
+            )
+        return result
 
     @staticmethod
     def _coerce_coordinator_verdict(value: object) -> str:
@@ -6815,6 +7075,46 @@ class Database:
     # Routing guard methods (Phase 37+)
     # ------------------------------------------------------------------
 
+    @classmethod
+    def _routing_guard_skip_reason(
+        cls,
+        existing: Mapping[str, object] | None,
+        *,
+        mode: str,
+        task_id: str | None,
+        task_text: str,
+    ) -> str | None:
+        """Return why a new guard must not replace *existing*, or None to write it.
+
+        The latest routing decision wins, with two exceptions:
+
+        * A live ``routed_plan`` is only replaced by another ``routed_plan``. It
+          stands for a host handoff in flight whose planned files must stay off
+          limits to direct edits; it ends through its terminal report, the
+          task's ``record_outcome``, or the TTL — not through a side route_task.
+        * Within the *same* task (same ``task_id``, or the same task text for
+          rows written before ``task_id`` existed) a guard is never downgraded:
+          re-routing a piece of the task that came back low-tier must not flip a
+          ``direct`` decision into an ``execute_subtask`` one mid-task.
+
+        A different task is a new decision, so ``direct`` -> ``execute_subtask``
+        across tasks is written: keeping the old guard would also keep its file
+        hints, and every edit of the new task would be denied as out of scope.
+        """
+        if not existing:
+            return None
+        existing_mode = str(existing.get("mode") or "")
+        rank = ROUTING_GUARD_MODE_RANK
+        if existing_mode == ROUTING_GUARD_MODE_ROUTED_PLAN and mode != ROUTING_GUARD_MODE_ROUTED_PLAN:
+            return "active_routed_plan"
+        existing_task_id = str(existing.get("task_id") or "")
+        same_task = bool(task_id) and existing_task_id == task_id
+        if not same_task and not existing_task_id:
+            same_task = bool(task_text) and str(existing.get("task_text") or "") == task_text
+        if same_task and rank.get(existing_mode, 0) > rank.get(mode, 0):
+            return "same_task_no_downgrade"
+        return None
+
     def routing_guard_put(
         self,
         *,
@@ -6828,30 +7128,56 @@ class Database:
         task_text: str = "",
         file_hints: list[str] | None = None,
         ttl_seconds: int = 3600,
+        task_id: str | None = None,
     ) -> dict[str, object]:
-        """Persist a routing guard record and return it."""
+        """Persist a routing guard record and return it.
+
+        When the write is refused (see ``_routing_guard_skip_reason``) the result
+        is ``{"skipped": True, "reason", "kept", "requested"}`` and carries no
+        top-level guard fields: the kept row belongs to another decision, and
+        callers must never present it as the guard for the task they issued.
+        """
         normalized_caller = str(caller or "").strip() or "mcp"
         normalized_cwd = self._normalize_routing_guard_cwd(cwd)
         normalized_mode = str(mode or "").strip()
         if not normalized_mode:
             raise ValueError("mode is required")
+        normalized_task_id = str(task_id or "").strip() or None
         now = time.time()
         expires_ts = now + max(int(ttl_seconds), 0)
         file_hints_json = self._serialize_json_field(file_hints or [], default="[]") or "[]"
         guard_key = self._routing_guard_key(normalized_caller, normalized_cwd)
-        # Don't downgrade an existing higher-tier guard (direct > execute_subtask).
-        _mode_rank: dict[str, int] = {"execute_subtask": 0, "direct": 1}
         existing = self.routing_guard_get(caller=normalized_caller, cwd=normalized_cwd)
-        if existing and _mode_rank.get(str(existing.get("mode", "")), 0) > _mode_rank.get(normalized_mode, 0):
-            return {**existing, "skipped": True}
+        skip_reason = self._routing_guard_skip_reason(
+            existing,
+            mode=normalized_mode,
+            task_id=normalized_task_id,
+            task_text=str(task_text or ""),
+        )
+        if existing and skip_reason:
+            return {
+                "skipped": True,
+                "reason": skip_reason,
+                "kept": {
+                    key: existing.get(key)
+                    for key in ("mode", "source_tool", "task_id", "tier", "created_ts", "expires_ts")
+                },
+                "requested": {
+                    "mode": normalized_mode,
+                    "source_tool": str(source_tool or ""),
+                    "task_id": normalized_task_id,
+                    "tier": tier,
+                },
+            }
         with self.conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO routing_guards (
                     guard_key, caller, cwd, mode, tier, provider, model,
-                    source_tool, task_text, file_hints_json, created_ts, expires_ts
+                    source_tool, task_text, file_hints_json, created_ts, expires_ts,
+                    task_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     guard_key,
@@ -6866,6 +7192,7 @@ class Database:
                     file_hints_json,
                     now,
                     expires_ts,
+                    normalized_task_id,
                 ),
             )
         return {
@@ -6880,6 +7207,7 @@ class Database:
             "file_hints": file_hints or [],
             "expires_ts": expires_ts,
             "created_ts": now,
+            "task_id": normalized_task_id,
         }
 
     @db_readonly
@@ -6897,7 +7225,8 @@ class Database:
             row = conn.execute(
                 """
                 SELECT caller, cwd, mode, tier, provider, model,
-                       source_tool, task_text, file_hints_json, expires_ts, created_ts
+                       source_tool, task_text, file_hints_json, expires_ts, created_ts,
+                       task_id
                 FROM routing_guards
                 WHERE caller = ? AND cwd = ? AND expires_ts > ?
                 ORDER BY created_ts DESC, guard_key DESC
@@ -6920,7 +7249,28 @@ class Database:
             "file_hints": file_hints if isinstance(file_hints, list) else [],
             "expires_ts": float(row[9]),
             "created_ts": float(row[10]),
+            "task_id": row[11],
         }
+
+    def routing_guard_clear_for_task(self, *, task_id: str) -> int:
+        """Delete every routing guard issued for *task_id*. Returns rows deleted.
+
+        Scoped by task, not by caller/cwd: the terminal signals that end a task
+        (``record_outcome``, a swarm's terminal report) carry the task id but no
+        cwd, and the caller recorded on the guard is normalised differently by
+        different issuers. Task ids are per-task hashes / generated run ids, so
+        matching on them alone cannot reach another task's guard. Rows from before
+        the ``task_id`` column (NULL) are left to the TTL.
+        """
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return 0
+        with self.conn() as conn:
+            result = conn.execute(
+                "DELETE FROM routing_guards WHERE task_id = ?",
+                (normalized_task_id,),
+            )
+            return int(result.rowcount or 0)
 
     def routing_guard_clear(
         self,

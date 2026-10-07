@@ -23,6 +23,7 @@ THRENODY_SKIP_WIZARD="${THRENODY_SKIP_WIZARD:-${SWITCHYARD_SKIP_WIZARD:-0}}"
 THRENODY_TEST_FAIL_AFTER_COPY="${THRENODY_TEST_FAIL_AFTER_COPY:-${SWITCHYARD_TEST_FAIL_AFTER_COPY:-0}}"
 THRENODY_PROVIDER_SCAN_TEST_MODE="${THRENODY_PROVIDER_SCAN_TEST_MODE:-${SWITCHYARD_PROVIDER_SCAN_TEST_MODE:-0}}"
 THRENODY_FORCE_PORTABLE_COPY="${THRENODY_FORCE_PORTABLE_COPY:-${SWITCHYARD_FORCE_PORTABLE_COPY:-0}}"
+THRENODY_SKIP_AGENT_HOOK="${THRENODY_SKIP_AGENT_HOOK:-0}"
 
 TMPDIR_CLONE=""
 PROVIDER_SCAN_JSON=""
@@ -123,7 +124,13 @@ if not env_path.is_absolute():
 sys.path.insert(0, str(source_dir))
 
 if os.environ.get("THRENODY_PROVIDER_SCAN_TEST_MODE") == "1" or os.environ.get("SWITCHYARD_PROVIDER_SCAN_TEST_MODE") == "1":
-    providers = []
+    # Tests may pretend a host is installed (comma-separated names) to exercise
+    # its registration path against a temporary HOME.
+    providers = [
+        {"name": name.strip(), "available": True, "host_shell": True}
+        for name in os.environ.get("THRENODY_PROVIDER_SCAN_TEST_HOSTS", "").split(",")
+        if name.strip()
+    ]
 else:
     from shared.discovery import installer_provider_inventory
     providers = installer_provider_inventory(verify_readiness=True)
@@ -1254,6 +1261,133 @@ PY
         fi
     else
         warn "Could not update $CLAUDE_SETTINGS_JSON learning hook"
+    fi
+
+    # --- Claude Agent-tool hook: model + effort on every subagent spawn ---
+    # One script, five events. Installed by default; THRENODY_SKIP_AGENT_HOOK=1 or
+    # config agent_hook.enabled=false removes the managed entries instead.
+    AGENT_HOOK_ACTION="install"
+    if [[ "$THRENODY_SKIP_AGENT_HOOK" == "1" ]]; then
+        AGENT_HOOK_ACTION="remove"
+    elif ! python3 - "$INSTALL_DIR" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+try:
+    from shared.config import TGsConfig, CONFIG_YAML
+    cfg = TGsConfig.from_yaml(CONFIG_YAML) if Path(CONFIG_YAML).exists() else TGsConfig()
+    raise SystemExit(0 if cfg.agent_hook.enabled else 1)
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(0)  # default-on if config can't be read
+PY
+    then
+        AGENT_HOOK_ACTION="remove"
+    fi
+
+    AGENT_HOOK_SCRIPT="$INSTALL_DIR/shell/threnody-agent-hook.sh"
+    if [[ -f "$AGENT_HOOK_SCRIPT" ]]; then
+        chmod +x "$AGENT_HOOK_SCRIPT"
+    fi
+
+    if python3 - "$CLAUDE_SETTINGS_JSON" "$AGENT_HOOK_ACTION" "$AGENT_HOOK_SCRIPT" <<'PY'
+from pathlib import Path
+import json
+import shlex
+import sys
+
+_home = Path.home().resolve()
+path = Path(sys.argv[1]).resolve()
+if not str(path).startswith(str(_home)):
+    raise SystemExit(f"path outside home: {path}")
+action = sys.argv[2]
+hook_script = sys.argv[3]
+path.parent.mkdir(parents=True, exist_ok=True)
+
+if path.exists():
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        cfg = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in {path}: {exc}") from exc
+else:
+    cfg = {}
+if not isinstance(cfg, dict):
+    raise SystemExit(f"Expected JSON object in {path}")
+
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    hooks = {}
+    cfg["hooks"] = hooks
+
+# event -> (matcher or None, subcommand)
+EVENTS = {
+    "PreToolUse": ("Agent", "pre"),
+    "PostToolUse": ("Agent", "post"),
+    "SubagentStart": (None, "subagent-start"),
+    "SubagentStop": (None, "subagent-stop"),
+    "SessionStart": (None, "session-start"),
+}
+
+
+def _is_managed_agent_hook(hook: object) -> bool:
+    return (
+        isinstance(hook, dict)
+        and hook.get("type") == "command"
+        and "threnody-agent-hook" in str(hook.get("command") or "")
+    )
+
+
+for event, (matcher, subcommand) in EVENTS.items():
+    groups = hooks.get(event)
+    if not isinstance(groups, list):
+        groups = []
+    kept = []
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            kept.append(group)
+            continue
+        own = [h for h in group["hooks"] if _is_managed_agent_hook(h)]
+        if not own:
+            kept.append(group)
+            continue
+        # Only our entry goes; a user hook sharing the group stays where it was.
+        rest = [h for h in group["hooks"] if not _is_managed_agent_hook(h)]
+        if rest:
+            kept.append({**group, "hooks": rest})
+    if action == "install":
+        entry = {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"{shlex.quote(hook_script)} {subcommand}",
+                    "timeout": 5,
+                }
+            ]
+        }
+        if matcher:
+            entry = {"matcher": matcher, **entry}
+        kept.append(entry)
+    if kept:
+        hooks[event] = kept
+    else:
+        hooks.pop(event, None)
+
+if not hooks:
+    cfg.pop("hooks", None)
+
+path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+PY
+    then
+        if [[ "$AGENT_HOOK_ACTION" == "install" ]]; then
+            info "Installed Claude Agent hook (model + effort per spawn) in $CLAUDE_SETTINGS_JSON"
+            SYNCED_CLAUDE_HOOKS=1
+        else
+            info "Removed managed Claude Agent hook from $CLAUDE_SETTINGS_JSON"
+        fi
+    else
+        warn "Could not update $CLAUDE_SETTINGS_JSON agent hook"
     fi
 fi
 

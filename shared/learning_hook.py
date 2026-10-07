@@ -254,10 +254,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         result = capture_edit(fields)
     except Exception as exc:  # never break the tool
-        log.debug("learning hook capture failed", exc_info=True)
+        log.warning("learning hook capture failed", exc_info=True)
         result = {"captured": False, "reason": f"{type(exc).__name__}: {exc}"}
     return _emit(result, hook_response=args.hook_response)
 
 
 if __name__ == "__main__":
+    from shared.logging_setup import configure_file_logging
+
+    configure_file_logging("learning_hook", logger_names=(log.name,))
     raise SystemExit(main())

@@ -30,7 +30,9 @@ high tier. High tier is reserved for explicit deep/security-critical wording,
 concrete exploit primitives, or large/dense files.
 
 The global `swarm.max_agents` cap still applies. If the requested count is
-clamped, report the `requested_vs_effective_agent_count` field and tell the
+clamped, the largest and riskiest files are kept (ranked by exploit signals, then
+risk signals, then LOC x density; listed order is only the last tiebreak), and the
+rest are dropped. Report the `requested_vs_effective_agent_count` field and tell the
 operator which files were not reviewed.
 
 ## Workflow
@@ -68,6 +70,15 @@ execute_swarm(
 ```
 
 The sentinel activates fast file-level review in the heuristic planner.
+
+### 2b. Check coverage before spawning
+
+If the response carries `requires_confirmation: true` or a `coverage_warning`, do
+**not** spawn yet. Print every dropped cell (`<file>:all` — `coverage_warning` lists
+all of them) with `confirmation_reason`, then ask the user with `AskUserQuestion`
+to **proceed** with the reduced coverage, **raise `max_agents`** (re-run), or
+**narrow** the file list (re-run). `requires_confirmation` means more than 30 % of
+the cells were dropped; never spawn past it on your own.
 
 ### 3. Execute host_spawn_waves
 

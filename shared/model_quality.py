@@ -31,7 +31,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -334,8 +334,12 @@ def record_findings_score(
     tier: str | None = None,
     profile_key: str | None = None,
     spawn_id: str | None = None,
+    attribution: Mapping[str, Any] | None = None,
 ) -> None:
     """Score one review agent's findings and record it (source='findings').
+
+    ``attribution`` (``model_source`` = ``reported``/``planned``, ``planned_effort``)
+    is provenance for ``model``/``effort`` and lands in ``sample_meta`` only.
 
     No-op when the findings carry no signal (see :func:`findings_to_score`).
 
@@ -368,6 +372,7 @@ def record_findings_score(
                 None if kept_by_synthesis is None else bool(kept_by_synthesis)
             ),
             "adjudicated": kept_by_synthesis is not None,
+            **_attribution_meta(attribution),
         },
         task_hash=task_hash,
         run_id=run_id,
@@ -503,6 +508,7 @@ def record_verify_gate_score(
     spawn_id: str | None = None,
     kind: str | None = None,
     ran_signals: Sequence[str] | None = None,
+    attribution: Mapping[str, Any] | None = None,
 ) -> None:
     """Record a verify-gate outcome (source='verify_gate').
 
@@ -527,6 +533,7 @@ def record_verify_gate_score(
     }
     if ran_signals is not None:
         meta["ran_signals"] = [str(sig) for sig in ran_signals]
+    meta.update(_attribution_meta(attribution))
     _write_event(
         db,
         model=model,
@@ -543,6 +550,17 @@ def record_verify_gate_score(
         spawn_id=spawn_id,
         kind=kind,
     )
+
+
+def _attribution_meta(attribution: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The non-empty provenance keys of *attribution* for ``sample_meta``."""
+    if not isinstance(attribution, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in attribution.items()
+        if key in ("model_source", "effort_source", "planned_effort") and value
+    }
 
 
 def _role_dimension(role: str | None) -> str:

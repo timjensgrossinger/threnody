@@ -184,7 +184,7 @@ def test_unknown_source_rejected(db: Database) -> None:
 def test_build_review_outcome_carries_model_and_categories() -> None:
     from shared.host_learning import _build_review_outcome
 
-    spec = {"subagent_type": "review-security", "target_file": "a.py",
+    spec = {"subagent_type": "threnody-review-security", "target_file": "a.py",
             "model": "claude-opus", "effort": "high"}
     result = {"review_meta": {
         "findings_total": 3, "findings_high": 2, "kept_by_synthesis": True,

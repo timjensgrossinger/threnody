@@ -232,7 +232,9 @@ def test_status_snapshot_includes_swarm_runs(db: Database) -> None:
     from shared.status import build_status_snapshot
 
     snapshot = build_status_snapshot(TGsConfig(), db, "proj")
-    assert snapshot["swarm_runs"] == {"by_status": {}, "abandoned": 0, "stale_active": 0}
+    assert snapshot["swarm_runs"] == {
+        "by_status": {}, "abandoned": 0, "superseded": 0, "stale_active": 0,
+    }
 
 
 def test_warm_path_reap_throttled(db: Database, monkeypatch: pytest.MonkeyPatch) -> None:

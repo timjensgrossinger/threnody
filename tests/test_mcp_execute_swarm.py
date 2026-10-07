@@ -862,8 +862,17 @@ def test_review_manifest_stays_within_a_byte_budget(monkeypatch, tmp_path: Path)
     size = len(json.dumps(result))
     # Generous ceiling: the point is that per-agent cost stays ~1.5 KB rather
     # than the ~4.6 KB that made a 22-agent review unreadable in one chunk.
-    assert size < 60_000, f"response is {size} bytes for {agents} agents"
-    assert size / agents < 2_500, f"{size / agents:.0f} bytes per agent"
+    #
+    # Ceilings raised from 60_000 / 2_500 (measured then: ~2_505 per agent) to
+    # 72_000 / 3_100 (measured now: 69_107 bytes, ~3_005 per agent, 23 agents, in
+    # this test's long tmp paths). Two additions, both deliberate and both of which
+    # have to travel inside each prompt rather than live in a definition: the literal
+    # findings format + example line (a definition can be missing or shadowed, and
+    # "the format given above" pointed at nothing), and — because no definition is
+    # installed in this test — the stable dimension block that the fallback now puts
+    # back. A real install with the definitions present skips the second.
+    assert size < 72_000, f"response is {size} bytes for {agents} agents"
+    assert size / agents < 3_100, f"{size / agents:.0f} bytes per agent"
     db.close()
 
 

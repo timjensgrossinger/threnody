@@ -65,6 +65,16 @@ def _run_installer(
     )
 
 
+_REVIEW_DEFINITIONS = {
+    "threnody-review-security",
+    "threnody-review-logic",
+    "threnody-review-edge",
+    "threnody-review-types",
+    "threnody-review-performance",
+    "threnody-review-fast",
+}
+
+
 def _bundled_skill_names(source: Path) -> set[str]:
     return {path.parent.name for path in source.glob("skills/threnody-*/SKILL.md")}
 
@@ -101,14 +111,22 @@ def test_clean_install_with_spaces_and_portable_copy(tmp_path: Path) -> None:
         home / ".cursor/skills",
     ):
         installed = {path.parent.name for path in target.glob("threnody-*/SKILL.md")}
-        assert installed == skill_names
+        # Review definitions share the threnody- prefix but are exported by
+        # agent_export, not copied from skills/ — compared separately below.
+        assert installed - _REVIEW_DEFINITIONS == skill_names
 
     for target in (
         home / ".copilot/agents",
         home / ".config/opencode/agent",
     ):
         installed = {path.stem for path in target.glob("threnody-*.md")}
-        assert installed == skill_names
+        assert installed - _REVIEW_DEFINITIONS == skill_names
+        assert _REVIEW_DEFINITIONS <= installed
+
+    claude_agents = {path.stem for path in (home / ".claude/agents").glob("threnody-review-*.md")}
+    assert _REVIEW_DEFINITIONS <= claude_agents
+    # Claude Code also gets one effort variant per review definition.
+    assert {f"{name}-high" for name in _REVIEW_DEFINITIONS} <= claude_agents
 
 
 def test_reinstall_is_idempotent_and_preserves_runtime_data(tmp_path: Path) -> None:
@@ -229,3 +247,98 @@ def test_uninstaller_help(flag: str) -> None:
 
     assert result.returncode == 0
     assert "Usage:" in result.stdout
+
+
+_AGENT_HOOK_EVENTS = {
+    "PreToolUse": "pre",
+    "PostToolUse": "post",
+    "SubagentStart": "subagent-start",
+    "SubagentStop": "subagent-stop",
+    "SessionStart": "session-start",
+}
+
+
+def _agent_hook_commands(settings: dict, event: str) -> list[str]:
+    return [
+        hook["command"]
+        for group in settings.get("hooks", {}).get(event, [])
+        for hook in group.get("hooks", [])
+        if "threnody-agent-hook" in str(hook.get("command"))
+    ]
+
+
+def test_agent_hook_registration_is_idempotent_and_removable(tmp_path: Path) -> None:
+    source = _copy_source(tmp_path / "source")
+    home = tmp_path / "home with spaces"
+    temp_dir = tmp_path / "tmp"
+    home.mkdir()
+    temp_dir.mkdir()
+    settings_path = home / ".claude/settings.json"
+    settings_path.parent.mkdir(parents=True)
+    user_hooks = {
+        "PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk-rewrite"}]},
+        ],
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": "gsd-session-start"}]},
+        ],
+        "SubagentStop": [
+            {"hooks": [{"type": "command", "command": "neovimagents-stop"}]},
+        ],
+    }
+    settings_path.write_text(
+        json.dumps({"model": "opus", "hooks": user_hooks}), encoding="utf-8"
+    )
+    claude = {"THRENODY_PROVIDER_SCAN_TEST_HOSTS": "claude-code"}
+
+    for _ in range(2):
+        result = _run_installer(source, home, temp_dir, **claude)
+        assert result.returncode == 0, result.stderr
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    script = home / ".local/lib/threnody/shell/threnody-agent-hook.sh"
+    for event, sub in _AGENT_HOOK_EVENTS.items():
+        commands = _agent_hook_commands(settings, event)
+        assert len(commands) == 1, (event, commands)
+        assert commands[0] == f"'{script}' {sub}"
+    pre_groups = [
+        g for g in settings["hooks"]["PreToolUse"]
+        if any("threnody-agent-hook" in h["command"] for h in g["hooks"])
+    ]
+    assert pre_groups[0]["matcher"] == "Agent"
+    assert pre_groups[0]["hooks"][0]["timeout"] == 5
+    # The user's own hooks survive untouched.
+    assert settings["model"] == "opus"
+    for event, groups in user_hooks.items():
+        for group in groups:
+            assert group in settings["hooks"][event]
+    # Tier effort variants are pre-generated beside the tier agents.
+    agents = home / ".claude/agents"
+    assert (agents / "threnody-medium-high.md").is_file()
+    assert "threnody:effort-variant" in (agents / "threnody-medium-high.md").read_text()
+
+    removed = _run_installer(source, home, temp_dir, THRENODY_SKIP_AGENT_HOOK="1", **claude)
+    assert removed.returncode == 0, removed.stderr
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert all(not _agent_hook_commands(settings, e) for e in _AGENT_HOOK_EVENTS)
+    for event, groups in user_hooks.items():
+        for group in groups:
+            assert group in settings["hooks"][event]
+
+    reinstalled = _run_installer(source, home, temp_dir, **claude)
+    assert reinstalled.returncode == 0, reinstalled.stderr
+    install_dir = home / ".local/lib/threnody"
+    uninstalled = subprocess.run(
+        ["bash", str(install_dir / "uninstall.sh")],
+        env=_installer_env(home, temp_dir),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert uninstalled.returncode == 0, uninstalled.stderr
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert all(not _agent_hook_commands(settings, e) for e in _AGENT_HOOK_EVENTS)
+    assert settings["hooks"]["SubagentStop"] == user_hooks["SubagentStop"]
+    assert settings["hooks"]["SessionStart"] == user_hooks["SessionStart"]
+    assert user_hooks["PreToolUse"][0] in settings["hooks"]["PreToolUse"]

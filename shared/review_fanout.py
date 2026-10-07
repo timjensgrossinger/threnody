@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from .findings_merge import findings_line_format
 from .risk_signals import (
     CONCRETE_HIGH_RISK_SIGNALS,
     RISK_SIGNALS,
@@ -121,7 +122,7 @@ class _Dim(NamedTuple):
 REVIEW_DIMENSIONS: list[_Dim] = [
     _Dim(
         key="security",
-        subagent_type="review-security",
+        subagent_type="threnody-review-security",
         title="Security review",
         focus=(
             "check for injection (SQL, command, XSS), "
@@ -129,33 +130,33 @@ REVIEW_DIMENSIONS: list[_Dim] = [
             "CSRF, IDOR, insecure deserialization, and input validation gaps."
         ),
         report=(
-            "Report each finding as: ⚠️ [SEVERITY] security/<category> — file:line — description (CWE-XXX), "
+            f"Report each finding as: {findings_line_format('security')} (CWE-XXX), "
             "where <category> is a kebab-case vulnerability class "
             "(e.g. sql-injection, xss, path-traversal, hardcoded-secret, ssrf, weak-crypto). "
-            "Output nothing if no issues found."
+            "One finding per line; a file with no issues has no findings."
         ),
         drop_priority=0,
         reasoning_heavy=True,
     ),
     _Dim(
         key="logic",
-        subagent_type="review-logic",
+        subagent_type="threnody-review-logic",
         title="Logic review",
         focus=(
             "check for off-by-one errors, wrong conditions, "
             "unreachable code, swapped arguments, missing returns, and state invariant violations."
         ),
         report=(
-            "Report each finding as: ⚠️ [SEVERITY] logic/<category> — file:line — description, "
+            f"Report each finding as: {findings_line_format('logic')}, "
             "where <category> is a kebab-case slug (e.g. off-by-one, wrong-condition, missing-return). "
-            "Output nothing if no issues found."
+            "One finding per line; a file with no issues has no findings."
         ),
         drop_priority=1,
         reasoning_heavy=True,
     ),
     _Dim(
         key="edge",
-        subagent_type="review-edge-cases",
+        subagent_type="threnody-review-edge",
         title="Edge and null case review",
         focus=(
             "check for null/None dereferences, "
@@ -163,30 +164,30 @@ REVIEW_DIMENSIONS: list[_Dim] = [
             "missing defaults, boundary conditions, and missing I/O error handling."
         ),
         report=(
-            "Report each finding as: ⚠️ [SEVERITY] edge/<category> — file:line — description, "
+            f"Report each finding as: {findings_line_format('edge')}, "
             "where <category> is a kebab-case slug (e.g. null-deref, empty-collection, div-by-zero). "
-            "Output nothing if no issues found."
+            "One finding per line; a file with no issues has no findings."
         ),
         drop_priority=2,
     ),
     _Dim(
         key="types",
-        subagent_type="review-types",
+        subagent_type="threnody-review-types",
         title="Type safety review",
         focus=(
             "check for type mismatches, unsafe casts, "
             "generic violations, incompatible return types, and serialization/deserialization drift."
         ),
         report=(
-            "Report each finding as: ⚠️ [SEVERITY] types/<category> — file:line — description, "
+            f"Report each finding as: {findings_line_format('types')}, "
             "where <category> is a kebab-case slug (e.g. type-mismatch, unsafe-cast, serde-drift). "
-            "Output nothing if no issues found."
+            "One finding per line; a file with no issues has no findings."
         ),
         drop_priority=3,
     ),
     _Dim(
         key="performance",
-        subagent_type="review-performance",
+        subagent_type="threnody-review-performance",
         title="Performance review",
         focus=(
             "check for O(n²) algorithms, N+1 queries, "
@@ -194,9 +195,9 @@ REVIEW_DIMENSIONS: list[_Dim] = [
             "and redundant calls."
         ),
         report=(
-            "Report each finding as: ⚠️ [SEVERITY] performance/<category> — file:line — description, "
+            f"Report each finding as: {findings_line_format('performance')}, "
             "where <category> is a kebab-case slug (e.g. quadratic, n-plus-1, memory-leak, blocking-io). "
-            "Output nothing if no issues found."
+            "One finding per line; a file with no issues has no findings."
         ),
         drop_priority=4,
         reasoning_heavy=True,
@@ -207,21 +208,75 @@ _DIM_BY_KEY: dict[str, _Dim] = {d.key: d for d in REVIEW_DIMENSIONS}
 # Fast review runs one agent per file covering every dimension. It still needs a
 # cell label so both review shapes reconcile against the same coverage contract.
 FAST_REVIEW_DIMENSION = "all"
-FAST_REVIEW_SUBAGENT = "review-fast-file"
+FAST_REVIEW_SUBAGENT = "threnody-review-fast"
+# The fast reviewer as a dimension record, so it exports a definition and renders
+# its inline prompt from one place like the per-dimension reviewers do. Not part of
+# REVIEW_DIMENSIONS: it is a different review *shape*, never a fan-out cell beside
+# the five. ``prompt_template`` reproduces the fast prompt wording byte for byte.
+FAST_REVIEW_DEFINITION = _Dim(
+    key=FAST_REVIEW_DIMENSION,
+    subagent_type=FAST_REVIEW_SUBAGENT,
+    title="Fast full-file review",
+    focus=(
+        "check logic, security, edge/null cases, type safety, and performance."
+    ),
+    report=(
+        "Report only concrete findings as: "
+        f"{findings_line_format()} [(CWE-XXX)], "
+        "where dimension is one of security, logic, edge, types, performance. "
+        "One finding per line; a file with no issues has no findings."
+    ),
+    drop_priority=0,
+)
 _DIM_BY_SUBAGENT: dict[str, str] = {d.subagent_type: d.key for d in REVIEW_DIMENSIONS}
 _DIM_BY_SUBAGENT[FAST_REVIEW_SUBAGENT] = FAST_REVIEW_DIMENSION
+# Names before the ``threnody-review-*`` namespace. Users ship their own
+# ``review-security`` etc., which shadowed Threnody's definitions; run logs and
+# stored manifests written under the old names must still classify.
+_LEGACY_SUBAGENT_ALIASES: dict[str, str] = {
+    "review-security": "security",
+    "review-logic": "logic",
+    "review-edge-cases": "edge",
+    "review-types": "types",
+    "review-performance": "performance",
+    "review-fast-file": FAST_REVIEW_DIMENSION,
+}
+for _legacy, _dim in _LEGACY_SUBAGENT_ALIASES.items():
+    _DIM_BY_SUBAGENT.setdefault(_legacy, _dim)
+_EFFORT_VARIANT_SUFFIXES = ("-low", "-medium", "-high")
+
+
+def stable_instructions_for(dimension: object) -> str:
+    """Path-free instruction block for a review dimension; ``""`` if unknown.
+
+    What a prompt must carry when the dimension's own agent definition is not the
+    thing that gets spawned (see ``review_stable_stripped`` on a review subtask).
+    """
+    dim = _DIM_BY_KEY.get(str(dimension or "").strip())
+    if dim is None and str(dimension or "").strip() == FAST_REVIEW_DIMENSION:
+        dim = FAST_REVIEW_DEFINITION
+    return dim.stable_block if dim is not None else ""
 
 
 def dimension_for_subagent_type(subagent_type: object) -> str:
-    """Map ``review-edge-cases`` -> ``edge``; ``""`` for a non-review agent.
+    """Map ``threnody-review-edge`` -> ``edge``; ``""`` for a non-review agent.
 
     Lets a consumer holding only the spawn manifest (no plan) identify which
     review cell an agent is, without the manifest having to carry a redundant
-    ``review_dimension`` field per agent.
+    ``review_dimension`` field per agent. Effort variants
+    (``threnody-review-logic-high``) and the legacy ``review-*`` names map to the
+    same dimension: the spawned type is the variant, the cell is the base.
     """
     if not isinstance(subagent_type, str):
         return ""
-    return _DIM_BY_SUBAGENT.get(subagent_type.strip(), "")
+    name = subagent_type.strip()
+    dim = _DIM_BY_SUBAGENT.get(name)
+    if dim:
+        return dim
+    for suffix in _EFFORT_VARIANT_SUFFIXES:
+        if name.endswith(suffix):
+            return _DIM_BY_SUBAGENT.get(name[: -len(suffix)], "")
+    return ""
 
 _SYNTHESIS_PROMPT = """\
 You are the synthesis agent for a multi-dimension code review swarm.
@@ -1293,6 +1348,127 @@ def _effective_drop_priority(dim: _Dim, requested_keys: set[str], has_risk: bool
 _TIER_ORDER = ("low", "medium", "high")
 
 
+def _file_score(prof: ReviewProfile) -> tuple[int, int, float]:
+    """Sortable weight of a file for the agent cap — larger = review it first.
+
+    Order of precedence: a concrete exploit primitive in the content, then any risk
+    signal, then ``loc * (1 + density)``. The size term is only a tiebreaker among
+    files with the same risk class; ``1 + density`` keeps a file with no density
+    reading (the unreadable-file default) ordered by size instead of collapsing to 0.
+    """
+    return (
+        1 if prof.concrete_high_risk else 0,
+        1 if prof.has_risk else 0,
+        float(prof.loc) * (1.0 + float(prof.density_score or 0.0)),
+    )
+
+
+def _is_heavy_file(prof: ReviewProfile) -> bool:
+    """Large or high-risk — the files whose reviewers get a deeper effort and tier."""
+    return bool(
+        prof.concrete_high_risk
+        or prof.loc > _LOC_HIGH
+        or (prof.loc >= _LOC_LOW and prof.density_score >= _HIGH_DENSITY)
+    )
+
+
+def _security_excluded(requested: list[str] | set[str]) -> bool:
+    """True when the request names dimensions and security is not among them.
+
+    ``[dims=logic,types]`` (or a bare keyword scan that found only those) is the
+    operator saying "not security", so the security reserve below stands down.
+    Security cells still keep their rank-0 priority on risky files; they merely stop
+    being guaranteed slots.
+    """
+    return bool(requested) and "security" not in requested
+
+
+def select_review_cells(
+    cells: list[tuple[str, _Dim, ReviewProfile]],
+    review_cap: int,
+    requested_keys: set[str],
+    *,
+    security_excluded: bool = False,
+) -> tuple[list[int], list[int]]:
+    """Choose which cells survive a *review_cap*; returns ``(kept, dropped)`` indices.
+
+    Both lists are in original cell order. The old rule dropped by dimension priority
+    alone and, among equals, whoever was listed first — so a cap kept the last-listed
+    (often smallest) files and cut the largest and riskiest. The order is now:
+
+    1. **Security reserve** — unless the request excluded security, when any file has
+       risk, ``max(1, cap // 4)`` slots go to security cells of the highest-scored
+       risky files.
+    2. **Pass 1, coverage** — files by score (see :func:`_file_score`), each gets its
+       best cell (lowest effective drop priority) before any file gets a second,
+       while slots remain.
+    3. **Pass 2, depth** — remaining cells by (priority bucket, file score).
+
+    Original position is the final tiebreak everywhere, so equal inputs always give
+    the same selection.
+    """
+    n = len(cells)
+    if review_cap <= 0 or n <= review_cap:
+        return list(range(n)), []
+    prio = [
+        _effective_drop_priority(dim, requested_keys, prof.has_risk) for _, dim, prof in cells
+    ]
+    score = [_file_score(prof) for _, _, prof in cells]
+    file_first: dict[str, int] = {}
+    for i, (path, _, _) in enumerate(cells):
+        file_first.setdefault(path, i)
+
+    def rank(i: int) -> tuple:
+        # Lower sorts first. Score is negated; position (via the file's first cell,
+        # then the cell index) is last so ties never depend on set/dict order.
+        sc = score[i]
+        return (-sc[0], -sc[1], -sc[2], file_first[cells[i][0]], i)
+
+    kept: set[int] = set()
+    if not security_excluded:
+        risky_security = [
+            i for i, (_, dim, prof) in enumerate(cells) if dim.key == "security" and prof.has_risk
+        ]
+        reserve = min(max(1, review_cap // 4), review_cap)
+        for i in sorted(risky_security, key=rank)[:reserve]:
+            kept.add(i)
+
+    by_file: dict[str, list[int]] = {}
+    for i, (path, _, _) in enumerate(cells):
+        by_file.setdefault(path, []).append(i)
+    covered = {cells[i][0] for i in kept}
+    for path in sorted(by_file, key=lambda p: rank(by_file[p][0])):
+        if len(kept) >= review_cap:
+            break
+        if path in covered:
+            continue
+        best = min(by_file[path], key=lambda i: (prio[i], i))
+        kept.add(best)
+        covered.add(path)
+
+    for i in sorted((i for i in range(n) if i not in kept), key=lambda i: (prio[i],) + rank(i)):
+        if len(kept) >= review_cap:
+            break
+        kept.add(i)
+
+    return sorted(kept), [i for i in range(n) if i not in kept]
+
+
+def _review_effort(dim: _Dim, tier: str, prof: ReviewProfile) -> str:
+    """Explicit ``reasoning_effort`` for one review cell.
+
+    Left unset, the host derived it from the prompt's duration bucket, and a one-line
+    review prompt classifies as short work — a high-tier opus security reviewer came
+    out "low". Reasoning-heavy dimensions (security, logic, performance) on a high
+    tier get ``high`` and ``medium`` elsewhere; the rest start at ``medium``. A large
+    or high-risk file bumps one level, never above ``high``.
+    """
+    level = 2 if (dim.reasoning_heavy and tier == "high") else 1
+    if _is_heavy_file(prof):
+        level += 1
+    return _TIER_ORDER[min(level, 2)]
+
+
 def _apply_tier_bias(tier: str, bias: int) -> str:
     """Shift a tier up/down by ``bias`` steps, clamped to low..high."""
     if not bias:
@@ -1320,7 +1496,7 @@ def _density_bucket(density_score: float) -> str:
     return "mid"
 
 
-def profile_key_for(prof: "ReviewProfile", path: str) -> str:
+def profile_key_for(prof: ReviewProfile, path: str) -> str:
     """Transferable learning key: ext|loc_bucket|density_bucket.
 
     Path-independent on purpose — a learned bias for ``.py|mid|dense`` applies to
@@ -1450,6 +1626,8 @@ def build_review_subtasks(
     if is_fast_review_intent(task):
         return build_fast_review_subtasks(entries, task, max_agents=max_agents)
 
+    from .prompt_budget import BOILERPLATE_DEFINITION
+
     task_force_high = _task_requests_high_tier(task)
     requested = _requested_dimensions(task)
     requested_keys = set(requested)
@@ -1578,25 +1756,22 @@ def build_review_subtasks(
     if max_agents is not None and max_agents > 0:
         review_cap = max_agents if synthesis_mode == "python" else max(1, max_agents - 1)
         if len(all_cells) > review_cap:
-            by_priority = sorted(
-                range(len(all_cells)),
-                key=lambda i: _effective_drop_priority(
-                    all_cells[i][1], requested_keys, all_cells[i][2].has_risk
-                ),
-                reverse=True,
+            kept_idx, drop_idx = select_review_cells(
+                all_cells,
+                review_cap,
+                requested_keys,
+                security_excluded=_security_excluded(requested),
             )
-            n_drop = len(all_cells) - review_cap
-            drop_indices = set(by_priority[:n_drop])
             dropped_labels = [
-                f"{all_cells[i][0]}:{all_cells[i][1].key}" for i in by_priority[:n_drop]
+                f"{all_cells[i][0]}:{all_cells[i][1].key}" for i in drop_idx
             ]
             log.info(
                 "review_fanout: max_agents=%d — dropping %d dimension(s): %s",
                 max_agents,
-                n_drop,
+                len(drop_idx),
                 ", ".join(dropped_labels),
             )
-            all_cells = [c for i, c in enumerate(all_cells) if i not in drop_indices]
+            all_cells = [all_cells[i] for i in kept_idx]
 
     subtasks: list[dict] = []
     review_ids: list[int] = []
@@ -1636,6 +1811,12 @@ def build_review_subtasks(
             # Consumed by host_learning to score static recall for this cell.
             # Absent/empty means "no static expectation" — never a zero score.
             "review_dimension": dim.key,
+            # Always explicit: derived from the one-line prompt it would be "low".
+            "reasoning_effort": _review_effort(dim, t, prof),
+            # The stable instruction block was left out of the prompt because the
+            # dimension's own definition carries it; host_spawn puts it back when
+            # that definition is not what actually gets spawned.
+            **({"review_stable_stripped": True} if boilerplate == BOILERPLATE_DEFINITION else {}),
             "expected_rules": _expected_rule_ids(dim_smells),
             "content_sha": prof.intel.content_sha if prof.intel else "",
         })
@@ -1750,41 +1931,44 @@ def build_fast_review_subtasks(
     """
     all_entries = list(entries)
     file_entries = list(all_entries)
+    profiles = {path: estimate_review_profile(path) for path, _ in all_entries}
     dropped = 0
     dropped_cells: list[str] = []
     if max_agents is not None and max_agents > 0:
         review_cap = max(1, max_agents - 1)
         if len(file_entries) > review_cap:
+            # Same ordering as the per-dimension cap: biggest/riskiest files first,
+            # listed position as the last tiebreak. Kept files stay in listed order.
+            order = sorted(
+                range(len(file_entries)),
+                key=lambda i: tuple(-v for v in _file_score(profiles[file_entries[i][0]])) + (i,),
+            )
+            keep = set(order[:review_cap])
             dropped = len(file_entries) - review_cap
             dropped_cells = [
-                f"{path}:{FAST_REVIEW_DIMENSION}" for path, _ in file_entries[review_cap:]
+                f"{file_entries[i][0]}:{FAST_REVIEW_DIMENSION}" for i in order[review_cap:]
             ]
-            file_entries = file_entries[:review_cap]
+            file_entries = [e for i, e in enumerate(file_entries) if i in keep]
 
     subtasks: list[dict] = []
     review_ids: list[int] = []
     task_force_high = _task_requests_high_tier(task)
     file_high_risks: list[bool] = []
     for idx, (path, _hint) in enumerate(file_entries, start=1):
-        prof = estimate_review_profile(path)
+        prof = profiles[path]
         file_high_risks.append(prof.concrete_high_risk)
         tier = _fast_review_tier(prof, force_high=task_force_high)
         subtasks.append({
             "id": idx,
-            "description": (
-                f"Fast full-file review of {path}: check logic, security, edge/null cases, "
-                "type safety, and performance. Report only concrete findings as: "
-                "⚠️ [SEVERITY] dimension/category — file:line — description [(CWE-XXX)], "
-                "where dimension is one of security, logic, edge, types, performance. "
-                "Output nothing if no issues found."
-            ),
+            "description": FAST_REVIEW_DEFINITION.prompt_template.format(path=path),
             "tier": tier,
             "target_file": path,
-            "subagent_type": "review-fast-file",
+            "subagent_type": FAST_REVIEW_SUBAGENT,
             "read_only": True,
             "depends_on": [],
             "single_file_insertion": False,
             "review_dimension": FAST_REVIEW_DIMENSION,
+            "reasoning_effort": "high" if _is_heavy_file(prof) else "medium",
         })
         review_ids.append(idx)
 

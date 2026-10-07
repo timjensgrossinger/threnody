@@ -21,8 +21,8 @@ def _plan(file_a: str = "app.py", file_b: str = "db.py") -> dict:
         "topology": "dag",
         "analysis": "review",
         "subtasks": [
-            {"id": 1, "tier": "high", "subagent_type": "review-security", "read_only": True, "target_file": file_a},
-            {"id": 2, "tier": "medium", "subagent_type": "review-logic", "read_only": True, "target_file": file_a},
+            {"id": 1, "tier": "high", "subagent_type": "threnody-review-security", "read_only": True, "target_file": file_a},
+            {"id": 2, "tier": "medium", "subagent_type": "threnody-review-logic", "read_only": True, "target_file": file_a},
             {"id": 3, "tier": "high", "depends_on": [1, 2], "read_only": True},
         ],
         "waves": [[1, 2], [3]],
@@ -39,7 +39,7 @@ def test_fingerprint_differs_on_shape_change() -> None:
     base = workflow_shape_fingerprint(_plan())
     altered = dict(_plan())
     altered["subtasks"] = altered["subtasks"] + [
-        {"id": 4, "tier": "low", "subagent_type": "review-edge-cases", "read_only": True}
+        {"id": 4, "tier": "low", "subagent_type": "threnody-review-edge", "read_only": True}
     ]
     altered["waves"] = [[1, 2, 4], [3]]
     assert workflow_shape_fingerprint(altered) != base

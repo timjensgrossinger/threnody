@@ -305,11 +305,11 @@ class TestTierFor:
             f"REVIEW: {f} [dims=logic]",
             tier_bias={(pk, "logic"): 1},
         )
-        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "threnody-review-logic"]
         assert logic and logic[0]["tier"] == "high"
         # Without bias the same cell is medium.
         plan2 = build_review_subtasks([(str(f), "")], f"REVIEW: {f} [dims=logic]")
-        logic2 = [s for s in plan2["subtasks"] if s.get("subagent_type") == "review-logic"]
+        logic2 = [s for s in plan2["subtasks"] if s.get("subagent_type") == "threnody-review-logic"]
         assert logic2 and logic2[0]["tier"] == "medium"
 
     def test_global_profile_key_bias_applies_to_every_profile(self, tmp_path: Path):
@@ -323,7 +323,7 @@ class TestTierFor:
             f"REVIEW: {f} [dims=logic]",
             tier_bias={(GLOBAL_PROFILE_KEY, "logic"): 1},
         )
-        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "threnody-review-logic"]
         assert logic and logic[0]["tier"] == "high"
 
     def test_profile_and_global_bias_clamp_to_one_step(self, tmp_path: Path):
@@ -338,7 +338,7 @@ class TestTierFor:
             f"REVIEW: {f} [dims=logic]",
             tier_bias={(pk, "logic"): 1, (GLOBAL_PROFILE_KEY, "logic"): 1},
         )
-        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "threnody-review-logic"]
         # medium + clamp(1+1) == medium + 1 == high, not beyond.
         assert logic and logic[0]["tier"] == "high"
 
@@ -353,7 +353,7 @@ class TestTierFor:
             f"REVIEW: {f} [dims=logic]",
             tier_bias={(pk, "logic"): 1, (GLOBAL_PROFILE_KEY, "logic"): -1},
         )
-        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "threnody-review-logic"]
         assert logic and logic[0]["tier"] == "medium"
 
     # --- density-aware tiering (density_score passed) ---
@@ -630,12 +630,12 @@ class TestRiskAwareTierFloors:
 
     def test_plain_small_file_stays_cheap(self, tmp_path):
         tiers = self._plan(tmp_path, "plain_helpers.py")
-        assert tiers["review-security"] == "low"
+        assert tiers["threnody-review-security"] == "low"
 
     def test_risk_vocabulary_filename_floors_to_medium(self, tmp_path):
         """The file body never says sql/exec/token — only its name is a signal."""
-        assert self._plan(tmp_path, "token_store.py")["review-security"] == "medium"
-        assert self._plan(tmp_path, "oauth_guard.py")["review-security"] == "medium"
+        assert self._plan(tmp_path, "token_store.py")["threnody-review-security"] == "medium"
+        assert self._plan(tmp_path, "oauth_guard.py")["threnody-review-security"] == "medium"
 
     def test_explicit_tier_token_floors_every_cell(self, tmp_path):
         tiers = self._plan(
@@ -785,7 +785,7 @@ class TestBuildReviewSubtasks:
         f.write_text("\n".join(lines), encoding="utf-8")
         result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
         sec = next(
-            (s for s in result["subtasks"] if s.get("subagent_type") == "review-security"),
+            (s for s in result["subtasks"] if s.get("subagent_type") == "threnody-review-security"),
             None,
         )
         assert sec is not None
@@ -797,7 +797,7 @@ class TestBuildReviewSubtasks:
         f.write_text("\n".join(lines), encoding="utf-8")
         result = build_review_subtasks([(str(f), "")], f"REVIEW: {f}")
         sec = next(
-            (s for s in result["subtasks"] if s.get("subagent_type") == "review-security"),
+            (s for s in result["subtasks"] if s.get("subagent_type") == "threnody-review-security"),
             None,
         )
         assert sec is not None
@@ -809,14 +809,14 @@ class TestBuildReviewSubtasks:
         f = tmp_path / "ordinary.md"
         f.write_text("\n".join(f"line {i}" for i in range(300)), encoding="utf-8")
         result = build_review_subtasks([(str(f), "")], f"REVIEW: security review {f}")
-        sec = next(s for s in result["subtasks"] if s.get("subagent_type") == "review-security")
+        sec = next(s for s in result["subtasks"] if s.get("subagent_type") == "threnody-review-security")
         assert sec["tier"] == "medium"
 
     def test_explicit_deep_security_review_escalates_security_worker(self, tmp_path: Path):
         f = tmp_path / "ordinary.md"
         f.write_text("\n".join(f"line {i}" for i in range(100)), encoding="utf-8")
         result = build_review_subtasks([(str(f), "")], f"REVIEW: deep security review {f}")
-        sec = next(s for s in result["subtasks"] if s.get("subagent_type") == "review-security")
+        sec = next(s for s in result["subtasks"] if s.get("subagent_type") == "threnody-review-security")
         assert sec["tier"] == "high"
 
     def test_synthesis_defaults_to_medium(self, tmp_path: Path):
@@ -860,7 +860,7 @@ class TestBuildReviewSubtasks:
         # Performance (drop_priority=4) should be absent when capped
         dropped_keys = {s.get("subagent_type") for s in review}
         # At least security and logic should be kept (drop_priority 0 and 1)
-        assert "review-security" in dropped_keys or "review-logic" in dropped_keys
+        assert "threnody-review-security" in dropped_keys or "threnody-review-logic" in dropped_keys
 
     def test_max_agents_drop_is_reported_in_coverage_and_analysis(self, tmp_path: Path):
         """The Aug-3/Aug-5 regression: a cap-driven drop must be visible, not silent.
@@ -929,7 +929,7 @@ class TestBuildReviewSubtasks:
         )
         review = [s for s in result["subtasks"] if not s.get("depends_on")]
         kept = {s.get("subagent_type") for s in review}
-        assert "review-performance" in kept
+        assert "threnody-review-performance" in kept
 
     def test_performance_intent_does_not_collapse_to_security(self, tmp_path: Path):
         # Even when the file has risk signals, a performance request keeps a
@@ -943,7 +943,7 @@ class TestBuildReviewSubtasks:
             for s in result["subtasks"]
             if not s.get("depends_on")
         }
-        assert "review-performance" in review_types
+        assert "threnody-review-performance" in review_types
 
     def test_synthesis_scales_high_on_many_agents(self, tmp_path: Path):
         # >=12 review cells → high-tier synthesis even with no risk.
@@ -974,7 +974,7 @@ class TestBuildReviewSubtasks:
         review = [s for s in result["subtasks"] if not s.get("depends_on")]
         for st in review:
             assert "subagent_type" in st
-            assert st["subagent_type"].startswith("review-")
+            assert st["subagent_type"].startswith("threnody-review-")
 
     def test_multiple_files_produces_correct_count(self, tmp_path: Path):
         f1 = tmp_path / "a.md"
@@ -1007,7 +1007,7 @@ class TestBuildReviewSubtasks:
         assert result["review_mode"] == "fast_file"
         assert len(review) == 3
         assert len(synthesis) == 1
-        assert all(s["subagent_type"] == "review-fast-file" for s in review)
+        assert all(s["subagent_type"] == "threnody-review-fast" for s in review)
         assert all(s["tier"] == "medium" for s in review)
         assert synthesis[0]["tier"] == "medium"
 
@@ -1128,7 +1128,7 @@ class TestPlannerSubtaskRoundtrip:
                     "description": "Security review of foo.py",
                     "tier": "high",
                     "target_file": "foo.py",
-                    "subagent_type": "review-security",
+                    "subagent_type": "threnody-review-security",
                     "read_only": True,
                     "depends_on": [],
                 },
@@ -1148,13 +1148,13 @@ class TestPlannerSubtaskRoundtrip:
         planner = _make_planner()
         plan = planner._build_plan(plan_json, "REVIEW: foo.py")
 
-        assert plan.subtasks[0].subagent_type == "review-security"
+        assert plan.subtasks[0].subagent_type == "threnody-review-security"
         assert plan.subtasks[0].read_only is True
         assert plan.subtasks[1].read_only is True
 
         d = Planner.plan_to_dict(plan)
         st0 = d["subtasks"][0]
-        assert st0["subagent_type"] == "review-security"
+        assert st0["subagent_type"] == "threnody-review-security"
         assert st0["read_only"] is True
 
     def test_normal_subtask_no_extra_keys(self):
@@ -1498,7 +1498,7 @@ class TestFilenameRiskFloorVocabulary:
         plan = build_review_subtasks(
             [(str(f), "")], f"REVIEW: {f} [dims=logic]", risk_floor=risk_floor
         )
-        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "review-logic"]
+        logic = [s for s in plan["subtasks"] if s.get("subagent_type") == "threnody-review-logic"]
         assert logic, "expected a logic review cell"
         return logic[0]["tier"]
 
@@ -1557,3 +1557,31 @@ class TestFilenameRiskFloorVocabulary:
     def test_the_floor_is_a_floor_not_a_ceiling(self, tmp_path: Path) -> None:
         """A cell the heuristic already put above the floor must not be pulled down."""
         assert self._cell_tier(tmp_path, "credentials_store.py", "low") == "medium"
+
+
+def test_legacy_review_names_still_classify() -> None:
+    """Run logs written before the threnody-review-* rename must still classify."""
+    from shared.review_fanout import dimension_for_subagent_type
+
+    assert dimension_for_subagent_type("review-security") == "security"
+    assert dimension_for_subagent_type("review-edge-cases") == "edge"
+    assert dimension_for_subagent_type("review-fast-file") == "all"
+    assert dimension_for_subagent_type("threnody-review-edge") == "edge"
+    assert dimension_for_subagent_type("threnody-review-performance-high") == "performance"
+    assert dimension_for_subagent_type("threnody-review-fast-low") == "all"
+    assert dimension_for_subagent_type("threnody-medium-high") == ""
+    assert dimension_for_subagent_type(None) == ""
+
+
+def test_fast_review_prompt_renders_from_its_definition() -> None:
+    from shared.review_fanout import (
+        FAST_REVIEW_DEFINITION,
+        FAST_REVIEW_SUBAGENT,
+        build_fast_review_subtasks,
+    )
+
+    plan = build_fast_review_subtasks([("a.py", "")], "FAST_REVIEW: a.py")
+    cell = plan["subtasks"][0]
+    assert cell["subagent_type"] == FAST_REVIEW_SUBAGENT == "threnody-review-fast"
+    assert cell["description"].startswith("Fast full-file review of a.py: check logic")
+    assert "Fast full-file review." in FAST_REVIEW_DEFINITION.stable_block

@@ -19,7 +19,7 @@ from .config import (
 )
 from .context import is_within_repo, normalize_target_path
 from .discovery import HOST_PROVIDER_NAMES, ROUTER_ONLY_PROVIDERS
-from .effort_support import host_native_effort_mode
+from .effort_support import default_routed_effort, host_native_effort_mode
 from .roles import derive_role_from_task, DEFAULT_ROLE
 
 HOST_SPAWN_ERROR = "HostNativeRequired"
@@ -65,12 +65,26 @@ class HostSpawnSpec:
     # and so the routing guard can tell a review target (named to be READ) apart
     # from a write target instead of issuing a write guard for every review run.
     read_only: bool = False
-    # APPLIED reasoning effort: set only when a `threnody-<tier>-<effort>` agent
-    # definition was actually chosen (the host has no per-call effort parameter).
+    # APPLIED reasoning effort: set only when the chosen agent definition actually
+    # pins it (the host has no per-call effort parameter) — see resolve_spawn_type.
     # Learning attributes the spawn to this, so it must never claim an effort that
     # was not pinned. `requested_effort` is what routing wanted, always carried.
     effort: str | None = None
     requested_effort: str | None = None
+    # Why ``effort`` is what it is: which resolver rule chose the type and — when a
+    # requested effort was not applied — why not. Without these a missing
+    # ``effort`` reads the same whether the variant was never generated, was
+    # generated mid-session, or the definition pins its own.
+    effort_source: str | None = None
+    effort_unapplied_reason: str | None = None
+    # ``<base>-<effort>`` definition a caller may generate so the *next* session
+    # can pin this effort. It cannot help the current one: definitions are frozen
+    # when a session starts.
+    variant_to_create: str | None = None
+    # The named type the plan asked for, when the spawned type differs from it (an
+    # effort variant, or a tier fallback for a definition that is not installed).
+    # Lets learning still classify a review agent by its dimension.
+    base_subagent_type: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -108,6 +122,16 @@ class HostSpawnSpec:
             payload["effort"] = self.effort
         if self.requested_effort:
             payload["requested_effort"] = self.requested_effort
+        if self.effort_source:
+            payload["effort_source"] = self.effort_source
+        # Omitted when it only repeats effort_source: a wide review emits this per agent,
+        # and the manifest's per-agent byte budget is what keeps it readable in one chunk.
+        if self.effort_unapplied_reason and self.effort_unapplied_reason != self.effort_source:
+            payload["effort_unapplied_reason"] = self.effort_unapplied_reason
+        if self.variant_to_create:
+            payload["variant_to_create"] = self.variant_to_create
+        if self.base_subagent_type and self.base_subagent_type != self.subagent_type:
+            payload["base_subagent_type"] = self.base_subagent_type
         return payload
 
 
@@ -246,38 +270,20 @@ def codex_agents_dir() -> Path:
     return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "agents"
 
 
-def _effort_definition_path(caller: str | None, name: str) -> Path | None:
+def _effort_definition_path(
+    caller: str | None, name: str, agents_dir: Path | None = None
+) -> Path | None:
     mode = host_native_effort_mode(caller)
     if mode == "frontmatter":
-        return claude_agents_dir() / f"{name}.md"
+        return (agents_dir or claude_agents_dir()) / f"{name}.md"
     if mode == "codex_toml":
         return codex_agents_dir() / f"{name}.toml"
     return None
 
 
-def _installed_effort_variant(caller: str | None, tier: str, effort: str | None) -> str | None:
-    """The effort variant for *caller*, only if its definition file is installed.
-
-    Shells without host-native effort support (see ``effort_support``) never get
-    one. Falling back when the file is missing is load-bearing: an
-    unknown ``subagent_type`` makes the host's Agent call fail outright, so a
-    machine that has not re-run install.sh must keep getting ``threnody-<tier>``.
-    """
-    name = effort_variant_subagent_type(tier, effort)
-    if name is None:
-        return None
-    try:
-        path = _effort_definition_path(caller, name)
-        if path is not None and path.is_file():
-            return name
-    except OSError:
-        log.debug("effort variant lookup failed for %s", name, exc_info=True)
-    return None
-
-
 def tier_subagent_type(caller: str | None, tier: str, effort: str | None = None) -> str:
     """Subagent type for a tier: the installed effort variant, else ``threnody-<tier>``."""
-    return _installed_effort_variant(caller, tier, effort) or subagent_type_for_tier(tier)
+    return resolve_spawn_type(caller=caller, base=None, tier=tier, effort=effort).subagent_type
 
 
 def named_subagent_types_supported(config: TGsConfig, caller: str | None) -> bool:
@@ -305,6 +311,427 @@ def named_subagent_types_supported(config: TGsConfig, caller: str | None) -> boo
     return bool(getattr(profile, "named_subagent_types", False))
 
 
+# ---------------------------------------------------------------------------
+# Spawn-type resolution: which definition carries the routed effort
+# ---------------------------------------------------------------------------
+
+# Claude Code's own agent types. They have no definition file and take no
+# effort at all, so a routed effort can never be pinned on them — and they must
+# never be mistaken for an "unknown" type and replaced by a tier fallback.
+# ``generalPurpose`` is what ``subagent_type_for_tier`` returns for a non-tier.
+BUILTIN_SUBAGENT_TYPES = frozenset(
+    {
+        "explore",
+        "plan",
+        "general-purpose",
+        "claude",
+        "claude-code-guide",
+        "statusline-setup",
+        "generalpurpose",
+    }
+)
+
+_EFFORT_SUFFIX_RE = re.compile(r"^(?P<base>.+)-(?P<effort>low|medium|high)$")
+_TIER_BASE_RE = re.compile(r"^threnody-(?P<tier>low|medium|high)$")
+# An agent name becomes a file name below, so anything that could walk out of the
+# agents directory is treated as an unknown type rather than looked up.
+# ``plugin:name`` is Claude Code's namespaced form for plugin-shipped agents.
+_SAFE_AGENT_NAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}(?::[A-Za-z0-9][A-Za-z0-9_.-]{0,127})?$"
+)
+
+# (path) -> (mtime_ns, size, parsed frontmatter). Definitions are read on every
+# spawn of a fan-out; the cache key includes mtime so an edited file is re-read.
+_FRONTMATTER_CACHE: dict[str, tuple[int, int, dict[str, str]]] = {}
+_FRONTMATTER_CACHE_MAX = 256
+
+
+def read_definition_frontmatter(path: Path) -> dict[str, str]:
+    """``key: value`` pairs of the first ``---`` block of *path*; ``{}`` if none.
+
+    Deliberately not a YAML parser: agent frontmatter is flat ``key: value``
+    lines, and this runs on files a user may have hand-written, so it must never
+    raise or execute anything. Bounded to the first 200 lines.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    key = str(path)
+    cached = _FRONTMATTER_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return dict(cached[2])
+    meta: dict[str, str] = {}
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+            if first.strip() == "---":
+                for _ in range(200):
+                    line = fh.readline()
+                    if not line or line.strip() == "---":
+                        break
+                    name, sep, value = line.partition(":")
+                    if sep and name.strip() and not name.startswith((" ", "\t", "#")):
+                        meta[name.strip().lower()] = value.strip().strip("'\"")
+    except OSError:
+        log.debug("frontmatter read failed for %s", path, exc_info=True)
+        return {}
+    if len(_FRONTMATTER_CACHE) >= _FRONTMATTER_CACHE_MAX:
+        _FRONTMATTER_CACHE.clear()
+    _FRONTMATTER_CACHE[key] = (st.st_mtime_ns, st.st_size, meta)
+    return dict(meta)
+
+
+def session_start_from_transcript(transcript_path: str | os.PathLike[str] | None) -> float | None:
+    """Best-effort session start time for a Claude Code session, as epoch seconds.
+
+    Hooks receive ``transcript_path``; the transcript is created when the session
+    starts, so its creation time (``st_birthtime`` where the OS has one, else the
+    earliest of ctime/mtime) bounds which agent definitions that session loaded.
+    ``None`` when it cannot be read — :func:`resolve_spawn_type` then skips the
+    freshness check rather than guessing.
+    """
+    if not transcript_path:
+        return None
+    try:
+        st = Path(transcript_path).stat()
+    except (OSError, ValueError):
+        return None
+    birth = getattr(st, "st_birthtime", None)
+    if isinstance(birth, (int, float)) and birth > 0:
+        return float(birth)
+    return float(min(st.st_ctime, st.st_mtime))
+
+
+# Fallback session start for resolve_spawn_type callers that pass none. The MCP
+# server sets it to its own process start (see mcp_server.main): a stdio server is
+# launched with the Claude Code session, so its start bounds which definitions the
+# session loaded. It is a proxy — after a ``/mcp`` reconnect it is later than the
+# real start, so a variant written in between counts as loaded when it is not; the
+# Agent hook's loadability net (shared/agent_hook.py) rewrites such a spawn back to
+# its base. Unset (None) outside the server, so tests and one-shot CLIs keep the
+# old "no freshness check" behaviour.
+_DEFAULT_SESSION_START_TS: float | None = None
+
+
+def set_default_session_start(ts: float | None) -> None:
+    """Set the session start :func:`resolve_spawn_type` assumes when given none."""
+    global _DEFAULT_SESSION_START_TS
+    _DEFAULT_SESSION_START_TS = float(ts) if ts is not None else None
+
+
+@dataclass(frozen=True)
+class SpawnTypeResolution:
+    """Outcome of :func:`resolve_spawn_type`.
+
+    ``applied_effort`` is set only when the chosen definition really pins it;
+    ``requested_effort`` is what routing wanted. ``effort_source`` names the rule
+    that decided (``tier_variant`` | ``caller_variant`` | ``definition`` |
+    ``not_applicable`` | ``base_variant`` | ``pending_restart`` | ``unknown_base``)
+    and ``effort_unapplied_reason`` says why a requested effort was not applied.
+    """
+
+    subagent_type: str
+    applied_effort: str | None
+    requested_effort: str | None
+    effort_source: str | None = None
+    effort_unapplied_reason: str | None = None
+    variant_to_create: str | None = None
+    base_subagent_type: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"subagent_type": self.subagent_type}
+        for key in (
+            "applied_effort",
+            "requested_effort",
+            "effort_source",
+            "effort_unapplied_reason",
+            "variant_to_create",
+            "base_subagent_type",
+        ):
+            value = getattr(self, key)
+            if value:
+                payload[key] = value
+        return payload
+
+
+def _definition_visible(path: Path, session_start_ts: float | None) -> bool:
+    """True when *path* existed before the session started (or no start is known).
+
+    A definition created or edited mid-session is not loaded until the next
+    session, so naming it would make the host's Agent call fail outright.
+    """
+    if session_start_ts is None:
+        return True
+    try:
+        return path.stat().st_mtime <= float(session_start_ts)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _is_builtin_subagent_type(name: str) -> bool:
+    return name.strip().lower() in BUILTIN_SUBAGENT_TYPES
+
+
+def _resolve_tier_type(
+    caller: str | None,
+    tier: str,
+    requested: str | None,
+    session_start_ts: float | None,
+    *,
+    base_subagent_type: str | None = None,
+) -> SpawnTypeResolution:
+    """Rule a: ``threnody-<tier>-<effort>`` if installed and visible, else the tier type."""
+    fallback = subagent_type_for_tier(tier)
+    if requested is None:
+        return SpawnTypeResolution(fallback, None, None, base_subagent_type=base_subagent_type)
+    if host_native_effort_mode(caller) is None:
+        return SpawnTypeResolution(
+            fallback, None, requested, "not_applicable", "shell_has_no_host_native_effort",
+            base_subagent_type=base_subagent_type,
+        )
+    name = effort_variant_subagent_type(tier, requested)
+    path = _effort_definition_path(caller, name) if name else None
+    try:
+        installed = bool(path is not None and path.is_file())
+    except OSError:
+        installed = False
+    if name and installed and path is not None:
+        if _definition_visible(path, session_start_ts):
+            return SpawnTypeResolution(
+                name, requested, requested, "tier_variant", base_subagent_type=base_subagent_type
+            )
+        return SpawnTypeResolution(
+            fallback, None, requested, "pending_restart", "variant_created_after_session_start",
+            base_subagent_type=base_subagent_type,
+        )
+    return SpawnTypeResolution(
+        fallback, None, requested, "tier_variant", "variant_not_installed",
+        base_subagent_type=base_subagent_type,
+    )
+
+
+def resolve_spawn_type(
+    *,
+    caller: str | None,
+    base: str | None,
+    tier: str,
+    effort: str | None,
+    config: TGsConfig | None = None,
+    session_start_ts: float | None = None,
+    agents_dir: Path | None = None,
+) -> SpawnTypeResolution:
+    """Pick the ``subagent_type`` that actually carries the routed *effort*.
+
+    The host's Agent tool has no effort parameter; effort exists only as
+    ``effort:`` frontmatter on a definition, and definitions are frozen when a
+    session starts. So "apply effort" means "name a definition that pins it and
+    that this session has loaded". Rules, first match wins:
+
+    a. no *base* → ``threnody-<tier>-<effort>`` if installed, else ``threnody-<tier>``.
+    b. *base* is itself an installed ``…-low|medium|high`` variant → keep it.
+    c. *base*'s definition declares ``effort:`` → keep it; the author wins over routing.
+    d. *base* is a built-in type → keep it; built-ins take no effort.
+    e. ``<base>-<effort>`` is installed (``.md`` only) → use it.
+    f. otherwise keep *base* unpinned and name ``variant_to_create`` for the next
+       session — unless *base* has no definition at all, in which case fall back to
+       rule a: an unknown type makes the Agent call fail outright.
+
+    *session_start_ts* (epoch seconds; see :func:`session_start_from_transcript`)
+    rejects variants whose mtime is newer than the session — they exist on disk
+    but the session has not loaded them. *config* applies the shell's
+    ``named_subagent_types`` gate; ``None`` skips it (the caller already knows the
+    host resolves names, e.g. a hook inspecting the host's own Agent call).
+
+    *agents_dir* is where *base* and its ``<base>-<effort>`` siblings are looked
+    up (default :func:`claude_agents_dir`); the Agent hook passes a project's
+    ``.claude/agents`` when the base lives there. ``threnody-<tier>`` types are
+    always looked up in the user directory, where install.sh puts them.
+    *session_start_ts* ``None`` falls back to :func:`set_default_session_start`.
+    """
+    if session_start_ts is None:
+        session_start_ts = _DEFAULT_SESSION_START_TS
+    requested = normalize_effort(effort)
+    name = base.strip() if isinstance(base, str) else ""
+    if name and config is not None and not named_subagent_types_supported(config, caller):
+        name = ""
+    if not name:
+        return _resolve_tier_type(caller, tier, requested, session_start_ts)
+
+    tier_match = _TIER_BASE_RE.match(name)
+    if tier_match:
+        # ``threnody-medium`` names a tier, not a definition to derive variants of.
+        return _resolve_tier_type(
+            caller, tier_match.group("tier"), requested, session_start_ts
+        )
+
+    if not _SAFE_AGENT_NAME_RE.match(name):
+        log.warning("resolve_spawn_type: unusable subagent_type %r; using tier type", name)
+        fallback = _resolve_tier_type(caller, tier, requested, session_start_ts, base_subagent_type=name)
+        return _with_source(fallback, "unknown_base")
+
+    mode = host_native_effort_mode(caller)
+
+    if ":" in name:
+        # Plugin agents live in the plugin's own directory, which cannot be found
+        # reliably from here — keep the name; a generated variant is flattened.
+        variant = f"{name.replace(':', '-')}-{requested}" if requested else None
+        vpath = _effort_definition_path(caller, variant, agents_dir) if variant else None
+        if variant and vpath is not None and vpath.is_file() and _definition_visible(vpath, session_start_ts):
+            return SpawnTypeResolution(variant, requested, requested, "base_variant", base_subagent_type=name)
+        if requested is None:
+            return SpawnTypeResolution(name, None, None, base_subagent_type=name)
+        return SpawnTypeResolution(
+            name, None, requested, "pending_restart", "plugin_definition_unresolvable",
+            base_subagent_type=name,
+        )
+
+    if mode is None:
+        # The shell resolves names but has no way to pin effort on a definition.
+        if requested is None:
+            return SpawnTypeResolution(name, None, None, base_subagent_type=name)
+        return SpawnTypeResolution(
+            name, None, requested, "not_applicable", "shell_has_no_host_native_effort",
+            base_subagent_type=name,
+        )
+
+    # b. The caller named an explicit variant.
+    suffix = _EFFORT_SUFFIX_RE.match(name)
+    if suffix:
+        own_path = _effort_definition_path(caller, name, agents_dir)
+        if own_path is not None and own_path.is_file():
+            if _definition_visible(own_path, session_start_ts):
+                declared = (
+                    normalize_effort(read_definition_frontmatter(own_path).get("effort"))
+                    if mode == "frontmatter"
+                    else None
+                )
+                applied = declared or suffix.group("effort")
+                return SpawnTypeResolution(
+                    name, applied, requested or applied, "caller_variant", base_subagent_type=name
+                )
+            # Present on disk, not loaded: resolve its base with the effort it named.
+            requested = requested or suffix.group("effort")
+            name = suffix.group("base")
+
+    base_path = _effort_definition_path(caller, name, agents_dir)
+    base_exists = bool(base_path is not None and base_path.is_file())
+
+    # c. The definition pins its own effort.
+    if mode == "frontmatter" and base_exists and base_path is not None:
+        declared = normalize_effort(read_definition_frontmatter(base_path).get("effort"))
+        if declared:
+            return SpawnTypeResolution(
+                name, declared, requested, "definition",
+                "definition_declares_effort" if requested and requested != declared else None,
+                base_subagent_type=name,
+            )
+
+    # d. Built-in type.
+    if _is_builtin_subagent_type(name):
+        if requested is None:
+            return SpawnTypeResolution(name, None, None, base_subagent_type=name)
+        return SpawnTypeResolution(
+            name, None, requested, "not_applicable", "builtin_type", base_subagent_type=name
+        )
+
+    # e. ``<base>-<effort>`` is installed.
+    variant = f"{name}-{requested}" if requested else None
+    if variant:
+        vpath = _effort_definition_path(caller, variant, agents_dir)
+        if vpath is not None and vpath.is_file():
+            if _definition_visible(vpath, session_start_ts):
+                return SpawnTypeResolution(
+                    variant, requested, requested, "base_variant", base_subagent_type=name
+                )
+            if base_exists or mode != "frontmatter":
+                return SpawnTypeResolution(
+                    name, None, requested, "pending_restart",
+                    "variant_created_after_session_start", base_subagent_type=name,
+                )
+
+    # f. Unknown base on a shell whose definition directory we can see: never pass
+    # it through. Codex review definitions are skills, not ``agents/*.toml``, so a
+    # missing toml there proves nothing and the name is kept.
+    if mode == "frontmatter" and not base_exists:
+        log.warning(
+            "resolve_spawn_type: no definition for subagent_type %r (%s); using tier type",
+            name,
+            base_path,
+        )
+        fallback = _resolve_tier_type(caller, tier, requested, session_start_ts, base_subagent_type=name)
+        return _with_source(fallback, "unknown_base")
+
+    if requested is None:
+        return SpawnTypeResolution(name, None, None, base_subagent_type=name)
+    if mode == "frontmatter":
+        return SpawnTypeResolution(
+            name, None, requested, "pending_restart", "variant_not_installed",
+            variant_to_create=variant, base_subagent_type=name,
+        )
+    return SpawnTypeResolution(
+        name, None, requested, "base_variant", "variant_not_installed", base_subagent_type=name
+    )
+
+
+def _with_source(resolution: SpawnTypeResolution, source: str) -> SpawnTypeResolution:
+    """Re-label a tier fallback with the rule that forced it."""
+    from dataclasses import replace
+
+    reason = (
+        source
+        if resolution.applied_effort is None and resolution.requested_effort
+        else None
+    )
+    return replace(resolution, effort_source=source, effort_unapplied_reason=reason)
+
+
+def resolve_named_spawn_type(
+    *,
+    config: TGsConfig,
+    caller: str | None,
+    tier: str,
+    subagent_type: str | None,
+    effort: str | None,
+    session_start_ts: float | None = None,
+) -> SpawnTypeResolution:
+    """Resolve what actually gets spawned for a plan subtask's named type.
+
+    Review agents use named subagent types on shells that resolve them to an
+    exported definition; every other host falls back to the tier-derived type.
+    Both go through one resolver so a named type carries the routed effort too —
+    it used to keep the bare name and silently drop the effort.
+    """
+    named_base = (
+        subagent_type
+        if subagent_type and named_subagent_types_supported(config, caller)
+        else None
+    )
+    return resolve_spawn_type(
+        caller=caller,
+        base=named_base,
+        tier=tier,
+        effort=effort,
+        # The capability gate was applied just above, including for config=None.
+        config=None,
+        session_start_ts=session_start_ts,
+    )
+
+
+def spawns_named_definition(resolution: SpawnTypeResolution, subagent_type: str | None) -> bool:
+    """True when the spawned type is the definition (or a variant of it) *subagent_type* names.
+
+    False for every fallback — a tier type standing in for a definition that is not
+    installed (``unknown_base``), a shell that does not resolve names, a tier variant —
+    because then the definition's instructions never reach the agent.
+    """
+    base = (subagent_type or "").strip()
+    if not base or resolution.effort_source in {"unknown_base", "tier_variant"}:
+        return False
+    spawned = resolution.subagent_type
+    return spawned == base or spawned.startswith(f"{base}-")
+
+
 def build_host_spawn(
     *,
     config: TGsConfig,
@@ -322,18 +749,21 @@ def build_host_spawn(
     upstream: list[dict[str, Any]] | None = None,
     role: str | None = None,
     effort: str | None = None,
+    session_start_ts: float | None = None,
+    resolution: SpawnTypeResolution | None = None,
 ) -> HostSpawnSpec:
-    # Review agents use named subagent types on shells that resolve them to an
-    # exported definition; every other host falls back to the tier-derived type.
+    # *resolution* lets a caller that already resolved the type (to decide what the
+    # prompt must carry) pass it in rather than resolve a second time.
     normalized_caller = normalize_caller_id(caller)
-    resolved_effort = normalize_effort(effort)
-    applied_effort: str | None = None
-    if subagent_type and named_subagent_types_supported(config, caller):
-        resolved_subagent_type = subagent_type
-    else:
-        variant = _installed_effort_variant(caller, tier, resolved_effort)
-        resolved_subagent_type = variant or subagent_type_for_tier(tier)
-        applied_effort = resolved_effort if variant else None
+    if resolution is None:
+        resolution = resolve_named_spawn_type(
+            config=config,
+            caller=caller,
+            tier=tier,
+            subagent_type=subagent_type,
+            effort=effort,
+            session_start_ts=session_start_ts,
+        )
     # read_only tasks must never use direct_edit — they read source context only.
     method = "host_task" if read_only else host_native_method_for_tier(tier)
     resolved_role = role or derive_role_from_task(prompt)
@@ -344,7 +774,7 @@ def build_host_spawn(
         tool=host_tool_for_caller(caller),
         method=method,
         model=model or host_native_model_for_tier(config, caller, tier),
-        subagent_type=resolved_subagent_type,
+        subagent_type=resolution.subagent_type,
         prompt=enriched_prompt,
         tier=tier,
         caller=normalized_caller,
@@ -356,8 +786,12 @@ def build_host_spawn(
         upstream=list(upstream or []),
         role=resolved_role,
         read_only=bool(read_only),
-        effort=applied_effort,
-        requested_effort=resolved_effort,
+        effort=resolution.applied_effort,
+        requested_effort=resolution.requested_effort,
+        effort_source=resolution.effort_source,
+        effort_unapplied_reason=resolution.effort_unapplied_reason,
+        variant_to_create=resolution.variant_to_create,
+        base_subagent_type=resolution.base_subagent_type,
     )
 
 
@@ -813,16 +1247,25 @@ def _findings_protocol_block(run_id: str, spawn_id: str, dimension: str) -> str:
     them directly instead of a synthesis agent being handed every prior agent's
     excerpt as context.
     """
-    from .findings_merge import findings_path
+    from .findings_merge import (
+        FINDINGS_SEVERITY_WORDS,
+        findings_line_example,
+        findings_line_format,
+        findings_path,
+    )
 
     path = findings_path(run_id, spawn_id)
+    # The format is spelled out here, not referred to: a definition-mode prompt
+    # carries no report text, and a definition that is missing or shadowed carries
+    # none either, so "the format given above" pointed at nothing.
     return (
-        f"Write your findings to {path} — one finding per line, in exactly the "
-        "format given above, creating parent directories if needed. Write the file "
-        "even when you find nothing (leave it empty).\n"
+        f"Write your findings to {path} (create parent dirs), one per line, exactly:\n"
+        f"{findings_line_format(dimension)}\n"
+        f"(SEVERITY: {FINDINGS_SEVERITY_WORDS}.) E.g.\n"
+        f"{findings_line_example(dimension)}\n"
+        "Leave the file empty if you find nothing.\n"
         "Then reply with ONLY this one-line summary and nothing else:\n"
-        f"dim={dimension} total=<number of findings> high=<number of high or critical>\n"
-        "Do not repeat the findings in your reply — they are read from the file."
+        f"dim={dimension} total=<number of findings> high=<number of high or critical>"
     )
 
 
@@ -848,9 +1291,13 @@ def _adjudication_block(run_id: str) -> str:
 # Instruction files each host actually loads into every subagent. Deliberately
 # per-host rather than the union of all known instruction files: reporting a total no
 # single run pays would overstate the tax and cost the number its credibility.
-# ``AGENTS.md`` is the cross-tool convention and is read by all of them.
+# ``AGENTS.md`` is a cross-tool convention, but NOT every host reads it: Claude Code
+# does not load it unless a CLAUDE.md imports it with ``@AGENTS.md``. Claude Code is
+# therefore resolved by ``claude_code_instruction_files`` (the entry below is only a
+# marker that the host is known). The other hosts' lists are unverified here and kept
+# as they were.
 _HOST_INSTRUCTION_FILES: dict[str, tuple[str, ...]] = {
-    "claude-code": ("CLAUDE.md", "AGENTS.md"),
+    "claude-code": ("CLAUDE.md",),
     "github-copilot-cli": (
         ".github/copilot-instructions.md",
         "copilot-instructions.md",
@@ -862,6 +1309,96 @@ _HOST_INSTRUCTION_FILES: dict[str, tuple[str, ...]] = {
     "junie": ("AGENTS.md",),
 }
 
+# Bytes per token for the instruction tax. 4 B/token is the textbook ratio for English
+# prose; these files are mixed German/English with tables, paths and code, which
+# tokenize denser, so 3.5 is the more honest estimate. Still approximate.
+_BYTES_PER_TOKEN = 3.5
+# Claude Code follows ``@path`` imports up to five hops deep.
+_CLAUDE_IMPORT_MAX_DEPTH = 5
+_FENCE_RE = re.compile(r"^[ \t]*(```|~~~).*?^[ \t]*\1[ \t]*$", re.DOTALL | re.MULTILINE)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+# ``@`` must start a token (so e-mail addresses do not match).
+_IMPORT_RE = re.compile(r"(?<![\w@])@([^\s`<>()\[\]\"']+)")
+
+
+def _claude_imports(text: str) -> list[str]:
+    """``@path`` tokens in *text*, ignoring fenced blocks and inline code spans."""
+    text = _FENCE_RE.sub("", text)
+    text = _INLINE_CODE_RE.sub("", text)
+    found: list[str] = []
+    for raw in _IMPORT_RE.findall(text):
+        ref = raw.rstrip(".,;:!?")
+        if ref:
+            found.append(ref)
+    return found
+
+
+def claude_code_instruction_files(
+    workspace_root: str | Path,
+    home: str | Path | None = None,
+    config_dir: str | Path | None = None,
+) -> list[Path]:
+    """Ordered, de-duplicated files Claude Code loads into a session at *workspace_root*.
+
+    Covers the user-level ``CLAUDE.md`` (``config_dir`` or ``$CLAUDE_CONFIG_DIR`` or
+    ``~/.claude``), ``CLAUDE.md`` / ``CLAUDE.local.md`` / ``.claude/CLAUDE.md`` in the
+    workspace, ``CLAUDE.md`` in every parent up to the git repo root (no repo: up to
+    ``home``, or the filesystem root if the workspace is outside it), ``.claude/rules``
+    in the workspace and user dir (counted even when path-scoped: an upper bound), and
+    ``@path`` imports of any loaded file (relative to the importer, ``~`` expanded,
+    depth <= 5). ``AGENTS.md`` is only counted when imported. Missing files are skipped.
+    """
+    ws = Path(workspace_root).expanduser().resolve()
+    home_dir = Path(home).expanduser() if home is not None else Path.home()
+    try:
+        home_dir = home_dir.resolve()
+    except OSError:
+        pass
+    if config_dir is None:
+        env = os.environ.get("CLAUDE_CONFIG_DIR")
+        config_dir = env if env else home_dir / ".claude"
+    cfg = Path(config_dir).expanduser()
+
+    roots: list[Path] = [cfg / "CLAUDE.md"]
+    chain: list[Path] = []
+    cur = ws
+    while True:
+        chain.append(cur)
+        if (cur / ".git").exists() or cur == home_dir or cur.parent == cur:
+            break
+        cur = cur.parent
+    for d in reversed(chain[1:]):  # outermost parents first, workspace last
+        roots.append(d / "CLAUDE.md")
+    roots += [ws / "CLAUDE.md", ws / ".claude" / "CLAUDE.md", ws / "CLAUDE.local.md"]
+    for rules in (cfg / "rules", ws / ".claude" / "rules"):
+        try:
+            roots.extend(sorted(rules.rglob("*.md")) if rules.is_dir() else [])
+        except OSError:
+            continue
+
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+
+    def visit(path: Path, depth: int) -> None:
+        try:
+            resolved = path.resolve()
+            if resolved in seen or not resolved.is_file():
+                return
+            text = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        seen.add(resolved)
+        ordered.append(resolved)
+        if depth >= _CLAUDE_IMPORT_MAX_DEPTH:
+            return
+        for ref in _claude_imports(text):
+            target = Path(ref).expanduser() if ref.startswith("~") else resolved.parent / ref
+            visit(target, depth + 1)
+
+    for root in roots:
+        visit(root, 0)
+    return ordered
+
 
 def instruction_tax_report(
     config: TGsConfig,
@@ -869,14 +1406,17 @@ def instruction_tax_report(
     workspace_root: str | None,
     agent_count: int,
     caller: str | None = None,
+    home: str | Path | None = None,
+    config_dir: str | Path | None = None,
 ) -> dict[str, Any] | None:
     """Report the per-agent instruction-file tax when it dominates a fan-out.
 
-    Every host reloads the workspace's own instruction files (CLAUDE.md, AGENTS.md,
-    …) into *each* subagent, so their combined size is multiplied by the agent count
-    before any work happens. Threnody cannot trim them — they are the operator's
-    files, and shrinking them may be exactly wrong — so the honest move is to state
-    the number.
+    Every host reloads its instruction files (CLAUDE.md and what it imports, …) into
+    *each* subagent, so their combined size is multiplied by the agent count before
+    any work happens. Threnody cannot trim them — they are the operator's files, and
+    shrinking them may be exactly wrong — so the honest move is to state the number.
+    This measures context size, not billed cost: prompt caching makes every repeat
+    after the first agent cheaper than a cold read.
 
     Returns ``None`` when disabled, when the caller's instruction files are unknown or
     absent, or when the total is under the configured threshold.
@@ -895,15 +1435,17 @@ def instruction_tax_report(
         # worse than no number.
         return None
     try:
-        from pathlib import Path
-
         root = Path(workspace_root)
         if not root.is_dir():
             return None
+        if shell_id == "claude-code":
+            paths = claude_code_instruction_files(root, home=home, config_dir=config_dir)
+        else:
+            paths = [root / rel for rel in candidates]
+        root_resolved = root.resolve()
         files: list[dict[str, Any]] = []
         per_agent_bytes = 0
-        for rel in candidates:
-            candidate = root / rel
+        for candidate in paths:
             try:
                 if not candidate.is_file():
                     continue
@@ -912,8 +1454,15 @@ def instruction_tax_report(
                 continue
             if size <= 0:
                 continue
+            try:
+                shown = str(candidate.relative_to(root_resolved))
+            except ValueError:
+                try:
+                    shown = str(candidate.relative_to(root))
+                except ValueError:
+                    shown = str(candidate)
             per_agent_bytes += size
-            files.append({"path": rel, "bytes": size})
+            files.append({"path": shown, "bytes": size})
         if not files:
             return None
         threshold = int(getattr(economy, "instruction_tax_warn_bytes", 200_000) or 200_000)
@@ -921,20 +1470,36 @@ def instruction_tax_report(
         if total_bytes < threshold:
             return None
         files.sort(key=lambda item: int(item["bytes"]), reverse=True)
+        per_agent_tokens = int(per_agent_bytes / _BYTES_PER_TOKEN)
+        total_tokens = int(total_bytes / _BYTES_PER_TOKEN)
+        # Largest first: the point of naming files is telling the operator what to shrink.
+        largest = sorted(files, key=lambda item: int(item["bytes"]), reverse=True)[:3]
+        top = ", ".join(
+            f"{item['path']} ({int(item['bytes']) / 1024:.1f} KB)" for item in largest
+        )
         return {
             "shell": shell_id,
             "per_agent_bytes": per_agent_bytes,
             "agent_count": agent_count,
             "total_bytes": total_bytes,
-            # ~4 bytes/token is the usual rough ratio for prose; stated as approximate
-            # because the real number depends on the host's tokenizer.
-            "approx_total_tokens": total_bytes // 4,
+            # Approximate: the real number depends on the host's tokenizer.
+            "bytes_per_token": _BYTES_PER_TOKEN,
+            "per_agent_tokens": per_agent_tokens,
+            "approx_total_tokens": total_tokens,
             "files": files,
+            "top_files": largest,
+            "note": (
+                "Context-size measure, not billed cost: prompt caching makes repeats "
+                "after the first agent cheaper."
+            ),
             "details": (
-                f"This workspace's instruction files total {per_agent_bytes:,} bytes and are "
-                f"reloaded into each of {agent_count} agents (~{total_bytes // 4:,} tokens "
-                "per run before any work). Threnody cannot trim them; shortening the "
-                "largest file is the single biggest per-agent saving available."
+                f"Instruction files loaded per agent total {per_agent_bytes:,} bytes "
+                f"(~{per_agent_tokens:,} tokens) and are reloaded into each of "
+                f"{agent_count} agents (~{total_tokens:,} tokens of context per run "
+                f"before any work). Largest: {top}. Threnody cannot trim them; shortening "
+                "the largest file is the single biggest per-agent saving available. "
+                "Prompt caching makes repeats after the first agent cheaper, so this "
+                "measures context size, not billed cost."
             ),
         }
     except Exception:
@@ -1244,6 +1809,28 @@ def build_host_spawn_waves(
                         "host_spawn_waves: adjudication block injection failed",
                         exc_info=True,
                     )
+            # The stable instruction block (dimension focus + report text) was left out
+            # of the cell's prompt because its definition carries it. Resolve now to
+            # find out whether that definition is what will actually be spawned; if not
+            # (not installed, shadowed, shell without named types), put it back.
+            resolution = resolve_named_spawn_type(
+                config=config,
+                caller=caller,
+                tier=tier,
+                subagent_type=subtask_subagent_type,
+                effort=subtask_effort,
+            )
+            if subtask.get("review_stable_stripped") and not spawns_named_definition(
+                resolution, subtask_subagent_type
+            ):
+                try:
+                    from .review_fanout import stable_instructions_for
+
+                    inline = stable_instructions_for(review_dimension)
+                    if inline:
+                        prompt = f"{inline}\n\n{prompt}"
+                except Exception:
+                    log.debug("host_spawn_waves: inline instructions failed", exc_info=True)
             raw_role = subtask.get("role")
             subtask_role = (
                 str(raw_role).strip()
@@ -1271,6 +1858,7 @@ def build_host_spawn_waves(
                     upstream=upstream_specs,
                     role=subtask_role,
                     effort=subtask_effort,
+                    resolution=resolution,
                 ).to_dict()
             )
         if agents:
@@ -1349,6 +1937,7 @@ def build_consensus_wave(
     task_text: str,
     wave_index: int,
     registry: Any | None = None,
+    effort: str | None = None,
 ) -> dict[str, Any] | None:
     """Build the host-native consensus wave appended after worker waves.
 
@@ -1373,6 +1962,9 @@ def build_consensus_wave(
     if len(personas) < 2:
         return None
     queen_tier = getattr(config, "consensus_queen_tier", "low")
+    # Queens used to spawn with no effort at all, so the variant lookup never ran
+    # for them. An explicit *effort* wins; otherwise the tier's routed default.
+    queen_effort = normalize_effort(effort) or default_routed_effort(queen_tier)
     review_prompt = consensus_review_instruction(task_text)
 
     agents: list[dict[str, Any]] = []
@@ -1386,6 +1978,7 @@ def build_consensus_wave(
             wave_id=f"consensus-wave-{wave_index}",
             spawn_id=f"queen-{persona_id}",
             read_only=True,
+            effort=queen_effort,
         ).to_dict()
         spec["persona"] = persona_id
         spec["wave_kind"] = "consensus"
@@ -1411,6 +2004,7 @@ def build_judge_spawn(
     task_text: str,
     judge_prompt: str,
     wave_index: int,
+    effort: str | None = None,
 ) -> dict[str, Any]:
     """Build the single read-only judge spawn spec for the lazy arbitration round."""
     judge_tier = getattr(config, "consensus_judge_tier", "low")
@@ -1422,6 +2016,7 @@ def build_judge_spawn(
         wave_id=f"consensus-judge-{wave_index}",
         spawn_id="consensus-judge",
         read_only=True,
+        effort=normalize_effort(effort) or default_routed_effort(judge_tier),
     ).to_dict()
     spec["wave_kind"] = "consensus_judge"
     spec["spawn_required"] = True
@@ -1532,7 +2127,13 @@ def build_host_native_required_response(
     delegation_targets: list[str],
     target_file: str | None = None,
     compliance_warning: str | None = None,
+    effort: str | None = None,
 ) -> dict[str, Any]:
+    """Refusal payload for same-host execute_subtask, carrying the spawn to use instead.
+
+    *effort* is the routed reasoning effort; without it the host is told to spawn
+    the bare tier type and the effort routing chose is lost on this path.
+    """
     target_files = [target_file] if isinstance(target_file, str) and target_file.strip() else []
     payload: dict[str, Any] = {
         "error": HOST_SPAWN_ERROR,
@@ -1543,6 +2144,7 @@ def build_host_native_required_response(
             tier=tier,
             prompt=prompt,
             target_files=target_files,
+            effort=effort,
         ).to_dict(),
         "delegation_targets": delegation_targets,
     }

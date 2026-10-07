@@ -76,6 +76,40 @@ _FINDING_RE = re.compile(
     re.UNICODE,
 )
 
+# The one-line report format every review agent is told to write. ``_FINDING_RE``
+# above is the parser for exactly this shape, so the text agents are given and the
+# regex that reads their file live side by side; tests/test_findings_merge.py parses
+# the example back to keep them from drifting. ``<dimension>`` is filled per cell.
+FINDINGS_LINE_FORMAT = "⚠️ [SEVERITY] <dimension>/<category> — file:line — description"
+# SEVERITY is one of these, in capitals, so a reviewer cannot invent a scale.
+FINDINGS_SEVERITY_WORDS = "LOW|MEDIUM|HIGH|CRITICAL"
+# A concrete category per dimension, used to build an example line the parser accepts.
+_EXAMPLE_CATEGORY = {
+    "security": "sql-injection",
+    "logic": "off-by-one",
+    "edge": "null-deref",
+    "types": "type-mismatch",
+    "performance": "n-plus-1",
+}
+_DEFAULT_EXAMPLE_DIMENSION = "logic"
+
+
+def findings_line_format(dimension: str = "") -> str:
+    """:data:`FINDINGS_LINE_FORMAT` with the dimension filled in when it is known."""
+    if dimension and dimension in _EXAMPLE_CATEGORY:
+        return FINDINGS_LINE_FORMAT.replace("<dimension>", dimension)
+    return FINDINGS_LINE_FORMAT
+
+
+def findings_line_example(dimension: str = "") -> str:
+    """One concrete line in the report format; always accepted by the parser."""
+    dim = dimension if dimension in _EXAMPLE_CATEGORY else _DEFAULT_EXAMPLE_DIMENSION
+    return (
+        f"⚠️ [HIGH] {dim}/{_EXAMPLE_CATEGORY[dim]} — src/app.py:42 — "
+        "what is wrong and why it matters"
+    )
+
+
 _CWE_RE = re.compile(r"\(?(CWE-\d+)\)?", re.IGNORECASE)
 
 # Lines an agent may emit around its findings that are not findings.

@@ -3445,6 +3445,90 @@ def test_execute_subtask_host_native_required_for_self_delegate(monkeypatch) -> 
     assert result["host_spawn"]["tool"] == "Agent"
 
 
+def test_execute_subtask_host_native_required_carries_routed_effort(monkeypatch, tmp_path) -> None:
+    """The refusal's host_spawn used to name the bare tier type, dropping effort."""
+    import shared.host_spawn as hs
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "threnody-medium-medium.md").write_text("x", encoding="utf-8")
+    (agents / "threnody-medium-high.md").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(hs, "claude_agents_dir", lambda: agents)
+
+    class SelfDelegateRegistry(DelegatingStubRegistry):
+        def _ordered_execution_candidates(self, tier, *, caller=None, caller_allowlists=None, prefer_free=True):
+            host = SimpleNamespace(name="claude-code", display_name="Claude Code")
+            return [host], [{"provider": "Claude Code", "reason": "self"}]
+
+        def _caller_matches_provider(self, provider, caller) -> bool:
+            return getattr(provider, "name", None) == "claude-code"
+
+    db_path = tmp_path / "host-native-effort.db"
+    cfg = TGsConfig(db_path=db_path, delegation_utilities_enabled=True)
+    db = Database(db_path=db_path)
+    monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, None, None, None))
+    monkeypatch.setattr(mcp_server, "get_registry", lambda: SelfDelegateRegistry())
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+    routed = mcp_server.handle_execute_subtask({"prompt": "refactor auth module", "tier": "medium"})
+    assert routed["host_spawn"]["subagent_type"] == "threnody-medium-medium"
+    assert routed["host_spawn"]["effort"] == "medium"
+    explicit = mcp_server.handle_execute_subtask(
+        {"prompt": "refactor auth module", "tier": "medium", "effort": "high"}
+    )
+    assert explicit["host_spawn"]["subagent_type"] == "threnody-medium-high"
+    assert explicit["host_spawn"]["effort"] == "high"
+
+
+def test_handle_route_task_resolves_named_subagent_type(monkeypatch, tmp_path) -> None:
+    import shared.host_spawn as hs
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "threnody-review-logic.md").write_text(
+        "---\nname: threnody-review-logic\ndescription: d\n---\nbody\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(hs, "claude_agents_dir", lambda: agents)
+    db_path = tmp_path / "route-named.db"
+    cfg = TGsConfig(db_path=db_path)
+    db = Database(db_path=db_path)
+    router = SimpleNamespace(
+        classify=lambda _task, project_path=None, evidence=None: SimpleNamespace(
+            tier="medium", score=0.55, reason="medium-tier task", agents=1,
+            override=False, reasoning_effort="high",
+        )
+    )
+    monkeypatch.setattr(mcp_server, "_ensure_init", lambda: (cfg, db, router, None, None))
+    monkeypatch.setattr(mcp_server, "get_registry", lambda: DelegatingStubRegistry())
+    monkeypatch.setattr(mcp_server, "_resolve_caller", lambda: "claude-code")
+
+    pending = mcp_server.handle_route_task(
+        {"task": "review the auth module", "subagent_type": "threnody-review-logic"}
+    )
+    hint = pending["execution_hint"]
+    assert hint["spawn_subagent_type"] == "threnody-review-logic"
+    assert hint["requested_effort"] == "high"
+    assert hint["effort_source"] == "pending_restart"
+    assert hint["variant_to_create"] == "threnody-review-logic-high"
+    assert "effort" not in hint
+    assert pending["host_spawn"]["spawn_subagent_type"] == "threnody-review-logic"
+
+    (agents / "threnody-review-logic-high.md").write_text("x", encoding="utf-8")
+    pinned = mcp_server.handle_route_task(
+        {"task": "review the auth module", "subagent_type": "threnody-review-logic"}
+    )
+    assert pinned["execution_hint"]["spawn_subagent_type"] == "threnody-review-logic-high"
+    assert pinned["execution_hint"]["effort"] == "high"
+    assert pinned["execution_hint"]["effort_source"] == "base_variant"
+    assert pinned["host_spawn"]["subagent_type"] == "threnody-review-logic-high"
+    assert pinned["host_spawn"]["effort"] == "high"
+
+    plain = mcp_server.handle_route_task({"task": "review the auth module"})
+    assert "spawn_subagent_type" not in plain["execution_hint"]
+    route_tool = next(t for t in mcp_server.TOOLS if t["name"] == "route_task")
+    assert "subagent_type" in route_tool["inputSchema"]["properties"]
+
+
 def test_handle_route_task_includes_host_spawn_for_claude_host(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "route-spawn.db"
@@ -3775,7 +3859,22 @@ def test_ladder_tools_registered_and_dispatch(monkeypatch) -> None:
         "case_id": "c1", "tier": "low", "model": "m", "sweep_id": "s", "content": "x=1",
     })
     assert seen["grade"] == {"case_id": "c1", "tier": "low", "content": "x=1",
-                             "model": "m", "sweep_id": "s"}
+                             "model": "m", "sweep_id": "s", "effort": None}
+
+    seen.pop("grade")
+    mcp_server.HANDLERS["ladder_grade"]({
+        "case_id": "c1", "tier": "low", "model": "m", "sweep_id": "s", "content": "x=1",
+        "effort": "High",
+    })
+    assert seen["grade"]["effort"] == "high"
+    bad = mcp_server.handle_ladder_grade({
+        "case_id": "c1", "tier": "low", "sweep_id": "s", "content": "x", "effort": "max",
+    })
+    assert bad["error"] == "invalid_request"
+
+    seen.pop("plan")
+    mcp_server.HANDLERS["ladder_plan"]({"effort": "low"})
+    assert seen["plan"]["effort"] == "low"
 
     missing = mcp_server.handle_ladder_grade({"case_id": "c1"})
     assert missing["error"] == "invalid_request"

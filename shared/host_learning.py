@@ -396,8 +396,7 @@ def _index_handoff_snapshots(
         # Write hits their own findings artifact. Index that path too, or the
         # PostToolUse hook (which only ever sees the artifact write) can never
         # resolve a review agent's hook record back to this snapshot.
-        subagent_type = str(snap.get("subagent_type") or "")
-        if subagent_type in _REVIEW_SUBAGENT_TO_DIM and isinstance(spawn_id, str) and spawn_id.strip():
+        if _review_dimension_of(snap) and isinstance(spawn_id, str) and spawn_id.strip():
             try:
                 from .findings_merge import findings_path
 
@@ -461,6 +460,7 @@ def _enrich_agent_from_handoff(
     if snap is None:
         snap = snapshots_by_wave_agent.get((wave_index, agent_index))
     if snap is None:
+        _mark_value_sources(merged, agent)
         return merged
     # Record what was *planned* before the gap-fill below, so a tier the host
     # actually reported can be compared against it. The loop only fills empty
@@ -469,7 +469,10 @@ def _enrich_agent_from_handoff(
     planned_tier = snap.get("tier")
     if isinstance(planned_tier, str) and planned_tier.strip():
         merged["planned_tier"] = planned_tier.strip()
-    for key in ("prompt", "tier", "model", "task_id", "spawn_id", "subagent_type", "role", "effort", "requested_effort"):
+    for key in (
+        "prompt", "tier", "model", "task_id", "spawn_id", "subagent_type",
+        "base_subagent_type", "role", "effort", "requested_effort",
+    ):
         if not merged.get(key) and snap.get(key):
             merged[key] = snap[key]
     if not merged.get("description") and snap.get("prompt"):
@@ -481,7 +484,43 @@ def _enrich_agent_from_handoff(
         target_files = snap_targets
     if not merged.get("target_file") and isinstance(target_files, list) and target_files:
         merged["target_file"] = target_files[0]
+    _mark_value_sources(merged, agent)
     return merged
+
+
+# Where an agent's model/effort came from. ``reported``: the host's wave report
+# (or hook record) carried it. ``planned``: it was missing and back-filled from
+# the handoff snapshot — what Threnody *asked for*, not evidence of what ran.
+VALUE_SOURCE_REPORTED = "reported"
+VALUE_SOURCE_PLANNED = "planned"
+_VALUE_SOURCES = (VALUE_SOURCE_REPORTED, VALUE_SOURCE_PLANNED)
+
+
+def _mark_value_sources(merged: dict[str, Any], reported: Mapping[str, Any]) -> None:
+    """Set ``model_source``/``effort_source`` on *merged* from the raw *reported* agent.
+
+    A source the record already carries wins (a run-log record re-ingested by
+    ``import_run_log`` keeps the marker it was written with).
+    """
+    for key, source_key in (("model", "model_source"), ("effort", "effort_source")):
+        if str(reported.get(source_key) or "") in _VALUE_SOURCES and merged.get(key):
+            merged[source_key] = str(reported[source_key])
+        elif str(reported.get(key) or "").strip():
+            merged[source_key] = VALUE_SOURCE_REPORTED
+        elif str(merged.get(key) or "").strip():
+            merged[source_key] = VALUE_SOURCE_PLANNED
+        else:
+            merged.pop(source_key, None)
+
+
+def _reported_effort(enriched: Mapping[str, Any]) -> str | None:
+    """The agent's effort when the host reported it and it is a known level."""
+    if enriched.get("effort_source") != VALUE_SOURCE_REPORTED:
+        return None
+    from .outcomes import EFFORT_VALUES
+
+    value = str(enriched.get("effort") or "").strip().lower()
+    return value if value in EFFORT_VALUES else None
 
 
 def _record_tier_override(db: Database, enriched: Mapping[str, Any]) -> bool:
@@ -502,6 +541,12 @@ def _record_tier_override(db: Database, enriched: Mapping[str, Any]) -> bool:
     try:
         from .outcomes import record_outcome
 
+        reported: dict[str, str] = {}
+        if enriched.get("model_source") == VALUE_SOURCE_REPORTED and enriched.get("model"):
+            reported["actual_model"] = str(enriched["model"])
+        effort = _reported_effort(enriched)
+        if effort:
+            reported["actual_effort"] = effort
         record_outcome(
             db,
             task_id,
@@ -509,6 +554,7 @@ def _record_tier_override(db: Database, enriched: Mapping[str, Any]) -> bool:
             routed_tier=planned,
             actual_tier=actual,
             note=f"host ran {actual} where {planned} was planned",
+            **reported,
         )
         return True
     except Exception:
@@ -618,6 +664,7 @@ def register_host_run_handoff(
                     "prompt": agent.get("prompt"),
                     "target_files": target_files,
                     "subagent_type": str(agent.get("subagent_type") or "") or None,
+                    "base_subagent_type": str(agent.get("base_subagent_type") or "") or None,
                     "role": str(agent.get("role") or "") or None,
                     "effort": str(agent.get("effort") or "") or None,
                     "requested_effort": str(agent.get("requested_effort") or "") or None,
@@ -884,13 +931,23 @@ def record_consensus_learning(
         log.debug("consensus bandit update failed for %s", run_id, exc_info=True)
 
 
-_REVIEW_SUBAGENT_TO_DIM = {
-    "review-security": "security",
-    "review-logic": "logic",
-    "review-edge-cases": "edge",
-    "review-types": "types",
-    "review-performance": "performance",
-}
+def _review_dimension_of(spec: Mapping[str, Any]) -> str:
+    """Per-dimension review cell this agent is, or ``""``.
+
+    Reads the spawned ``subagent_type`` first, then ``base_subagent_type``: the
+    spawned type may be an effort variant (``threnody-review-logic-high``) or a
+    tier fallback when the review definition is not installed, and either must
+    still count as the review cell it was planned as. Fast whole-file reviewers
+    (dimension ``all``) are excluded, as they always were — they carry no single
+    dimension to attribute.
+    """
+    from .review_fanout import FAST_REVIEW_DIMENSION, dimension_for_subagent_type
+
+    for key in ("subagent_type", "base_subagent_type"):
+        dim = dimension_for_subagent_type(spec.get(key))
+        if dim and dim != FAST_REVIEW_DIMENSION:
+            return dim
+    return ""
 
 
 def _build_review_outcome(
@@ -904,7 +961,7 @@ def _build_review_outcome(
     review_meta = result.get("review_meta")
     if not isinstance(review_meta, Mapping):
         return None
-    dim = _REVIEW_SUBAGENT_TO_DIM.get(str(agent_spec.get("subagent_type") or ""))
+    dim = _review_dimension_of(agent_spec)
     target_file = str(agent_spec.get("target_file") or "").strip()
     if not dim or not target_file:
         return None
@@ -935,6 +992,16 @@ def _build_review_outcome(
                 }
             except (TypeError, ValueError):
                 continue
+    effort = (str(agent_spec.get("effort")).strip() or None) if agent_spec.get("effort") else None
+    attribution: dict[str, Any] = {}
+    model_source = str(agent_spec.get("model_source") or "")
+    if model_source in _VALUE_SOURCES:
+        attribution["model_source"] = model_source
+    if effort and agent_spec.get("effort_source") == VALUE_SOURCE_PLANNED:
+        # A planned effort is what was asked for, not what ran: keep it out of the
+        # ledger's effort axis and record it as provenance only.
+        attribution["planned_effort"] = effort
+        effort = None
     return {
         "target_file": target_file,
         "dimension": dim,
@@ -943,7 +1010,8 @@ def _build_review_outcome(
         # produced it, not just to the run.
         "spawn_id": str(agent_spec.get("spawn_id") or ""),
         "model": str(agent_spec.get("model") or ""),
-        "effort": (str(agent_spec.get("effort")).strip() or None) if agent_spec.get("effort") else None,
+        "effort": effort,
+        "attribution": attribution,
         "findings_total": findings_total,
         "findings_high": findings_high,
         # bool | None. None means no adjudicator judged this agent's findings, which
@@ -1007,7 +1075,7 @@ def _backfill_review_meta(
         return result
     if not run_id or not spawn_id:
         return result
-    if not str(agent_spec.get("subagent_type") or "") in _REVIEW_SUBAGENT_TO_DIM:
+    if not _review_dimension_of(agent_spec):
         return result
     try:
         from .findings_merge import findings_path, parse_findings_text, review_meta_for
@@ -1243,11 +1311,13 @@ def _record_review_outcome(
         effort = outcome.get("effort")
         task_hash = outcome.get("task_hash")
         run_id = outcome.get("run_id")
+        attribution = outcome.get("attribution") if isinstance(outcome.get("attribution"), Mapping) else None
         # Top-level dimension score.
         model_quality.record_findings_score(
             db,
             model=model,
             effort=effort,
+            attribution=attribution,
             dimension=dimension,
             findings_high=int(outcome["findings_high"]),
             findings_total=int(outcome["findings_total"]),
@@ -1278,6 +1348,7 @@ def _record_review_outcome(
                     db,
                     model=model,
                     effort=effort,
+                    attribution=attribution,
                     dimension=dimension,
                     sub_dimension=sub,
                     findings_high=int(cat.get("findings_high") or 0),
@@ -1511,6 +1582,7 @@ def ingest_host_wave(
     draft_projects_by_hash: dict[str, str] = {}
     processed_agents = 0
     tier_overrides = 0
+    model_attribution: dict[str, int] = {}
 
     for agent_index, agent in enumerate(agents):
         if not isinstance(agent, Mapping):
@@ -1536,8 +1608,12 @@ def ingest_host_wave(
             "prompt": enriched.get("prompt"),
             "description": enriched.get("description") or enriched.get("prompt"),
             "subagent_type": enriched.get("subagent_type"),
+            "base_subagent_type": enriched.get("base_subagent_type"),
             "target_file": enriched.get("target_file"),
             "role": enriched.get("role"),
+            "effort": enriched.get("effort"),
+            "model_source": enriched.get("model_source"),
+            "effort_source": enriched.get("effort_source"),
         }
         touched_files_raw = enriched.get("touched_files")
         touched_files: list[str] = []
@@ -1579,6 +1655,15 @@ def ingest_host_wave(
             "eval_quality": rec["eval_quality"],
             "touched_files": rec["touched_files"],
         }
+        # Model/effort travel with their source, so the run's event log never
+        # shows a planned value as what ran.
+        for key in ("model", "effort"):
+            source = spec.get(f"{key}_source")
+            if spec.get(key) and source:
+                recorded[key] = spec[key]
+                recorded[f"{key}_source"] = source
+        model_source = str(spec.get("model_source") or "unknown")
+        model_attribution[model_source] = model_attribution.get(model_source, 0) + 1
         agent_results.append(recorded)
         task_id = str(spec.get("task_id") or "")
         for path in recorded.get("touched_files") or []:
@@ -1745,6 +1830,10 @@ def ingest_host_wave(
         # Surfaced so an operator can see the router being disagreed with without
         # querying routing_outcomes. The rows are what feed the adaptive bands.
         response["tier_overrides"] = tier_overrides
+    if model_attribution:
+        # How many agents' model the host actually reported vs. how many were
+        # filled in from the plan — a "planned" count is not evidence of what ran.
+        response["model_attribution"] = dict(sorted(model_attribution.items()))
     if effective_root or auto_excerpt_count or files_read:
         response["learning_enrichment"] = {
             "workspace_root": effective_root,
@@ -2030,14 +2119,14 @@ def _record_verify_quality(
         except Exception:
             log.debug("handoff path index unavailable for %s", run_id, exc_info=True)
 
-        writers: dict[str, tuple[str | None, str | None]] = {}
+        writers: dict[str, tuple[str | None, str | None, dict[str, Any]]] = {}
         for rec in run_log.read_run_log(run_id):
             if not isinstance(rec, Mapping) or rec.get("read_only"):
                 continue
             touched_files = _agent_touched_files(rec)
             if not touched_files:
                 continue
-            enriched = rec
+            enriched: dict[str, Any] = dict(rec)
             if not str(rec.get("model") or "").strip():
                 snap: Mapping[str, object] | None = None
                 for touched in touched_files:
@@ -2046,18 +2135,30 @@ def _record_verify_quality(
                         break
                 if snap is not None:
                     enriched = {**rec, **{k: v for k, v in snap.items() if not rec.get(k) and v}}
+            _mark_value_sources(enriched, rec)
             model = str(enriched.get("model") or "").strip()
             if model:
                 effort = (str(enriched.get("effort")).strip() or None) if enriched.get("effort") else None
+                attribution: dict[str, Any] = {"model_source": enriched.get("model_source")}
+                if effort and enriched.get("effort_source") == VALUE_SOURCE_PLANNED:
+                    attribution["planned_effort"] = effort
+                    effort = None
                 role = str(enriched.get("role") or "").strip() or None
-                writers[model] = (effort, role)
+                previous = writers.get(model)
+                if previous is not None and previous[2].get("model_source") == VALUE_SOURCE_REPORTED:
+                    # One reported record is enough to call this model's attribution
+                    # reported; a later planned back-fill must not downgrade it.
+                    attribution["model_source"] = VALUE_SOURCE_REPORTED
+                    effort = effort or previous[0]
+                writers[model] = (effort, role, attribution)
         if not writers:
-            writers = {model_quality.MODEL_UNRESOLVED: (None, None)}
-        for model, (effort, role) in writers.items():
+            writers = {model_quality.MODEL_UNRESOLVED: (None, None, {})}
+        for model, (effort, role, attribution) in writers.items():
             model_quality.record_verify_gate_score(
                 db,
                 model=model,
                 effort=effort,
+                attribution=attribution or None,
                 role=role,
                 score_0_10=score,
                 new_failure_count=len(verify_report.get("new_failures") or []),

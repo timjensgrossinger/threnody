@@ -23,6 +23,10 @@ from .model_registry import (
     tier_projection,
 )
 
+# Price table: LiteLLM format. claude-opus-5-5 / claude-sonnet-5-5 / claude-fable-5-1
+# added by hand 2026-10-07 (Anthropic first-party list prices); a catalog refresh
+# may overwrite the file, so keep them upstream-compatible. A top-level "updated"
+# key is not used: the loader would treat any dict-valued key as a model.
 _PRICE_DATA_PATH = Path(__file__).resolve().parent / "data" / "model_prices.json"
 _LOW_TIER_MAX_PER_MILLION = 0.50
 _MEDIUM_TIER_MAX_PER_MILLION = 5.00

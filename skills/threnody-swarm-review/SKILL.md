@@ -120,6 +120,13 @@ drop-protected under the agent cap; `security` is still *added* (never evicting 
 named dimension) when a file has real risk signals. With no `[dims=...]`, the
 band-based default set runs.
 
+**Agent cap.** When `max_agents` is smaller than the planned cell count the planner
+keeps the biggest and riskiest files, not the first-listed: every file gets one cell
+(its highest-priority dimension) before any gets a second, files are ranked by
+concrete exploit signals, then risk signals, then LOC x density, and — unless a
+`[dims=...]` list leaves security out — `max(1, cap // 4)` slots are reserved for
+security on the highest-risk files. Dropped cells are never silent (next step).
+
 **Response is a compact spawn manifest.** Every host-native run carries
 `host_spawn_waves` (the lean per-agent spawn list) plus a small `plan_summary` —
 the heavy duplicate `plan` is omitted so the host reads it in one chunk and hits
@@ -127,6 +134,22 @@ the <20s first-spawn target; for review runs any `workflow_script` is dropped to
 `plan_summary.coverage` keeps the file accounting (`deferred`, `packed`). Full plan
 fidelity is still recorded server-side (`inspect_run_receipt`). Spawn directly from
 `host_spawn_waves`; do not expect a full `plan` object.
+
+### 3b. Check coverage before spawning
+
+If the response carries `requires_confirmation: true` or a `coverage_warning`, do
+**not** spawn yet. Print every dropped cell (`coverage_warning` lists all of them;
+`plan_summary.contract.dropped` gives the reason for each) together with
+`confirmation_reason`, then ask the user with `AskUserQuestion` to choose one of:
+
+- **Proceed** with the reduced coverage as planned;
+- **Raise `max_agents`** — re-run `execute_swarm` with a higher cap;
+- **Narrow** the file list or add `[dims=...]` — re-run with fewer cells.
+
+`requires_confirmation` is set when more than 30 % of the review cells were dropped
+or any security cell was. A `coverage_warning` without it is a smaller loss: still
+show it, but proceeding without asking is acceptable. Never spawn past a
+confirmation flag on your own, and carry any accepted gap into the final report.
 
 ### 4. Execute host_spawn_waves
 

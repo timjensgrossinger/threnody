@@ -196,4 +196,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from shared.logging_setup import configure_file_logging
+
+    configure_file_logging("routing_hook", logger_names=(log.name,))
     raise SystemExit(main())

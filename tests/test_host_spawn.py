@@ -334,7 +334,7 @@ def test_read_only_cell_does_not_claim_ownership_from_a_writer() -> None:
     plan = {
         "subtasks": [
             {"id": 1, "description": "Security review of app/core.py.", "tier": "low",
-             "target_file": "app/core.py", "subagent_type": "review-security",
+             "target_file": "app/core.py", "subagent_type": "threnody-review-security",
              "review_dimension": "security", "read_only": True},
             {"id": 2, "description": "Implement the retry policy in app/core.py.",
              "tier": "medium", "target_file": "app/core.py"},
@@ -387,7 +387,7 @@ def _review_plan() -> dict:
                 "tier": "medium",
                 "read_only": True,
                 "review_dimension": "security",
-                "subagent_type": "review-security",
+                "subagent_type": "threnody-review-security",
                 "target_file": "shared/db.py",
                 "depends_on": [],
             }
@@ -416,7 +416,7 @@ def test_unknown_shell_spawn_matches_tier_derived_type() -> None:
         caller="not-a-real-shell",
         tier="medium",
         prompt="p",
-        subagent_type="review-security",
+        subagent_type="threnody-review-security",
         read_only=True,
     )
     assert spec.subagent_type == "threnody-medium"
@@ -596,23 +596,189 @@ def test_instruction_tax_report_is_per_host_and_thresholded(tmp_path) -> None:
     config = TGsConfig()
     from shared.host_spawn import instruction_tax_report
 
-    (tmp_path / "CLAUDE.md").write_text("x" * 40_000, encoding="utf-8")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    iso = {"home": tmp_path / "home", "config_dir": tmp_path / "cfg"}
+    (ws / "CLAUDE.md").write_text("x" * 40_000, encoding="utf-8")
     big = instruction_tax_report(
-        config, workspace_root=str(tmp_path), agent_count=15, caller="claude-code"
+        config, workspace_root=str(ws), agent_count=15, caller="claude-code", **iso
     )
     assert big is not None and big["per_agent_bytes"] == 40_000
     assert big["total_bytes"] == 600_000
+    assert big["per_agent_tokens"] == int(40_000 / 3.5)
+    assert big["approx_total_tokens"] == int(600_000 / 3.5)
+    assert big["files"] == [{"path": "CLAUDE.md", "bytes": 40_000}]
+    assert "CLAUDE.md (39.1 KB)" in big["details"] and "caching" in big["note"]
     # Codex does not read CLAUDE.md, so it must not be billed for it.
     assert instruction_tax_report(
-        config, workspace_root=str(tmp_path), agent_count=15, caller="codex"
+        config, workspace_root=str(ws), agent_count=15, caller="codex"
     ) is None
     # Under the threshold, and unknown hosts, stay quiet.
     assert instruction_tax_report(
-        config, workspace_root=str(tmp_path), agent_count=1, caller="claude-code"
+        config, workspace_root=str(ws), agent_count=1, caller="claude-code", **iso
     ) is None
     assert instruction_tax_report(
-        config, workspace_root=str(tmp_path), agent_count=15, caller="mystery-shell"
+        config, workspace_root=str(ws), agent_count=15, caller="mystery-shell"
     ) is None
+
+
+def _cc_files(ws, tmp_path, **kw):
+    from shared.host_spawn import claude_code_instruction_files
+
+    kw.setdefault("home", tmp_path / "home")
+    kw.setdefault("config_dir", tmp_path / "cfg")
+    return [p.resolve() for p in claude_code_instruction_files(ws, **kw)]
+
+
+def _ws(tmp_path):
+    ws = tmp_path / "home" / "repo"
+    ws.mkdir(parents=True)
+    return ws
+
+
+def test_claude_code_files_agents_md_alone_not_counted(tmp_path) -> None:
+    ws = _ws(tmp_path)
+    (ws / "AGENTS.md").write_text("a", encoding="utf-8")
+    (ws / "CLAUDE.md").write_text("c", encoding="utf-8")
+    assert _cc_files(ws, tmp_path) == [(ws / "CLAUDE.md").resolve()]
+
+
+def test_claude_code_files_agents_md_counted_when_imported(tmp_path) -> None:
+    ws = _ws(tmp_path)
+    (ws / "AGENTS.md").write_text("a", encoding="utf-8")
+    (ws / "CLAUDE.md").write_text("see @AGENTS.md\n", encoding="utf-8")
+    assert (ws / "AGENTS.md").resolve() in _cc_files(ws, tmp_path)
+
+
+def test_claude_code_files_user_level_and_config_dir(tmp_path, monkeypatch) -> None:
+    ws = _ws(tmp_path)
+    (ws / "CLAUDE.md").write_text("c", encoding="utf-8")
+    user = tmp_path / "home" / ".claude"
+    user.mkdir()
+    (user / "CLAUDE.md").write_text("u", encoding="utf-8")
+    assert (user / "CLAUDE.md").resolve() in _cc_files(ws, tmp_path, config_dir=user)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "CLAUDE.md").write_text("o", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
+    from shared.host_spawn import claude_code_instruction_files
+
+    got = [p.resolve() for p in claude_code_instruction_files(ws, home=tmp_path / "home")]
+    assert (other / "CLAUDE.md").resolve() in got
+    assert (user / "CLAUDE.md").resolve() not in got
+
+
+def test_claude_code_files_parent_walk_stops_at_repo_root(tmp_path) -> None:
+    outer = tmp_path / "home" / "outer"
+    repo = outer / "repo"
+    ws = repo / "pkg"
+    ws.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (outer / "CLAUDE.md").write_text("above repo", encoding="utf-8")
+    (repo / "CLAUDE.md").write_text("repo", encoding="utf-8")
+    (ws / "CLAUDE.md").write_text("pkg", encoding="utf-8")
+    (ws / "CLAUDE.local.md").write_text("local", encoding="utf-8")
+    (ws / ".claude").mkdir()
+    (ws / ".claude" / "CLAUDE.md").write_text("dot", encoding="utf-8")
+    got = _cc_files(ws, tmp_path)
+    assert (outer / "CLAUDE.md").resolve() not in got
+    for p in (repo / "CLAUDE.md", ws / "CLAUDE.md", ws / "CLAUDE.local.md",
+              ws / ".claude" / "CLAUDE.md"):
+        assert p.resolve() in got
+
+
+def test_claude_code_files_parent_walk_stops_at_home(tmp_path) -> None:
+    ws = _ws(tmp_path)  # home/repo, no .git
+    (tmp_path / "CLAUDE.md").write_text("above home", encoding="utf-8")
+    (tmp_path / "home" / "CLAUDE.md").write_text("home", encoding="utf-8")
+    got = _cc_files(ws, tmp_path)
+    assert (tmp_path / "home" / "CLAUDE.md").resolve() in got
+    assert (tmp_path / "CLAUDE.md").resolve() not in got
+
+
+def test_claude_code_files_import_rules(tmp_path) -> None:
+    ws = _ws(tmp_path)
+    (ws / "docs").mkdir()
+    (ws / "docs" / "a.md").write_text("see @b.md and @missing.md", encoding="utf-8")
+    (ws / "docs" / "b.md").write_text("loop @a.md", encoding="utf-8")
+    (ws / "fenced.md").write_text("x", encoding="utf-8")
+    (ws / "inline.md").write_text("x", encoding="utf-8")
+    (ws / "CLAUDE.md").write_text(
+        "@docs/a.md @docs/b.md mail me@fenced.md\n"
+        "`@inline.md`\n```\n@fenced.md\n```\n",
+        encoding="utf-8",
+    )
+    got = _cc_files(ws, tmp_path)
+    assert got.count((ws / "docs" / "a.md").resolve()) == 1
+    assert got.count((ws / "docs" / "b.md").resolve()) == 1
+    assert (ws / "fenced.md").resolve() not in got
+    assert (ws / "inline.md").resolve() not in got
+
+
+def test_claude_code_files_import_depth_limit_and_tilde(tmp_path) -> None:
+    ws = _ws(tmp_path)
+    for i in range(8):
+        (ws / f"n{i}.md").write_text(f"@n{i + 1}.md", encoding="utf-8")
+    (ws / "CLAUDE.md").write_text("@n0.md", encoding="utf-8")
+    names = [p.name for p in _cc_files(ws, tmp_path)]
+    assert "n4.md" in names and "n5.md" not in names  # CLAUDE.md depth 0 -> n4 depth 5
+    home = tmp_path / "home"
+    (home / "shared.md").write_text("s", encoding="utf-8")
+    (ws / "CLAUDE.md").write_text("@~/shared.md", encoding="utf-8")
+    import os
+
+    old = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)
+    try:
+        assert (home / "shared.md").resolve() in _cc_files(ws, tmp_path)
+    finally:
+        if old is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old
+
+
+def test_claude_code_files_rules_dirs(tmp_path) -> None:
+    ws = _ws(tmp_path)
+    (ws / ".claude" / "rules" / "sub").mkdir(parents=True)
+    (ws / ".claude" / "rules" / "sub" / "r.md").write_text("r", encoding="utf-8")
+    (tmp_path / "cfg" / "rules").mkdir(parents=True)
+    (tmp_path / "cfg" / "rules" / "u.md").write_text("u", encoding="utf-8")
+    names = [p.name for p in _cc_files(ws, tmp_path)]
+    assert "r.md" in names and "u.md" in names
+
+
+def test_instruction_tax_report_counts_imports_and_names_top_files(tmp_path) -> None:
+    from shared.host_spawn import instruction_tax_report
+
+    ws = _ws(tmp_path)
+    (ws / "CLAUDE.md").write_text("@AGENTS.md\n" + "c" * 10_000, encoding="utf-8")
+    (ws / "AGENTS.md").write_text("a" * 30_000, encoding="utf-8")
+    rep = instruction_tax_report(
+        TGsConfig(), workspace_root=str(ws), agent_count=10, caller="claude-code",
+        home=tmp_path / "home", config_dir=tmp_path / "cfg",
+    )
+    assert rep is not None
+    assert [f["path"] for f in rep["files"]] == ["AGENTS.md", "CLAUDE.md"]
+    assert rep["per_agent_bytes"] == rep["files"][0]["bytes"] + rep["files"][1]["bytes"]
+    assert rep["approx_total_tokens"] == int(rep["total_bytes"] / 3.5)
+    assert rep["details"].index("AGENTS.md") < rep["details"].index("CLAUDE.md (")
+
+
+def test_instruction_tax_top_files_are_largest_first(tmp_path) -> None:
+    from shared.host_spawn import instruction_tax_report
+
+    ws = _ws(tmp_path)
+    (ws / "CLAUDE.md").write_text("@small.md\n@big.md\n" + "c" * 5_000, encoding="utf-8")
+    (ws / "small.md").write_text("s" * 1_000, encoding="utf-8")
+    (ws / "big.md").write_text("b" * 50_000, encoding="utf-8")
+    rep = instruction_tax_report(
+        TGsConfig(), workspace_root=str(ws), agent_count=10, caller="claude-code",
+        home=tmp_path / "home", config_dir=tmp_path / "cfg",
+    )
+    assert rep is not None
+    assert [f["path"] for f in rep["top_files"]] == ["big.md", "CLAUDE.md", "small.md"]
+    assert rep["details"].index("big.md") < rep["details"].index("small.md")
 
 
 # --- effort variants ---------------------------------------------------------
@@ -718,17 +884,281 @@ def test_no_effort_omitted_from_dict(monkeypatch, tmp_path) -> None:
     assert "effort" not in spec.to_dict()
 
 
-def test_explicit_review_subagent_type_wins_over_variant(monkeypatch, tmp_path) -> None:
-    _agents_dir(monkeypatch, tmp_path, "threnody-medium-high")
-    cfg = TGsConfig.defaults()
+# --- resolve_spawn_type: one resolver for every spawn path --------------------
+
+
+def _defs(monkeypatch, tmp_path, defs: dict[str, str]):
+    """Install Claude agent definitions ``{name: frontmatter-body}`` in a tmp dir."""
     import shared.host_spawn as hs
 
-    monkeypatch.setattr(hs, "named_subagent_types_supported", lambda c, k: True)
+    d = tmp_path / "claude-defs"
+    d.mkdir(exist_ok=True)
+    for name, body in defs.items():
+        (d / name).write_text(body, encoding="utf-8")
+    monkeypatch.setattr(hs, "claude_agents_dir", lambda: d)
+    return d
+
+
+_PLAIN = "---\nname: {n}\ndescription: d\ntools: Read\n---\nbody\n"
+
+
+def _resolve(**kw):
+    from shared.host_spawn import resolve_spawn_type
+
+    kw.setdefault("caller", "claude-code")
+    kw.setdefault("tier", "medium")
+    kw.setdefault("config", TGsConfig.defaults())
+    return resolve_spawn_type(**kw)
+
+
+def test_named_review_type_carries_effort_via_variant(monkeypatch, tmp_path) -> None:
+    """The bug: a named type kept its bare name and the routed effort was dropped."""
+    _defs(monkeypatch, tmp_path, {
+        "threnody-review-logic.md": _PLAIN.format(n="threnody-review-logic"),
+        "threnody-review-logic-high.md": _PLAIN.format(n="threnody-review-logic-high"),
+        "threnody-medium-high.md": "x",
+    })
     spec = build_host_spawn(
-        config=cfg, caller="claude-code", tier="medium", prompt="x",
-        subagent_type="threnody-review-security", effort="high",
+        config=TGsConfig.defaults(), caller="claude-code", tier="medium", prompt="x",
+        subagent_type="threnody-review-logic", effort="high", read_only=True,
     )
-    assert spec.subagent_type == "threnody-review-security"
+    assert spec.subagent_type == "threnody-review-logic-high"
+    d = spec.to_dict()
+    assert d["effort"] == "high"
+    assert d["effort_source"] == "base_variant"
+    assert d["base_subagent_type"] == "threnody-review-logic"
+
+
+def test_named_review_type_without_variant_is_pending_restart(monkeypatch, tmp_path) -> None:
+    _defs(monkeypatch, tmp_path, {
+        "threnody-review-logic.md": _PLAIN.format(n="threnody-review-logic"),
+        "threnody-medium-high.md": "x",
+    })
+    spec = build_host_spawn(
+        config=TGsConfig.defaults(), caller="claude-code", tier="medium", prompt="x",
+        subagent_type="threnody-review-logic", effort="high", read_only=True,
+    )
+    assert spec.subagent_type == "threnody-review-logic"
+    d = spec.to_dict()
+    assert "effort" not in d
+    assert d["requested_effort"] == "high"
+    assert d["effort_source"] == "pending_restart"
+    assert d["effort_unapplied_reason"] == "variant_not_installed"
+    assert d["variant_to_create"] == "threnody-review-logic-high"
+    assert "base_subagent_type" not in d  # same as the spawned type
+
+
+def test_rule_a_tier_variant_and_fallback(monkeypatch, tmp_path) -> None:
+    _defs(monkeypatch, tmp_path, {"threnody-medium-high.md": "x"})
+    hit = _resolve(base=None, effort="high")
+    assert (hit.subagent_type, hit.applied_effort, hit.effort_source) == (
+        "threnody-medium-high", "high", "tier_variant",
+    )
+    miss = _resolve(base=None, effort="low")
+    assert miss.subagent_type == "threnody-medium"
+    assert miss.applied_effort is None
+    assert miss.effort_unapplied_reason == "variant_not_installed"
+    # A named tier type is a tier, not a definition to derive variants from.
+    tier_named = _resolve(base="threnody-medium", effort="high")
+    assert tier_named.subagent_type == "threnody-medium-high"
+
+
+def test_rule_a_when_shell_cannot_resolve_names(monkeypatch, tmp_path) -> None:
+    import shared.host_spawn as hs
+
+    _defs(monkeypatch, tmp_path, {
+        "threnody-review-logic.md": _PLAIN.format(n="threnody-review-logic"),
+        "threnody-medium-high.md": "x",
+    })
+    monkeypatch.setattr(hs, "named_subagent_types_supported", lambda c, k: False)
+    res = _resolve(base="threnody-review-logic", effort="high")
+    assert res.subagent_type == "threnody-medium-high"
+
+
+def test_rule_b_explicit_variant_is_kept(monkeypatch, tmp_path) -> None:
+    _defs(monkeypatch, tmp_path, {
+        "threnody-review-logic-high.md": (
+            "---\nname: threnody-review-logic-high\ndescription: d\neffort: high\n---\n"
+        ),
+    })
+    res = _resolve(base="threnody-review-logic-high", effort="low")
+    assert res.subagent_type == "threnody-review-logic-high"
+    assert res.applied_effort == "high"
+    assert res.requested_effort == "low"
+    assert res.effort_source == "caller_variant"
+
+
+def test_rule_c_definition_effort_wins(monkeypatch, tmp_path) -> None:
+    _defs(monkeypatch, tmp_path, {
+        "my-agent.md": "---\nname: my-agent\ndescription: d\neffort: 'low'\n---\nbody\n",
+        "my-agent-high.md": _PLAIN.format(n="my-agent-high"),
+    })
+    res = _resolve(base="my-agent", effort="high")
+    assert res.subagent_type == "my-agent"
+    assert res.applied_effort == "low"
+    assert res.effort_source == "definition"
+    assert res.effort_unapplied_reason == "definition_declares_effort"
+
+
+def test_rule_d_builtin_types_take_no_effort(monkeypatch, tmp_path) -> None:
+    _defs(monkeypatch, tmp_path, {"threnody-medium-high.md": "x"})
+    for name in ("Explore", "Plan", "general-purpose", "claude-code-guide", "statusline-setup"):
+        res = _resolve(base=name, effort="high")
+        assert res.subagent_type == name
+        assert res.applied_effort is None
+        assert res.effort_source == "not_applicable"
+        assert res.effort_unapplied_reason == "builtin_type"
+
+
+def test_rule_e_variant_newer_than_session_is_pending_restart(monkeypatch, tmp_path) -> None:
+    import os
+    import time
+
+    d = _defs(monkeypatch, tmp_path, {
+        "my-agent.md": _PLAIN.format(n="my-agent"),
+        "my-agent-high.md": _PLAIN.format(n="my-agent-high"),
+    })
+    past = time.time() - 3600
+    os.utime(d / "my-agent.md", (past, past))
+    session_start = time.time() - 60  # the variant was written after this
+    res = _resolve(base="my-agent", effort="high", session_start_ts=session_start)
+    assert res.subagent_type == "my-agent"
+    assert res.applied_effort is None
+    assert res.effort_source == "pending_restart"
+    assert res.effort_unapplied_reason == "variant_created_after_session_start"
+    assert res.variant_to_create is None  # it exists; only the session is stale
+    later = _resolve(base="my-agent", effort="high", session_start_ts=time.time() + 60)
+    assert later.subagent_type == "my-agent-high"
+    assert later.effort_source == "base_variant"
+
+
+def test_rule_e_ignores_agent_md_variants(monkeypatch, tmp_path) -> None:
+    """``.agent.md`` bodies never load on Claude Code, so they do not count."""
+    _defs(monkeypatch, tmp_path, {
+        "my-agent.md": _PLAIN.format(n="my-agent"),
+        "my-agent-high.agent.md": _PLAIN.format(n="my-agent-high"),
+    })
+    res = _resolve(base="my-agent", effort="high")
+    assert res.subagent_type == "my-agent"
+    assert res.effort_source == "pending_restart"
+
+
+def test_rule_f_unknown_base_falls_back_to_tier(monkeypatch, tmp_path, caplog) -> None:
+    import logging
+
+    _defs(monkeypatch, tmp_path, {
+        "threnody-medium-high.md": "x",
+        "review-logic.agent.md": _PLAIN.format(n="review-logic"),
+    })
+    with caplog.at_level(logging.WARNING, logger="shared.host_spawn"):
+        res = _resolve(base="review-logic", effort="high")
+    assert res.subagent_type == "threnody-medium-high"
+    assert res.effort_source == "unknown_base"
+    assert res.base_subagent_type == "review-logic"
+    assert any("no definition" in r.message for r in caplog.records)
+    unpinned = _resolve(base="nope", effort="low")
+    assert unpinned.subagent_type == "threnody-medium"
+    assert unpinned.effort_unapplied_reason == "unknown_base"
+
+
+def test_unsafe_names_are_never_looked_up(monkeypatch, tmp_path) -> None:
+    _defs(monkeypatch, tmp_path, {})
+    res = _resolve(base="../../etc/passwd", effort="high")
+    assert res.subagent_type == "threnody-medium"
+    assert res.effort_source == "unknown_base"
+
+
+def test_plugin_agents_keep_their_name(monkeypatch, tmp_path) -> None:
+    _defs(monkeypatch, tmp_path, {})
+    res = _resolve(base="myplugin:reviewer", effort="high")
+    assert res.subagent_type == "myplugin:reviewer"
+    assert res.applied_effort is None
+    assert res.effort_source == "pending_restart"
+    assert res.variant_to_create is None
+    _defs(monkeypatch, tmp_path, {"myplugin-reviewer-high.md": _PLAIN.format(n="x")})
+    flat = _resolve(base="myplugin:reviewer", effort="high")
+    assert flat.subagent_type == "myplugin-reviewer-high"
+    assert flat.effort_source == "base_variant"
+
+
+def test_named_type_without_effort_is_untouched(monkeypatch, tmp_path) -> None:
+    _defs(monkeypatch, tmp_path, {"my-agent.md": _PLAIN.format(n="my-agent")})
+    res = _resolve(base="my-agent", effort=None)
+    assert (res.subagent_type, res.applied_effort, res.effort_source) == ("my-agent", None, None)
+
+
+def test_codex_named_type_uses_toml_variant(monkeypatch, tmp_path) -> None:
+    import shared.host_spawn as hs
+
+    d = tmp_path / "codex"
+    d.mkdir()
+    (d / "threnody-review-logic-high.toml").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(hs, "codex_agents_dir", lambda: d)
+    hit = _resolve(caller="codex", base="threnody-review-logic", effort="high")
+    assert hit.subagent_type == "threnody-review-logic-high"
+    # Codex review definitions are skills, so a missing toml keeps the name.
+    miss = _resolve(caller="codex", base="threnody-review-types", effort="high")
+    assert miss.subagent_type == "threnody-review-types"
+    assert miss.applied_effort is None
+
+
+def test_frontmatter_reader_is_cached_and_safe(tmp_path) -> None:
+    from shared.host_spawn import read_definition_frontmatter
+
+    f = tmp_path / "a.md"
+    f.write_text("---\nname: a\neffort: High\n  nested: x\n---\neffort: low\n", encoding="utf-8")
+    assert read_definition_frontmatter(f) == {"name": "a", "effort": "High"}
+    assert read_definition_frontmatter(tmp_path / "missing.md") == {}
+    (tmp_path / "b.md").write_text("no frontmatter\neffort: high\n", encoding="utf-8")
+    assert read_definition_frontmatter(tmp_path / "b.md") == {}
+
+
+def test_session_start_from_transcript(tmp_path) -> None:
+    from shared.host_spawn import session_start_from_transcript
+
+    t = tmp_path / "t.jsonl"
+    t.write_text("{}\n", encoding="utf-8")
+    ts = session_start_from_transcript(t)
+    assert isinstance(ts, float) and ts > 0
+    assert session_start_from_transcript(tmp_path / "missing") is None
+    assert session_start_from_transcript(None) is None
+
+
+def test_consensus_and_judge_carry_effort(monkeypatch, tmp_path) -> None:
+    from shared.host_spawn import build_consensus_wave, build_judge_spawn
+
+    _defs(monkeypatch, tmp_path, {"threnody-low-low.md": "x", "threnody-low-high.md": "x"})
+    cfg = TGsConfig.defaults()
+    cfg.consensus_enabled = True
+    cfg.consensus_host_native_enabled = True
+    wave = build_consensus_wave(
+        config=cfg, caller="claude-code", task_text="t", wave_index=3
+    )
+    assert wave is not None
+    for agent in wave["agents"]:
+        assert agent["subagent_type"] == "threnody-low-low"
+        assert agent["effort"] == "low"
+    forced = build_consensus_wave(
+        config=cfg, caller="claude-code", task_text="t", wave_index=3, effort="high"
+    )
+    assert forced is not None and forced["agents"][0]["subagent_type"] == "threnody-low-high"
+    judge = build_judge_spawn(
+        config=cfg, caller="claude-code", task_text="t", judge_prompt="j", wave_index=4
+    )
+    assert judge["subagent_type"] == "threnody-low-low"
+    assert judge["effort"] == "low"
+
+
+def test_host_native_required_response_carries_effort(monkeypatch, tmp_path) -> None:
+    from shared.host_spawn import build_host_native_required_response
+
+    _defs(monkeypatch, tmp_path, {"threnody-medium-high.md": "x"})
+    payload = build_host_native_required_response(
+        config=TGsConfig.defaults(), caller="claude-code", tier="medium", prompt="p",
+        delegation_targets=[], effort="high",
+    )
+    assert payload["host_spawn"]["subagent_type"] == "threnody-medium-high"
+    assert payload["host_spawn"]["effort"] == "high"
 
 
 def test_waves_derive_effort(monkeypatch, tmp_path) -> None:

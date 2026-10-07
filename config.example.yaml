@@ -208,3 +208,10 @@ learning:
       # - opencode             # writes to .opencode/agent/<slug>.md
     promotion_threshold: 10    # match_count before promoting to user-global skills dir
     auto_promote: false        # promote automatically on threshold hit; default: manual via CLI
+
+# Claude Code Agent-tool hook (shell/threnody-agent-hook.sh): fills the routed model
+# and reasoning effort on every subagent spawn and logs each spawn to
+# logs/agent_spawns.jsonl. false = no-op hook, and install.sh removes its entries.
+# THRENODY_AGENT_HOOK=off disables it for one shell.
+agent_hook:
+  enabled: true

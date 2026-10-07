@@ -20,7 +20,9 @@ from shared.review_fanout import (
 
 # The exact dimension prompts as they read before the title/focus/report split. If
 # `prompt_template` ever stops reproducing these byte-for-byte, a host that has not
-# opted into prompt economy silently gets different instructions.
+# opted into prompt economy silently gets different instructions. The closing
+# sentence was changed on purpose (it contradicted the findings-file protocol's
+# "empty file, one-line reply"); the finding format is unchanged.
 _PRE_SPLIT_TEMPLATES = {
     "security": (
         "Security review of {path}: check for injection (SQL, command, XSS), "
@@ -29,14 +31,14 @@ _PRE_SPLIT_TEMPLATES = {
         "Report each finding as: ⚠️ [SEVERITY] security/<category> — file:line — description (CWE-XXX), "
         "where <category> is a kebab-case vulnerability class "
         "(e.g. sql-injection, xss, path-traversal, hardcoded-secret, ssrf, weak-crypto). "
-        "Output nothing if no issues found."
+        "One finding per line; a file with no issues has no findings."
     ),
     "logic": (
         "Logic review of {path}: check for off-by-one errors, wrong conditions, "
         "unreachable code, swapped arguments, missing returns, and state invariant violations. "
         "Report each finding as: ⚠️ [SEVERITY] logic/<category> — file:line — description, "
         "where <category> is a kebab-case slug (e.g. off-by-one, wrong-condition, missing-return). "
-        "Output nothing if no issues found."
+        "One finding per line; a file with no issues has no findings."
     ),
     "edge": (
         "Edge and null case review of {path}: check for null/None dereferences, "
@@ -44,14 +46,14 @@ _PRE_SPLIT_TEMPLATES = {
         "missing defaults, boundary conditions, and missing I/O error handling. "
         "Report each finding as: ⚠️ [SEVERITY] edge/<category> — file:line — description, "
         "where <category> is a kebab-case slug (e.g. null-deref, empty-collection, div-by-zero). "
-        "Output nothing if no issues found."
+        "One finding per line; a file with no issues has no findings."
     ),
     "types": (
         "Type safety review of {path}: check for type mismatches, unsafe casts, "
         "generic violations, incompatible return types, and serialization/deserialization drift. "
         "Report each finding as: ⚠️ [SEVERITY] types/<category> — file:line — description, "
         "where <category> is a kebab-case slug (e.g. type-mismatch, unsafe-cast, serde-drift). "
-        "Output nothing if no issues found."
+        "One finding per line; a file with no issues has no findings."
     ),
     "performance": (
         "Performance review of {path}: check for O(n²) algorithms, N+1 queries, "
@@ -59,7 +61,7 @@ _PRE_SPLIT_TEMPLATES = {
         "and redundant calls. "
         "Report each finding as: ⚠️ [SEVERITY] performance/<category> — file:line — description, "
         "where <category> is a kebab-case slug (e.g. quadratic, n-plus-1, memory-leak, blocking-io). "
-        "Output nothing if no issues found."
+        "One finding per line; a file with no issues has no findings."
     ),
 }
 

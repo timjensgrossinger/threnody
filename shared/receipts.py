@@ -91,6 +91,49 @@ def _agent_count_from_payload(payload: Mapping[str, Any] | None, fallback: int =
     return max(1, fallback)
 
 
+_TIER_ALIASES = {"low": "haiku", "medium": "sonnet", "high": "opus"}
+
+
+def resolve_receipt_model(model: str | None, tier: str) -> tuple[str, str]:
+    """Return ``(concrete_model_id, alias)`` for pricing/attribution.
+
+    Host specs carry bare Claude Code aliases ("opus"); the price table is keyed
+    by concrete ids. A missing or placeholder model ("host-native") falls back to
+    the tier's alias. ``alias`` is "" when *model* was already concrete.
+    """
+    raw = (model or "").strip()
+    if not raw or raw.lower() == "host-native":
+        raw = _TIER_ALIASES.get(tier, "")
+    if not raw:
+        return "", ""
+    try:
+        from .model_registry import CLAUDE_ALIAS_TABLE, resolve_model_alias
+
+        concrete, _source = resolve_model_alias(None, raw)
+    except Exception:
+        log.debug("receipt: alias resolution failed for %s", raw, exc_info=True)
+        return raw, ""
+    concrete = concrete or raw
+    alias = raw if raw.casefold() in CLAUDE_ALIAS_TABLE else ""
+    return concrete, alias
+
+
+def _agent_specs_from_payload(payload: Mapping[str, Any] | None) -> list[tuple[str | None, str | None]]:
+    """``(tier, model)`` for every agent in ``host_spawn_waves`` (empty if none)."""
+    specs: list[tuple[str | None, str | None]] = []
+    waves = payload.get("host_spawn_waves") if isinstance(payload, Mapping) else None
+    if isinstance(waves, list):
+        for wave in waves:
+            agents = wave.get("agents") if isinstance(wave, Mapping) else None
+            if isinstance(agents, list):
+                for agent in agents:
+                    if isinstance(agent, Mapping):
+                        specs.append((agent.get("tier"), agent.get("model")))
+                    else:
+                        specs.append((None, None))
+    return specs
+
+
 def build_cost_receipt(
     *,
     source_tool: str,
@@ -105,58 +148,60 @@ def build_cost_receipt(
 ) -> dict[str, Any]:
     """Build a compact, response-safe savings receipt.
 
-    ``savings`` is only ever populated from two priced numbers. When either side
-    can't be priced (unrecognized model) or the "counterfactual" isn't actually
-    more expensive than what was selected (e.g. a host-native run comparing
-    itself against itself, both opus), ``estimated_usd``/``pct`` are ``None``
-    with a ``basis`` explaining why — never a fabricated fallback like
-    "selected + $0.0025/agent", which is how a same-model comparison previously
-    read as "100% savings, $0.0025".
+    Both sides are priced in USD by the same estimator (tier token budget x
+    concrete model price, per agent), so they are always comparable. The
+    counterfactual is the concrete model the HIGH tier resolves to on this host.
+
+    ``savings.basis``: ``priced`` (real difference), ``same_model`` (selected is
+    the counterfactual model: 0), ``no_savings`` (selected costs at least as much)
+    or ``unpriced`` (a model is missing from the price table).
+
+    ``estimated_cost_usd`` is accepted for compatibility but ignored: caller
+    supplied figures (credits heuristics, 0.0 for host-native) were not comparable
+    with the counterfactual. Host-native runs still consume model tokens on the
+    user's subscription, flagged ``billing: "host_entitlement"`` rather than $0.
     """
+    del estimated_cost_usd
     agent_count = _agent_count_from_payload(payload)
     resolved_tier = tier or "medium"
 
-    if isinstance(estimated_cost_usd, (int, float)):
-        selected_cost: float | None = round(float(estimated_cost_usd), 6)
-        selected_priced = True
-    else:
-        selected_priced = _model_price_known(model)
-        selected_cost = (
-            _estimate_model_cost(model, tier=resolved_tier, agents=agent_count)
-            if selected_priced
-            else None
-        )
+    specs = _agent_specs_from_payload(payload)
+    if not specs:
+        specs = [(resolved_tier, model)] * agent_count
+    agents: list[tuple[str, str, str]] = []  # (tier, concrete model, alias)
+    for spec_tier, spec_model in specs:
+        agent_tier = str(spec_tier or resolved_tier)
+        # A spec without its own model inherits the route-level one only when it
+        # is the same tier; otherwise the tier's own alias applies.
+        inherited = model if agent_tier == resolved_tier else None
+        concrete, alias = resolve_receipt_model(str(spec_model or inherited or ""), agent_tier)
+        agents.append((agent_tier, concrete, alias))
 
-    # Catalog id uses hyphens ("claude-opus-4-6"), not the "4.6" version string
-    # used elsewhere for display — the dotted form was never in the price table,
-    # so this counterfactual silently priced to $0 on every call, which is what
-    # drove the old fallback formula to fire unconditionally (every receipt
-    # showing "100% savings" regardless of the model actually selected).
-    counterfactual_model = "claude-opus-4-6"
+    selected_priced = all(_model_price_known(m) for _t, m, _a in agents)
+    selected_cost: float | None = (
+        round(sum(_estimate_model_cost(m, tier=t) for t, m, _a in agents), 6) if selected_priced else None
+    )
+
+    counterfactual_model, counterfactual_alias = resolve_receipt_model("opus", "high")
     counterfactual_priced = _model_price_known(counterfactual_model)
     high_counterfactual = (
-        _estimate_model_cost(counterfactual_model, tier="high", agents=agent_count)
+        _estimate_model_cost(counterfactual_model, tier="high", agents=len(agents))
         if counterfactual_priced
         else None
     )
 
-    comparable = (
-        selected_priced
-        and counterfactual_priced
-        and selected_cost is not None
-        and high_counterfactual is not None
-        and high_counterfactual > selected_cost
-    )
-    if comparable:
+    savings_usd: float | None = None
+    savings_pct: float | None = None
+    if not (selected_priced and counterfactual_priced):
+        savings_basis = "unpriced"
+    elif all(m == counterfactual_model for _t, m, _a in agents):
+        savings_usd, savings_pct, savings_basis = 0.0, 0.0, "same_model"
+    elif selected_cost is not None and high_counterfactual and high_counterfactual > selected_cost:
         savings_usd = round(high_counterfactual - selected_cost, 6)
-        savings_pct = round((savings_usd / high_counterfactual) * 100.0, 1) if high_counterfactual else 0.0
+        savings_pct = round((savings_usd / high_counterfactual) * 100.0, 1)
         savings_basis = "priced"
     else:
-        savings_usd = None
-        savings_pct = None
-        savings_basis = (
-            "unpriced" if not (selected_priced and counterfactual_priced) else "not_comparable"
-        )
+        savings_usd, savings_pct, savings_basis = 0.0, 0.0, "no_savings"
 
     host_native = bool(
         (payload or {}).get("host_spawn")
@@ -166,26 +211,49 @@ def build_cost_receipt(
     skipped = list(skipped_calls or [])
     if host_native:
         skipped.extend(["same-host subprocess delegation", "extra coordinator fanout process"])
+    model_counts: dict[str, int] = {}
+    for _t, m, _a in agents:
+        model_counts[m] = model_counts.get(m, 0) + 1
+    selected_model = next(iter(model_counts)) if len(model_counts) == 1 else "mixed"
+    selected_alias = agents[0][2] if len({a for _t, _m, a in agents}) == 1 else ""
+    # The tier is the agents' own, not the caller's argument: execute_swarm passes a
+    # placeholder tier, and a nine-opus swarm labelled "medium" misreports the run.
+    tier_counts: dict[str, int] = {}
+    for t, _m, _a in agents:
+        tier_counts[t] = tier_counts.get(t, 0) + 1
+    selected_tier = next(iter(tier_counts)) if len(tier_counts) == 1 else "mixed"
+    selected: dict[str, Any] = {
+        "tier": selected_tier,
+        "model": selected_model,
+        "provider": provider,
+        "estimated_cost_usd": selected_cost,
+        "host_native": host_native,
+        "billing": "host_entitlement" if host_native else "metered",
+    }
+    if selected_alias:
+        selected["model_alias"] = selected_alias
+    if len(model_counts) > 1:
+        selected["models"] = model_counts
+    if len(tier_counts) > 1:
+        selected["tiers"] = tier_counts
+    counterfactual: dict[str, Any] = {
+        "tier": "high",
+        "model": counterfactual_model,
+        "estimated_cost_usd": high_counterfactual,
+    }
+    if counterfactual_alias:
+        counterfactual["model_alias"] = counterfactual_alias
     return {
-        "receipt_version": 1,
+        "receipt_version": 2,
         "source_tool": source_tool,
         "task_hash": sha256(task.encode("utf-8")).hexdigest()[:16],
         "agent_count": agent_count,
         # These are token-budget-per-tier estimates (_TIER_TOKEN_BUDGETS), not
         # measured spend — labeled so the figure is never read as billed usage.
         "estimate_basis": "tier_token_budget",
-        "selected": {
-            "tier": resolved_tier,
-            "model": model,
-            "provider": provider,
-            "estimated_cost_usd": selected_cost,
-            "host_native": host_native,
-        },
-        "counterfactual": {
-            "tier": "high",
-            "model": counterfactual_model,
-            "estimated_cost_usd": high_counterfactual,
-        },
+        "currency": "USD",
+        "selected": selected,
+        "counterfactual": counterfactual,
         "savings": {
             "estimated_usd": savings_usd,
             "pct": savings_pct,
@@ -232,6 +300,12 @@ def build_run_receipt_payload(
         "host_spawn_waves": waves or [],
         "learning_report_contract": payload.get("learning_report_contract"),
         "cost_receipt": dict(cost_receipt or {}),
+        # Concrete model id (aliases resolved) — telemetry columns still hold the alias.
+        "model_id": (
+            (cost_receipt.get("selected") or {}).get("model")
+            if isinstance(cost_receipt, Mapping) and isinstance(cost_receipt.get("selected"), Mapping)
+            else None
+        ),
         "approvals": [],
         "policy_decisions": [
             "host-native execution" if payload.get("host_execution_mode") == "host_native" or waves else "direct route",

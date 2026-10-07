@@ -38,7 +38,7 @@ def _review_plan() -> dict:
                 "description": "Security review of app.py",
                 "tier": "high",
                 "target_file": "app.py",
-                "subagent_type": "review-security",
+                "subagent_type": "threnody-review-security",
                 "read_only": True,
                 "depends_on": [],
             },
@@ -47,7 +47,7 @@ def _review_plan() -> dict:
                 "description": "Logic review of app.py",
                 "tier": "medium",
                 "target_file": "app.py",
-                "subagent_type": "review-logic",
+                "subagent_type": "threnody-review-logic",
                 "read_only": True,
                 "depends_on": [],
             },
@@ -56,7 +56,7 @@ def _review_plan() -> dict:
                 "description": "Edge review of app.py",
                 "tier": "low",
                 "target_file": "app.py",
-                "subagent_type": "review-edge-cases",
+                "subagent_type": "threnody-review-edge",
                 "read_only": True,
                 "depends_on": [],
             },
@@ -134,10 +134,53 @@ def test_dependency_results_injected_into_prompt() -> None:
     assert "JSON.stringify([r_1, r_2, r_3]" in script
 
 
-def test_read_only_agenttype_and_instruction() -> None:
+def _install_agents(monkeypatch, tmp_path, *names: str, body: str = "x"):
+    import shared.host_spawn as hs
+
+    d = tmp_path / "agents"
+    d.mkdir(exist_ok=True)
+    for n in names:
+        (d / f"{n}.md").write_text(body, encoding="utf-8")
+    monkeypatch.setattr(hs, "claude_agents_dir", lambda: d)
+    return d
+
+
+def test_read_only_agenttype_and_instruction(monkeypatch, tmp_path) -> None:
+    _install_agents(monkeypatch, tmp_path, "threnody-review-security")
     script = _render(_review_plan())
-    assert 'agentType: "review-security"' in script
+    assert 'agentType: "threnody-review-security"' in script
     assert "READ-ONLY" in script
+
+
+def test_review_agenttype_dropped_when_definition_missing(monkeypatch, tmp_path) -> None:
+    """An uninstalled review type must not reach agent(): the runtime rejects it."""
+    _install_agents(monkeypatch, tmp_path)
+    script = _render(_review_plan())
+    assert "threnody-review-security" not in script
+
+
+def test_review_agenttype_uses_effort_variant(monkeypatch, tmp_path) -> None:
+    _install_agents(
+        monkeypatch, tmp_path, "threnody-review-security", "threnody-review-security-high"
+    )
+    plan = _review_plan()
+    plan["subtasks"][0]["reasoning_effort"] = "high"
+    script = _render(plan)
+    assert 'agentType: "threnody-review-security-high"' in script
+    assert '"effort": "high"' in script
+
+
+def test_write_agent_gets_tier_effort_variant(monkeypatch, tmp_path) -> None:
+    _install_agents(monkeypatch, tmp_path, "threnody-medium-high")
+    plan = _linear_plan()
+    plan["subtasks"][0]["reasoning_effort"] = "high"
+    plan["subtasks"][1]["reasoning_effort"] = "low"  # variant not installed
+    script = _render(plan, task="refactor auth module")
+    first = next(line for line in script.splitlines() if line.startswith("const r_1 ="))
+    second = next(line for line in script.splitlines() if line.startswith("const r_2 ="))
+    assert 'agentType: "threnody-medium-high"' in first
+    # No variant installed: stays the untyped agent it always was.
+    assert "agentType" not in second
 
 
 def test_linear_plan_all_single_waves() -> None:

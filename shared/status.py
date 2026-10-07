@@ -81,6 +81,7 @@ def build_status_snapshot(
     usage_state = build_usage_state(db, config)
     plan_cache_summary = build_plan_cache_summary(db)
 
+    swarm_run_summary = _load_swarm_run_summary(db)
     return {
         "project_id": project_id,
         "readiness": {
@@ -99,12 +100,14 @@ def build_status_snapshot(
         "recent_summary": _load_recent_summary(db),
         "adaptive_thresholds": _load_adaptive_summary(db),
         "rework_summary": _load_rework_summary(db),
-        "swarm_runs": _load_swarm_run_summary(db),
+        "swarm_runs": swarm_run_summary,
+        "reporting": _load_reporting_summary(db, superseded=swarm_run_summary.get("superseded")),
         "provider_health": _load_provider_health(db),
         "spend_summary": spend_snapshot,
         "quality_summary": quality_summary,
         "usage_state": usage_state,
         "plan_cache_summary": plan_cache_summary,
+        "agent_spawns": _load_agent_spawn_summary(),
         "db_health": {
             "last_backup": (
                 datetime.datetime.fromtimestamp(getattr(db, 'last_backup_ts', None)).isoformat()
@@ -118,6 +121,22 @@ def build_status_snapshot(
         "explainability_link": "threnody inspect status --details",
         "spend_link": "threnody inspect spend --since 7d",
     }
+
+
+def _load_agent_spawn_summary(*, window_s: float = 86400.0) -> dict:
+    """Last 24 h of the Agent hook's spawn ledger (``logs/agent_spawns.jsonl``).
+
+    Fail-soft and file-only: the ledger is the hook's, never the DB's. Shows
+    which effort rule fired per spawn and where a requested effort did not land.
+    """
+    try:
+        from shared.agent_ledger import summarize
+
+        summary = summarize(since_ts=time.time() - window_s)
+    except Exception:
+        log.debug("agent spawn summary load failed", exc_info=True)
+        return {"window_hours": int(window_s // 3600), "available": False}
+    return {"window_hours": int(window_s // 3600), **summary}
 
 
 def _load_db_health_snapshot(db: Database) -> dict:
@@ -246,8 +265,12 @@ def _load_swarm_run_summary(db: Database, *, stale_after_s: float = 86400.0) -> 
     ``stale_active`` counts runs still in an active status that are older than
     *stale_after_s* — the backlog ``Database.reap_stale_swarm_runs`` has not
     marked ``abandoned`` yet (or skipped for recent run-dir activity).
+    ``superseded`` counts handoffs retired by a newer handoff of the same
+    workspace before any worker started (``Database.supersede_idle_swarm_runs``).
     """
-    result: dict[str, object] = {"by_status": {}, "abandoned": 0, "stale_active": 0}
+    result: dict[str, object] = {
+        "by_status": {}, "abandoned": 0, "superseded": 0, "stale_active": 0,
+    }
     active = Database.ACTIVE_SWARM_STATUSES
     try:
         with db.conn() as conn:
@@ -262,9 +285,92 @@ def _load_swarm_run_summary(db: Database, *, stale_after_s: float = 86400.0) -> 
             ).fetchone()
         result["by_status"] = by_status
         result["abandoned"] = by_status.get("abandoned", 0)
+        result["superseded"] = by_status.get(Database.SWARM_STATUS_SUPERSEDED, 0)
         result["stale_active"] = int(stale_row[0]) if stale_row and stale_row[0] else 0
     except Exception:
         log.debug("swarm run summary load failed", exc_info=True)
+    return result
+
+
+_UNREPORTED_AFTER_S = 3600.0
+_UNREPORTED_SAMPLE = 5
+
+
+def _load_reporting_summary(
+    db: Database, *, now: float | None = None, superseded: object = None
+) -> dict:
+    """Is reporting actually reaching Threnody? Fail-soft; each part degrades alone.
+
+    * ``unreported_swarms`` — host handoffs still ``awaiting_host_execution`` an
+      hour after they were issued: the host never sent a single wave report.
+    * ``superseded`` — handoffs retired by a newer handoff of the same workspace
+      (the ``swarm_runs`` summary's count when the caller passes it in).
+    * ``outcomes_missing_model_24h`` — outcome rows from the last 24 h with no
+      ``model_used``: nobody, not even route telemetry, said which model ran.
+    * ``log_file`` — where warnings about lost reports are written.
+    """
+    current = time.time() if now is None else now
+    result: dict[str, object] = {
+        "unreported_swarms": {"count": 0, "newest": [], "older_than_s": _UNREPORTED_AFTER_S},
+        "superseded": 0,
+        "outcomes_missing_model_24h": None,
+        "outcomes_24h": None,
+        "log_file": None,
+    }
+    try:
+        with db.conn() as conn:
+            cutoff = current - _UNREPORTED_AFTER_S
+            count_row = conn.execute(
+                "SELECT COUNT(*) FROM swarm_runs "
+                "WHERE status = 'awaiting_host_execution' AND created_ts < ?",
+                (cutoff,),
+            ).fetchone()
+            rows = conn.execute(
+                "SELECT swarm_id, created_ts FROM swarm_runs "
+                "WHERE status = 'awaiting_host_execution' AND created_ts < ? "
+                "ORDER BY created_ts DESC LIMIT ?",
+                (cutoff, _UNREPORTED_SAMPLE),
+            ).fetchall()
+        result["unreported_swarms"] = {
+            "count": int(count_row[0]) if count_row and count_row[0] else 0,
+            "newest": [
+                {"swarm_id": str(rid), "age_s": round(max(0.0, current - float(ts or 0.0)), 1)}
+                for rid, ts in rows
+            ],
+            "older_than_s": _UNREPORTED_AFTER_S,
+        }
+    except Exception:
+        log.warning("reporting summary: unreported swarm scan failed", exc_info=True)
+    if isinstance(superseded, int):
+        result["superseded"] = superseded
+    else:
+        try:
+            with db.conn() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM swarm_runs WHERE status = ?",
+                    (Database.SWARM_STATUS_SUPERSEDED,),
+                ).fetchone()
+            result["superseded"] = int(row[0]) if row and row[0] else 0
+        except Exception:
+            log.warning("reporting summary: superseded count failed", exc_info=True)
+    try:
+        with db.conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN model_used IS NULL OR model_used = '' THEN 1 ELSE 0 END) "
+                "FROM routing_outcomes WHERE recorded_at >= ?",
+                (current - 86400.0,),
+            ).fetchone()
+        result["outcomes_24h"] = int(row[0]) if row and row[0] else 0
+        result["outcomes_missing_model_24h"] = int(row[1]) if row and row[1] else 0
+    except Exception:
+        log.warning("reporting summary: routing_outcomes scan failed", exc_info=True)
+    try:
+        from shared.logging_setup import log_file_path
+
+        result["log_file"] = str(log_file_path())
+    except Exception:
+        log.warning("reporting summary: log path resolution failed", exc_info=True)
     return result
 
 

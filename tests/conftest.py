@@ -105,6 +105,44 @@ def _isolate_host_model_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_model_registry, "_claude_settings_path", lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_threnody_logs(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch):
+    """Keep threnody.log and the agent-spawn ledger out of the repo's real logs/.
+
+    ``mcp_server.main()`` attaches the rotating file handler once per process; a
+    test that runs it would otherwise leave that handler on the root logger, so
+    later tests both write to the checkout's logs/ and see its path returned by the
+    idempotent ``configure_file_logging``.
+    """
+    try:
+        from shared import logging_setup as _logging_setup
+    except Exception:  # pragma: no cover - import-light test modules
+        yield
+        return
+    monkeypatch.setenv(_logging_setup.LOG_DIR_ENV, str(tmp_path_factory.mktemp("threnody-logs")))
+    _logging_setup.remove_file_logging()
+    yield
+    _logging_setup.remove_file_logging()
+
+
+@pytest.fixture(autouse=True)
+def _reset_default_session_start() -> None:
+    """``mcp_server.main()`` pins host_spawn's process-wide session-start default.
+
+    A test that runs ``main()`` would otherwise leave it set, and every later test
+    that writes an effort-variant file sees that file as "newer than the session"
+    and gets the base type instead (test order decided the outcome).
+    """
+    try:
+        from shared import host_spawn as _host_spawn
+    except Exception:  # pragma: no cover - import-light test modules
+        yield
+        return
+    _host_spawn.set_default_session_start(None)
+    yield
+    _host_spawn.set_default_session_start(None)
+
+
 # ============================================================================
 # FIXTURE 0: _isolate_learning_state  (autouse — do not make opt-in)
 # ============================================================================

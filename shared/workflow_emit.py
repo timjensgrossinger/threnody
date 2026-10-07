@@ -40,7 +40,13 @@ from .consensus import (
     consensus_review_instruction,
     select_personas,
 )
-from .host_spawn import host_native_model_for_tier
+from .effort_support import default_routed_effort
+from .host_spawn import (
+    _effort_for_subtask,
+    host_native_model_for_tier,
+    normalize_effort,
+    resolve_spawn_type,
+)
 
 log = logging.getLogger(__name__)
 
@@ -108,15 +114,51 @@ def _resolve_model(
     return None
 
 
+def _resolve_agent_type(
+    config: TGsConfig,
+    caller: str | None,
+    *,
+    base: str | None,
+    tier: str,
+    effort: str | None,
+    read_only: bool,
+) -> tuple[str | None, str | None]:
+    """``(agentType to emit or None, applied effort or None)`` for one ``agent()``.
+
+    ``agent()`` takes no effort option either, so the only way a workflow agent runs
+    at the routed effort is an ``agentType`` naming a definition that pins it — the
+    same resolver ``build_host_spawn`` uses. Only read-only agents may name their
+    own (review) type, as before. A write agent gets an ``agentType`` only when an
+    effort variant was actually chosen; otherwise it stays the untyped agent it
+    always was. A review type with no installed definition is dropped rather than
+    replaced by a tier type the workflow never asked for.
+    """
+    named = base.strip() if read_only and isinstance(base, str) and base.strip() else None
+    try:
+        resolution = resolve_spawn_type(
+            caller=caller, base=named, tier=tier, effort=effort, config=config
+        )
+    except Exception:
+        log.debug("workflow emit: spawn type resolution failed", exc_info=True)
+        return named, None
+    if resolution.applied_effort:
+        return resolution.subagent_type, resolution.applied_effort
+    if named and resolution.subagent_type == named:
+        return named, None
+    return None, None
+
+
 def _agent_opts(
     *,
     label: str,
     phase: str,
     model: str | None,
-    subagent_type: str | None,
-    read_only: bool,
+    agent_type: str | None,
 ) -> str:
-    """Build the JS options object literal for an ``agent()`` call."""
+    """Build the JS options object literal for an ``agent()`` call.
+
+    *agent_type* is already resolved (see :func:`_resolve_agent_type`).
+    """
     parts = [
         f"label: {_js_str(label)}",
         f"phase: {_js_str(phase)}",
@@ -124,10 +166,19 @@ def _agent_opts(
     ]
     if model:
         parts.append(f"model: {_js_str(model)}")
-    # Named review subagent types are claude-code first-class agent types.
-    if read_only and subagent_type and subagent_type.strip():
-        parts.append(f"agentType: {_js_str(subagent_type.strip())}")
+    if agent_type and agent_type.strip():
+        parts.append(f"agentType: {_js_str(agent_type.strip())}")
     return "{" + ", ".join(parts) + "}"
+
+
+def _meta_entry(
+    sid: Any, label: str, tier: str, model: str | None, effort: str | None
+) -> dict[str, Any]:
+    """Telemetry record for one agent; ``effort`` only when a definition pins it."""
+    entry: dict[str, Any] = {"id": str(sid), "label": label, "tier": tier, "model": model}
+    if normalize_effort(effort):
+        entry["effort"] = effort
+    return entry
 
 
 def _agent_prompt_expr(
@@ -272,12 +323,29 @@ def render_workflow_script(
 
     # ----- wave-by-wave emission ---------------------------------------------
     phase_cursor = 0
+    router_holder: list[Any] = []
     for wave_idx, wave_ids in enumerate(waves, start=1):
         if not isinstance(wave_ids, list) or not wave_ids:
             continue
         valid_ids = [sid for sid in wave_ids if sid in subtask_by_id]
         if not valid_ids:
             continue
+        # Resolved once per subtask: the multi-agent branch below walks the wave a
+        # second time, and the effort derivation classifies the prompt.
+        agent_types: dict[Any, tuple[str | None, str | None]] = {}
+        for sid in valid_ids:
+            subtask = subtask_by_id[sid]
+            tier = str(subtask.get("tier") or "medium")
+            prompt_text = str(subtask.get("description") or "").strip()
+            raw_type = subtask.get("subagent_type")
+            agent_types[sid] = _resolve_agent_type(
+                config,
+                caller,
+                base=raw_type if isinstance(raw_type, str) else None,
+                tier=tier,
+                effort=_effort_for_subtask(subtask, tier, prompt_text, router_holder, config),
+                read_only=bool(subtask.get("read_only", False)),
+            )
         phase_title = phase_titles[phase_cursor] if phase_cursor < len(phase_titles) else f"Wave {wave_idx}"
         phase_cursor += 1
         lines.append(f"phase({_js_str(phase_title)})")
@@ -287,7 +355,7 @@ def render_workflow_script(
             tier = str(subtask.get("tier") or "medium")
             model = _resolve_model(config, caller, subtask, tier, registry)
             read_only = bool(subtask.get("read_only", False))
-            subagent_type = subtask.get("subagent_type")
+            agent_type, applied_effort = agent_types[sid]
             label = str(subtask.get("stable_id") or f"st-{sid}")
             dep_ids = subtask.get("depends_on") or []
             dep_vars = [f"r_{d}" for d in dep_ids if d in subtask_by_id]
@@ -298,11 +366,10 @@ def render_workflow_script(
                 label=label,
                 phase=phase_title,
                 model=model,
-                subagent_type=subagent_type if isinstance(subagent_type, str) else None,
-                read_only=read_only,
+                agent_type=agent_type,
             )
             meta_entry = _js_literal(
-                {"id": str(sid), "label": label, "tier": tier, "model": model}
+                _meta_entry(sid, label, tier, model, applied_effort)
             )
             if len(valid_ids) == 1:
                 # Single-agent wave — await directly.
@@ -319,7 +386,7 @@ def render_workflow_script(
                 tier = str(subtask.get("tier") or "medium")
                 model = _resolve_model(config, caller, subtask, tier, registry)
                 read_only = bool(subtask.get("read_only", False))
-                subagent_type = subtask.get("subagent_type")
+                agent_type, applied_effort = agent_types[sid]
                 label = str(subtask.get("stable_id") or f"st-{sid}")
                 dep_ids = subtask.get("depends_on") or []
                 dep_vars = [f"r_{d}" for d in dep_ids if d in subtask_by_id]
@@ -330,11 +397,10 @@ def render_workflow_script(
                     label=label,
                     phase=phase_title,
                     model=model,
-                    subagent_type=subagent_type if isinstance(subagent_type, str) else None,
-                    read_only=read_only,
+                    agent_type=agent_type,
                 )
                 meta_entry = _js_literal(
-                    {"id": str(sid), "label": label, "tier": tier, "model": model}
+                    _meta_entry(sid, label, tier, model, applied_effort)
                 )
                 thunks.append(
                     f"  async () => {{ r_{sid} = await agent({prompt_expr}, {opts}); "
@@ -351,6 +417,14 @@ def render_workflow_script(
     if emit_consensus:
         queen_tier = str(getattr(config, "consensus_queen_tier", "low") or "low")
         queen_model = host_native_model_for_tier(config, caller, queen_tier, registry=registry)
+        queen_type, queen_effort = _resolve_agent_type(
+            config,
+            caller,
+            base=None,
+            tier=queen_tier,
+            effort=default_routed_effort(queen_tier),
+            read_only=True,
+        )
         review_instruction = consensus_review_instruction(task_text or "")
         lines.append("// Consensus phase — persona-diverse read-only review queens. Their")
         lines.append("// verdicts are tallied by report_workflow_result (shared/consensus.py),")
@@ -381,16 +455,18 @@ def render_workflow_script(
                 label=f"queen-{pid}",
                 phase="Consensus",
                 model=queen_model,
-                subagent_type=None,
-                read_only=True,
+                agent_type=queen_type,
             )
             # Read-only instruction prepended; queens review, never write.
             qprompt_expr = (
                 _js_str("READ-ONLY consensus review. Do not write or edit any file.\n\n" + qprompt)
             )
-            qmeta = _js_literal(
-                {"persona": pid, "wave_kind": "consensus", "tier": queen_tier, "model": queen_model}
-            )
+            qmeta_obj: dict[str, Any] = {
+                "persona": pid, "wave_kind": "consensus", "tier": queen_tier, "model": queen_model,
+            }
+            if queen_effort:
+                qmeta_obj["effort"] = queen_effort
+            qmeta = _js_literal(qmeta_obj)
             queen_thunks.append(
                 f"  async () => {{ const q = await agent({qprompt_expr}, {qopts}); "
                 f"__consensus.push(Object.assign({qmeta}, {{result: q}})); return q }}"

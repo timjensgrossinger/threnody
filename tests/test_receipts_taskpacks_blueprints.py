@@ -4,6 +4,8 @@ from pathlib import Path
 
 import sys
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mcp_server
@@ -63,20 +65,136 @@ def test_cost_receipt_does_not_fabricate_savings_for_unpriced_selection() -> Non
     assert cost["estimate_basis"] == "tier_token_budget"
 
 
-def test_cost_receipt_reports_not_comparable_for_opus_vs_opus() -> None:
-    """Selecting the same model as the counterfactual (host-native opus vs the
-    opus counterfactual) must not read as a real savings figure."""
+def test_cost_receipt_same_model_is_zero_savings_not_not_comparable() -> None:
+    """Selecting the counterfactual model itself (host-native opus) is zero
+    savings with an explicit basis, and a caller-supplied cost figure (credits
+    heuristic) must not leak into the USD comparison."""
     cost = build_cost_receipt(
         source_tool="execute_swarm",
         task="host-native opus run",
         tier="high",
-        model="claude-opus-4-6",
+        model="claude-opus-5-5",
         provider="claude-code",
         payload={"host_spawn_waves": [{"wave": 1, "agents": [{}, {}]}]},
-        estimated_cost_usd=5.0,  # deliberately higher than the counterfactual estimate
+        estimated_cost_usd=5.0,
     )
-    assert cost["savings"]["estimated_usd"] is None
-    assert cost["savings"]["basis"] == "not_comparable"
+    assert cost["savings"]["estimated_usd"] == 0.0
+    assert cost["savings"]["basis"] == "same_model"
+    assert cost["selected"]["estimated_cost_usd"] == cost["counterfactual"]["estimated_cost_usd"]
+    assert cost["selected"]["estimated_cost_usd"] != 5.0
+
+
+def _opus_swarm_payload(n: int) -> dict:
+    agents = [{"tier": "high", "model": "opus", "id": i} for i in range(n)]
+    return {"host_spawn_waves": [{"wave": 1, "agents": agents}]}
+
+
+def test_nine_agent_opus_swarm_receipt_is_comparable_usd(monkeypatch) -> None:
+    for var in ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("shared.model_registry._claude_settings_path", lambda: None)
+    cost = build_cost_receipt(
+        source_tool="execute_swarm",
+        task="review swarm",
+        tier="medium",
+        model=None,
+        provider="claude-code",
+        payload=_opus_swarm_payload(9),
+    )
+    assert cost["currency"] == "USD"
+    assert cost["agent_count"] == 9
+    assert cost["selected"]["model"] == "claude-opus-5-5"
+    assert cost["selected"]["model_alias"] == "opus"
+    # The agents are high tier; the "medium" argument is execute_swarm's placeholder.
+    assert cost["selected"]["tier"] == "high"
+    assert cost["counterfactual"]["model"] == "claude-opus-5-5"
+    assert cost["selected"]["billing"] == "host_entitlement"
+    assert cost["selected"]["estimated_cost_usd"] == cost["counterfactual"]["estimated_cost_usd"] > 0
+    assert cost["savings"]["basis"] == "same_model"
+    assert cost["savings"]["estimated_usd"] == 0.0
+
+
+def test_mixed_tier_swarm_receipt_reports_tier_counts(monkeypatch) -> None:
+    for var in ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("shared.model_registry._claude_settings_path", lambda: None)
+    agents = [{"tier": "high", "model": "opus"}] * 7 + [{"tier": "medium", "model": "sonnet"}]
+    cost = build_cost_receipt(
+        source_tool="execute_swarm",
+        task="review swarm",
+        tier="medium",
+        model=None,
+        provider="claude-code",
+        payload={"host_spawn_waves": [{"wave": 1, "agents": agents}]},
+    )
+    assert cost["selected"]["tier"] == "mixed"
+    assert cost["selected"]["tiers"] == {"high": 7, "medium": 1}
+    assert cost["selected"]["models"] == {"claude-opus-5-5": 7, "claude-sonnet-5-5": 1}
+    assert cost["savings"]["basis"] == "priced"
+
+
+def test_sonnet_selected_vs_opus_counterfactual_saves(monkeypatch) -> None:
+    for var in ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("shared.model_registry._claude_settings_path", lambda: None)
+    cost = build_cost_receipt(
+        source_tool="route_task",
+        task="medium task",
+        tier="medium",
+        model="sonnet",
+        provider="claude-code",
+        payload={"host_spawn": {"tool": "Task"}},
+    )
+    assert cost["selected"]["model"] == "claude-sonnet-5-5"
+    assert cost["selected"]["model_alias"] == "sonnet"
+    assert cost["selected"]["estimated_cost_usd"] > 0  # host-native is priced, not 0
+    assert cost["savings"]["basis"] == "priced"
+    assert cost["savings"]["estimated_usd"] > 0
+
+
+def test_receipt_alias_resolution_honours_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-6")
+    cost = build_cost_receipt(
+        source_tool="execute_swarm",
+        task="t",
+        tier="high",
+        model="opus",
+        provider="claude-code",
+        payload=_opus_swarm_payload(2),
+    )
+    assert cost["selected"]["model"] == "claude-opus-4-6"
+    assert cost["counterfactual"]["model"] == "claude-opus-4-6"
+
+
+def test_unknown_model_is_unpriced_never_not_comparable() -> None:
+    cost = build_cost_receipt(
+        source_tool="route_task",
+        task="t",
+        tier="medium",
+        model="some-unknown-model",
+        provider="x",
+    )
+    assert cost["savings"]["basis"] == "unpriced"
+    assert cost["selected"]["estimated_cost_usd"] is None
+
+
+def test_price_table_has_current_claude_models() -> None:
+    from shared.model_catalog import _load_price_data
+
+    prices = _load_price_data()
+    expected = {
+        "claude-opus-5-5": (4.0, 20.0, 0.20, 5.0),
+        "claude-sonnet-5-5": (2.0, 10.0, 0.20, 2.5),
+        "claude-fable-5-1": (10.0, 50.0, 0.25, 12.5),
+        "claude-haiku-4-5": (1.0, 5.0, 0.10, 1.25),
+    }
+    for model_id, (inp, out, cread, cwrite) in expected.items():
+        info = prices[model_id]
+        assert info["input_cost_per_token"] * 1e6 == pytest.approx(inp)
+        assert info["output_cost_per_token"] * 1e6 == pytest.approx(out)
+        if "cache_read_input_token_cost" in info:
+            assert info["cache_read_input_token_cost"] * 1e6 == pytest.approx(cread)
+            assert info["cache_creation_input_token_cost"] * 1e6 == pytest.approx(cwrite)
 
 
 def test_cost_receipt_reports_real_savings_when_both_sides_priced() -> None:

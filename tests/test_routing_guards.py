@@ -795,7 +795,10 @@ def test_route_task_preserves_routed_plan_guard_during_active_handoff(
 
         routed = mcp_server.handle_route_task({"task": "quick follow-up", "cwd": str(ROOT)})
         assert routed["execution_hint"].get("active_handoff") is True
-        guard = routed.get("routing_guard")
+        # No guard was written for the follow-up task, so none is presented as
+        # its routing_guard; the handoff's own plan guard is named separately.
+        assert "routing_guard" not in routed
+        guard = routed.get("active_handoff_guard")
         assert isinstance(guard, dict)
         assert guard.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN
 
@@ -870,7 +873,10 @@ def test_route_task_active_handoff_keeps_codex_host_native_metadata(
         )
         assert routed["execution_hint"].get("active_handoff") is True
         assert routed["execution_hint"].get("host_native_method") == "host_task"
-        guard = routed.get("routing_guard")
+        # No guard was written for the follow-up task, so none is presented as
+        # its routing_guard; the handoff's own plan guard is named separately.
+        assert "routing_guard" not in routed
+        guard = routed.get("active_handoff_guard")
         assert isinstance(guard, dict)
         assert guard.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN
 
@@ -935,7 +941,10 @@ def test_route_task_active_handoff_keeps_other_host_provider_metadata(
         _assert_host_native_route(routed, host_provider=caller)
         assert routed["execution_hint"].get("active_handoff") is True
         assert routed["execution_hint"].get("host_native_method") == "host_task"
-        guard = routed.get("routing_guard")
+        # No guard was written for the follow-up task, so none is presented as
+        # its routing_guard; the handoff's own plan guard is named separately.
+        assert "routing_guard" not in routed
+        guard = routed.get("active_handoff_guard")
         assert isinstance(guard, dict)
         assert guard.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN
 
@@ -1318,10 +1327,14 @@ def test_install_removes_claude_routing_hook_when_policy_disables_it() -> None:
 
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         # An explicit "off" removes the PreToolUse routing guard. The PostToolUse
-        # learning hook is independent of routing policy (default-on), so it may
-        # remain — but no routing guard should survive.
+        # learning hook and the Agent model/effort hook are independent of routing
+        # policy (default-on), so they may remain — but no routing guard should
+        # survive, neither the Edit|Write entry nor the legacy mcp_tool one.
         hooks = settings.get("hooks", {})
-        assert "PreToolUse" not in hooks
+        for group in hooks.get("PreToolUse", []):
+            assert group.get("matcher") == "Agent", group
+            for hook in group.get("hooks", []):
+                assert "threnody-agent-hook" in str(hook.get("command", "")), hook
         for group in hooks.get("PostToolUse", []):
             for hook in group.get("hooks", []):
                 assert "threnody-routing-hook" not in str(hook.get("command", ""))

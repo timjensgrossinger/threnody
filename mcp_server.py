@@ -44,6 +44,11 @@ from typing import Any, Mapping
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 
+# When this process started. A stdio MCP server is launched together with the host
+# session, so this bounds which agent definitions that session loaded; main() hands
+# it to host_spawn as the default session start (see set_default_session_start).
+_PROCESS_START_TS = time.time()
+
 from shared.config import CONFIG_YAML, TGsConfig, DEFAULT_ROUTING_EXCEPTION_FILETYPES, DEFAULT_ROUTING_EXCEPTION_PATHS
 from shared.claude_compat import load_claude_module
 from shared.version import get_display_version, get_version
@@ -151,6 +156,8 @@ from shared.host_spawn import (
     build_host_native_required_response,
     build_host_spawn,
     build_host_spawn_waves,
+    resolve_spawn_type,
+    set_default_session_start,
     tier_subagent_type,
     sanitize_plan_for_host,
     effective_planner_host_execution_mode,
@@ -583,7 +590,7 @@ def _run_warm_path_loop() -> None:
             time.sleep(interval)
             if not background_db_available(_db):
                 continue  # deferred, not lost: the queue lives in the DB
-            run_warm_path_background_tasks(_db)
+            run_warm_path_background_tasks(_db, config=_config, router=_router)
         except Exception:
             log.debug("warm path background loop error", exc_info=True)
 
@@ -1289,6 +1296,14 @@ TOOLS = [
                         "Omit and paths named in the task text are used instead."
                     ),
                 },
+                "subagent_type": {
+                    "type": "string",
+                    "description": (
+                        "Agent type you intend to spawn (e.g. threnody-review-logic). "
+                        "Returns spawn_subagent_type: the definition that pins the routed "
+                        "effort, or why it cannot be pinned this session."
+                    ),
+                },
             },
             "required": ["task"],
         },
@@ -1363,6 +1378,11 @@ TOOLS = [
                 "tiers": {"type": "array", "items": {"type": "string", "enum": ["low", "medium", "high"]}},
                 "levels": {"type": "array", "items": {"type": "integer"}},
                 "case_ids": {"type": "array", "items": {"type": "string"}},
+                "effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Force one reasoning effort for every item (default: per-tier routed effort)",
+                },
             },
         },
     },
@@ -1378,6 +1398,11 @@ TOOLS = [
                 "case_id": {"type": "string"},
                 "tier": {"type": "string", "enum": ["low", "medium", "high"]},
                 "model": {"type": "string", "description": "Model the agent actually ran on"},
+                "effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "The item's applied effort from ladder_plan (omit when it had none)",
+                },
                 "sweep_id": {"type": "string", "description": "sweep_id returned by ladder_plan"},
                 "content": {"type": "string", "description": "The agent's raw file content"},
             },
@@ -2160,7 +2185,16 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "The model that actually did the work, when it differs from "
-                        "what route_task returned. Used to attribute quality-ledger rows."
+                        "what route_task returned. Aliases (opus/sonnet/haiku) are stored "
+                        "as the concrete model id. Used to attribute quality-ledger rows."
+                    ),
+                },
+                "actual_effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": (
+                        "The reasoning effort the work actually ran at, when known. "
+                        "Attributed to the verify-gate and outcome rows instead of a guess."
                     ),
                 },
             },
@@ -2429,6 +2463,7 @@ def _persist_host_plan_run(
     task: str,
     payload: Mapping[str, object],
     workspace_root: str | None,
+    caller: str | None = None,
 ) -> None:
     waves = payload.get("host_spawn_waves")
     if not isinstance(waves, list) or not waves:
@@ -2452,10 +2487,28 @@ def _persist_host_plan_run(
                 "round": 0,
                 "resumable": False,
                 "resume_status": "awaiting_host_execution",
+                # Unresolved/absent cwd stays NULL ("workspace unknown"); only a
+                # root the host actually named scopes the active-handoff check.
+                "workspace_root": _normalized_cwd_or_none(workspace_root),
+                "caller": _swarm_caller_key(caller),
             }
         )
     except Exception:
         log.debug("host plan run persist failed for %s", run_id, exc_info=True)
+
+
+def _swarm_caller_key(caller: str | None) -> str | None:
+    """Caller id as stored on swarm_runs; None when the caller is unknown.
+
+    execute_swarm falls back to ``"anonymous"`` and the routing guard to
+    ``"mcp"`` for the same unknown caller, so neither placeholder may be stored:
+    a recorded caller is used to tell two hosts' runs apart, and two spellings of
+    "unknown" would read as two different hosts.
+    """
+    normalized = normalize_caller_id(caller)
+    if not normalized or normalized in {"anonymous", "mcp"}:
+        return None
+    return normalized
 
 
 def _attach_and_persist_plan_receipt(
@@ -2499,7 +2552,7 @@ def _attach_and_persist_plan_receipt(
                     workspace_root=workspace_root,
                 )
             except Exception as exc:
-                log.debug("%s receipt persist failed for %s", source_tool, run_id, exc_info=True)
+                log.warning("%s receipt persist failed for %s", source_tool, run_id, exc_info=True)
                 _failed_receipts[run_id] = str(exc)[:200]
             finally:
                 _pending_receipts.pop(run_id, None)
@@ -2559,13 +2612,14 @@ def handle_plan_task(args: dict) -> dict:
                 task=task,
                 source_tool="plan_task",
                 payload=result,
+                task_id=host_run_id or plan_run_id(task),
             )
-            if guard is not None:
-                result["routing_guard"] = guard
+            _attach_routing_guard(result, guard)
             if host_run_id:
                 _persist_host_plan_run(
                     db,
                     run_id=host_run_id,
+                    caller=caller,
                     task=task,
                     payload=result,
                     workspace_root=workspace_root,
@@ -2646,13 +2700,14 @@ def handle_plan_task(args: dict) -> dict:
         task=task,
         source_tool="plan_task",
         payload=result,
+        task_id=host_run_id or plan_run_id(task),
     )
-    if guard is not None:
-        result["routing_guard"] = guard
+    _attach_routing_guard(result, guard)
     if host_run_id:
         _persist_host_plan_run(
             db,
             run_id=host_run_id,
+            caller=caller,
             task=task,
             payload=result,
             workspace_root=workspace_root,
@@ -2667,6 +2722,7 @@ def handle_plan_task(args: dict) -> dict:
     )
     cacheable_result = dict(result)
     cacheable_result.pop("routing_guard", None)
+    cacheable_result.pop("routing_guard_skipped", None)
     cacheable_result.pop("cost_receipt", None)
     db.cache_put(task, json.dumps(cacheable_result), "planner")
     return result
@@ -2717,13 +2773,14 @@ def handle_fleet_plan(args: dict) -> dict:
                     task=task,
                     source_tool="fleet_plan",
                     payload=plan_payload,
+                    task_id=host_run_id or plan_run_id(task),
                 )
-                if guard is not None:
-                    cached_result["routing_guard"] = guard
+                _attach_routing_guard(cached_result, guard)
                 if host_run_id:
                     _persist_host_plan_run(
                         db,
                         run_id=host_run_id,
+                        caller=caller,
                         task=task,
                         payload=plan_payload,
                         workspace_root=workspace_root,
@@ -2764,13 +2821,14 @@ def handle_fleet_plan(args: dict) -> dict:
                     task=task,
                     source_tool="fleet_plan",
                     payload=cached_result,
+                    task_id=host_run_id or plan_run_id(task),
                 )
-                if guard is not None:
-                    result["routing_guard"] = guard
+                _attach_routing_guard(result, guard)
                 if host_run_id:
                     _persist_host_plan_run(
                         db,
                         run_id=host_run_id,
+                        caller=caller,
                         task=task,
                         payload=cached_result,
                         workspace_root=workspace_root,
@@ -2833,19 +2891,21 @@ def handle_fleet_plan(args: dict) -> dict:
         task=task,
         source_tool="fleet_plan",
         payload=plan_dict,
+        task_id=host_run_id or plan_run_id(task),
     )
-    if guard is not None:
-        result["routing_guard"] = guard
+    _attach_routing_guard(result, guard)
     if host_run_id:
         _persist_host_plan_run(
             db,
             run_id=host_run_id,
+            caller=caller,
             task=task,
             payload=plan_dict,
             workspace_root=workspace_root,
         )
     cacheable_result = dict(result)
     cacheable_result.pop("routing_guard", None)
+    cacheable_result.pop("routing_guard_skipped", None)
     db.cache_put(task, json.dumps(cacheable_result), "planner")
     return result
 
@@ -3580,8 +3640,13 @@ def _attach_host_spawn_metadata(
     run_id: str | None = None,
     workspace_root: str | None = None,
     topology: str | None = None,
+    subagent_type: str | None = None,
 ) -> None:
-    """Attach host_spawn or host_spawn_waves for MCP host callers."""
+    """Attach host_spawn or host_spawn_waves for MCP host callers.
+
+    *subagent_type* (single-agent path only) is the type the caller said it will
+    spawn; ``host_spawn`` then carries its effort-resolved form.
+    """
     if normalize_caller_id(caller) not in HOST_PROVIDER_NAMES:
         return
     if isinstance(payload.get("subtasks"), list) and isinstance(payload.get("waves"), list):
@@ -3655,14 +3720,18 @@ def _attach_host_spawn_metadata(
     host_model = hint.get("host_native_model")
     model = host_model if isinstance(host_model, str) and host_model.strip() else None
     prompt = task if isinstance(task, str) else ""
-    payload["host_spawn"] = build_host_spawn(
+    spawn = build_host_spawn(
         config=config,
         caller=caller,
         tier=resolved_tier,
         prompt=prompt,
         model=model,
+        subagent_type=subagent_type.strip() if isinstance(subagent_type, str) and subagent_type.strip() else None,
         effort=payload.get("reasoning_effort") if isinstance(payload.get("reasoning_effort"), str) else None,
     ).to_dict()
+    if isinstance(subagent_type, str) and subagent_type.strip():
+        spawn["spawn_subagent_type"] = spawn["subagent_type"]
+    payload["host_spawn"] = spawn
 
 
 def _enrich_fleet_waves_with_host_spawn(
@@ -3757,7 +3826,9 @@ def _emitted_cell_labels(
             if not label:
                 # Fall back to the manifest's own fields when the plan's subtask
                 # list is unavailable (or ids were renumbered downstream).
-                dim = dimension_for_subagent_type(agent.get("subagent_type"))
+                dim = dimension_for_subagent_type(
+                    agent.get("subagent_type")
+                ) or dimension_for_subagent_type(agent.get("base_subagent_type"))
                 target = agent.get("target_file")
                 if not isinstance(target, str) or not target.strip():
                     tfs = agent.get("target_files")
@@ -3769,6 +3840,49 @@ def _emitted_cell_labels(
             else:
                 non_cells += 1
     return labels, non_cells
+
+
+# A review that lost more than this share of its cells, or any security cell, is not the
+# review the caller asked for. Past it the response carries ``requires_confirmation``.
+_REVIEW_DROP_CONFIRM_FRACTION = 0.30
+
+
+def _review_drop_confirmation(
+    dropped_cells: list[str],
+    expected_agents: object,
+    planned_agents: object,
+    coverage: object,
+) -> str:
+    """Reason a review that dropped cells needs the user's go-ahead; ``""`` if it does not.
+
+    Fires when more than 30 % of the expected review cells are missing, or when any
+    dropped cell is a security cell. Cells served from prior-review memory are not
+    in ``dropped_cells`` (they are reported as ``skipped``), so replaying an unchanged
+    revision never trips it.
+    """
+    total = 0
+    if isinstance(coverage, Mapping) and isinstance(coverage.get("dimensions_expected"), Mapping):
+        total = sum(
+            len(d) for d in coverage["dimensions_expected"].values() if isinstance(d, list)
+        )
+    if total <= 0:
+        total = len(dropped_cells) + max(0, int(planned_agents or 0) - 1)
+    security = [c for c in dropped_cells if c.rsplit(":", 1)[-1] == "security"]
+    share = len(dropped_cells) / total if total else 0.0
+    reasons: list[str] = []
+    if security:
+        reasons.append(f"{len(security)} security cell(s) dropped ({', '.join(security)})")
+    if share > _REVIEW_DROP_CONFIRM_FRACTION:
+        reasons.append(
+            f"{len(dropped_cells)} of {total} review cells dropped ({share:.0%}, limit "
+            f"{_REVIEW_DROP_CONFIRM_FRACTION:.0%})"
+        )
+    if not reasons:
+        return ""
+    return (
+        "; ".join(reasons)
+        + ". Ask the user whether to proceed, raise max_agents, or narrow the file list."
+    )
 
 
 def _build_plan_contract(
@@ -4050,10 +4164,18 @@ def _execute_swarm_host_native_response(
                 "round": 0,
                 "resumable": False,
                 "resume_status": "awaiting_host_execution",
+                "workspace_root": resolved_workspace,
+                "caller": _swarm_caller_key(caller),
             }
         )
     except Exception:
         log.warning("host-native execute_swarm persist failed", exc_info=True)
+    supersede = _supersede_previous_workspace_runs(
+        db,
+        swarm_id=swarm_id,
+        workspace_root=resolved_workspace,
+        caller=caller,
+    )
     _log_swarm_event_safe(
         db,
         swarm_id,
@@ -4067,6 +4189,7 @@ def _execute_swarm_host_native_response(
         task=task_text,
         source_tool="execute_swarm",
         payload=plan_dict,
+        task_id=swarm_id,
     )
     learning_contract = build_learning_report_contract(
         resolved_workspace, run_id=swarm_id, config=config, caller=_resolve_caller(),
@@ -4110,8 +4233,10 @@ def _execute_swarm_host_native_response(
         "fast_start_target_ms": fast_start_target_ms,
         "plan": plan_dict,
         "cost_estimate": {
+            # Effort heuristic, NOT money: "estimated" is kept as a deprecated alias
+            # because budget preview/confirm compare it. USD lives in cost_receipt.
+            "effort_credits": float(estimated_cost),
             "estimated": float(estimated_cost),
-            "currency": "USD",
             "unit": "credits",
             "method": "fast_heuristic",
         },
@@ -4135,8 +4260,19 @@ def _execute_swarm_host_native_response(
             "judge's JSON output."
         ),
     }
-    if guard is not None:
-        swarm_result["routing_guard"] = guard
+    _attach_routing_guard(swarm_result, guard)
+    if supersede.get("superseded"):
+        swarm_result["superseded_runs"] = list(supersede["superseded"])
+    if supersede.get("concurrent_active"):
+        swarm_result["concurrent_active_run"] = {
+            "swarm_ids": list(supersede["concurrent_active"]),
+            "warning": (
+                "Another run for this workspace is still active and has worker "
+                "activity; it was left alone. Finish or report it "
+                "(report_host_swarm_complete) before relying on this run's "
+                "learning capture — both write to the same workspace."
+            ),
+        }
     if plan_dict.get("host_execution_contract"):
         swarm_result["host_execution_contract"] = plan_dict["host_execution_contract"]
     # Surface workflow-emit keys (claude-code opt-in) so the /threnody-workflow skill
@@ -4159,14 +4295,16 @@ def _execute_swarm_host_native_response(
         source_tool="execute_swarm",
         task=task_text,
         tier="medium",
-        model="host-native",
+        model=None,  # priced per agent from host_spawn_waves tier/model
         provider=normalize_caller_id(caller) or "host",
         payload=swarm_result,
-        estimated_cost_usd=float(estimated_cost),
         rationale="Host-native swarm handoff plans once and executes in the host without subprocess fanout.",
         skipped_calls=["delegate coordinator process", "same-host subprocess delegation"],
     )
     swarm_result["cost_receipt"] = cost_receipt
+    _swarm_cost_estimate = swarm_result.get("cost_estimate")
+    if isinstance(_swarm_cost_estimate, dict):
+        _swarm_cost_estimate["estimated_usd"] = cost_receipt["selected"]["estimated_cost_usd"]
     # Defer the detailed receipt DB write off the first-spawn critical path.
     # cost_receipt is already in the wire response; inspect_run_receipt will be
     # available once the background persist completes.
@@ -4188,7 +4326,7 @@ def _execute_swarm_host_native_response(
                 workspace_root=_bg_workspace,
             )
         except Exception as exc:
-            log.debug("execute_swarm receipt persist failed for %s", _bg_swarm_id, exc_info=True)
+            log.warning("execute_swarm receipt persist failed for %s", _bg_swarm_id, exc_info=True)
             _failed_receipts[_bg_swarm_id] = str(exc)[:200]
         finally:
             _pending_receipts.pop(_bg_swarm_id, None)
@@ -4233,12 +4371,24 @@ def _execute_swarm_host_native_response(
         _dropped = plan_summary["contract"].get("dropped") or []
         if _dropped:
             _cells = [str(d.get("cell")) for d in _dropped if isinstance(d, Mapping)]
+            # Every cell, not a sample: a host that sees "first 8 of 13" has no way to
+            # tell whether the missing five were the riskiest files.
             swarm_result["coverage_warning"] = (
                 f"{len(_dropped)} review cell(s) planned but not emitted: "
-                f"{', '.join(_cells[:8])}"
-                f"{'...' if len(_cells) > 8 else ''}. "
+                f"{', '.join(_cells)}. "
                 "See plan_summary.contract.dropped for the reason on each."
             )
+            _confirm = _review_drop_confirmation(
+                _cells, plan_summary["contract"].get("expected_agents"),
+                plan_summary["contract"].get("planned_agents"), p.get("coverage"),
+            )
+            if _confirm:
+                # A flag the host must act on, not a preview token: this response is
+                # host-native (the host spawns the agents), so there is no runtime
+                # handoff for resume_swarm_confirm to release. The skills ask the
+                # user before spawning when this is set.
+                swarm_result["requires_confirmation"] = True
+                swarm_result["confirmation_reason"] = _confirm
     if review_run and requested_topology and requested_topology != "dag":
         # A REVIEW: plan hardcodes topology="dag" and never reads the caller's
         # value, so accepting one and silently discarding it was the worst of the
@@ -4281,7 +4431,7 @@ def _execute_swarm_host_native_response(
         if instruction_tax is not None:
             swarm_result["instruction_tax_warning"] = instruction_tax
     except Exception:
-        log.debug("instruction tax report failed", exc_info=True)
+        log.warning("instruction tax report failed", exc_info=True)
     return {
         "result": swarm_result,
         "started": False,
@@ -4407,6 +4557,50 @@ def _handoff_payload_writes_files(payload: Mapping[str, object], task: str) -> b
     return False
 
 
+def _supersede_previous_workspace_runs(
+    db: Database,
+    *,
+    swarm_id: str,
+    workspace_root: str,
+    caller: str | None,
+) -> dict[str, list[str]]:
+    """Retire this workspace's earlier, never-started handoffs. Best-effort.
+
+    Must run before ``set_active_run`` moves the workspace pointer to the new
+    run: the pointer is the one place a previous run is recorded even when its
+    swarm_runs row predates the workspace_root column.
+    """
+    extra: list[str] = []
+    try:
+        from shared import run_log as _run_log
+
+        previous = _run_log.get_active_run(workspace_root)
+        if previous:
+            extra.append(previous)
+    except Exception:
+        log.debug("active-run pointer lookup failed for %s", workspace_root, exc_info=True)
+    try:
+        result = db.supersede_idle_swarm_runs(
+            new_swarm_id=swarm_id,
+            workspace_root=workspace_root,
+            caller=_swarm_caller_key(caller),
+            extra_candidates=extra,
+        )
+    except Exception:
+        log.warning("supersede of previous swarm runs failed for %s", swarm_id, exc_info=True)
+        return {"superseded": [], "concurrent_active": []}
+    # A superseded run's pointer would keep the PostToolUse hook appending this
+    # workspace's edits to it when the new run sets no pointer (inline mode).
+    for old_id in result.get("superseded") or []:
+        try:
+            from shared import run_log as _run_log
+
+            _run_log.remove_active_pointers_for(old_id)
+        except Exception:
+            log.debug("pointer removal failed for superseded %s", old_id, exc_info=True)
+    return result
+
+
 def _caller_has_active_host_handoff(db: Database, caller: str | None, cwd: object | None) -> bool:
     existing = db.routing_guard_get(
         caller=_normalize_route_text(caller) or "mcp",
@@ -4414,26 +4608,40 @@ def _caller_has_active_host_handoff(db: Database, caller: str | None, cwd: objec
     )
     if isinstance(existing, Mapping) and existing.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN:
         return True
-    # swarm_runs carries no cwd/caller column, so this fallback cannot be scoped
-    # to a workspace; bound it by age instead. A handoff must not outlive its own
-    # routing guard (ROUTING_GUARD_TTL_SECONDS), otherwise abandoned rows would
-    # suppress route_task guards for every project indefinitely.
+    # Fallback for a handoff whose routed_plan guard was never written (no write
+    # targets, or a skipped write). Scoped to this cwd's workspace and caller:
+    # unscoped, a swarm handed off in project A suppressed route_task guards in
+    # project B for an hour. Rows from before swarm_runs.workspace_root existed
+    # (NULL) keep the old age-only behaviour — their workspace is unknowable.
+    # Either way a handoff must not outlive its own routing guard
+    # (ROUTING_GUARD_TTL_SECONDS), or abandoned rows would suppress guards forever.
     cutoff = time.time() - ROUTING_GUARD_TTL_SECONDS
+    cwd_path = Path(_routing_guard_cwd(cwd))
+    caller_key = _swarm_caller_key(caller)
     try:
         with db.conn() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 """
-                SELECT 1 FROM swarm_runs
+                SELECT workspace_root, caller FROM swarm_runs
                 WHERE status IN ('awaiting_host_execution', 'running')
                   AND created_ts >= ?
-                LIMIT 1
                 """,
                 (cutoff,),
-            ).fetchone()
-        return row is not None
+            ).fetchall()
     except Exception:
-        log.debug("active host handoff lookup failed", exc_info=True)
+        log.warning("active host handoff lookup failed", exc_info=True)
         return False
+    for row_root, row_caller in rows:
+        if caller_key and row_caller and str(row_caller) != caller_key:
+            continue
+        if not row_root:
+            return True
+        try:
+            if cwd_path == Path(str(row_root)) or cwd_path.is_relative_to(Path(str(row_root))):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def _issue_host_handoff_routing_guard(
@@ -4447,6 +4655,7 @@ def _issue_host_handoff_routing_guard(
     tier: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    task_id: str | None = None,
 ) -> dict[str, object] | None:
     if not _handoff_payload_writes_files(payload, task):
         return None
@@ -4463,6 +4672,7 @@ def _issue_host_handoff_routing_guard(
         provider=provider,
         model=model,
         file_hints=extra_hints,
+        task_id=task_id,
     )
 
 
@@ -4478,7 +4688,14 @@ def _issue_routing_guard(
     provider: str | None = None,
     model: str | None = None,
     file_hints: list[str] | None = None,
+    task_id: str | None = None,
 ) -> dict[str, object] | None:
+    """Write the routing guard for this task; returns it, a skip record, or None.
+
+    A skip record (``{"skipped": True, ...}``, see ``Database.routing_guard_put``)
+    means another decision's guard stays in force. Attach results through
+    ``_attach_routing_guard`` so a skip is never presented as this task's guard.
+    """
     if mode is None:
         return None
     normalized_caller = _normalize_route_text(caller) or "mcp"
@@ -4541,6 +4758,7 @@ def _issue_routing_guard(
             task_text=task,
             file_hints=file_hints,
             ttl_seconds=ROUTING_GUARD_TTL_SECONDS,
+            task_id=task_id,
         )
     except (OSError, ValueError, sqlite3.DatabaseError) as exc:
         try:
@@ -4550,6 +4768,32 @@ def _issue_routing_guard(
         log.warning("Failed to issue routing guard via %s: %s", source_tool, exc)
         log.debug("Routing guard issuance failed", exc_info=True)
         return None
+
+
+def _attach_routing_guard(result: dict, guard: Mapping[str, object] | None) -> None:
+    """Attach *guard* to *result* only if it was written for this task.
+
+    ``routing_guard`` in a response is read as "the guard now enforcing this
+    task". A skipped write leaves another task's guard in force; attaching that
+    row as ``routing_guard`` (which is what every site used to do) told the host
+    its plan was guarded by an unrelated, sometimes hour-old, task. A skip is
+    reported as ``routing_guard_skipped`` with the kept row's identity only.
+    """
+    if not isinstance(guard, Mapping):
+        return
+    if guard.get("skipped"):
+        kept = guard.get("kept") if isinstance(guard.get("kept"), Mapping) else {}
+        requested = guard.get("requested") if isinstance(guard.get("requested"), Mapping) else {}
+        result["routing_guard_skipped"] = {
+            "reason": guard.get("reason"),
+            "kept_mode": kept.get("mode"),
+            "kept_source_tool": kept.get("source_tool"),
+            "kept_task_id": kept.get("task_id"),
+            "kept_expires_ts": kept.get("expires_ts"),
+            "requested_mode": requested.get("mode"),
+        }
+        return
+    result["routing_guard"] = dict(guard)
 
 
 def _deny_routing_guard(reason: str, *, guard: Mapping[str, object] | None = None) -> dict[str, object]:
@@ -5194,6 +5438,7 @@ def _build_route_execution_hint(
     selection: dict[str, object] | None = None,
     config: TGsConfig | None = None,
     effort: str | None = None,
+    subagent_type: str | None = None,
 ) -> dict[str, object]:
     normalized_caller = normalize_caller_id(caller)
     delegation_targets = _delegation_targets_for_tier(
@@ -5216,6 +5461,18 @@ def _build_route_execution_hint(
         if host_native and normalized_caller == "claude-code"
         else None
     )
+    # A caller that names the type it will spawn gets that type resolved to the
+    # definition carrying the routed effort, through the same resolver every
+    # spawn path uses — a named type used to keep its bare name and lose effort.
+    spawn_resolution = (
+        resolve_spawn_type(
+            caller=caller, base=subagent_type, tier=tier, effort=effort, config=config
+        )
+        if host_native and isinstance(subagent_type, str) and subagent_type.strip()
+        else None
+    )
+    if spawn_resolution is not None:
+        host_subagent_type = spawn_resolution.subagent_type
 
     if host_native:
         if tier == "low":
@@ -5263,6 +5520,8 @@ def _build_route_execution_hint(
             payload["host_native_model"] = host_native_model
         if host_subagent_type:
             payload["subagent_type"] = host_subagent_type
+        if spawn_resolution is not None:
+            payload.update(_spawn_resolution_fields(spawn_resolution))
         return payload
 
     if delegation_targets:
@@ -5299,6 +5558,18 @@ def _build_route_execution_hint(
     if host_native_model:
         payload["host_native_model"] = host_native_model
     return payload
+
+
+def _spawn_resolution_fields(resolution: Any) -> dict[str, object]:
+    """route_task's view of a :class:`SpawnTypeResolution` (set fields only)."""
+    fields: dict[str, object] = {"spawn_subagent_type": resolution.subagent_type}
+    if resolution.applied_effort:
+        fields["effort"] = resolution.applied_effort
+    for key in ("requested_effort", "effort_source", "effort_unapplied_reason", "variant_to_create"):
+        value = getattr(resolution, key, None)
+        if value:
+            fields[key] = value
+    return fields
 
 
 def _route_quick_action(
@@ -5356,7 +5627,7 @@ def _finalize_previous_route_guard(
             db, prev_id, config=config, outcome=None, caller=caller, task_text=prev_text
         )
     except Exception:
-        log.debug("previous route guard finalize failed", exc_info=True)
+        log.warning("previous route guard finalize failed", exc_info=True)
 
 
 def handle_route_task(args: dict) -> dict:
@@ -5411,6 +5682,9 @@ def handle_route_task(args: dict) -> dict:
         selection=selection if isinstance(selection, dict) else None,
         config=config,
         effort=getattr(decision, "reasoning_effort", None),
+        subagent_type=(
+            args.get("subagent_type") if isinstance(args.get("subagent_type"), str) else None
+        ),
     )
     execution_mode = str(execution_hint.get("mode") or "")
     host_model = execution_hint.get("host_native_model")
@@ -5482,12 +5756,23 @@ def handle_route_task(args: dict) -> dict:
         )
         execution_hint["host_native_method"] = "host_task"
         result["execution_hint"] = execution_hint
+        # No guard is written for this task while a handoff is in flight, so none
+        # is attached as routing_guard. The handoff's own routed_plan guard is
+        # named separately; any other live guard belongs to an unrelated earlier
+        # task (the swarm_runs fallback can report a handoff with no plan guard)
+        # and is not this response's business.
         existing_guard = db.routing_guard_get(
             caller=_normalize_route_text(caller) or "mcp",
             cwd=_routing_guard_cwd(args.get("cwd")),
         )
-        if isinstance(existing_guard, Mapping):
-            result["routing_guard"] = dict(existing_guard)
+        if (
+            isinstance(existing_guard, Mapping)
+            and existing_guard.get("mode") == ROUTING_GUARD_MODE_ROUTED_PLAN
+        ):
+            result["active_handoff_guard"] = {
+                key: existing_guard.get(key)
+                for key in ("mode", "source_tool", "task_id", "file_hints", "expires_ts")
+            }
     else:
         _finalize_previous_route_guard(db, config, caller=caller, cwd=args.get("cwd"), new_task_id=task_id)
         guard = _issue_routing_guard(
@@ -5511,9 +5796,9 @@ def handle_route_task(args: dict) -> dict:
             tier=decision.tier,
             provider=result.get("provider") if isinstance(result.get("provider"), str) else None,
             model=result.get("model") if isinstance(result.get("model"), str) else None,
+            task_id=task_id,
         )
-        if guard is not None:
-            result["routing_guard"] = guard
+        _attach_routing_guard(result, guard)
     # Computed last, from the final execution_hint — the active-handoff branch
     # above overrides execution_hint["recommended_action"], and _route_quick_action
     # prefers that field. Computing quick_action before this override meant the
@@ -5532,6 +5817,9 @@ def handle_route_task(args: dict) -> dict:
         task=task,
         tier=decision.tier,
         execution_hint=execution_hint,
+        subagent_type=(
+            args.get("subagent_type") if isinstance(args.get("subagent_type"), str) else None
+        ),
     )
     economics = execution_hint.get("economics") if isinstance(execution_hint, dict) else None
     estimated_cost = (
@@ -5555,6 +5843,11 @@ def handle_route_task(args: dict) -> dict:
         skipped_calls=["planner call"],
     )
     result["cost_receipt"] = cost_receipt
+    # economics.estimated_cost_usd is the marginal spend (0 on a host entitlement); the
+    # receipt prices the tokens. Carry the receipt figure too so the two never disagree
+    # silently about what the run consumes.
+    if isinstance(economics, dict):
+        economics["token_cost_usd"] = (cost_receipt.get("selected") or {}).get("estimated_cost_usd")
     try:
         record_run_receipt(
             db,
@@ -5566,7 +5859,7 @@ def handle_route_task(args: dict) -> dict:
             workspace_root=project_path,
         )
     except Exception:
-        log.debug("route_task receipt persist failed for %s", task_id, exc_info=True)
+        log.warning("route_task receipt persist failed for %s", task_id, exc_info=True)
     shared_outcomes.persist_route_telemetry(
         db,
         task_id=task_id,
@@ -7063,8 +7356,10 @@ def handle_execute_swarm(args: dict) -> dict:
             }
         ],
         "cost_estimate": {
+            # Effort heuristic, NOT money: "estimated" is kept as a deprecated alias
+            # because budget preview/confirm compare it. USD lives in cost_receipt.
+            "effort_credits": float(estimated_cost),
             "estimated": float(estimated_cost),
-            "currency": "USD",
             "unit": "credits",
             "method": "fast_heuristic",
         },
@@ -7230,6 +7525,116 @@ def _resolve_host_run_id(args: Mapping[str, object]) -> str:
 
 
 def handle_report_host_wave(args: dict) -> dict:
+    result = _handle_report_host_wave_impl(args)
+    # A terminal report ends the run's task: its routed_plan guard (task_id =
+    # the swarm/plan run id) must stop blocking direct edits now, not an hour
+    # later. Wrapped rather than inlined because the implementation has several
+    # terminal return paths (batch import, consensus, inline).
+    if bool(args.get("terminal", False)) and isinstance(result, dict) and "error" not in result:
+        try:
+            run_id = _resolve_host_run_id(args)
+        except ValueError:
+            run_id = ""
+        if run_id:
+            try:
+                _clear_routing_guard_for_task(_ensure_init()[1], run_id)
+            except Exception:
+                log.debug("terminal guard clear failed for %s", run_id, exc_info=True)
+    return result
+
+
+def _host_run_workspace_root(db: Database, run_id: str) -> str | None:
+    """``swarm_runs.workspace_root`` for *run_id*, or ``None``. Never raises."""
+    try:
+        with db.conn() as conn:
+            row = conn.execute(
+                "SELECT workspace_root FROM swarm_runs WHERE swarm_id = ?", (run_id,)
+            ).fetchone()
+    except Exception:
+        log.warning("workspace_root lookup failed for %s", run_id, exc_info=True)
+        return None
+    value = str(row[0] or "").strip() if row else ""
+    return value or None
+
+
+def _hook_capture_lost_reason(run_log_mod: Any, run_id: str, workspace_root: str | None) -> str | None:
+    """Why the PostToolUse hook could not have captured *run_id*, or ``None`` if it could.
+
+    The hook resolves its target run from the per-workspace active-run pointer
+    (``run_log.get_active_run(cwd)``); a pointer that is missing, expired, or
+    names another run means its records went elsewhere or nowhere.
+    """
+    try:
+        if workspace_root:
+            current = run_log_mod.get_active_run(workspace_root)
+            if current == run_id:
+                return None
+            if current:
+                return f"active-run pointer for {workspace_root} names another run ({current})"
+            return f"no valid active-run pointer for {workspace_root} (missing or expired)"
+        # No workspace known for this run: the hook could only have used the legacy
+        # global pointer.
+        if run_log_mod.get_active_run(None) == run_id:
+            return None
+        return "no workspace_root for this run and no global active-run pointer naming it"
+    except Exception as exc:
+        log.warning("active pointer check failed for %s", run_id, exc_info=True)
+        return f"active-run pointer check failed: {type(exc).__name__}"
+
+
+def _salvage_wave_agents(
+    run_log_mod: Any,
+    run_id: str,
+    wave_index: int,
+    agents: list,
+    workspace_root: str | None,
+) -> int:
+    """Append a lost-capture wave's reported agents to the run log; return the count.
+
+    An agent is skipped when the run log already holds it (same wave and
+    spawn/task id — a retried report) or already holds every file it touched (a
+    hook record written before the pointer lapsed), so the terminal import never
+    counts one edit twice.
+    """
+    from shared.host_learning import _agent_touched_files, _normalize_path_key
+
+    seen_ids: set[tuple[int, str]] = set()
+    seen_files: set[str] = set()
+    try:
+        for rec in run_log_mod.read_run_log(run_id):
+            if not isinstance(rec, dict):
+                continue
+            ident = str(rec.get("spawn_id") or rec.get("task_id") or "")
+            try:
+                rec_wave = int(rec.get("wave") or 0)
+            except (TypeError, ValueError):
+                rec_wave = 0
+            if ident:
+                seen_ids.add((rec_wave, ident))
+            seen_files.update(_normalize_path_key(f, workspace_root) for f in _agent_touched_files(rec))
+    except Exception:
+        log.warning("run log read failed while salvaging %s wave %d", run_id, wave_index, exc_info=True)
+    salvaged = 0
+    for a in agents:
+        if not isinstance(a, dict):
+            continue
+        ident = str(a.get("spawn_id") or a.get("task_id") or "")
+        if ident and (wave_index, ident) in seen_ids:
+            continue
+        files = {_normalize_path_key(f, workspace_root) for f in _agent_touched_files(a)}
+        if files and files <= seen_files:
+            continue
+        rec = dict(a)
+        rec["wave"] = wave_index
+        run_log_mod.append_agent_record(run_id, rec)
+        if ident:
+            seen_ids.add((wave_index, ident))
+        seen_files.update(files)
+        salvaged += 1
+    return salvaged
+
+
+def _handle_report_host_wave_impl(args: dict) -> dict:
     config, db, router, planner, orchestrator = _ensure_init()
     try:
         run_id = _resolve_host_run_id(args)
@@ -7287,23 +7692,54 @@ def handle_report_host_wave(args: dict) -> dict:
                     rec["wave"] = wave_index
                     run_log.append_agent_record(run_id, rec)
                     captured += 1
-        # capture == "hook": records already appended by the PostToolUse hook.
+        # capture == "hook": records were appended by the PostToolUse hook — but
+        # only if it could resolve this run through the workspace's active-run
+        # pointer. Check that BEFORE refreshing it: a missing, expired or foreign
+        # pointer means this wave's edits went nowhere, and saying "deferred"
+        # would promise a terminal import of records that do not exist.
+        lost_reason: str | None = None
+        pointer_root = workspace_root or _host_run_workspace_root(db, run_id)
+        if learning_capture == "hook":
+            lost_reason = _hook_capture_lost_reason(run_log, run_id, pointer_root)
         # A worker-wave report is real host activity: refresh this run's hook
         # pointer so a run longer than run_log.ACTIVE_POINTER_TTL_S keeps being
         # captured, without stealing the pointer from a different active run.
-        if workspace_root:
+        pointer_restored = False
+        if pointer_root:
             try:
-                if run_log.get_active_run(workspace_root) in (None, run_id):
-                    run_log.set_active_run(run_id, workspace_root=workspace_root)
+                if run_log.get_active_run(pointer_root) in (None, run_id):
+                    run_log.set_active_run(run_id, workspace_root=pointer_root)
+                    pointer_restored = lost_reason is not None
             except Exception:
-                log.debug("active pointer refresh failed for %s", run_id, exc_info=True)
-        return {
+                log.warning("active pointer refresh failed for %s", run_id, exc_info=True)
+        response: dict[str, object] = {
             "run_id": run_id,
             "wave": wave_index,
             "report_mode": "batch",
             "captured": captured,
-            "deferred": True,
         }
+        if lost_reason is None:
+            response["deferred"] = True
+            return response
+        # Salvage what the report itself carries: those agents are the only record
+        # of this wave now. The pointer may have lapsed part-way through the wave
+        # (or the report may be a retry), so skip what the run log already holds.
+        captured += _salvage_wave_agents(run_log, run_id, wave_index, agents_raw, pointer_root)
+        log.warning(
+            "hook capture lost for run %s wave %d: %s (%d agent(s) salvaged from the report)",
+            run_id, wave_index, lost_reason, captured,
+        )
+        response["captured"] = captured
+        response["capture"] = "lost"
+        response["capture_lost_reason"] = lost_reason
+        response["pointer_restored"] = pointer_restored
+        response["hint"] = (
+            "The PostToolUse hook could not attribute this wave's edits to this run; only "
+            "the agents passed in this report were recorded. Include each agent's "
+            "touched_files, model and effort in the next reports"
+            + (" — the pointer is restored, so later waves are captured again." if pointer_restored else ".")
+        )
+        return response
 
     # ---- Batch terminal (non-consensus): import the whole run log once. ----
     if report_mode == "batch" and terminal and not is_consensus:
@@ -7667,6 +8103,8 @@ def handle_ladder_plan(args: dict) -> dict:
         kwargs["levels"] = [int(v) for v in args["levels"]]
     if isinstance(args.get("case_ids"), list) and args["case_ids"]:
         kwargs["case_ids"] = [str(c) for c in args["case_ids"]]
+    if isinstance(args.get("effort"), str) and args["effort"].strip():
+        kwargs["effort"] = args["effort"].strip()
     try:
         return shared_ladder.plan_host_ladder(**kwargs)
     except (TypeError, ValueError) as exc:
@@ -7683,6 +8121,13 @@ def handle_ladder_grade(args: dict) -> dict:
         return {"error": "invalid_request", "details": "content is required"}
     _config, db, *_ = _ensure_init()
     model = args.get("model")
+    # The effort the item actually ran at (ladder_plan's applied ``effort``). Without
+    # it every host-graded row was recorded effort-less, so the ledger could not
+    # tell a high-effort pass from a low-effort one on the same model.
+    effort = args.get("effort")
+    effort = effort.strip().lower() if isinstance(effort, str) and effort.strip() else None
+    if effort is not None and effort not in ("low", "medium", "high"):
+        return {"error": "invalid_request", "details": "effort must be low, medium or high"}
     return shared_ladder.grade_host_output(
         db,
         case_id=args["case_id"].strip(),
@@ -7690,6 +8135,7 @@ def handle_ladder_grade(args: dict) -> dict:
         content=args["content"],
         model=model if isinstance(model, str) and model.strip() else None,
         sweep_id=args["sweep_id"].strip(),
+        effort=effort,
     )
 
 
@@ -9673,6 +10119,31 @@ def _resolve_record_outcome_operator_id(raw_operator_id: object) -> tuple[str, d
     }
 
 
+def _clear_routing_guard_for_task(db: Database, task_id: str) -> str:
+    """Delete the routing guard(s) issued for *task_id*; return the task text.
+
+    A guard used to stay in force for the full TTL after its task was over, so
+    the next task in the same cwd was judged against the previous task's mode
+    and file hints. The terminal signals for a task — ``record_outcome`` and a
+    swarm's terminal report — are where it ends. Best-effort: never raises.
+    """
+    normalized = str(task_id or "").strip()
+    if not normalized:
+        return ""
+    task_text = ""
+    try:
+        with db.conn() as conn:
+            row = conn.execute(
+                "SELECT task_text FROM routing_guards WHERE task_id = ? LIMIT 1",
+                (normalized,),
+            ).fetchone()
+        task_text = str(row[0] or "") if row else ""
+        db.routing_guard_clear_for_task(task_id=normalized)
+    except Exception:
+        log.debug("routing guard clear failed for %s", normalized, exc_info=True)
+    return task_text
+
+
 def handle_record_outcome(args: dict) -> dict:
     raw_task_id = args.get("task_id")
     if not isinstance(raw_task_id, str) or not raw_task_id.strip():
@@ -9706,9 +10177,28 @@ def handle_record_outcome(args: dict) -> dict:
             "error": "invalid_request",
             "details": "actual_model must be a string when provided",
         }
+    actual_effort = args.get("actual_effort")
+    if actual_effort is not None:
+        if not isinstance(actual_effort, str):
+            return {
+                "error": "invalid_request",
+                "details": "actual_effort must be a string when provided",
+            }
+        actual_effort = actual_effort.strip().lower() or None
+        if actual_effort is not None and actual_effort not in shared_outcomes.EFFORT_VALUES:
+            return {
+                "error": "invalid_request",
+                "details": "actual_effort must be one of: " + ", ".join(shared_outcomes.EFFORT_VALUES),
+            }
+    actual_model = (actual_model or "").strip() or None
 
     try:
         _config, db, *_ = _ensure_init()
+        reported: dict[str, object] = {}
+        if actual_model:
+            reported["actual_model"] = actual_model
+        if actual_effort:
+            reported["actual_effort"] = actual_effort
         recorded = shared_outcomes.record_outcome(
             db,
             raw_task_id,
@@ -9718,15 +10208,25 @@ def handle_record_outcome(args: dict) -> dict:
             project_id=str(_active_workspace_root()),
             routed_tier=args.get("routed_tier"),
             actual_tier=args.get("actual_tier"),
+            **reported,
         )
+        guard_task_text = _clear_routing_guard_for_task(db, raw_task_id.strip())
+        finalize_kwargs: dict[str, object] = {}
+        if guard_task_text:
+            # The guard is gone before the warm-path finalize runs; hand over the
+            # text it would otherwise have recovered from the live guard.
+            finalize_kwargs["task_text"] = guard_task_text
+        if actual_effort:
+            finalize_kwargs["actual_effort"] = actual_effort
         shared_direct_edit_quality.schedule_finalize(
             db,
             raw_task_id.strip(),
             config=_config,
             outcome=normalized_outcome,
-            actual_model=(actual_model or "").strip() or None,
+            actual_model=actual_model,
             actual_tier=args.get("actual_tier"),
             caller=_resolve_caller(),
+            **finalize_kwargs,
         )
         return recorded
     except shared_outcomes.OutcomeReadonlyWindowError as exc:
@@ -9944,6 +10444,7 @@ def handle_plan_task_pack(args: dict) -> dict:
         _persist_host_plan_run(
             db,
             run_id=host_run_id,
+            caller=caller,
             task=task,
             payload=result,
             workspace_root=workspace_root,
@@ -10778,6 +11279,7 @@ def handle_execute_subtask(args: dict) -> dict:
             prompt=str(prompt),
             delegation_targets=delegation_targets,
             target_file=target_file if isinstance(target_file, str) else None,
+            effort=effort or default_routed_effort(tier),
         )
 
     if provenance_depth > 2:
@@ -12980,10 +13482,20 @@ def _parent_death_watchdog(poll: float = _WATCHDOG_POLL_SECONDS) -> None:
 
 
 def main() -> None:
+    # stderr of a stdio MCP server is invisible to the user and stays at WARNING;
+    # INFO and the failures below it go to <install>/logs/threnody.log.
+    from shared.logging_setup import configure_file_logging
+
+    log_path = configure_file_logging("mcp_server", logger_names=(log.name, "mcp_server"))
     log.info(
-        "Threnody MCP server %s — cross-provider orchestrator",
+        "Threnody MCP server %s — cross-provider orchestrator (log: %s)",
         get_display_version(),
+        log_path,
     )
+    # Proxy for the host session's start, so spawn payloads never name an effort
+    # variant written after the session loaded its definitions. Set here rather
+    # than at import: tests import this module and create variants afterwards.
+    set_default_session_start(_PROCESS_START_TS)
     threading.Thread(
         target=_parent_death_watchdog, daemon=True, name="parent-death-watchdog"
     ).start()
